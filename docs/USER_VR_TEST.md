@@ -6,6 +6,30 @@ supply an exact build/package identity and list remaining disabled features befo
 asking for a final pass. Individual weapon-firing tests belong to the user in VR;
 Codex must not continue those probes under the current instruction.
 
+## Current candidate — 2026-10-10
+
+- Version `0.2.11-dev.0aaec65a9c5a`, source fingerprint
+  `0aaec65a9c5a8135c6e7b19c54b924f757fdfc9fb94afd052e4552ec476a1f05`, source commit
+  `8f92c54`, IPC11/wire7. The package is supplied privately; binaries are not published.
+- Product SHA-256: `Bin/d3d9.dll` `478a78cb…a1d4`, `Bin/SS2VRServer.dll`
+  `711ed021…ab41`, `Bin/SS2VR/ss2vr_host.exe` `1688679c…e473`,
+  `Bin/SS2VR/openxr_loader.dll` `bb011caa…bd1d`. Compare against the package
+  `manifest.json`; the installer refuses mismatches.
+- Pre-handoff evidence (simulated Monado, fixed neutral pose, no input): with
+  `[Roomscale]`, `[HeadComfort]` and `[Melee]` `Enabled=1`, fourteen consecutive
+  fresh startups loaded Jungle, presented both native eyes with the visible world,
+  dual weapons and lasers, head clearance Clear, and shut down cleanly. This is not
+  a headset, motion, firing, vehicle or multiplayer result.
+- For the full-feature pass set `Enabled=1` in `[Roomscale]`, `[HeadComfort]` and
+  `[Melee]` of `Bin/SS2VR/SS2VR.ini` (all three default to 0), then restart.
+  Repeat the world/tracking section once with them at 0 for comparison.
+- Not supported in this candidate: literal driver wheels and physical vehicle
+  controls beyond the admitted Fighter/Saucer handles (`[Vehicles]ImmersiveGrips`,
+  default 1); teleport (excluded by design).
+- Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log`
+  and the game's `Sam2.log`. A startup that hangs on loading should be reported
+  with its log even if a retry succeeds.
+
 Use a separate test profile/save and a private multiplayer session. Keep original
 saves and settings backed up. Record game version, mod package/source fingerprint,
 platform, runtime version, headset and controller models. Use the same scene/save
