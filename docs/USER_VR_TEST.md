@@ -149,6 +149,13 @@ must remain stable. Repeat on foot and in supported seats, separately from firin
    level. Check recenter, sitting/standing and physical position changes.
 5. Adjust panel size/distance within supported settings. Record clipped text,
    unreadable labels, intrusive placement or uncomfortable following separately.
+6. Watch an in-level cutscene, a pre-rendered movie (do not use
+   `+sam_bSkipMovies 1`), Netricsa, a loading screen and the death view. Each must
+   appear on the same flat virtual screen as menus, not black eyes or a stuck
+   world frame, and return to stereo gameplay when control returns. Trigger/Use
+   confirm and Menu goes back (skip a movie, close Netricsa); the pointer works
+   only in real menus. After death, trigger or Use must reach the native
+   respawn/reload prompt.
 
 Optional native UI aid: if this pinned game build exposes the documented menu
 gadget grid (`men_bRenderGadgetGrid` and X/Y spacing controls), compare its visible
