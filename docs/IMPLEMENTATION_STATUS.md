@@ -1,5 +1,34 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-10 — repaired full-feature run timed out before scene readiness
+
+Fresh private neutral run20261010T160619 used source
+4caca4b159df3351ea5cd707ce56851924e2685e and compiled fingerprint
+61ce671273a668d28bffdfd4288a2d4a29e65d7e7b60c1a92f53d0c6b0d3926b.
+The independently installed profile enabled Roomscale, HeadComfort and Melee;
+all inputs stayed neutral. The private D3D9 timing check and graphical simulated
+Monado window initialized. Native routing and VR hooks attached, but no first
+admitted presentation, host log, loaded-scene receipt or gameplay eye image was
+recorded. All76owned loading observations remained at observer stage2, meaning
+verified process identity without an admitted ready loading-menu state. This
+marker does not identify the native instruction or worker causing the stall.
+
+The bounded attempt ended with scene-readiness timeout. No native crash report
+was produced. Normal native shutdown was not observed; native cleanup reported
+no errors or termination requests. Outer cleanup stopped the private display
+with no surviving owned processes, errors or deferred signals. Original game,
+settings, saves and old checkout remained protected. The attempted fixture and
+its exact source/settings/logs are private and immutable.
+
+The common-join source repair has passed its compiled/native checks, but this
+attempt never reached the previous failing world-load extent. It therefore
+proves neither V59 crash causality nor runtime recovery. The next bounded
+investigation is the existing startup/loading-owner and first-presentation route,
+using these actual records before proposing a native or launch change. More
+optional animation/grasp research is not an ordinary gun-attachment prerequisite.
+No head motion, firing, vehicle, multiplayer or hardware acceptance was added.
+
+
 ## 2026-10-10 — repair model-preparation hooks at their common joins
 
 The full-feature startup investigation found two unsafe hook placements. Native
