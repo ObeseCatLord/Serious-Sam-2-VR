@@ -451,6 +451,7 @@ struct HeadQueryDiagnostic {
     bool prepared=false,clear=false,failed=false,mathReturned=false,coverValid=false;
     SphereQueryOutcome sphere;
     RoomscaleScopeFailure kernel;
+    uint32_t ownerFailure=0,phaseFailure=0;
 };
 static HeadQueryDiagnostic headQueryDiagnostic;
 static std::atomic<unsigned> headDiagnosticReceipts{0};
@@ -3223,6 +3224,8 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
                         eyeAnchor.p.x,eyeAnchor.p.y,eyeAnchor.p.z,eyeAnchor.q.x,eyeAnchor.q.y,eyeAnchor.q.z,eyeAnchor.q.w,
                         s.head.p.x,s.head.p.y,s.head.p.z,head.p.x,head.p.y,head.p.z);
                     const auto& q=d.sphere;const auto& k=d.kernel;
+                    log("Head clearance owner receipt=%u ownerFailure=%u phaseFailure=%u",
+                        ordinal,d.ownerFailure,d.phaseFailure);
                     log("Head clearance kernel receipt=%u sphereStage=%u completed=%u hit=%d scopeCompleted=%u scopeFailed=%u ownerLost=%u kind=%u calls=%u origin=(%.9g,%.9g,%.9g) direction=(%.9g,%.9g,%.9g) a=(%.9g,%.9g,%.9g) b=(%.9g,%.9g,%.9g) c=(%.9g,%.9g,%.9g) normal=(%.9g,%.9g,%.9g) shape=%u,%.9g,%.9g,%.9g radius=%.9g result=%.9g entry=%.9g exit=%.9g maxT=%.17g budget=%.17g whole=%u reject=%u",
                         ordinal,q.stage,q.completed,q.hit,unsigned(q.scopeCompleted),unsigned(q.scopeFailed),unsigned(q.ownerLost),
                         k.kind,k.calls,k.ray.origin.x,k.ray.origin.y,k.ray.origin.z,
@@ -6426,6 +6429,44 @@ static bool roomscalePhaseCurrent(const LocalRoomscaleAttempt& c,bool checkContr
         roomscaleOwnedWord(c,c.brain,0x10,value)&&!(value&2u)&&
         roomscaleOwnedWord(c,c.brain,0x28,value)&&value==c.snapshot.playerHandle;
 }
+// Lab diagnostic only, evaluated after roomscalePhaseCurrent already failed:
+// the first failing term in its original order (0 when it now passes).
+static uint32_t roomscalePhaseFailure(const LocalRoomscaleAttempt& c,bool checkControls=true) noexcept {
+    uint32_t n=0;
+    const auto term=[&](bool ok) {++n;return !ok;};
+    if(term(roomscaleConfigured)||term(roomscaleBusy)||term(!roomscaleFaulted.load())||
+       term(!nativeRayFaulted.load(std::memory_order_acquire))||term(hooksReady.load(std::memory_order_acquire))||
+       term(nativeMainThread&&nativeMainThread())||term(GetCurrentThreadId()==c.thread)||
+       term(simulationThread.load()==c.thread)||term(simulationInterval==c.interval&&c.interval)||
+       term(!c.interval->previous&&c.interval->managerPrepared&&c.interval->failure&&!*c.interval->failure)||
+       term(c.interval->nativeCaller==roomscaleSimulationReturn)||term(simulationRevision==c.simulationSequence)||
+       term(c.world&&c.physics)||term(!activeNativeRay)||term(!laserQuerying)||term(!snapshotNativeReadDepth)||
+       term(eyeIndex<0)||term(!scopeSource.active)||term(!physicalWeapon)||term(!nativeShotDepth)||
+       term(!primaryInvocation)||term(!zoomManagerFrame)||term(!zoomContext)||term(!uiOwnerDepth)||
+       term(!uiOverlayDepth)||term(!executingView)||term(nativePresentationIdleForBodyMove()))return n;
+    uint32_t value=0,pool=0;
+    if(term(roomscaleOwnedWord(c,roomscaleEngineBase,0x2f1a70,value)&&value==reinterpret_cast<uintptr_t>(c.interval->simulation))||
+       term(roomscaleOwnedWord(c,reinterpret_cast<uintptr_t>(c.interval->simulation),0x4c,value)&&value==0)||
+       term(roomscaleOwnedWord(c,roomscaleEngineBase,0x2f1b3c,value)&&value==c.world)||
+       term(c.world==reinterpret_cast<uintptr_t>(c.interval->preparedWorld))||
+       term(roomscaleOwnedWord(c,c.world,4,value)&&!(value&1u))||
+       term(roomscaleOwnedWord(c,c.world,0x74,value)&&value==reinterpret_cast<uintptr_t>(c.interval->preparedManager))||
+       term(roomscaleOwnedWord(c,c.world,0x6c,value)&&value==c.physics)||
+       term(roomscaleOwnedWord(c,roomscaleEngineBase,0x2ec948,pool)&&pool)||
+       term(roomscaleOwnedWord(c,pool,0x10,value)&&value==0))return n;
+    if(!checkControls)return 0;
+    if(term(c.worldInfoHandle&&c.worldInfo&&c.brainHandle&&c.brain)||
+       term(roomscaleOwnedWord(c,c.world,0x64,value)&&value==c.worldInfoHandle&&resolve(value)==reinterpret_cast<void*>(c.worldInfo))||
+       term(roomscaleOwnedWord(c,c.worldInfo,0,value)&&value==roomscaleWorldInfoTable)||
+       term(roomscaleOwnedWord(c,c.worldInfo,0x10,value)&&!(value&2u))||
+       term(roomscaleOwnedWord(c,c.worldInfo,0x6c,value)&&value==0)||
+       term(roomscaleOwnedWord(c,reinterpret_cast<uintptr_t>(c.snapshot.player),0x38c,value)&&value==c.brainHandle&&
+            resolve(value)==reinterpret_cast<void*>(c.brain))||
+       term(roomscaleOwnedWord(c,c.brain,0,value)&&value==roomscaleBrainTable)||
+       term(roomscaleOwnedWord(c,c.brain,0x10,value)&&!(value&2u))||
+       term(roomscaleOwnedWord(c,c.brain,0x28,value)&&value==c.snapshot.playerHandle))return n;
+    return 0;
+}
 static bool roomscaleSnapshotMatches(const Snapshot& a,const Snapshot& b) noexcept {
     return a.player==b.player&&a.playerHandle==b.playerHandle&&a.rider==b.rider&&
         a.generation==b.generation&&a.rigRevision==b.rigRevision&&
@@ -6623,13 +6664,30 @@ static bool captureHeadQueryBinding(HeadVisibilityAttempt& h,roomscale::HeadQuer
 }
 static bool __cdecl headQueryOwnerCurrent(void* opaque) noexcept {
     auto& h=*static_cast<HeadVisibilityAttempt*>(opaque);auto& c=h.owner;
-    if(c.failed||!roomscalePhaseCurrent(c)||!roomscaleCleanupReady(c))return false;
+    // Diagnostic: remember only the first failing term; same predicate order.
+    const auto fail=[&](uint32_t code) {
+        if(!h.diagnostic.ownerFailure) {
+            h.diagnostic.ownerFailure=code;
+            if(code==2)h.diagnostic.phaseFailure=roomscalePhaseFailure(c);
+        }
+        return false;
+    };
+    if(c.failed)return fail(1);
+    if(!roomscalePhaseCurrent(c))return fail(2);
+    if(!roomscaleCleanupReady(c))return fail(3);
     const auto live=copySnapshot();
-    if(!roomscaleSnapshotMatches(c.snapshot,live)||!vrSession(live)||!fresh(live.input)||!live.ui.gameplay||
-       (!live.rider.handheld()&&!live.rider.seated())||recenterHeld(live.input)||!livePlayer(live)||
-       !nativeRiderCurrent(live.player,live.rider))return false;
+    if(!roomscaleSnapshotMatches(c.snapshot,live))return fail(4);
+    if(!vrSession(live))return fail(5);
+    if(!fresh(live.input))return fail(6);
+    if(!live.ui.gameplay)return fail(7);
+    if(!live.rider.handheld()&&!live.rider.seated())return fail(8);
+    if(recenterHeld(live.input))return fail(9);
+    if(!livePlayer(live))return fail(10);
+    if(!nativeRiderCurrent(live.player,live.rider))return fail(11);
     roomscale::HeadQueryBinding current;
-    return captureHeadQueryBinding(h,current)&&roomscale::sameHeadQueryBinding(h.binding,current);
+    if(!captureHeadQueryBinding(h,current))return fail(12);
+    if(!roomscale::sameHeadQueryBinding(h.binding,current))return fail(13);
+    return true;
 }
 static void __cdecl queryHeadVolume(void* opaque) noexcept {
     auto& h=*static_cast<HeadVisibilityAttempt*>(opaque);auto& c=h.owner;
