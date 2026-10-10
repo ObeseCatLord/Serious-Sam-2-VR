@@ -8,6 +8,108 @@ import private_display_lab as display
 GOOD={'schema':1,'stage':'swapchain-query','operation':'get-raster-status','desktop_hz':60,'adapter_hz':60,'swapchain_hz':60,
       'width':1280,'height':720,'raster_called':True,'cleanup_completed':True,'hresult':0,'scanline':0,'in_vblank':True}
 class Checks(unittest.TestCase):
+    def test_startup_snapshot_failure_is_contained_and_never_admits_success(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);record={'result':'incomplete'};owner={'pid':123}
+            (root/'Sam2.log').write_text('Loading native modules\n');cfg={'startup_snapshot':True,'game_lab':str(root)}
+            with patch.object(lab,'still_owned',return_value=True),patch.object(lab,'observer',side_effect=[{'process_creation':456},TimeoutError('snapshot timeout')]) as query:
+                lab.capture_startup_snapshot(cfg,{},root,record,owner,'owned-path')
+            self.assertEqual([c.args[2] for c in query.call_args_list],['stock-status','stock-dump'])
+            self.assertEqual(record['result'],'incomplete');self.assertEqual(record['startup_snapshot_error'],'snapshot timeout')
+            self.assertNotIn('startup_snapshot',record)
+            for selection,state in (({},'incomplete'),({'startup_snapshot':True},'native_neutral_captured')):
+                with patch.object(lab,'observer') as query:
+                    lab.capture_startup_snapshot(selection,{},root,{'result':state},owner,'owned-path')
+                    query.assert_not_called()
+            with patch.object(lab,'observer') as query:
+                lab.capture_startup_snapshot({'startup_snapshot':True},{},root,
+                    {'result':'incomplete','loaded_scene_confirmed':True},owner,'owned-path')
+                query.assert_not_called()
+            with patch.object(lab,'still_owned',side_effect=OSError('owner vanished')),patch.object(lab,'observer') as query:
+                lab.capture_startup_snapshot(cfg,{},root,record,owner,'owned-path')
+                query.assert_not_called();self.assertEqual(record['startup_snapshot_error'],'owner vanished')
+            receipt=root/'startup-native-snapshot.json';receipt.write_text('{"dump_written":0,"write_error":5}')
+            with patch.object(lab,'still_owned',return_value=True),patch.object(lab,'observer',side_effect=[{'process_creation':456},RuntimeError('API refused')]) as query:
+                lab.capture_startup_snapshot(cfg,{},root,record,owner,'owned-path')
+            self.assertEqual(record['startup_snapshot']['write_error'],5);self.assertEqual(record['result'],'incomplete')
+            self.assertEqual([c.args[2] for c in query.call_args_list],['stock-status','stock-dump'])
+            self.assertEqual(record['startup_snapshot_error'],'API refused')
+    def test_snapshot_excludes_world_logs_and_gameplay_before_full_vr_readiness(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);cfg={'startup_snapshot':True,'game_lab':str(root)}
+            (root/'Sam2.log').write_text("Started simulation on 'Jungle.wld'\n")
+            with patch.object(lab,'still_owned',return_value=True),patch.object(lab,'observer') as query:
+                record={'result':'incomplete'};lab.capture_startup_snapshot(cfg,{},root,record,{'pid':1},'path')
+                query.assert_not_called();self.assertIn('startup_snapshot_skipped',record)
+            (root/'Sam2.log').write_text('Loading modules\n')
+            with patch.object(lab,'still_owned',return_value=True),patch.object(lab,'observer') as query:
+                record={'result':'incomplete','world_before_vr_readiness':True}
+                lab.capture_startup_snapshot(cfg,{},root,record,{'pid':1},'path');query.assert_not_called()
+            with patch.object(lab,'still_owned',return_value=True),patch.object(lab,'observer',return_value={'native_simulation':123}) as query:
+                record={'result':'incomplete'};lab.capture_startup_snapshot(cfg,{},root,record,{'pid':1},'path')
+                self.assertEqual(query.call_count,1);self.assertEqual(record['startup_snapshot_skipped'],'native-simulation-observed')
+    def test_snapshot_timeout_rediscovery_keeps_exclusions_and_reports_unresolved_helpers(self):
+        from unittest.mock import Mock
+        for token in (None,'ipc-token'):
+            for unresolved in (False,True):
+                with self.subTest(token=token,unresolved=unresolved),tempfile.TemporaryDirectory() as d:
+                    root=Path(d);(root/'Sam2.log').write_text('Loading modules\n')
+                    cfg={'startup_snapshot':True,'game_lab':str(root),'proton':'proton','observer':str(root/'observer.exe')}
+                    helper={'pid':2,'start':'new'};old={'pid':3,'start':'old'};remaining=[helper,old];calls=[0];stops=[0]
+                    actor=Mock();actor.returncode=None;actor.poll.side_effect=lambda:actor.returncode
+                    def communicate(**kw):
+                        calls[0]+=1
+                        if calls[0]==1:raise lab.subprocess.TimeoutExpired('observer',1)
+                        return b'',b''
+                    actor.communicate.side_effect=communicate;actor.terminate.side_effect=lambda:setattr(actor,'returncode',-15)
+                    inventories=[0]
+                    def inventory(executable,scope=None):
+                        if Path(executable)!=Path(cfg['observer']):return []
+                        if scope not in ('stock-path',token):return []
+                        inventories[0]+=1
+                        if inventories[0]==1:return [old]
+                        return list(remaining)
+                    def stop(item,budget=None):
+                        self.assertEqual(item,helper);stops[0]+=1
+                        if stops[0]==1 or unresolved:raise RuntimeError('helper retirement failed')
+                        remaining.remove(helper)
+                    real_observer=lab.observer
+                    def query(config,env,command,key,*args,**kw):
+                        if command=='stock-status':return {'process_creation':1}
+                        return real_observer(config,env,command,key,*args,**kw)
+                    record={'result':'incomplete'};errors=[]
+                    def cleanup(action):
+                        try:action()
+                        except Exception as e:errors.append(str(e))
+                    with patch.object(lab,'still_owned',return_value=True),patch.object(lab,'private_processes',side_effect=inventory),patch.object(lab,'stop_exact',side_effect=stop),patch.object(lab.subprocess,'Popen',return_value=actor),patch.object(lab,'observer',side_effect=query):
+                        lab.capture_startup_snapshot(cfg,{},root,record,{'pid':1},'stock-path')
+                        lab.retire_run_children(root,Path(cfg['observer']),token,'stock-path',{(3,'old')},lab.time.monotonic()+20,cleanup)
+                    self.assertIn('startup_snapshot_error',record);self.assertEqual(stops[0],2)
+                    self.assertEqual(old,remaining[-1]);self.assertEqual(bool(errors),unresolved)
+                    self.assertEqual(helper in remaining,unresolved)
+    def test_retirement_exclusions_survive_actual_game_observer_argument_overlap(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);exe=root/'observer.exe';game=root/'Bin/Sam2.exe';stock='Z:'+str(game)
+            old={'pid':1,'start':'old','argv':[b'wine',str(exe).encode(),b'stock-status',stock.encode()]}
+            helper={'pid':2,'start':'new','argv':[b'wine',str(exe).encode(),b'stock-dump',stock.encode()]}
+            actor={'pid':3,'start':'game','argv':[b'wine',str(game).encode()]}
+            other={'pid':4,'start':'foreign','argv':[b'wine',str(exe).encode(),b'stock-status',b'Z:/other-lab/Bin/Sam2.exe']}
+            rows={str(x['pid']):x for x in (old,helper,actor,other)}
+            for token in (None,'ipc-token'):
+                calls=[]
+                with patch.object(Path,'iterdir',return_value=[Path('/proc')/key for key in rows]),patch.object(lab,'identity',side_effect=lambda pid:rows.get(str(pid))),patch.object(lab,'stop_exact',side_effect=lambda item,budget=None:calls.append((item['pid'],item['start']))):
+                    self.assertEqual({x['pid'] for x in lab.private_processes(game)},{1,2,3})
+                    lab.retire_run_children(root,exe,token,stock,{(1,'old')},lab.time.monotonic()+20,lambda action:action())
+                self.assertEqual(set(calls),{(2,'new'),(3,'game')});self.assertEqual(len(calls),2)
+    def test_startup_snapshot_is_explicit_and_requires_neutral_runtime(self):
+        for cfg in ({'startup_snapshot':1},{'startup_snapshot':'true'},
+                    {'startup_snapshot':True},{'startup_snapshot':True,'neutral_runtime_probe':False},
+                    {'startup_snapshot':True,'neutral_runtime_probe':True,'idle_weapon_probe':False}):
+            with self.subTest(cfg=cfg),self.assertRaises(ValueError):lab.validate_idle_probe(cfg)
+        lab.validate_idle_probe({'startup_snapshot':False})
+        lab.validate_idle_probe({'startup_snapshot':True,'neutral_runtime_probe':True,
+            'idle_weapon_probe':True,'idle_native_id':2,'expected_product_source':'a'*64,
+            'baseline_head':[0,1.6,0],'pose_steps':[{'name':'baseline','head':[0,1.6,0]}]})
     def test_neutral_runtime_mode_requires_exact_stationary_prepared_game_selection(self):
         cfg={'neutral_runtime_probe':True,'idle_weapon_probe':True,'idle_native_id':2,
              'expected_product_source':'a'*64,'baseline_head':[0,1.6,0],

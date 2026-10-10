@@ -445,6 +445,7 @@ def observer(cfg, env, command, token, output=None, timeout=20, deadline=None):
     # Proton opens the same app-id log for every invocation. Status observers
     # must not truncate the owned game's startup trace or mutate its environment.
     observer_env=env.copy();observer_env['PROTON_LOG']='0'
+    if command=='stock-dump':observer_env['SS2VR_LAB_STARTUP_SNAPSHOT']='1'
     process=subprocess.Popen(args,env=observer_env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
     try:
         stdout,stderr=process.communicate(timeout=timeout)
@@ -520,6 +521,9 @@ def preparation_target(native_id):
     return PREPARATION_TARGETS[native_id]
 
 def validate_idle_probe(cfg):
+    snapshot=cfg.get('startup_snapshot',False)
+    if type(snapshot) is not bool or (snapshot and cfg.get('neutral_runtime_probe') is not True):
+        raise ValueError('Startup snapshot requires the sealed private neutral runtime extent')
     neutral_runtime=cfg.get('neutral_runtime_probe',False)
     if type(neutral_runtime) is not bool:
         raise ValueError('Neutral runtime selection must be an explicit boolean')
@@ -1018,6 +1022,43 @@ def finish_idle_capture(cfg,lab,run_dir,manifest):
         return True
     return False
 
+def retire_run_children(lab,observer_path,token,stock_token,exclusions,budget,cleanup):
+    seen=set()
+    for executable in (lab/'Bin/Sam2.exe',lab/'Bin/SS2VR/ss2vr_host.exe',observer_path):
+        scopes=(None,) if executable!=observer_path else tuple(dict.fromkeys(t for t in (token,stock_token) if t))
+        for scope in scopes:
+            for item in private_processes(executable,scope):
+                key=(item['pid'],item['start'])
+                if key in seen or key in exclusions:continue
+                seen.add(key)
+                cleanup(lambda item=item:stop_exact(item,budget))
+
+def capture_startup_snapshot(cfg,env,run_dir,manifest,owned_game,stock_token):
+    receipt=run_dir/'startup-native-snapshot.json'
+    try:
+        if cfg.get('startup_snapshot') is not True or manifest.get('result')!='incomplete' or manifest.get('loaded_scene_confirmed') is True or not owned_game or not still_owned(owned_game):
+            return
+        log=Path(cfg['game_lab'])/'Sam2.log'
+        if log.is_symlink() or not log.is_file() or log.stat().st_size>16*1024*1024:
+            raise RuntimeError('Fresh native startup log unavailable or unbounded')
+        if manifest.get('world_before_vr_readiness') is True or "Started simulation on '" in log.read_text(errors='replace'):
+            manifest['startup_snapshot_skipped']='world-observed-before-VR-readiness'
+            return
+        deadline=time.monotonic()+12
+        dump=run_dir/'startup-native-private.dmp'
+        state=observer(cfg,env,'stock-status',stock_token,timeout=3,deadline=deadline)
+        if state.get('native_simulation'):
+            manifest['startup_snapshot_skipped']='native-simulation-observed'
+            return
+        observer(cfg,env,'stock-dump',stock_token,
+                 (state['process_creation'],'Z:'+str(dump),'Z:'+str(receipt)),timeout=8,deadline=deadline)
+        manifest['startup_snapshot']=json.loads(receipt.read_text())
+    except BaseException as error:
+        manifest['startup_snapshot_error']=str(error)
+        try:
+            if receipt.is_file():manifest['startup_snapshot']=json.loads(receipt.read_text())
+        except (OSError,ValueError):pass
+
 def run(cfg):
     private,lab,prefix=validate(cfg)
     stock=cfg.get('renderer_mode','vr')=='stock'
@@ -1252,6 +1293,7 @@ def run(cfg):
                         time.sleep(.05);continue
                     raise
                 last_state=state
+                if state.get('gameplay')==1:manifest['world_before_vr_readiness']=True
                 if cfg.get('native_input_probe'):
                     if state.get('native_state_repeated') and state.get('loading_native_ready')==1:
                         samples=manifest.setdefault('native_input_samples',[]);samples.append(state)
@@ -1458,15 +1500,16 @@ def run(cfg):
                 except (RuntimeError,subprocess.TimeoutExpired,TimeoutError):pass
                 end=min(cleanup_deadline,time.monotonic()+3)
                 while still_owned(owned_game) and time.monotonic()<end:time.sleep(.1)
+        if cfg.get('startup_snapshot') is True:
+            # Existing signal deferral is installed before the optional capture.
+            # Its bounded evidence attempt precedes, and cannot replace, cleanup.
+            capture_startup_snapshot(cfg,env,run_dir,manifest,owned_game,stock_token)
+            cleanup_deadline=time.monotonic()+20
         cleanup(graceful_close)
         # Rediscover late descendants before and after stopping the launcher;
         # exact executable path/start identity prevents unrelated process cleanup.
         def retire_children():
-            for executable in (lab/'Bin/Sam2.exe',lab/'Bin/SS2VR/ss2vr_host.exe',Path(cfg['observer'])):
-                if executable==Path(cfg['observer']) and not token:continue
-                for item in private_processes(executable,token if executable==Path(cfg['observer']) else None):
-                    if executable==Path(cfg['observer']) and (item['pid'],item['start']) in observer_exclusions:continue
-                    cleanup(lambda item=item:stop_exact(item,cleanup_deadline))
+            retire_run_children(lab,Path(cfg['observer']),token,stock_token,observer_exclusions,cleanup_deadline,cleanup)
         cleanup(retire_children)
         def retire_launcher(process):
             if not process or process.poll() is not None: return

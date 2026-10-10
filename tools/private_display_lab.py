@@ -247,6 +247,8 @@ def launch(cfg_path, cfg, display_only=False, prerequisite_only=False):
             time.sleep(.01)
         else:raise RuntimeError('Private compositor exec certification timed out')
         end=time.monotonic()+((cfg.get('timeout',60)+45 if cfg.get('monado_window_order_probe') else 75) if prerequisite_only else 285)
+        if not display_only and not prerequisite_only and cfg.get('startup_snapshot') is True:
+            end+=12 # Preserve the existing outer cleanup margin for the optional snapshot.
         while server.poll() is None:
             gather(owned,token,str(runtime),{os.getpid(),server.pid})
             if time.monotonic()>=end:raise TimeoutError('Private collection budget expired')

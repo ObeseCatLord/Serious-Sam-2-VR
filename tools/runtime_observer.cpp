@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <tlhelp32.h>
 #include <shellapi.h>
+#include <dbghelp.h>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -135,14 +136,15 @@ struct OwnedStockProcess {
     HANDLE handle=nullptr; DWORD pid=0; uint64_t creation=0;
     ~OwnedStockProcess(){if(handle)CloseHandle(handle);}
 };
-static bool stockProcess(const wchar_t *path,OwnedStockProcess &out) {
+static bool stockProcess(const wchar_t *path,OwnedStockProcess &out,
+                         DWORD access=PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_VM_READ) {
     std::wstring expected(path);for(auto &c:expected)if(c==L'/')c=L'\\';
     HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
     if(snapshot==INVALID_HANDLE_VALUE)return false;
     PROCESSENTRY32W entry{};entry.dwSize=sizeof(entry);bool ambiguous=false;
     if(Process32FirstW(snapshot,&entry))do {
         if(_wcsicmp(entry.szExeFile,L"Sam2.exe"))continue;
-        HANDLE h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_VM_READ,FALSE,entry.th32ProcessID);
+        HANDLE h=OpenProcess(access,FALSE,entry.th32ProcessID);
         wchar_t actual[2048]{};DWORD size=2048;FILETIME created{},exited{},kernel{},user{};
         const bool match=h&&QueryFullProcessImageNameW(h,0,actual,&size)&&
             !_wcsicmp(actual,expected.c_str())&&GetProcessTimes(h,&created,&exited,&kernel,&user);
@@ -153,6 +155,48 @@ static bool stockProcess(const wchar_t *path,OwnedStockProcess &out) {
         } else if(h)CloseHandle(h);
     }while(Process32NextW(snapshot,&entry));
     CloseHandle(snapshot);return out.handle&&!ambiguous;
+}
+// Optional private startup evidence; no debugger attachment or game API call.
+// The retained, path/creation-checked process handle prevents PID reuse.
+static int stockDump(int argc,wchar_t **argv) {
+    if(argc!=6)return 2;
+    wchar_t selected[2]{},isolated[2]{};
+    if(GetEnvironmentVariableW(L"SS2VR_LAB_STARTUP_SNAPSHOT",selected,2)!=1 || selected[0]!=L'1' ||
+       GetEnvironmentVariableW(L"SS2VR_LAB_ISOLATE_ONLINE",isolated,2)!=1 || isolated[0]!=L'1')return 8;
+    OwnedStockProcess process;
+    if(!stockProcess(argv[2],process,PROCESS_QUERY_INFORMATION|PROCESS_VM_READ))return 4;
+    wchar_t *end=nullptr;const auto expected=std::wcstoull(argv[3],&end,10);
+    if(!expected||!end||*end||expected!=process.creation)return 8;
+    FILE *receipt=_wfopen(argv[5],L"wbx");if(!receipt)return 6;
+    // Load the system provider only for this optional command. Ordinary status
+    // observers retain their original imports/startup behavior.
+    HMODULE provider=LoadLibraryExW(L"dbghelp.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto address=provider?GetProcAddress(provider,"MiniDumpWriteDump"):nullptr;
+    decltype(&MiniDumpWriteDump) writer=nullptr;
+    static_assert(sizeof(writer)==sizeof(address));std::memcpy(&writer,&address,sizeof(writer));
+    DWORD error=writer?ERROR_SUCCESS:GetLastError();
+    HANDLE dump=CreateFileW(argv[4],GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+    const bool created=dump!=INVALID_HANDLE_VALUE;
+    bool captured=false;
+    if(created&&writer) {
+        captured=writer(process.handle,process.pid,dump,MiniDumpNormal,nullptr,nullptr,nullptr);
+        error=captured?ERROR_SUCCESS:GetLastError();
+    } else if(!created)error=GetLastError();
+    LARGE_INTEGER size{};const bool sized=created&&GetFileSizeEx(dump,&size);
+    const bool closed=!created||CloseHandle(dump);
+    if(provider)FreeLibrary(provider);
+    DWORD exitCode=0;const bool running=GetExitCodeProcess(process.handle,&exitCode)&&exitCode==STILL_ACTIVE;
+    const bool bounded=sized&&size.QuadPart>0&&size.QuadPart<=512ll*1024*1024;
+    const int written=std::fprintf(receipt,
+        "{\"schema\":1,\"scope\":\"private-native-startup-snapshot\",\"game_pid\":%u,"
+        "\"process_creation\":%llu,\"dump_created\":%u,\"dump_written\":%u,\"write_error\":%u,"
+        "\"dump_bytes\":%llu,\"dump_bounded\":%u,\"dump_closed\":%u,\"process_still_running\":%u,"
+        "\"debugger_attached\":false,\"gameplay_acceptance\":false}\n",
+        static_cast<unsigned>(process.pid),static_cast<unsigned long long>(process.creation),
+        created,captured,static_cast<unsigned>(error),static_cast<unsigned long long>(size.QuadPart),
+        bounded,closed,running);
+    const bool failed=written<0||std::ferror(receipt);const int receiptClosed=std::fclose(receipt);
+    return captured&&bounded&&closed&&running&&!failed&&receiptClosed==0?0:7;
 }
 static uint32_t stockModule(DWORD pid,const wchar_t *name) {
     HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);
@@ -297,6 +341,7 @@ static int stockFocus(int argc,wchar_t **argv) {
     return finish("foreground-observed",focus.foregroundObserved?0:8);
 }
 static int stockCommand(int argc,wchar_t **argv) {
+    if(!wcscmp(argv[1],L"stock-dump"))return stockDump(argc,argv);
     if(argc!=4&&!(argc==5&&(!wcscmp(argv[1],L"stock-focus")||!wcscmp(argv[1],L"stock-background"))))return 2;
     if(!wcscmp(argv[1],L"stock-focus"))return stockFocus(argc,argv);
     OwnedStockProcess process;if(!stockProcess(argv[2],process))return 4;

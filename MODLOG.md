@@ -1,5 +1,55 @@
 # Mod journal
 
+## 2026-10-10 — optional normal snapshot for failed initialization
+
+The existing private observer can write `MiniDumpNormal` for a failed, unloaded
+neutral startup, using a retained executable/creation-checked process handle.
+The system DbgHelp provider loads only for this explicit command. This adds no
+live debugger attachment, full-memory capture, native gameplay call or security/
+global-runtime change. Dumps and raw stacks stay private. The receipt records
+API output/error/closure/liveness; it proves neither valid stacks nor resumption.
+Actual dump streams, contexts, ranges, module attribution and unwind require
+independent offline inspection before identifying a native waiting function.
+
+The selected diagnostic runs after existing signal deferral, with a12-second
+attempt before the normal20-second owned cleanup budget. Final retirement now
+finds both IPC-token and pre-host game-path observers. Preserved process-identity
+exclusions apply before every discovery branch, including overlapping arguments;
+identities are deduplicated. Unresolved final retirement is a cleanup error.
+World/simulation exclusion uses fresh native log and existing gameplay evidence
+independently of focus/head/completeVR readiness. Outer game collection receives
+12additional seconds for the selected diagnostic; tagged sweeps and survivor
+checks remain required if its grace preempts inner cleanup.
+
+Astra found and main fixed the helper-discovery gap, delayed world exclusion,
+argument-overlap exclusion bypass and ineffective API-refusal regression. Final
+scoped Astra source GO; current local Astra/xhigh routing verified, independent
+backend attestation unavailable. All68harness regressions pass normally/optimized,
+including actual matcher overlap and timeout/failed immediate retirement/final
+rediscovery. The x86 GUI/static observer builds with strict warnings; native
+products remain61ce671/IPC11/wire7. No new runtime or stack acceptance yet.
+
+
+## 2026-10-10 — pre-host observations narrow the remaining startup stall
+
+Fresh quiet run20261010T161632 used source760e35ab2dbe9a8c014b3549387efc10cef4f969,
+compiled61ce671/IPC11/wire7 and the private full-feature profile. All77owned loading
+samples stayed at stage2;76observed the game module mapped. Native startup and
+activation repetition flags remained false. Partial-read zeros do not prove null
+objects or identify a native instruction. No loaded-scene receipt, host log,
+gameplay eye image or native crash report was produced. Per-process fsync was
+selected, with no Wine ntsync assertion. Startup C++ exceptions and an audio-driver
+warning alone do not establish the cause.
+
+The bounded attempt timed out and retained its exact private logs/settings.
+Passive procfs recorded21owned waiting threads, but no guest call stack. Normal
+native shutdown was not observed; native cleanup reported no errors or termination
+requests. The private display stopped with no surviving tagged processes or
+cleanup errors. Original game/assets/settings/saves and old checkout remained
+protected. The failed fixture is never rerun/resealed. No world rendering or
+join-repair recovery acceptance follows from this attempt.
+
+
 ## 2026-10-10 — expose existing startup observations before host creation
 
 The private observer now shares its existing native loading/input/activation JSON

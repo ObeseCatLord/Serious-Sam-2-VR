@@ -104,6 +104,15 @@ preserve normal profiles/saves, and retain the private-window/no-desktop-interfe
 and no-firing/movement limits. It does not authorize cheats in online sessions
 or replace user-operated firing, vehicle, headset or multiplayer acceptance.
 
+An explicitly selected failed-startup diagnostic may collect a normal minidump
+from the separate owned observer, retaining exact executable/creation identity.
+Use the system provider only for that command; no live debugger attachment,
+full-memory dump, native gameplay call, security or global runtime change.
+Keep all dumps/stacks private. Provider success and process liveness do not prove
+usable stacks, coherent state or thread resumption. Interrupted capture still
+requires exact helper/game/private-prefix retirement and reported survivor checks.
+Exclude existing world/simulation evidence independently of full VR readiness.
+
 Use the reviewed isolated lab/prefix and per-process simulated Monado setup,
 fixed neutral poses/zero controls, exact products/settings/profiles/scene and
 source/tool seals, bounded readiness/deadlines and exact owned-process cleanup.
