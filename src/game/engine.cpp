@@ -608,11 +608,24 @@ static bool vrSession(const Snapshot &s) {
 static bool local(void *p) {
     return p && isLocal && isLocal(p);
 }
+// Native Brain RenderView renders WorldInfo::GetCurrentCamera (resolve(+0x6C))
+// instead of the player's view while a cinematic camera is active. Those frames
+// are presented as flat 2D content, never as tracked stereo gameplay.
+bool cinematicCameraActive() noexcept {
+    if(!nativeWorldInfo || !resolve || !roomscaleWorldInfoTable || !nativeMainThread || !nativeMainThread())
+        return false;
+    void *info=nativeWorldInfo();
+    if(!info || !readableMemory(info,0x70))return false;
+    uintptr_t table=0;std::memcpy(&table,info,4);
+    if(table!=roomscaleWorldInfoTable)return false;
+    uint32_t camera=0;std::memcpy(&camera,static_cast<uint8_t*>(info)+0x6c,4);
+    return camera && resolve(camera);
+}
 static bool trackingEligible(void *p) {
     RiderIdentity rider;
     return nativeInputHealthy() && hooksReady.load(std::memory_order_acquire) && local(p) &&
            (singlePlayer() || multiplayer::server() || multiplayer::negotiatedLocal()) && isAlive(p) &&
-           !isNetricsa(p) && !menus::active() && readNativeRider(p, rider) &&
+           !isNetricsa(p) && !menus::active() && !cinematicCameraActive() && readNativeRider(p, rider) &&
            (rider.seated() || (rider.handheld() && !thirdPerson(p)));
 }
 static bool trackingAnchor(void *p, Pose &out) {
@@ -3039,6 +3052,7 @@ thread_local void *eyePlayer = nullptr;
 thread_local Request eyeRequest;
 thread_local Snapshot eyeSnapshot;
 thread_local Pose eyeAnchor, eyeNativeCamera;
+static thread_local bool eyeAnchorReady = false; // eyeAnchor refreshed for this stereo pair.
 struct PhysicalWeaponInvocation {
     void *weapon = nullptr;
     int hand = -1;
@@ -3192,8 +3206,10 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
         !vrSession(eyeSnapshot))
         return false;
     originalCamera(p, &eyeNativeCamera);
+    eyeAnchorReady = false;
     bool ready = nativeRiderCurrent(p, eyeSnapshot.rider) &&
                  nativeTrackingAnchor(p, eyeAnchor, &eyeSnapshot.rider) && finite(eyeNativeCamera);
+    eyeAnchorReady = ready;
     if (ready) {
         freezeLasers(request);
         if (settings.headFade && (eyeSnapshot.rider.handheld()||eyeSnapshot.rider.seated())) {
@@ -5655,6 +5671,10 @@ static const char *commands[] = {"plcmdX+",   "plcmdX-",        "plcmdZ+",  "plc
                                  "plcmdH-",   "plcmdMouseLook", "plcmdP+",  "plcmdP-"};
 static void *playerBindings = nullptr;
 static float values[14]{}, priorValues[14]{};
+// A dead local player has no tracked gameplay, but native respawn/reload prompts
+// still wait for Fire/Use. Forward only those presses while dead (main thread).
+static float respawnValues[14]{}, respawnPrior[14]{};
+static uint64_t respawnTick = 0;
 // Provenance of the existing cached command values, not an admission policy.
 struct ControlSample {
     RiderIdentity rider;
@@ -6182,6 +6202,7 @@ struct SteeringWheelRuntime {
     bool textureTried=false;
 };
 static SteeringWheelRuntime steeringWheel;
+static_assert(SteeringWheelRim==SteeringWheelRimRadius,"Grasp rim must match the generated mesh");
 static WheelSteering steeringWheelClass(void *ride) {
     if(!ride || !controlsGameBase || !readableMemory(ride,4))return WheelSteering::None;
     uintptr_t table=0;std::memcpy(&table,ride,4);
@@ -6227,6 +6248,7 @@ static void loadSteeringWheelTexture() {
 }
 static void updateSteeringWheel(const Snapshot &s) {
     auto &w=steeringWheel;
+    if(!nativeMainThread || !nativeMainThread())return;
     const auto &config=settings.steeringWheel;
     const auto now=GetTickCount64();
     const float dt=w.updated && now>w.updated ? float(now-w.updated)/1000.f : 0.f;
@@ -6254,6 +6276,7 @@ static void updateSteeringWheel(const Snapshot &s) {
     w.visible=steering!=WheelSteering::None || w.preview;
     if(w.visible)loadSteeringWheelTexture();
     const bool eligible=steering!=WheelSteering::None && fresh(s.input) && !recenterHeld(s.input) &&
+        s.ui.tickMs<=now && now-s.ui.tickMs<200 &&
         !s.ui.wheel[0].open && !s.ui.wheel[1].open && nativeRiderCurrent(s.player,s.rider);
     w.grasp.update(config,s.input,s.gripPoseGeneration,s.origin,s.turn,s.inputProducer,eligible,dt);
 }
@@ -6264,7 +6287,8 @@ static bool steeringWheelHeading(Vec3 &look) {
     const auto now=GetTickCount64();
     const float dt=w.clamped && now>w.clamped ? std::min(.1f,float(now-w.clamped)/1000.f) : 0.f;
     w.clamped=now;
-    if(w.steering!=WheelSteering::Heading || !w.grasp.held() || !quaternionEuler || now-w.updated>200)return false;
+    if(w.steering!=WheelSteering::Heading || !w.grasp.steering() || rideGrasp.mask || !quaternionEuler ||
+       now-w.updated>200)return false;
     const float delta=-w.grasp.steer(settings.steeringWheel)*settings.steeringWheel.turnRateDegrees*Pi/180*dt;
     Vec3 converted;
     if(quaternionEuler(&converted,yaw(delta))!=&converted || !std::isfinite(converted.x))return true;
@@ -6273,7 +6297,8 @@ static bool steeringWheelHeading(Vec3 &look) {
 }
 static void drawSteeringWheel() {
     auto &w=steeringWheel;
-    if(!w.visible || !eyeSnapshot.ui.gameplay || !currentCanvas || !*currentCanvas || !unbindVertexBuffers ||
+    if(!w.visible || !eyeAnchorReady || !nativeMainThread || !nativeMainThread() ||
+       !eyeSnapshot.ui.gameplay || !currentCanvas || !*currentCanvas || !unbindVertexBuffers ||
        !*unbindVertexBuffers || !bindVertexArray || !*bindVertexArray || !drawVertices || !*drawVertices ||
        !useSimpleShader || !constantColor || !currentTexture)return;
     if(w.preview ? !eyeSnapshot.rider.handheld() :
@@ -6326,6 +6351,7 @@ static void drawSteeringWheel() {
         }
         (*drawVertices)(0x99,int(n/3),0);
     }
+    (*unbindVertexBuffers)(); // Leave no client arrays bound to later native draws.
     if(!wasDepth)(*disableDepth)();
     if(!wasWrite)(*disableDepthWrite)();
     if(wasBlend)(*enableBlend)();
@@ -6422,6 +6448,7 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
     }
 }
 
+static bool respawnRoute(const Snapshot &s);
 static void __fastcall poll(void *b, void *) {
     originalPoll(b);
     if (!ids[0])
@@ -6452,8 +6479,20 @@ static void __fastcall poll(void *b, void *) {
             fire[h] = fire[h] && multiplayer::localPrimaryAllowed(s.player, h, s.intentEpoch[h],
                 s.input.primaryInputGeneration[h], s.input.sequence);
     updateSteeringWheel(s); // Before controlsLock: may load a native texture.
+    const bool respawn = respawnRoute(s);
     AcquireSRWLockExclusive(&controlsLock);
     playerBindings = b;
+    std::copy(std::begin(respawnValues), std::end(respawnValues), std::begin(respawnPrior));
+    std::fill(std::begin(respawnValues), std::end(respawnValues), 0);
+    if (respawn) {
+        respawnValues[5] = primaryActionEligible(s.input, 1) && s.input.trigger[1] > .5f ? 1 : 0;
+        respawnValues[6] = primaryActionEligible(s.input, 0) && s.input.trigger[0] > .5f ? 1 : 0;
+        respawnValues[7] = ((s.input.buttons[0] | s.input.buttons[1]) & Use) ? 1 : 0;
+        respawnTick = GetTickCount64();
+    } else {
+        std::fill(std::begin(respawnPrior), std::end(respawnPrior), 0);
+        respawnTick = 0;
+    }
     const bool sameContext = sampledControls.rider == s.rider && sampledControls.generation == s.generation &&
         sampledControls.input.session == s.input.session && sampledControls.input.reference == s.input.reference;
     if (sameContext)
@@ -6472,7 +6511,7 @@ static void __fastcall poll(void *b, void *) {
     if (enabled) {
         auto direction = horizontalStickMovement(s.input, s.ui.wheel[0].open,
                                                 s.rider.seated() ? 0.f : s.turn);
-        if (steeringWheel.steering == WheelSteering::Axis && steeringWheel.grasp.held())
+        if (steeringWheel.steering == WheelSteering::Axis && steeringWheel.grasp.steering())
             direction.x = steeringWheel.grasp.steer(settings.steeringWheel); // Wheel replaces stick steering.
         // Verified native labels: X+ right, X- left, Z- forward, Z+ backward.
         values[0] = std::max(0.f, direction.x);
@@ -6495,10 +6534,25 @@ static int commandIndex(void *b, uint32_t id) {
             return i;
     return -1;
 }
+static bool respawnRoute(const Snapshot &s) {
+    return livePlayer(s) && s.initialized && local(s.player) && isAlive && !isAlive(s.player) &&
+           fresh(s.input) && !recenterHeld(s.input) && !menus::active();
+}
+static bool respawnCommand(int i, const Snapshot &s) {
+    return (i == 5 || i == 6 || i == 7) && respawnTick && GetTickCount64() - respawnTick < 200 && respawnRoute(s);
+}
 static float __fastcall commandValue(void *b, void *, uint32_t id) {
     auto snapshot = copySnapshot();
     if (!vrSession(snapshot))
         return originalValue(b, id);
+    {
+        AcquireSRWLockShared(&controlsLock);
+        const int i = commandIndex(b, id);
+        const bool respawn = respawnCommand(i, snapshot);
+        const float v = respawn ? respawnValues[i] : 0;
+        ReleaseSRWLockShared(&controlsLock);
+        if (respawn) return v;
+    }
     bool enabled = fresh(snapshot.input) && !recenterHeld(snapshot.input) && snapshot.ui.gameplay &&
                    GetTickCount64() - snapshot.ui.tickMs < 200 && livePlayer(snapshot);
     AcquireSRWLockShared(&controlsLock);
@@ -6514,6 +6568,14 @@ static int query(void *b, uint32_t id, int mode, CommandInt original) {
     auto snapshot = copySnapshot();
     if (!vrSession(snapshot))
         return original(b, id);
+    {
+        AcquireSRWLockShared(&controlsLock);
+        const int i = commandIndex(b, id);
+        const bool respawn = respawnCommand(i, snapshot);
+        const float v = respawn ? respawnValues[i] : 0, prev = respawn ? respawnPrior[i] : 0;
+        ReleaseSRWLockShared(&controlsLock);
+        if (respawn) return nativeCommandQuery(v, prev, mode, true);
+    }
     bool enabled = fresh(snapshot.input) && !recenterHeld(snapshot.input) && snapshot.ui.gameplay &&
                    GetTickCount64() - snapshot.ui.tickMs < 200 && livePlayer(snapshot);
     AcquireSRWLockShared(&controlsLock);
@@ -7433,22 +7495,30 @@ bool attach(bool headless) {
         S(e, "?cldSetAvatarMechanism@SeriousEngine@@YAXPAVCMechanism@1@@Z", rayMechanism);
         S(e, "?cldSetRayTestsFluids@SeriousEngine@@YAXH@Z", rayFluids);
         S(e, "?gfuDrawLine3f@SeriousEngine@@YAXABVVector3f@1@0KK@Z", drawLine);
-        S(c, "?resObtainResource@SeriousEngine@@YA?AV?$Ptr@VCResource@SeriousEngine@@@1@PAVCDataType@1@W4ResObtainMethod@1@HHPBD2@Z",
+        // Steering-wheel entries are optional: a missing one disables only the wheel.
+        bool wheelSymbols = true;
+#define WHEEL(module, name, out) wheelSymbols = symbol(module, name, out) && wheelSymbols
+        WHEEL(c, "?resObtainResource@SeriousEngine@@YA?AV?$Ptr@VCResource@SeriousEngine@@@1@PAVCDataType@1@W4ResObtainMethod@1@HHPBD2@Z",
           resourceObtain);
-        S(e, "?md_pdtDataType@CTexture@SeriousEngine@@2PAVCDataType@2@A", textureDataType);
-        S(e, "?gfuCurrentTexture@SeriousEngine@@YAXJPAVCTexture@1@W4TexBindType@1@@Z", currentTexture);
-        S(c, "?AddRef@CSmartObject@SeriousEngine@@QAEXPBX@Z", smartAddRef);
-        S(c, "?RemRef@CSmartObject@SeriousEngine@@QAEJPBX@Z", smartRemRef);
+        WHEEL(e, "?md_pdtDataType@CTexture@SeriousEngine@@2PAVCDataType@2@A", textureDataType);
+        WHEEL(e, "?gfuCurrentTexture@SeriousEngine@@YAXJPAVCTexture@1@W4TexBindType@1@@Z", currentTexture);
+        WHEEL(c, "?AddRef@CSmartObject@SeriousEngine@@QAEXPBX@Z", smartAddRef);
+        WHEEL(c, "?RemRef@CSmartObject@SeriousEngine@@QAEJPBX@Z", smartRemRef);
         {
             void *table=nullptr;
-            S(e, "??_7CStaticTexture@SeriousEngine@@6B@", table);
+            WHEEL(e, "??_7CStaticTexture@SeriousEngine@@6B@", table);
             staticTextureVtable=reinterpret_cast<uintptr_t>(table);
         }
-        S(e, "?gfuUseSimpleShader@SeriousEngine@@YAXW4GfuSimpleShader@1@@Z", useSimpleShader);
-        S(e, "?gfuConstantColor@SeriousEngine@@YAXK@Z", constantColor);
-        S(e, "?_gfxUnbindVertexBuffers@SeriousEngine@@3P6AXXZA", unbindVertexBuffers);
-        S(e, "?_gfxBindVertexArray@SeriousEngine@@3P6AXJPBXW4GfxUsageType@1@JJ@ZA", bindVertexArray);
-        S(e, "?_gfxDrawVertices@SeriousEngine@@3P6AXW4GfxPrimitive@1@JJ@ZA", drawVertices);
+        WHEEL(e, "?gfuUseSimpleShader@SeriousEngine@@YAXW4GfuSimpleShader@1@@Z", useSimpleShader);
+        WHEEL(e, "?gfuConstantColor@SeriousEngine@@YAXK@Z", constantColor);
+        WHEEL(e, "?_gfxUnbindVertexBuffers@SeriousEngine@@3P6AXXZA", unbindVertexBuffers);
+        WHEEL(e, "?_gfxBindVertexArray@SeriousEngine@@3P6AXJPBXW4GfxUsageType@1@JJ@ZA", bindVertexArray);
+        WHEEL(e, "?_gfxDrawVertices@SeriousEngine@@3P6AXW4GfxPrimitive@1@JJ@ZA", drawVertices);
+#undef WHEEL
+        if (!wheelSymbols) {
+            settings.steeringWheel.enabled = false;
+            log("Steering wheel disabled: native drawing/resource entries unavailable");
+        }
         S(e, "?_gfxEnableDepthBuffer@SeriousEngine@@3P6AXXZA", enableDepth);
         S(e, "?_gfxDisableDepthBuffer@SeriousEngine@@3P6AXXZA", disableDepth);
         S(e, "?_gfxEnableDepthWrite@SeriousEngine@@3P6AXXZA", enableDepthWrite);

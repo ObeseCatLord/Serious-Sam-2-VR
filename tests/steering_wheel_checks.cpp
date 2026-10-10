@@ -113,9 +113,51 @@ void limits() {
     const Vec3 right = rotate(spun.q, Vec3{1, 0, 0}), base = rotate(steeringWheelPose(settings).q, Vec3{0, 1, 0});
     assert(near(dot(right, base), 1, 1e-4f)); // Spin turns the rim about its own axis.
 }
+void hubAndReversal() {
+    Rig r;
+    r.step(); r.step();
+    r.input.buttons[1] = Wheel; r.step();
+    r.input.grip[1].p = rimPoint(1.f, .02f); // Hand slides to the hub.
+    assert(!r.step() && r.grasp.angle == 0);   // Grasp dropped, no spin.
+    r.place(1, 0); assert(!r.step());          // Held button cannot regrab.
+    r.input.buttons[1] = 0; r.step(); r.input.buttons[1] = Wheel; assert(r.step());
+    float phase = 0;
+    for (int i = 0; i < 30; ++i) { phase -= .2f; r.place(1, phase); r.step(); }
+    const float limit = -settings.maxAngleDegrees * Pi / 180;
+    assert(near(r.grasp.angle, limit));
+    phase += .1f; r.place(1, phase); r.step();  // Reversal acts immediately: no wind-up.
+    assert(near(r.grasp.angle, limit + .1f));
+}
+void oppositeHandsAndTiming() {
+    Rig r;
+    r.step(); r.step();
+    r.input.buttons[0] = r.input.buttons[1] = Wheel; r.step();
+    r.place(0, Pi + .2f); r.place(1, -.2f);    // Hands fight: averaged turn cancels.
+    assert(r.step() && near(r.grasp.angle, 0));
+    r.input.buttons[0] = 0; r.place(1, .3f); r.step(); // Right hand turns left alone.
+    assert(near(r.grasp.angle, .5f));
+    r.input.buttons[1] = 0;
+    assert(!r.step(true, true, std::nanf("")) && near(r.grasp.angle, .5f)); // NaN dt holds still.
+    assert(r.grasp.steering());                // Released rim still steers while recentering.
+    r.step(true, true, 5.f);                   // Huge dt is clamped to 0.1 s.
+    assert(near(r.grasp.angle, .5f - .6f < 0 ? 0 : .5f - .6f) && !r.grasp.steering());
+}
+void streamChanges() {
+    Rig r;
+    r.step(); r.step();
+    r.input.buttons[1] = Wheel; assert(r.step());
+    ++r.input.session;                         // New XR session rekeys and drops the grasp.
+    assert(!r.step());
+    r.input.buttons[1] = 0; r.step(); r.input.buttons[1] = Wheel; assert(r.step());
+    r.input.sequence -= 5;                     // Sequence regression is a new stream.
+    assert(!r.step(false));
+}
 } // namespace
 
 int main() {
+    hubAndReversal();
+    oppositeHandsAndTiming();
+    streamChanges();
     oneHandTurn();
     twoHandsAndTransfer();
     releaseRearmAndCentering();

@@ -1445,7 +1445,11 @@ void present(IDirect3DDevice9 *d) {
     uint64_t now = GetTickCount64();
     bool gameplay = ui.gameplay && now >= ui.tickMs && now - ui.tickMs < 250;
     const bool nativeMenu = menus::active();
-    const bool menuVisible = nativeMenu;
+    // Every frame the stereo world path cannot own is presented on the flat
+    // screen: menus, loading, pre-rendered movies, cinematic cameras, Netricsa,
+    // death views, and gameplay without stereo resources. Only native menus
+    // accept pointer interaction; Confirm/Back keys work for all of them.
+    const bool menuVisible = nativeMenu || !gameplay || !stereoReady;
     static unsigned diagnostics = 0, previousClassification = ~0u;
     const unsigned classification = unsigned(nativeMenu) | (unsigned(gameplay) << 1) | (unsigned(stereoReady) << 2);
     if (diagnostics < 16 && classification != previousClassification) {
@@ -1494,7 +1498,7 @@ void present(IDirect3DDevice9 *d) {
     }
     if (!menuVisible || now - lastMenuCopy < 33)
         return;
-    uint32_t menuGeneration = menus::captureGeneration();
+    uint32_t menuGeneration = nativeMenu ? menus::captureGeneration() : 0;
     lastMenuCopy = now;
     const auto generation = resourceGeneration.load(std::memory_order_acquire);
     const uint32_t copyWidth = width, copyHeight = height;

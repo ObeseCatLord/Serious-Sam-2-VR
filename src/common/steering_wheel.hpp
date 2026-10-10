@@ -54,6 +54,8 @@ struct SteeringWheelGrasp {
         keyed = false; angle = 0; sequence = 0;
     }
     bool held() const { return hands[0].held || hands[1].held; }
+    // Steering continues while held and while the released rim recentres.
+    bool steering() const { return held() || angle != 0; }
     // Steering command in [-1, 1]; positive steers right.
     float steer(const SteeringWheelSettings &s) const {
         const float lock = std::max(1.f, s.fullLockDegrees) * Pi / 180;
@@ -109,6 +111,9 @@ struct SteeringWheelGrasp {
                 if (!down) {
                     hand.held = false;
                     if (hand.blocked.permits(input, input.tickMs, currentProducer)) hand.armed = true;
+                } else if (hand.held && p.x * p.x + p.y * p.y < .05f * .05f) {
+                    // Near the hub the phase is singular: drop the grasp; a regrab rebaselines.
+                    hand.held = hand.armed = false;
                 } else if (hand.held) {
                     // Keep holding even if the hand drifts off the rim; only phase drives rotation.
                     const float difference = phase - hand.phase;
