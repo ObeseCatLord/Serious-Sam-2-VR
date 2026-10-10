@@ -1,5 +1,48 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-10 — full-feature black world and startup stall resolved
+
+The user resumed development after the pause recorded in
+[the takeover handoff](TAKEOVER_HANDOFF_2026_10_10.md). Bounded lab receipts
+(V63–V68) traced the enabled-profile black world to one cause: every
+head-clearance query reached the owned native ray, then the collision
+vertex-buffer resource gate cancelled it. Jungle collision meshes use
+provider-owned static buffers (format 0x1f) locked through Engine's exported
+`_gfxLockStaticVertexBuffer` slot, which the admission rejected as an unknown
+provider. The guard then correctly masked the world before UI.
+
+`c31220a` admits format 0x1f only when both Engine slots hold the fingerprinted
+GfxD3D pair (RVA 92D0: `IDirect3DVertexBuffer9::Lock` with `D3DLOCK_READONLY`
+for read type 0x93; RVA 9350: `Unlock`), the buffer is not already locked and the
+request fits. Other providers, write access and held buffers still cancel. The
+resource ABI verifier pins the provider installation, lock flags and the absence
+of cancellation gates between the native lock and unlock. Roomscale body sweeps
+share these gates, so provider-buffer levels previously cancelled body movement
+queries too. V70 (Roomscale/HeadComfort/Melee=1): head mode Clear, 89 triangle
+kernel calls without contact, both actual 1280x720 eyes show the full Jungle
+world, weapons and lasers, 611,095 of 921,600 pixels differ between eyes.
+
+Stalled startups (V60, V61, V67, V69) left every thread in ntdll waits, with the
+main thread and the former background hook worker blocked on Serious Engine
+`CSyncMutex` locks (allocator / string table) during world loading. The worker
+attached at an arbitrary point: it called engine string-ID functions from a
+foreign thread and suspended the loading thread for MinHook patching.
+`4f077d9` runs attach once on the device-owning thread at the start of an outer
+native Present, after the modules load. Ten consecutive fresh private captures
+(V71–V80) then completed cleanly with Clear receipts; before it, four of roughly
+eleven attempts stalled. This is strong but statistical evidence.
+
+Astra source review: attach GO; provider-lock concerns (lock skipped by a traversal
+cancel, failed lock on device loss) were checked against native code: every
+cancellation stub exits only its own function frame, and device loss releases
+the eye targets the query phase requires. Hardening followed (`attach` inside the
+native-finally scope, no VR presentation on the attach frame, all 26 gate sites
+checked against the lock span). Builds: all four products rebuilt; Debug and
+Release 82/82, artifact, head-volume
+(game and server) and resource-ABI verifiers pass. Neutral captures exercise no
+head/hand motion, firing, vehicles, hardware or multiplayer; those remain
+user-operated acceptance.
+
 ## 2026-10-10 — consume native PPM and reject opaque-world readiness
 
 The neutral runtime summary reads the observer's actual P6 RGB PPM files, removing

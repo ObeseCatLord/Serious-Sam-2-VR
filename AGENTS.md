@@ -1,5 +1,12 @@
 # Serious Sam 2 OpenXR VR — active instructions
 
+## Resumed — 2026-10-10
+
+The user resumed development after the pause recorded in
+[the takeover handoff](docs/TAKEOVER_HANDOFF_2026_10_10.md) ("continue working on
+the VR mod until it's done"). The black-world and startup-stall blockers are
+resolved; see the current [status](docs/IMPLEMENTATION_STATUS.md).
+
 ## Authority and scope
 
 The user authorizes PC development, tool setup, additional sessions and online

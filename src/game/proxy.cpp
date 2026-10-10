@@ -130,21 +130,20 @@ template <class T> static void proxyHook(void *address, void *detour, T &origina
         logHook(name, "enable", enabled, enableOk, enableFailed);
     }
 }
-static void attachAtPresentation(IDirect3DDevice9 *d);
+static bool attachAtPresentation(IDirect3DDevice9 *d);
 static __attribute__((noinline)) HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *src, const RECT *dst, HWND window,
                               const RGNDATA *region) {
     const auto caller = reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
     HRESULT hr = D3DERR_INVALIDCALL;
     const bool outer = presentationDepth == 0;
-    if (outer) {
-        // The fingerprinted GfxD3D device Present site (the same one
-        // nativePresentationCaller admits once hooks are ready).
-        const auto gfx = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"GfxD3D.dll"));
-        if (gfx && caller == gfx + 0x1c75u) attachAtPresentation(d);
-    }
     ++presentationDepth;
     ss2vr::game::withNativeFinally([&] {
-        if (outer) ss2vr::game::presentDevice(d, caller, src, dst, window, region);
+        // The fingerprinted GfxD3D device Present site (the same one
+        // nativePresentationCaller admits once hooks are ready). The frame
+        // that attaches presents natively; VR presentation starts next frame.
+        const auto gfx = outer ? reinterpret_cast<uintptr_t>(GetModuleHandleW(L"GfxD3D.dll")) : 0;
+        const bool attachedNow = gfx && caller == gfx + 0x1c75u && attachAtPresentation(d);
+        if (outer && !attachedNow) ss2vr::game::presentDevice(d, caller, src, dst, window, region);
         else if (ss2vr::game::nativePresentationCaller(caller, false)) ss2vr::game::nestedNativePresentation();
         hr = originalPresent(d, src, dst, window, region);
     }, [&](bool) noexcept { --presentationDepth; });
@@ -158,13 +157,18 @@ static bool vrEnabled = false, minHookReady = false, stockRenderer = false, labI
 // functions from a foreign thread and suspended the loading thread to patch,
 // which intermittently deadlocked startup on Serious Engine mutexes.
 static std::atomic<bool> attachPending{false};
-static void attachAtPresentation(IDirect3DDevice9 *d) {
-    if (!attachPending.load(std::memory_order_relaxed) || !ss2vr::game::presentationDeviceOwner(d) ||
-        !GetModuleHandleW(L"Sam2Game.dll") || !GetModuleHandleW(L"Engine.dll") || !GetModuleHandleW(L"Core.dll"))
-        return;
+static bool attachAtPresentation(IDirect3DDevice9 *d) {
+    static unsigned waiting = 0;
+    if (!attachPending.load(std::memory_order_relaxed) || !ss2vr::game::presentationDeviceOwner(d))
+        return false;
+    if (!GetModuleHandleW(L"Sam2Game.dll") || !GetModuleHandleW(L"Engine.dll") || !GetModuleHandleW(L"Core.dll")) {
+        if (++waiting == 600) ss2vr::game::log("Native modules unavailable after 600 presents; attach still pending");
+        return false;
+    }
     attachPending.store(false, std::memory_order_relaxed);
     ss2vr::game::log("Startup native attach on presentation thread=%lu", GetCurrentThreadId());
     ss2vr::game::attach();
+    return true;
 }
 static BOOL CALLBACK init(PINIT_ONCE, PVOID, PVOID *) {
     // Detours outlive graphics backend reloads; their owning DLL must stay mapped.

@@ -212,7 +212,11 @@ def verify(game):
             'GfxD3D unlock must be IDirect3DVertexBuffer9::Unlock only')
     # No optional-query resource gate may cancel between the collision lock and unlock.
     span=[i.address-base for i in md.disasm(pe.get_data(0xcbaa4,0xcbb2e-0xcbaa4),base+0xcbaa4)]
-    require(0xcbb29 in span and not any(0xcbaa4<=site[0]<0xcbb2e for site in RESOURCE_SITES.values()),
+    # Every cancellation continuation exits only the frame of the function that
+    # contains its gate (stack rebuilt from that EBP), so a cancel inside the
+    # traversal returns normally and the native unlock still runs. Only a gate
+    # in this function's own locked span could skip it.
+    require(0xcbb29 in span and not any(0xcbaa4<=int(rva,16)<0xcbb2e for _,rva,*_ in bindings),
             'A cancellation gate lies inside the provider lock span')
     # Native save/cleanup contracts; no recovery from arbitrary allocator faults.
     suffixes={
