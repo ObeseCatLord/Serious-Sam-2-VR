@@ -8,6 +8,79 @@ import private_display_lab as display
 GOOD={'schema':1,'stage':'swapchain-query','operation':'get-raster-status','desktop_hz':60,'adapter_hz':60,'swapchain_hz':60,
       'width':1280,'height':720,'raster_called':True,'cleanup_completed':True,'hresult':0,'scanline':0,'in_vblank':True}
 class Checks(unittest.TestCase):
+    def test_neutral_runtime_mode_requires_exact_stationary_prepared_game_selection(self):
+        cfg={'neutral_runtime_probe':True,'idle_weapon_probe':True,'idle_native_id':2,
+             'expected_product_source':'a'*64,'baseline_head':[0,1.6,0],
+             'pose_steps':[{'name':'baseline','head':[0,1.6,0]}]}
+        lab.validate_idle_probe(cfg)
+        for delta in ({'neutral_runtime_probe':1},{'neutral_runtime_probe':'true'},
+                      {'idle_weapon_probe':False},{'display_prerequisite_only':True},
+                      {'monado_window_order_probe':True},{'native_dual_probe':'zap-initial-inventory'},
+                      {'pose_steps':[]},{'renderer_mode':'stock'}):
+            with self.subTest(delta=delta),self.assertRaises(ValueError):lab.validate_idle_probe(cfg|delta)
+    def test_neutral_runtime_summary_requires_scene_projection_both_eyes_and_clean_shutdown(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            private=Path(d);directory=private/'runs/fresh';directory.mkdir(parents=True)
+            cfg={'private_root':str(private),'scene':{'entry_sha256':'b'*64},
+                 'expected_product_source':'a'*64,'prepare_idle_fixture':True,'idle_native_id':2}
+            result={'scene':cfg['scene'],'validated_config':{'expected_product_source':'a'*64},
+                    'result':'native_neutral_captured','renderer_mode':'vr',
+                    'game_launch_requested':True,'monado_launch_requested':True,
+                    'hardware_acceptance':False,'loaded_scene_confirmed':True,
+                    'native_scene_receipts':[['123','0','b'*64]],
+                    'distinct_neutral_complete_pairs':30,'shutdown_observed':True,
+                    'cleanup_errors':[],'termination_requests':[],
+                    'idle_fixture_preparation':{'native_id':2}}
+            left=directory/'baseline-left-private.png';right=directory/'baseline-right-private.png'
+            Image.new('RGB',(8,8),(10,20,30)).save(left)
+            Image.new('RGB',(8,8),(11,20,30)).save(right)
+            receipt=directory/'result.json';receipt.write_text(json.dumps(result))
+            summary=display.neutral_runtime_summary(directory,cfg)
+            self.assertTrue(summary['complete']);self.assertTrue(summary['different_eye_pixels'])
+            for key in ('hardware_acceptance','head_translation_verified','head_rotation_verified',
+                        'physical_grasp_verified','native_release_verified'):self.assertIs(summary[key],False)
+            for delta in ({'result':'display_prerequisite_only'},{'renderer_mode':'stock'},
+                          {'game_launch_requested':False},{'monado_launch_requested':False},
+                          {'hardware_acceptance':True},{'loaded_scene_confirmed':1},
+                          {'native_scene_receipts':[]},{'native_scene_receipts':[['123','0','c'*64]]},
+                          {'scene':{'entry_sha256':'c'*64}},{'validated_config':{}},
+                          {'distinct_neutral_complete_pairs':29},{'distinct_neutral_complete_pairs':True},
+                          {'shutdown_observed':False},{'shutdown_observed':1},{'cleanup_errors':['survivor']},
+                          {'termination_requests':[15]},{'idle_fixture_preparation':{'native_id':13}}):
+                receipt.write_text(json.dumps(result|delta))
+                with self.subTest(delta=delta),self.assertRaises(RuntimeError):display.neutral_runtime_summary(directory,cfg)
+            receipt.write_text(json.dumps(result))
+            for mutation in ('identical','extent','truncated','symlink','missing'):
+                if right.exists() or right.is_symlink():right.unlink()
+                if mutation=='identical':right.write_bytes(left.read_bytes())
+                elif mutation=='extent':Image.new('RGB',(9,8),(11,20,30)).save(right)
+                elif mutation=='truncated':right.write_bytes(b'\x89PNG\r\n\x1a\n')
+                elif mutation=='symlink':right.symlink_to(left)
+                with self.subTest(mutation=mutation),self.assertRaises((RuntimeError,OSError)):
+                    display.neutral_runtime_summary(directory,cfg)
+    def test_neutral_completion_bypasses_optional_geometry_without_weakening_legacy(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);record={}
+            self.assertTrue(lab.finish_idle_capture({'neutral_runtime_probe':True,'idle_weapon_probe':True},
+                                                   root/'missing-game',root,record))
+            self.assertEqual(record,{'result':'native_neutral_captured'})
+            self.assertFalse(lab.finish_idle_capture({},root,root,{}))
+            with self.assertRaises(FileNotFoundError):
+                lab.finish_idle_capture({'idle_weapon_probe':True},root/'missing-game',root,{})
+    def test_outer_neutral_receipt_matches_only_the_sealed_runtime_mode(self):
+        good={'completed':True,'evidence_scope':'native-neutral-runtime',
+              'neutral_runtime_complete':True,'data_ready_for_review':False}
+        self.wrapper_mock(True,False,neutral=True,receipt=good,expect_success=True)
+        self.wrapper_mock(True,False,expect_success=True) # Legacy qualified geometry remains accepted.
+        for change in ({'completed':False},{'neutral_runtime_complete':1},
+                       {'neutral_runtime_complete':False},{'evidence_scope':'geometry'},
+                       {'data_ready_for_review':True}):
+            self.wrapper_mock(True,False,neutral=True,receipt=good|change)
+        for key in good:
+            self.wrapper_mock(True,False,neutral=True,receipt={k:v for k,v in good.items() if k!=key})
+        self.wrapper_mock(True,False,neutral=True) # Geometry receipt cannot pass neutral mode.
+        self.wrapper_mock(True,False,receipt=good|{'data_ready_for_review':True})
     def test_eager_window_admission_requires_exact_helper_and_nongame_gui_extent(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);helper=root/'query';helper.write_bytes(b'\x7fELFfixture')
@@ -201,7 +274,9 @@ class Checks(unittest.TestCase):
         self.inner_mode(False)
     def test_prerequisite_wrapper_never_imports_idle_collector_or_claims_geometry(self):
         self.inner_mode(True)
-    def inner_mode(self, prerequisite):
+    def test_neutral_runtime_uses_shared_run_without_loading_optional_geometry_collector(self):
+        self.inner_mode(False,True)
+    def inner_mode(self, prerequisite, neutral=False):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);out=root/'display-check';out.mkdir();runtime=root/'runtime';runtime.mkdir()
             cfg=root/'config.json';cfg.write_text(json.dumps({'private_root':str(root)}))
@@ -222,13 +297,20 @@ class Checks(unittest.TestCase):
             env=display.private_environment({},runtime,'token')|{'DISPLAY':':2','WAYLAND_DISPLAY':'ss2-vr-private'}
             directory=root/'runs/diagnostic';directory.mkdir(parents=True)
             (directory/'result.json').write_text(json.dumps({'result':'display_prerequisite_only','cleanup_errors':[], 'game_launch_requested':False,'monado_launch_requested':False}))
-            with patch.object(display,'prepared_configuration',return_value={'display_prerequisite_only':True}),patch.object(display,'run',return_value=directory) as native,patch.object(display.signal,'signal'),patch.dict(display.os.environ,env,clear=True),patch.object(display.os,'getppid',return_value=456),patch.object(display,'identity',side_effect=identify),patch.object(Path,'iterdir',list_paths),patch.object(display.subprocess,'run',side_effect=query),patch.object(display.importlib.util,'spec_from_file_location') as load:
-                display.inside(cfg,out,not prerequisite,prerequisite);load.assert_not_called()
-                if prerequisite:native.assert_called_once()
+            prepared={'display_prerequisite_only':True} if prerequisite else {'neutral_runtime_probe':True}
+            with patch.object(display,'prepared_configuration',return_value=prepared),patch.object(display,'run',return_value=directory) as native,patch.object(display.signal,'signal') as signals,patch.object(display,'neutral_runtime_summary',return_value={'evidence_scope':'native-neutral-runtime'}) as summary,patch.dict(display.os.environ,env,clear=True),patch.object(display.os,'getppid',return_value=456),patch.object(display,'identity',side_effect=identify),patch.object(Path,'iterdir',list_paths),patch.object(display.subprocess,'run',side_effect=query),patch.object(display.importlib.util,'spec_from_file_location') as load:
+                display.inside(cfg,out,not (prerequisite or neutral),prerequisite);load.assert_not_called()
+                if prerequisite or neutral:
+                    native.assert_called_once();self.assertEqual(signals.call_args.args[0],display.signal.SIGTERM)
                 else:native.assert_not_called()
+                if neutral:summary.assert_called_once_with(directory,prepared)
+                else:summary.assert_not_called()
             self.assertLess(events.index('x-client'),events.index('server-check'))
             outcome=json.loads((out/'collection-outcome.json').read_text())
-            self.assertTrue(outcome['prerequisite_only' if prerequisite else 'display_only']);self.assertFalse(outcome['game_launched']);self.assertFalse(outcome['data_ready_for_review'])
+            self.assertFalse(outcome['data_ready_for_review'])
+            if neutral:self.assertTrue(outcome['neutral_runtime_complete'])
+            else:
+                self.assertTrue(outcome['prerequisite_only' if prerequisite else 'display_only']);self.assertFalse(outcome['game_launched'])
     def test_check_cannot_be_combined_with_display_launch(self):
         with tempfile.TemporaryDirectory() as d:
             cfg=Path(d)/'config.json';cfg.write_text('{}')
@@ -281,9 +363,10 @@ class Checks(unittest.TestCase):
         self.wrapper_mock(True,True)
     def test_late_cancellation_is_interrupted_after_complete_cleanup(self):
         self.wrapper_mock(True,False,True)
-    def wrapper_mock(self, completed, fail_cleanup, late=False):
+    def wrapper_mock(self, completed, fail_cleanup, late=False, neutral=False, receipt=None, expect_success=False):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);cfg={'private_root':str(root),'display_timing_probe':True,'expected_product_source':'a'*64}
+            if neutral:cfg['neutral_runtime_probe']=True
             (root/'config.json').write_text(json.dumps(cfg));command=[];calls=[];live={101,102};identified=[0]
             class Process:
                 pid=100;returncode=0
@@ -293,7 +376,7 @@ class Checks(unittest.TestCase):
                 self.assertNotIn('DISPLAY',kw['env']);self.assertNotIn('WAYLAND_DISPLAY',kw['env'])
                 self.assertEqual(Path(kw['env']['XDG_RUNTIME_DIR']).parent,root)
                 self.assertLess(len((kw['env']['XDG_RUNTIME_DIR']+'/ss2-vr-private').encode()),108)
-                if completed:(root/'private-display/collection-outcome.json').write_text(json.dumps({'completed':True,'data_ready_for_review':True}))
+                if completed:(root/'private-display/collection-outcome.json').write_text(json.dumps(receipt if receipt is not None else {'completed':True,'data_ready_for_review':True}))
                 return Process()
             def identify(pid):
                 identified[0]+=1
@@ -310,8 +393,10 @@ class Checks(unittest.TestCase):
                 if faults[0]:faults[0]=False;raise RuntimeError('injected child cleanup fault')
                 live.discard(item['pid'])
             with patch.object(display.subprocess,'Popen',side_effect=popen),patch.object(display,'identity',side_effect=identify),patch.object(display,'gather',side_effect=gather),patch.object(display,'still_owned',side_effect=lambda item:item['pid'] in live),patch.object(display,'stop_exact',side_effect=stop),patch.object(display.signal,'signal',side_effect=signals),patch.object(display.time,'sleep'):
-                with self.assertRaises((FileNotFoundError,RuntimeError)):
-                    display.launch(root/'config.json',cfg)
+                if expect_success:display.launch(root/'config.json',cfg)
+                else:
+                    with self.assertRaises((FileNotFoundError,RuntimeError)):
+                        display.launch(root/'config.json',cfg)
             report=json.loads((root/'private-display/result.json').read_text())
             self.assertEqual(report['survivors'],[]);self.assertTrue(report['display_stopped'])
             self.assertTrue((root/'agent-capture-attempt.json').exists())
@@ -319,6 +404,7 @@ class Checks(unittest.TestCase):
             if fail_cleanup:self.assertTrue(report['cleanup_errors'])
             elif late:
                 self.assertTrue(report['deferred_signals']);self.assertEqual(report['cleanup_errors'],[])
+            elif expect_success:self.assertNotIn('error',report)
             else:self.assertIn('error',report)
             certificate=json.loads((root/'private-display/owner.json').read_text())
             self.assertEqual(certificate['argv'],command)

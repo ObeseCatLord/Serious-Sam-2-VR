@@ -1,5 +1,34 @@
 # Current source continuation
 
+## 2026-10-10 — neutral native runtime check independent of optional grip research
+
+The existing private display launcher has an explicitly sealed
+`neutral_runtime_probe=true` mode. It reuses the same run/configuration/native
+startup/neutral input/cleanup extent, with SIGTERM handling installed before run.
+The optional geometry collector is not imported in this mode. Legacy geometry
+collection and its stronger reference-ready requirement remain unchanged.
+
+Neutral readiness requires the exact scene/build identity, native scene-stream
+receipts, at least30distinct complete native/UI/worldprojection requests, two
+bounded valid PNGs of equal size with different decoded pixels, native shutdown
+and no cleanup errors or termination requests. Output is
+`neutral-runtime-summary.json`, with scope `native-neutral-runtime`; head motion,
+hardware, grasp and native release remain explicitly unverified. The private
+launcher outcome sets neutral runtime completion separately from geometry
+`data_ready_for_review`, which remains false. Different eye pixels alone do not
+certify depth parallax or complete6DoF acceptance.
+
+Astra found and main fixed both the outer legacy readiness gate and the inner
+optional assessment dependency. Bounded Astra follow-up GO; current local
+Astra/xhigh routing verified, independent backend attestation unavailable.
+All63combined runtime/private-display regressions pass normally and with optimized
+Python and through the existing CTest runtime target. The existing test target now
+includes private-display cases; no new launcher/cleanup state machine or native
+build input was added. Pillow12.3.0 is already installed locally and is pinned in
+tooling requirements for actual decoded-pixel comparison. Compiled products still
+matchc0bae37152f4b3d38129bf0392c2feed508e72df70420f0304553dff192eb990,
+IPC11/wire7. No new runtime capture has been launched with this mode yet.
+
 ## 2026-10-10 — ordinary weapon calibration checks its current model binding
 
 All16used installed native weapon slots now retain model/configuration/resource

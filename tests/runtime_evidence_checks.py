@@ -14,6 +14,7 @@ from runtime_lab import (native_grip_resource_receipts,validate_idle_probe,valid
                          preparation_weapon,validate_fixture_destination,fixture_preparation_receipt,
                          idle_configuration_digest,IDLE_FIXED_FILES,IDLE_TOOLS)
 from build_contract import OBSERVER_FORMAT, OBSERVER_FIELDS, read_observer_layout, validate_observer_layout
+from private_display_checks import Checks as PrivateDisplayChecks
 
 HEAD={'p':[0,0,0],'q':[0,0,0,1]}
 

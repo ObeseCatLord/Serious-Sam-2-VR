@@ -17,6 +17,53 @@ import sys
 import time
 from runtime_lab import identity, still_owned, stop_exact, validate, checked_file, run
 
+def neutral_runtime_summary(directory,cfg):
+    """Native neutral readiness only; never geometry, motion or hardware acceptance."""
+    from PIL import Image, ImageChops
+    directory=Path(directory).resolve(strict=True)
+    if not directory.is_relative_to(Path(cfg['private_root']).resolve()/'runs'):
+        raise RuntimeError('Neutral runtime result escapes the private run inventory')
+    receipt=directory/'result.json'
+    if receipt.is_symlink() or not receipt.is_file() or not 0<receipt.stat().st_size<=2*1024*1024:
+        raise RuntimeError('Neutral runtime result is absent, redirected or unbounded')
+    result=json.loads(receipt.read_text())
+    pairs=result.get('distinct_neutral_complete_pairs')
+    if result.get('scene')!=cfg['scene'] or \
+       result.get('validated_config',{}).get('expected_product_source')!=cfg['expected_product_source']:
+        raise RuntimeError('Neutral runtime scene/product identity differs')
+    receipts=result.get('native_scene_receipts')
+    if not isinstance(receipts,list) or not 1<=len(receipts)<=4096 or \
+       any(not isinstance(row,list) or len(row)!=3 or row[2]!=cfg['scene']['entry_sha256'] for row in receipts):
+        raise RuntimeError('Neutral native scene receipt differs')
+    if result.get('result')!='native_neutral_captured' or \
+       result.get('renderer_mode')!='vr' or result.get('hardware_acceptance') is not False or \
+       result.get('game_launch_requested') is not True or result.get('monado_launch_requested') is not True or \
+       result.get('loaded_scene_confirmed') is not True or \
+       type(pairs) is not int or pairs<30 or result.get('shutdown_observed') is not True or \
+       result.get('cleanup_errors')!=[] or result.get('termination_requests')!=[]:
+        raise RuntimeError('Neutral scene/projection/shutdown evidence is incomplete')
+    preparation=result.get('idle_fixture_preparation',result.get('sniper_preparation'))
+    if cfg.get('prepare_idle_fixture') or cfg.get('prepare_sniper_fixture'):
+        if not isinstance(preparation,dict) or preparation.get('native_id')!=cfg.get('idle_native_id'):
+            raise RuntimeError('Neutral native preparation identity differs')
+    images=[];captures=[]
+    for eye in ('left','right'):
+        path=directory/('baseline-'+eye+'-private.png')
+        if path.is_symlink() or not path.is_file() or not 0<path.stat().st_size<=32*1024*1024:
+            raise RuntimeError('Neutral eye capture is absent, redirected or unbounded')
+        with Image.open(path) as image:
+            if image.format!='PNG' or not all(1<=n<=2048 for n in image.size):
+                raise RuntimeError('Neutral eye capture has an invalid format or extent')
+            image.load();images.append(image.convert('RGB'))
+            captures.append({'eye':eye,'file':path.name,'width':image.width,'height':image.height})
+    if images[0].size!=images[1].size or ImageChops.difference(*images).getbbox() is None:
+        raise RuntimeError('Neutral eyes are mismatched or contain identical pixels')
+    return {'schema':1,'evidence_scope':'native-neutral-runtime','complete':True,
+            'distinct_native_projection_pairs':pairs,'eye_captures':captures,
+            'different_eye_pixels':True,'head_translation_verified':False,
+            'head_rotation_verified':False,'hardware_acceptance':False,
+            'physical_grasp_verified':False,'native_release_verified':False}
+
 def selected_shell(cfg):
     shell=cfg.get('private_display_shell','kiosk')
     if shell not in ('kiosk','desktop'):raise ValueError('Private display shell must be kiosk or desktop')
@@ -114,6 +161,22 @@ def inside(cfg_path, output, display_only=False, prerequisite_only=False):
             'private_run':str(directory),'collector_launched':False,'game_launched':False,
             'monado_launched':ordered,'data_ready_for_review':False}))
         return
+    cfg=prepared_configuration(cfg_path)
+    if cfg.get('neutral_runtime_probe') is True:
+        def interrupted(signum,frame):raise RuntimeError('Private neutral runtime interrupted')
+        signal.signal(signal.SIGTERM,interrupted)
+        try:
+            directory=run(cfg)
+            summary=neutral_runtime_summary(directory,cfg)
+            (directory/'neutral-runtime-summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+        except BaseException as error:
+            (output/'collection-outcome.json').write_text(json.dumps({'completed':False,'error':str(error)}))
+            raise
+        (output/'collection-outcome.json').write_text(json.dumps({'completed':True,
+            'private_run':str(directory),'evidence_scope':'native-neutral-runtime',
+            'data_ready_for_review':False,'neutral_runtime_complete':True,
+            'physical_grasp_verified':False,'native_release_verified':False}))
+        return
     # Reuse the reviewed collector and run() cleanup. No second validation after
     # a standalone Wine invocation, no rewritten collection state machine.
     collector=cfg_path.parent/'collect.py'
@@ -192,10 +255,19 @@ def launch(cfg_path, cfg, display_only=False, prerequisite_only=False):
         if server.returncode:raise RuntimeError('Private collection failed; preserve logs, do not repeat')
         # Weston exiting normally does not certify its application's success.
         outcome=json.loads((out/'collection-outcome.json').read_text())
+        runtime_mode=not display_only and not prerequisite_only
+        if runtime_mode and cfg.get('neutral_runtime_probe') is True:
+            ready=outcome.get('evidence_scope')=='native-neutral-runtime' and \
+                  outcome.get('neutral_runtime_complete') is True and \
+                  outcome.get('data_ready_for_review') is False
+        else:
+            ready=outcome.get('data_ready_for_review') is True and \
+                  'neutral_runtime_complete' not in outcome and \
+                  outcome.get('evidence_scope')!='native-neutral-runtime'
         if outcome.get('completed') is not True or \
            (display_only and outcome.get('display_only') is not True) or \
            (prerequisite_only and outcome.get('prerequisite_only') is not True) or \
-           (not display_only and not prerequisite_only and outcome.get('data_ready_for_review') is not True):
+           (runtime_mode and not ready):
             reason=outcome.get('error')
             detail=(' '.join(reason.split())[:512] if isinstance(reason,str) and reason.strip() else
                     'required completion/readiness receipt is missing')

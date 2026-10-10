@@ -520,6 +520,12 @@ def preparation_target(native_id):
     return PREPARATION_TARGETS[native_id]
 
 def validate_idle_probe(cfg):
+    neutral_runtime=cfg.get('neutral_runtime_probe',False)
+    if type(neutral_runtime) is not bool:
+        raise ValueError('Neutral runtime selection must be an explicit boolean')
+    if neutral_runtime and (idle_probe_weapon(cfg) is None or
+                           cfg.get('display_prerequisite_only') or cfg.get('monado_window_order_probe')):
+        raise ValueError('Neutral runtime check requires the prepared stationary game extent')
     alternate=cfg.get('idle_alternate_world_eyes',False)
     if type(alternate) is not bool:raise ValueError('Idle eye order must be an explicit boolean')
     if alternate and idle_probe_weapon(cfg)!=13:
@@ -992,6 +998,26 @@ def native_dual_probe(cfg,env,token,deadline,run_dir,state):
         (run_dir/'native-dual-probe.json').write_text(json.dumps(report,indent=2))
     return report
 
+def finish_idle_capture(cfg,lab,run_dir,manifest):
+    """Select postprocessing only; the caller retains the existing run/finally."""
+    if cfg.get('neutral_runtime_probe') is True:
+        manifest['result']='native_neutral_captured'
+        return True
+    if cfg.get('idle_weapon_probe'):
+        from assess_idle_weapon import assess
+        log=(lab/'Bin/SS2VR.log').read_text(errors='strict')
+        if len(log.encode())>16*1024*1024:raise ValueError('Idle log exceeds the bounded reader budget')
+        evidence=assess(log,cfg['compiled_product_contract']['source_fingerprint'])
+        path=run_dir/'idle-event-pose-geometry.json';path.write_text(json.dumps(evidence,indent=2)+'\n')
+        manifest['idle_collection']={'schema':evidence['schema'],'evidence_file':path.name,
+            'complete_event_pose_observations':len(evidence['copied_event_pose_observations']),
+            'rejected_observations':len(evidence['rejected_or_missing_observations']),
+            'copied_geometry_draws':sum(o['draws'] for o in evidence['copied_event_pose_observations']),
+            'positive_grasp_verified':False,'alignment_accepted':False}
+        manifest['result']='idle_collection_copied_unreviewed'
+        return True
+    return False
+
 def run(cfg):
     private,lab,prefix=validate(cfg)
     stock=cfg.get('renderer_mode','vr')=='stock'
@@ -1390,18 +1416,7 @@ def run(cfg):
                 if captured.returncode:
                     manifest.setdefault('desktop_capture_errors',[]).append({'pose':step['name'],
                         'returncode':captured.returncode,'stderr':captured.stderr[-4096:]})
-        if cfg.get('idle_weapon_probe'):
-            from assess_idle_weapon import assess
-            log=(lab/'Bin/SS2VR.log').read_text(errors='strict')
-            if len(log.encode())>16*1024*1024:raise ValueError('Idle log exceeds the bounded reader budget')
-            evidence=assess(log,cfg['compiled_product_contract']['source_fingerprint'])
-            path=run_dir/'idle-event-pose-geometry.json';path.write_text(json.dumps(evidence,indent=2)+'\n')
-            manifest['idle_collection']={'schema':evidence['schema'],'evidence_file':path.name,
-                'complete_event_pose_observations':len(evidence['copied_event_pose_observations']),
-                'rejected_observations':len(evidence['rejected_or_missing_observations']),
-                'copied_geometry_draws':sum(o['draws'] for o in evidence['copied_event_pose_observations']),
-                'positive_grasp_verified':False,'alignment_accepted':False}
-            manifest['result']='idle_collection_copied_unreviewed'
+        if finish_idle_capture(cfg,lab,run_dir,manifest):
             return run_dir
         if cfg.get('background_controls_probe'):
             manifest['background_controls_probe']=background_controls_probe(cfg,env,token,deadline,run_dir,state)
