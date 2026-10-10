@@ -175,6 +175,11 @@ static void(__cdecl *constantColor)(uint32_t) = nullptr;
 using GfxBindArray = void(__cdecl *)(int, const void *, int, int, int);
 using GfxDrawVertices = void(__cdecl *)(int, int, int);
 static RayInit *unbindVertexBuffers = nullptr;
+using SmartReference = void(__thiscall *)(void *, const void *);
+using SmartRelease = int32_t(__thiscall *)(void *, const void *);
+static SmartReference smartAddRef = nullptr;
+static SmartRelease smartRemRef = nullptr;
+static uintptr_t staticTextureVtable = 0;
 static GfxBindArray *bindVertexArray = nullptr;
 static GfxDrawVertices *drawVertices = nullptr;
 static void **currentCanvas = nullptr;
@@ -6190,19 +6195,35 @@ static WheelSteering steeringWheelClass(void *ride) {
     default: return WheelSteering::None; // Turrets, mounts and unknown classes.
     }
 }
+static bool steeringWheelTextureReady(void *texture) {
+    // Only a loaded CStaticTexture may reach gfuCurrentTexture.
+    if(!texture || !staticTextureVtable || !readableMemory(texture,8))return false;
+    uintptr_t table=0;std::memcpy(&table,texture,4);
+    return table==staticTextureVtable && !(static_cast<const uint8_t*>(texture)[4]&1u);
+}
 static void loadSteeringWheelTexture() {
     auto &w=steeringWheel;
-    if(w.textureTried || !resourceObtain || !textureDataType || !*textureDataType)return;
+    if(w.textureTried || !resourceObtain || !textureDataType || !*textureDataType || !smartAddRef || !smartRemRef)return;
     w.textureTried=true;
-    void *resource=nullptr;
-    // The game's own texture wrapper uses this non-throwing route and a null name.
+    // Mirror the game's own immediate texture wrapper (sniper mask): method 0,
+    // null name, then replace a pending proxy by its loaded object. The Ptr owner
+    // address is &w.texture throughout, as for the native AddRef/RemRef pairs.
     const bool completed=withNativeFinally([&] {
-        resourceObtain(&w.texture,*textureDataType,1,1,1,
+        resourceObtain(&w.texture,*textureDataType,0,1,1,
             "Content/SeriousSam2/Models/Vehicles/HoverFighter/Textures/Fighter.tex",nullptr);
-        resource=w.texture;
+        void *proxy=w.texture;
+        if(proxy && readableMemory(proxy,8) && (static_cast<const uint8_t*>(proxy)[4]&1u)) {
+            using Replacement=void *(__thiscall *)(void *);
+            auto **table=*static_cast<Replacement **>(proxy);
+            void *loaded=table[3](proxy);
+            if(loaded)smartAddRef(loaded,&w.texture);
+            w.texture=loaded;
+            smartRemRef(proxy,&w.texture);
+        }
     },[](bool) noexcept {});
     if(!completed)w.texture=nullptr;
-    log("Steering wheel texture %s",completed && resource ? "loaded" : "unavailable; using plain wheel");
+    const bool ready=completed && steeringWheelTextureReady(w.texture);
+    log("Steering wheel texture %s",ready ? "loaded" : "unavailable; using plain wheel");
 }
 static void updateSteeringWheel(const Snapshot &s) {
     auto &w=steeringWheel;
@@ -6289,7 +6310,7 @@ static void drawSteeringWheel() {
     const int priorComparison=*depthComparison;
     (*enableDepth)();(*enableDepthWrite)();(*disableBlend)();(*disableAlpha)();
     (*setDepthComparison)(42); // LESSEQUAL, as for the lasers.
-    const bool textured=w.texture!=nullptr;
+    const bool textured=steeringWheelTextureReady(w.texture);
     if(textured)currentTexture(0,w.texture,0);
     (*unbindVertexBuffers)();
     useSimpleShader(textured?3:0);
@@ -7416,6 +7437,13 @@ bool attach(bool headless) {
           resourceObtain);
         S(e, "?md_pdtDataType@CTexture@SeriousEngine@@2PAVCDataType@2@A", textureDataType);
         S(e, "?gfuCurrentTexture@SeriousEngine@@YAXJPAVCTexture@1@W4TexBindType@1@@Z", currentTexture);
+        S(c, "?AddRef@CSmartObject@SeriousEngine@@QAEXPBX@Z", smartAddRef);
+        S(c, "?RemRef@CSmartObject@SeriousEngine@@QAEJPBX@Z", smartRemRef);
+        {
+            void *table=nullptr;
+            S(e, "??_7CStaticTexture@SeriousEngine@@6B@", table);
+            staticTextureVtable=reinterpret_cast<uintptr_t>(table);
+        }
         S(e, "?gfuUseSimpleShader@SeriousEngine@@YAXW4GfuSimpleShader@1@@Z", useSimpleShader);
         S(e, "?gfuConstantColor@SeriousEngine@@YAXK@Z", constantColor);
         S(e, "?_gfxUnbindVertexBuffers@SeriousEngine@@3P6AXXZA", unbindVertexBuffers);
