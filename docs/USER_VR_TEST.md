@@ -23,9 +23,10 @@ Codex must not continue those probes under the current instruction.
 - For the full-feature pass set `Enabled=1` in `[Roomscale]`, `[HeadComfort]` and
   `[Melee]` of `Bin/SS2VR/SS2VR.ini` (all three default to 0), then restart.
   Repeat the world/tracking section once with them at 0 for comparison.
-- Not supported in this candidate: literal driver wheels and physical vehicle
-  controls beyond the admitted Fighter/Saucer handles (`[Vehicles]ImmersiveGrips`,
-  default 1); teleport (excluded by design).
+- Vehicles: Fighter/Saucer use their authored handles (`[Vehicles]ImmersiveGrips`);
+  other driven vehicles use the virtual steering wheel (`[SteeringWheel]`). Stock
+  SS2 has no modeled driver wheel, so the wheel is a mod-made model textured from
+  the game's own HoverFighter texture. Teleport is excluded by design.
 - Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log`
   and the game's `Sam2.log`. A startup that hangs on loading should be reported
   with its log even if a retry succeeds.
@@ -160,10 +161,20 @@ a passing pointer test; visible selection must match the chosen native item.
 Test walking, sprint/jump/use and head-directed swimming. Test optional arm pulls
 only if enabled. Enter/exit each supported vehicle and seat, aim, use native
 throttle/steering fallback and check head/hand anchoring through seat changes.
-For positively identified driver wheels with enabled physical steering, test left,
-right and both hands, smooth transfer, release, tracking loss and joystick
-fallback. Record vehicle/seat identity. Do not treat a road-wheel joint or a
-weapon-wheel action as physical driver steering. Teleport is outside scope.
+Fighter and Saucer use their real cockpit handles. Every other driven vehicle
+(cars, buggy, aircraft, rollerball, air bike, hover scooter) shows the virtual
+steering wheel (`[SteeringWheel]`, default on) about 0.4 m in front of and below
+your seated eyes; recenter first if it sits in the wrong place. Check that it
+looks like stock SS2 metalwork (HoverFighter texture) in both eyes and stays fixed
+to the vehicle while driving. Squeeze on the rim with the left hand, right hand
+and both; turn it both ways: cars steer, hover/air vehicles turn steadily while
+the wheel is held off-centre. Release: the wheel recentres and steering stops.
+Grab with one hand, add the other and release the first: no jump. Lose and
+regain tracking while squeezing: it must not regrab until you release and
+squeeze again. Joystick steering must still work without holding the wheel.
+Record vehicle names, which steering route they used, and adjust `OffsetX/Y/Z`,
+`TiltDegrees`, `FullLockDegrees` or `TurnRateDegrees` if needed. Teleport is
+outside scope.
 
 For optional arm pulls, use `[Swimming]Immersive=1` only in the separate test
 copy; the default is0. Keep the movement stick centered in water. Briefly lose

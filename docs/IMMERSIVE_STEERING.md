@@ -35,6 +35,27 @@ loaded precedence, occupied rider identity, dynamically attached models, rider
 mesh geometry or evaluated ride animations. Those limits remain separate from
 the already inspected helicopter model; no new physical control is admitted.
 
+## Virtual steering wheel — 2026-10-10
+
+The owner chose a mod-made wheel for driven rides without authored controls,
+textured from existing game art. `tools/blender/steering_wheel.py` builds the
+mesh headlessly in Blender and maps it onto regions of the stock HoverFighter
+atlas (riveted strip for the rim, panel for spokes, the round dial for the hub);
+the game loads that texture at runtime through its own immediate
+`resObtainResource` wrapper pattern, so no texture bytes ship. The wheel is drawn
+after the lasers in each eye with native simple-shader vertex arrays, with depth.
+
+Ride classes come from the Sam2Game vtable: wheeled/buggy/military car steer from
+move X (wheel replaces stick X while held); aircraft, rolling ball, air bike and
+hovercraft turn toward look heading (held wheel adds a yaw rate in the mounted
+look clamp instead of hand aim). Fighter/Saucer keep authored handles; a
+hovercraft-class ride waits 1.5 s for handle admission before showing the wheel.
+Grabbing reuses the squeeze availability/re-arm rules of the handle grasp; each
+hand keeps its own baseline, so joining/leaving never jumps, and the rim
+self-centres on release. A private capture rendered it in both eyes on foot
+(preview mode); grasp and steering are unit-tested only. Aircraft/rolling-ball
+route choice and feel are user acceptance items.
+
 ## Current implementation boundary — 2026-10-10
 
 The existing default-off [render observer](RIDE_RENDER_OBSERVATION.md) now joins
