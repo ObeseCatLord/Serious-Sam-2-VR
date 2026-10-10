@@ -13,6 +13,7 @@
 #include "roomscale_math_frame.hpp"
 #include "roomscale_placement.hpp"
 #include "roomscale_sweep_query.hpp"
+#include "steering_wheel_mesh.hpp"
 #include "common/swimming_input.hpp"
 #include "common/native_zoom.hpp"
 #include "common/native_primary_projection.hpp"
@@ -164,6 +165,18 @@ using RasterComparison = void(__cdecl *)(int);
 static RasterComparison *setDepthComparison = nullptr;
 static RayInit ortho = nullptr;
 static VoidThis activateView = nullptr;
+// Native resource/gfx entries for the virtual steering wheel (pinned exports).
+using ResourceObtain = void *(__cdecl *)(void **, void *, int, int, int, const char *, const char *);
+static ResourceObtain resourceObtain = nullptr;
+static void **textureDataType = nullptr;
+static void(__cdecl *currentTexture)(int, void *, int) = nullptr;
+static void(__cdecl *useSimpleShader)(int) = nullptr;
+static void(__cdecl *constantColor)(uint32_t) = nullptr;
+using GfxBindArray = void(__cdecl *)(int, const void *, int, int, int);
+using GfxDrawVertices = void(__cdecl *)(int, int, int);
+static RayInit *unbindVertexBuffers = nullptr;
+static GfxBindArray *bindVertexArray = nullptr;
+static GfxDrawVertices *drawVertices = nullptr;
 static void **currentCanvas = nullptr;
 static uintptr_t allowedRayReturn = 0;
 static uintptr_t laserEngineBase = 0, laserTurretVtable = 0;
@@ -3069,6 +3082,7 @@ float frozenWorldVisibility() {
 }
 static void freezeLasers(const Request &request);
 static void drawLasers();
+static void drawSteeringWheel();
 static void __fastcall viewExecute(void *command, void *) {
     const auto generation = graphicsResourceGeneration();
     auto *previousExecution = executingView;
@@ -3087,6 +3101,7 @@ static void __fastcall viewExecute(void *command, void *) {
             rootCaptureArmed = false;
             if (!executedWeaponWorld.valid) weaponPairFault = true;
             drawLasers();
+            drawSteeringWheel();
         }
     }, [&](bool aborted) noexcept {
         executingView = !aborted && generation == graphicsResourceGeneration() ? previousExecution : nullptr;
@@ -5663,9 +5678,12 @@ struct RideGripBorrow {
     bool eligible=false,headingIntent=false;
 };
 static thread_local RideGripBorrow *activeRideGrip=nullptr;
+static uint32_t handleFrameRide=0;
+static uint64_t handleFrameTick=0;
 void recordRideGripFrame(const RideGripFrame &frame) {
     AcquireSRWLockExclusive(&controlsLock);
     rideGripFrames.add(frame);
+    if(frame.valid) {handleFrameRide=frame.rig.rider.ride;handleFrameTick=GetTickCount64();}
     ReleaseSRWLockExclusive(&controlsLock);
 }
 using LookClamp = void(__thiscall *)(void *, Vec3 &);
@@ -6145,6 +6163,154 @@ static void __fastcall waterPlayerControls(void *brain, void *, uint8_t fire, Ve
     originalPlayerControls(brain, fire, look, move);
     logLocalControls(observation,caller,fire,look,move);
 }
+// Virtual steering wheel for driven rides without authored controls. Main
+// thread only: input sampling updates the grasp, the mounted look clamp turns
+// heading-steered rides, and the root view draws the wheel in each eye.
+enum class WheelSteering : uint32_t { None, Axis, Heading };
+struct SteeringWheelRuntime {
+    SteeringWheelGrasp grasp;
+    uint32_t ride=0;
+    uint64_t rideSince=0,updated=0,clamped=0;
+    WheelSteering steering=WheelSteering::None;
+    bool visible=false,preview=false;
+    void *texture=nullptr;
+    bool textureTried=false;
+};
+static SteeringWheelRuntime steeringWheel;
+static WheelSteering steeringWheelClass(void *ride) {
+    if(!ride || !controlsGameBase || !readableMemory(ride,4))return WheelSteering::None;
+    uintptr_t table=0;std::memcpy(&table,ride,4);
+    if(table<controlsGameBase)return WheelSteering::None;
+    switch(table-controlsGameBase) {
+    // EnforcePuppetMoveLook 1563D0 with wheel-joint steering from move X.
+    case 0x2a7ea0: case 0x2ba688: case 0x2aedd8: case 0x2af898: return WheelSteering::Axis;
+    // Aircraft, rolling ball, air bike and hovercraft turn toward look heading.
+    case 0x2b79b0: case 0x2b7348: case 0x2b9240: case 0x2b0760: case 0x2a8558: case 0x2b8420:
+        return WheelSteering::Heading;
+    default: return WheelSteering::None; // Turrets, mounts and unknown classes.
+    }
+}
+static void loadSteeringWheelTexture() {
+    auto &w=steeringWheel;
+    if(w.textureTried || !resourceObtain || !textureDataType || !*textureDataType)return;
+    w.textureTried=true;
+    void *resource=nullptr;
+    // The game's own texture wrapper uses this non-throwing route and a null name.
+    const bool completed=withNativeFinally([&] {
+        resourceObtain(&w.texture,*textureDataType,1,1,1,
+            "Content/SeriousSam2/Models/Vehicles/HoverFighter/Textures/Fighter.tex",nullptr);
+        resource=w.texture;
+    },[](bool) noexcept {});
+    if(!completed)w.texture=nullptr;
+    log("Steering wheel texture %s",completed && resource ? "loaded" : "unavailable; using plain wheel");
+}
+static void updateSteeringWheel(const Snapshot &s) {
+    auto &w=steeringWheel;
+    const auto &config=settings.steeringWheel;
+    const auto now=GetTickCount64();
+    const float dt=w.updated && now>w.updated ? float(now-w.updated)/1000.f : 0.f;
+    w.updated=now;
+    WheelSteering steering=WheelSteering::None;
+    if(config.enabled && s.rider.seated() && livePlayer(s) && s.ui.gameplay) {
+        steering=steeringWheelClass(resolve(s.rider.ride));
+        if(w.ride!=s.rider.ride) {w.ride=s.rider.ride;w.rideSince=now;w.grasp.reset();}
+        // Rides with admitted authored handles keep them; wait for that admission first.
+        const bool hover=steering==WheelSteering::Heading && controlsGameBase && [&] {
+            void *ride=resolve(s.rider.ride);uintptr_t table=0;
+            if(ride && readableMemory(ride,4))std::memcpy(&table,ride,4);
+            return table==controlsGameBase+0x2a8558 || table==controlsGameBase+0x2b8420;
+        }();
+        if(hover && settings.immersiveVehicleGrips) {
+            AcquireSRWLockShared(&controlsLock);
+            const bool handles=handleFrameRide==s.rider.ride && now-handleFrameTick<1500;
+            ReleaseSRWLockShared(&controlsLock);
+            if(handles || now-w.rideSince<1500)steering=WheelSteering::None;
+        }
+    } else w.ride=0;
+    w.steering=steering;
+    w.preview=steering==WheelSteering::None && config.enabled && config.previewOnFoot && s.rider.handheld() &&
+        livePlayer(s) && s.ui.gameplay;
+    w.visible=steering!=WheelSteering::None || w.preview;
+    if(w.visible)loadSteeringWheelTexture();
+    const bool eligible=steering!=WheelSteering::None && fresh(s.input) && !recenterHeld(s.input) &&
+        !s.ui.wheel[0].open && !s.ui.wheel[1].open && nativeRiderCurrent(s.player,s.rider);
+    w.grasp.update(config,s.input,s.gripPoseGeneration,s.origin,s.turn,s.inputProducer,eligible,dt);
+}
+// Heading-steered rides: while the wheel is held, the wheel's steering replaces
+// hand-aim heading with a turn rate; pitch keeps the native current value.
+static bool steeringWheelHeading(Vec3 &look) {
+    auto &w=steeringWheel;
+    const auto now=GetTickCount64();
+    const float dt=w.clamped && now>w.clamped ? std::min(.1f,float(now-w.clamped)/1000.f) : 0.f;
+    w.clamped=now;
+    if(w.steering!=WheelSteering::Heading || !w.grasp.held() || !quaternionEuler || now-w.updated>200)return false;
+    const float delta=-w.grasp.steer(settings.steeringWheel)*settings.steeringWheel.turnRateDegrees*Pi/180*dt;
+    Vec3 converted;
+    if(quaternionEuler(&converted,yaw(delta))!=&converted || !std::isfinite(converted.x))return true;
+    if(std::isfinite(look.x+converted.x))look.x+=converted.x;
+    return true;
+}
+static void drawSteeringWheel() {
+    auto &w=steeringWheel;
+    if(!w.visible || !eyeSnapshot.ui.gameplay || !currentCanvas || !*currentCanvas || !unbindVertexBuffers ||
+       !*unbindVertexBuffers || !bindVertexArray || !*bindVertexArray || !drawVertices || !*drawVertices ||
+       !useSimpleShader || !constantColor || !currentTexture)return;
+    if(w.preview ? !eyeSnapshot.rider.handheld() :
+       (!eyeSnapshot.rider.seated() || eyeSnapshot.rider.ride!=w.ride))return;
+    const auto &config=settings.steeringWheel;
+    const Pose wheel=compose(eyeAnchor,steeringWheelSpin(config,w.preview?0.f:w.grasp.angle));
+    if(!finite(wheel))return;
+    constexpr size_t Count=SteeringWheelVertexCount;
+    // Both windings, so native face culling cannot hide the far side.
+    static Vec3 position[Count*2];
+    static float uv[Count*2][2];
+    static uint32_t color[Count*2];
+    const Vec3 light=rotate(eyeAnchor.q,Vec3{.3f,.85f,.45f}*(1/std::sqrt(.3f*.3f+.85f*.85f+.45f*.45f)));
+    for(size_t i=0;i<Count;i+=3)
+        for(unsigned k=0;k<3;++k) {
+            const auto &v=SteeringWheelMesh[i+k];
+            const Vec3 p=wheel.p+rotate(wheel.q,Vec3{v.x,v.y,v.z}*config.scale);
+            const Vec3 n=rotate(wheel.q,Vec3{v.nx,v.ny,v.nz});
+            const float lit=dot(n,light);
+            const auto shade=[](float x) {
+                const uint32_t c=uint32_t(std::clamp(x,0.f,1.f)*255.f+.5f);
+                return c|c<<8|c<<16|0xff000000u;
+            };
+            const size_t front=i+k,back=Count+i+(2-k);
+            position[front]=position[back]=p;
+            uv[front][0]=uv[back][0]=v.u;uv[front][1]=uv[back][1]=v.v;
+            color[front]=shade(.38f+.62f*std::max(0.f,lit));
+            color[back]=shade(.38f+.62f*std::max(0.f,-lit));
+        }
+    ortho();
+    activateView(rootView);
+    const bool wasDepth=*depthEnabled!=0,wasWrite=*depthWriting!=0;
+    const bool wasBlend=*blending!=0,wasAlpha=*alphaTesting!=0;
+    const int priorComparison=*depthComparison;
+    (*enableDepth)();(*enableDepthWrite)();(*disableBlend)();(*disableAlpha)();
+    (*setDepthComparison)(42); // LESSEQUAL, as for the lasers.
+    const bool textured=w.texture!=nullptr;
+    if(textured)currentTexture(0,w.texture,0);
+    (*unbindVertexBuffers)();
+    useSimpleShader(textured?3:0);
+    if(!textured)constantColor(0x8a8f96ffu);
+    // Bounded batches of whole triangles keep each client array small.
+    constexpr size_t Batch=900;
+    for(size_t first=0;first<Count*2;first+=Batch) {
+        const size_t n=std::min(Batch,Count*2-first);
+        (*bindVertexArray)(0,position+first,0x87,int(n*12),12);
+        if(textured) {
+            (*bindVertexArray)(2,uv+first,0x86,int(n*8),8);
+            (*bindVertexArray)(3,color+first,0x82,int(n*4),4);
+        }
+        (*drawVertices)(0x99,int(n/3),0);
+    }
+    if(!wasDepth)(*disableDepth)();
+    if(!wasWrite)(*disableDepthWrite)();
+    if(wasBlend)(*enableBlend)();
+    if(wasAlpha)(*enableAlpha)();
+    (*setDepthComparison)(priorComparison);
+}
 static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -6178,7 +6344,9 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
             const Pose aim = worldHandTracking(anchor, captured.origin, captured.turn,
                 captured.input.head, captured.input.hand[1]);
             Vec3 desired;
-            if (trackedHandCurrent(captured.input,snapshot.input,1) && validNativeBodyPose(aim)) {
+            if (steeringWheelHeading(look)) {
+                nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
+            } else if (trackedHandCurrent(captured.input,snapshot.input,1) && validNativeBodyPose(aim)) {
                 quaternionEuler(&desired, aim.q);
                 desired.z = 0; // Native vehicle control look has heading/pitch, zero bank.
                 void *candidateRideToken=nullptr;
@@ -6262,6 +6430,7 @@ static void __fastcall poll(void *b, void *) {
         for (unsigned h = 0; h < 2; ++h)
             fire[h] = fire[h] && multiplayer::localPrimaryAllowed(s.player, h, s.intentEpoch[h],
                 s.input.primaryInputGeneration[h], s.input.sequence);
+    updateSteeringWheel(s); // Before controlsLock: may load a native texture.
     AcquireSRWLockExclusive(&controlsLock);
     playerBindings = b;
     const bool sameContext = sampledControls.rider == s.rider && sampledControls.generation == s.generation &&
@@ -6282,6 +6451,8 @@ static void __fastcall poll(void *b, void *) {
     if (enabled) {
         auto direction = horizontalStickMovement(s.input, s.ui.wheel[0].open,
                                                 s.rider.seated() ? 0.f : s.turn);
+        if (steeringWheel.steering == WheelSteering::Axis && steeringWheel.grasp.held())
+            direction.x = steeringWheel.grasp.steer(settings.steeringWheel); // Wheel replaces stick steering.
         // Verified native labels: X+ right, X- left, Z- forward, Z+ backward.
         values[0] = std::max(0.f, direction.x);
         values[1] = std::max(0.f, -direction.x);
@@ -7241,6 +7412,15 @@ bool attach(bool headless) {
         S(e, "?cldSetAvatarMechanism@SeriousEngine@@YAXPAVCMechanism@1@@Z", rayMechanism);
         S(e, "?cldSetRayTestsFluids@SeriousEngine@@YAXH@Z", rayFluids);
         S(e, "?gfuDrawLine3f@SeriousEngine@@YAXABVVector3f@1@0KK@Z", drawLine);
+        S(c, "?resObtainResource@SeriousEngine@@YA?AV?$Ptr@VCResource@SeriousEngine@@@1@PAVCDataType@1@W4ResObtainMethod@1@HHPBD2@Z",
+          resourceObtain);
+        S(e, "?md_pdtDataType@CTexture@SeriousEngine@@2PAVCDataType@2@A", textureDataType);
+        S(e, "?gfuCurrentTexture@SeriousEngine@@YAXJPAVCTexture@1@W4TexBindType@1@@Z", currentTexture);
+        S(e, "?gfuUseSimpleShader@SeriousEngine@@YAXW4GfuSimpleShader@1@@Z", useSimpleShader);
+        S(e, "?gfuConstantColor@SeriousEngine@@YAXK@Z", constantColor);
+        S(e, "?_gfxUnbindVertexBuffers@SeriousEngine@@3P6AXXZA", unbindVertexBuffers);
+        S(e, "?_gfxBindVertexArray@SeriousEngine@@3P6AXJPBXW4GfxUsageType@1@JJ@ZA", bindVertexArray);
+        S(e, "?_gfxDrawVertices@SeriousEngine@@3P6AXW4GfxPrimitive@1@JJ@ZA", drawVertices);
         S(e, "?_gfxEnableDepthBuffer@SeriousEngine@@3P6AXXZA", enableDepth);
         S(e, "?_gfxDisableDepthBuffer@SeriousEngine@@3P6AXXZA", disableDepth);
         S(e, "?_gfxEnableDepthWrite@SeriousEngine@@3P6AXXZA", enableDepthWrite);

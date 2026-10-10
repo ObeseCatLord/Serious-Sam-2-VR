@@ -1,5 +1,6 @@
 #pragma once
 #include "ui.hpp"
+#include "steering_wheel.hpp"
 namespace ss2vr {
 struct VrSettings {
     ComfortConfig comfort;
@@ -11,6 +12,7 @@ struct VrSettings {
     float scopeEyeRelief = .1f; // Optical presentation parameter, not native zoom timing.
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;
+    SteeringWheelSettings steeringWheel;
     bool roomscale = false; // Development gate until controller/replication completion.
     bool physicalMelee = false; // Unique-saw single-player integration gate.
     bool headFade = false;

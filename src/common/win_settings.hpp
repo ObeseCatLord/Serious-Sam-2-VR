@@ -37,6 +37,19 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.physicalMelee = number(L"Melee", L"Enabled", 0, 0, 1) >= .5f;
     settings.immersiveSwimming = number(L"Swimming", L"Immersive", 0, 0, 1) >= .5f;
     settings.immersiveVehicleGrips = number(L"Vehicles", L"ImmersiveGrips", 1, 0, 1) >= .5f;
+    {
+        auto &w = settings.steeringWheel;
+        w.enabled = number(L"SteeringWheel", L"Enabled", 1, 0, 1) >= .5f;
+        w.previewOnFoot = number(L"SteeringWheel", L"PreviewOnFoot", 0, 0, 1) >= .5f;
+        w.offset = {number(L"SteeringWheel", L"OffsetX", 0, -.5f, .5f),
+                    number(L"SteeringWheel", L"OffsetY", -.38f, -.9f, .2f),
+                    number(L"SteeringWheel", L"OffsetZ", -.42f, -.9f, -.15f)};
+        w.tiltDegrees = number(L"SteeringWheel", L"TiltDegrees", 25, -10, 70);
+        w.scale = number(L"SteeringWheel", L"Scale", 1, .6f, 1.6f);
+        w.maxAngleDegrees = number(L"SteeringWheel", L"MaxAngleDegrees", 135, 45, 540);
+        w.fullLockDegrees = number(L"SteeringWheel", L"FullLockDegrees", 90, 15, 540);
+        w.turnRateDegrees = number(L"SteeringWheel", L"TurnRateDegrees", 120, 20, 360);
+    }
     settings.remoteHeadTracking = number(L"Multiplayer", L"RemoteHeadTracking", 1, 0, 1) >= .5f;
     settings.headFade = number(L"HeadComfort", L"Enabled", 0, 0, 1) >= .5f;
     settings.headRadius = number(L"HeadComfort", L"RadiusMeters", .12f, .05f, .2f);
