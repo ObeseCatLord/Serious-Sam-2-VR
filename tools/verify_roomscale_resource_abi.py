@@ -41,8 +41,8 @@ RESOURCE_SITES={
 }
 RETURN_SITES={
     'resourceMaterialReturn':0xe1cc9,
-    'resourceChildOneReturn':0xe1f9b,
-    'resourceChildTwoReturn':0xe203b,
+    'resourceChildOneReturn':0xe1f9e,
+    'resourceChildTwoReturn':0xe203e,
     'resourcePrepareReturn':0xe2472,
     'resourceQueryReturn':0xda4e1,
 }
@@ -50,6 +50,19 @@ RETURN_SITES={
 
 def require(condition,message):
     if not condition: raise ValueError(message)
+
+def check_patch_incoming_edges(instructions,base,patches):
+    """Direct edges within a pinned decoded function, not cross-module coverage."""
+    for ins in instructions:
+        jump=ins.group(capstone.CS_GRP_JUMP)
+        if not jump and not ins.group(capstone.CS_GRP_CALL):continue
+        if not ins.operands or ins.operands[0].type!=capstone.x86.X86_OP_IMM:
+            require(not jump,'Unclassified indirect jump in model preparation')
+            continue # Existing virtual calls are not direct branch receipts.
+        target=ins.operands[0].imm-base
+        for name,start in patches:
+            require(not start<target<start+5,
+                    'Native edge enters patched jump interior: '+name+' at '+hex(ins.address-base))
 
 
 def functions(assembly):
@@ -106,6 +119,36 @@ def verify(game):
             require(address==RETURN_SITES[name] and clear=='0','Post-call mapping differs')
             require(f'RESOURCE_GATE({name},0,1)' in source,'Post-call kind differs')
     require(found==set(RESOURCE_SITES)|set(RETURN_SITES)|{'resourceHullDispatch','resourceCollisionBuffer'},'Missing gate')
+    # MinHook overwrites five bytes. A native branch into the second instruction
+    # of a six-byte displaced prefix bypasses the detour and executes displacement
+    # bytes. Check the complete pinned E1720 preparation body, including BOTH
+    # no-child paths. The common joins retain the native argument cleanup.
+    preparation_start=0xe1720;preparation_end=0xe2056
+    preparation_bytes=pe.get_data(preparation_start,preparation_end-preparation_start)
+    preparation=list(md.disasm(preparation_bytes,base+preparation_start))
+    require(preparation and preparation[-1].address+preparation[-1].size==base+preparation_end and
+            preparation[-1].mnemonic=='ret','Incomplete model preparation decode')
+    preparation_patches=[(name,int(rva,16)) for name,rva,*_ in bindings
+                         if preparation_start<=int(rva,16)<preparation_end]
+    require(len(preparation_patches)==9,'Model preparation gate inventory differs')
+    check_patch_incoming_edges(preparation,base,preparation_patches)
+    for name,old,branch in [('resourceChildOneReturn',0xe1f9b,0xe1f44),
+                            ('resourceChildTwoReturn',0xe203b,0xe1fe7)]:
+        old_patches=[(n,old if n==name else address) for n,address in preparation_patches]
+        try:check_patch_incoming_edges(preparation,base,old_patches)
+        except ValueError:pass
+        else:raise ValueError('Former interior-branch hook was accepted: '+name)
+        # A future verifier regression must reject an actual encoded branch
+        # shifted one byte into the new detour, even though other edges are valid.
+        instruction=next(i for i in preparation if i.address==base+branch)
+        require(instruction.imm_size==1,'Negative-control branch encoding differs')
+        changed=bytearray(preparation_bytes)
+        offset=branch-preparation_start+instruction.imm_offset
+        changed[offset]+=1
+        mutated=list(md.disasm(bytes(changed),base+preparation_start))
+        try:check_patch_incoming_edges(mutated,base,preparation_patches)
+        except ValueError:pass
+        else:raise ValueError('Encoded interior-branch mutation was accepted: '+name)
     for table,target in [(0x209268,0x525b0),(0x2094b8,0x51430),
                          (0x209308,0x4fa20),(0x2093b8,0x111f80)]:
         require(struct.unpack('<I',pe.get_data(table+0x40,4))[0]==base+target,
@@ -201,6 +244,8 @@ def verify(game):
     return {'runtime_executed':False,'hooks_activated':False,'native_resource_branches':len(RESOURCE_SITES),
             'hull_dispatch_gates':1,'vertex_buffer_admission_gates':1,'post_call_cancellation_sites':len(RETURN_SITES),'engine_sha256':ENGINE_SHA,'compiled_object_sha256':object_hash,
             'source_sha256':hashlib.sha256(source.encode()).hexdigest(),
+            'model_preparation_direct_edge_checks':{'gates':9,'old_sites_rejected':2,
+                                                   'encoded_branch_mutations_rejected':2},
             'query_ownership_complete':False,'body_movement_implemented':False}
 
 

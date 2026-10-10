@@ -1,5 +1,53 @@
 # Current source continuation
 
+## 2026-10-10 — repair model-preparation hooks at their common joins
+
+The full-feature startup investigation found two unsafe hook placements. Native
+no-child branches entered three bytes after the old hook entries, inside the
+five-byte MinHook jump displacements. The gates now enter at common joinsE1F9E/
+E203E. Native call paths retain their preceding argument cleanup; no-child paths
+reach the same entries directly. The two displaced MOVs resume atE1FA4/E2044.
+The unchanged cancellation suffix restores its stack from native EBP, so cleanup
+is not duplicated. No query/physics rewrite or feature disablement was introduced.
+
+The owned-native verifier now checks allnine gate patch spans within the complete
+E1720–E2056 function:779instructions,118direct edges and no indirect jumps. It
+rejects both former bad placements and two actual encoded branch mutations.
+This is finite function-local coverage, not a proof about all external code.
+Astra investigation and design/candidate review agreed; source GO with current
+localAstra/xhigh routing verified, independent backend attestation unavailable.
+Allfourproducts rebuilt at61ce671273a668d28bffdfd4288a2d4a29e65d7e7b60c1a92f53d0c6b0d3926b,
+IPC11/wire7;82Debug/82assertion-enabledRelease groups, normal/optimized native+
+compiled resource checks and product contracts/layouts pass. The confirmed hook
+defect is fixed in source; V59 crash causality and runtime recovery remain unproved
+until a fresh full-feature neutral scene run. Historical V59 is preserved.
+
+## 2026-10-10 — actual full-feature neutral startup exposed a native load crash
+
+The fresh isolated neutral check used compiledC0 products and a private settings
+profile enabling Roomscale, HeadComfort and Melee. D3D9 device/routing, native hooks,
+IPC and the D3D11OpenXR host initialized. Monado25.1.0 selected RTX4090,
+XR_KHR_D3D11_enable, format87 swapchains and session states1through5 with simulated
+Index profiles. It submitted no world frame. Native Jungle loading began, then
+Engine raised BREAKPOINT80000003 at RVAE2059, padding after the E1720 return.
+There was no loaded-scene receipt, completed world readiness or eye capture.
+The IPC observer's later status3 was secondary to the native crash.
+
+The game had already crashed, so normal native shutdown was not observed. Exact
+owned cleanup completed with no errors or termination requests; the private display
+stopped with no surviving tagged processes. The original installation, old checkout,
+settings and saves were unchanged. All generated logs/reports stay private, and the
+attempt is never rerun/resealed. Earlier neutral world captures used disabled
+feature flags and a different native build; they are not an exact baseline here.
+
+The crash does not yet identify the responsible feature/hook. A bounded read-only
+Astra investigation is checking the known native model-preparation return and
+existing pass-through gate/placement ABI, with no competing source writer or runtime.
+Native stereo/6DoF source and earlier observations remain, but full-feature startup
+must be fixed before final user acceptance. Disabling the requested features is
+not the completion target. No shooting, movement, vehicle, hardware or network
+input was supplied, and this failed startup is not a gameplayVR pass.
+
 ## 2026-10-10 — neutral native runtime check independent of optional grip research
 
 The existing private display launcher has an explicitly sealed

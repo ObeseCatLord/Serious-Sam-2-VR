@@ -180,8 +180,11 @@ bool queueRoomscaleResourceGates(HMODULE engine, RoomscaleInternalHook registrar
         BIND(resourceCollisionVertexResource,0xcba64,0xcba84,BYTES(0xf6,0x41,0x04,0x01,0x74,0x1a),6,collisionAbort,0),
         BIND(resourceCollisionMaterial,0xcbef3,0xcbf14,BYTES(0xf6,0x47,0x04,0x01,0x74,0x1b),6,collisionAbort,0),
         BIND(resourceMaterialReturn,0xe1cc9,0,BYTES(0x89,0x46,0x1c,0x8b,0x45,0xc8),6,modelAbort,0),
-        BIND(resourceChildOneReturn,0xe1f9b,0,BYTES(0x83,0xc4,0x14,0x8b,0x4d,0x10),6,modelAbort,0),
-        BIND(resourceChildTwoReturn,0xe203b,0,BYTES(0x83,0xc4,0x14,0x8b,0x45,0x18),6,modelAbort,0),
+        // Native no-child branches enter AFTER the call's argument cleanup.
+        // Hook the common join so they cannot land inside MinHook's rel32 jump.
+        // Cancellation rebuilds ESP from EBP; the already-cleaned args add no debt.
+        BIND(resourceChildOneReturn,0xe1f9e,0,BYTES(0x8b,0x4d,0x10,0x8b,0x45,0xb4),6,modelAbort,0),
+        BIND(resourceChildTwoReturn,0xe203e,0,BYTES(0x8b,0x45,0x18,0x8b,0x4d,0x08),6,modelAbort,0),
         BIND(resourcePrepareReturn,0xe2472,0,BYTES(0xa1,0x68,0xac,0x2e,0x10),5,reinterpret_cast<void*>(&resourceCancelOuterPreparation),0),
         BIND(resourceQueryReturn,0xda4e1,0,BYTES(0xe8,0x4a,0x39,0x00,0x00),5,reinterpret_cast<void*>(&resourceCancelQueryTail),0),
     };
