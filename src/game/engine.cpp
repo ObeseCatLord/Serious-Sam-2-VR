@@ -438,6 +438,20 @@ static bool meleeReleaseObligation(void *subject, uint32_t player) noexcept {
 static std::atomic<DWORD> simulationThread{0};
 static LaserAim laserAim[2];
 static HeadVolumeObservation headVolumeObservation;
+// Mod-owned diagnostic values, published with the observation under laserLock.
+// No pointers, extra native reads or alternative clearance policy.
+enum class HeadQueryStage : uint32_t {
+    NotEntered, Phase, Cleanup, Binding, RelativePose, Translation, NearPose,
+    EyePoseFov, Guard, Radius, Cover, Owner, ResourceQuery, Complete
+};
+struct HeadQueryDiagnostic {
+    HeadQueryStage stage=HeadQueryStage::NotEntered;
+    double computedRadius=0,computedGuard=0;
+    uint32_t categoryCount=0;
+    bool prepared=false,clear=false,failed=false,mathReturned=false,coverValid=false;
+};
+static HeadQueryDiagnostic headQueryDiagnostic;
+static std::atomic<unsigned> headDiagnosticReceipts{0};
 static HeadClearance eyeHeadClearance;
 static Pose protectedWorldHead;
 static float protectedWorldRadius=0;
@@ -3160,18 +3174,54 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
         freezeLasers(request);
         if (settings.headFade && (eyeSnapshot.rider.handheld()||eyeSnapshot.rider.seated())) {
             const Pose head = worldHeadTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,request.input.head);
+            HeadVolumeObservation diagnosticSample;
+            HeadQueryDiagnostic diagnosticQuery;
+            HeadVolumeVisibilityReason visibilityReason=HeadVolumeVisibilityReason::Unsampled;
+            uint64_t checkedAt=0;
+            unsigned renderGate=0; // 1 native fault, 2 thread, 3 visibility predicate.
+            bool diagnostic=false;
             AcquireSRWLockShared(&laserLock);
-            const bool clear = !nativeRayFaulted.load(std::memory_order_acquire) &&
-                simulationThread.load()==GetCurrentThreadId() &&
-                headVolumeVisible(headVolumeObservation,eyeAnchor,head,eyeSnapshot.playerHandle,request,
-                                  simulationRevision,eyeSnapshot.rigRevision,GetTickCount64());
+            bool clear=false;
+            if(nativeRayFaulted.load(std::memory_order_acquire))renderGate=1;
+            else if(simulationThread.load()!=GetCurrentThreadId())renderGate=2;
+            else {
+                renderGate=3;checkedAt=GetTickCount64();
+                visibilityReason=headVolumeVisibilityReason(headVolumeObservation,eyeAnchor,head,
+                    eyeSnapshot.playerHandle,request,simulationRevision,eyeSnapshot.rigRevision,checkedAt);
+                clear=visibilityReason==HeadVolumeVisibilityReason::Clear;
+            }
             eyeHeadClearance.mode=HeadClearanceMode::Opaque;
             if(clear) eyeHeadClearance={headVolumeObservation.tickMs,request.input.head.p,
                 headVolumeObservation.radius-headVolumeObservation.numericalGuard,settings.headRadius,headVolumeObservation.nearZ,
                 HeadClearanceMode::Clear,0};
             protectedWorldHead=headVolumeObservation.head;protectedWorldRadius=headVolumeObservation.radius;
+            if(headVolumeObservation.requestSequence==request.sequence &&
+               headVolumeObservation.inputSequence==request.input.sequence) {
+                diagnosticSample=headVolumeObservation;diagnosticQuery=headQueryDiagnostic;diagnostic=true;
+            }
             ReleaseSRWLockShared(&laserLock);
             eyeWorldVisibility = clear ? 1.f : 0.f;
+            // Environment lookup, formatting and I/O occur outside the lock.
+            if(diagnostic&&labDualTrace()&&headDiagnosticReceipts.load(std::memory_order_relaxed)<8) {
+                const unsigned ordinal=headDiagnosticReceipts.fetch_add(1,std::memory_order_relaxed);
+                if(ordinal<8) {
+                    const auto& d=diagnosticQuery;const auto& s=diagnosticSample;
+                    log("Head clearance receipt=%u request=%llu input=%llu gate=%u reason=%u stage=%u prepared=%u queryClear=%u failed=%u mathReturned=%u cover=%u categories=%u computedRadius=%.17g computedGuard=%.17g near=%.9g radius=%.9g guard=%.9g mode=%u visibility=%.9g checkedAt=%llu sampleTick=%llu",
+                        ordinal,(unsigned long long)request.sequence,(unsigned long long)request.input.sequence,
+                        renderGate,unsigned(visibilityReason),unsigned(d.stage),unsigned(d.prepared),unsigned(d.clear),
+                        unsigned(d.failed),unsigned(d.mathReturned),unsigned(d.coverValid),d.categoryCount,
+                        d.computedRadius,d.computedGuard,s.nearZ,s.radius,s.numericalGuard,unsigned(eyeHeadClearance.mode),
+                        eyeWorldVisibility,(unsigned long long)checkedAt,(unsigned long long)s.tickMs);
+                    log("Head clearance identity receipt=%u owner=%u/%u generation=%u/%u session=%u/%u reference=%u/%u simulation=%llu/%llu rig=%llu/%llu sampleBody=(%.9g,%.9g,%.9g;%.9g,%.9g,%.9g,%.9g) body=(%.9g,%.9g,%.9g;%.9g,%.9g,%.9g,%.9g) sampleHead=(%.9g,%.9g,%.9g) head=(%.9g,%.9g,%.9g)",
+                        ordinal,s.owner,eyeSnapshot.playerHandle,s.generation,request.trackingGeneration,
+                        s.session,request.session,s.reference,request.reference,
+                        (unsigned long long)s.simulationRevision,(unsigned long long)simulationRevision,
+                        (unsigned long long)s.rigRevision,(unsigned long long)eyeSnapshot.rigRevision,
+                        s.body.p.x,s.body.p.y,s.body.p.z,s.body.q.x,s.body.q.y,s.body.q.z,s.body.q.w,
+                        eyeAnchor.p.x,eyeAnchor.p.y,eyeAnchor.p.z,eyeAnchor.q.x,eyeAnchor.q.y,eyeAnchor.q.z,eyeAnchor.q.w,
+                        s.head.p.x,s.head.p.y,s.head.p.z,head.p.x,head.p.y,head.p.z);
+                }
+            }
         }
         remoteOwner=remote_render::freezePair(eyeSnapshot.playerHandle);
         ready=remoteOwner!=0;
@@ -6551,6 +6601,7 @@ struct HeadVisibilityAttempt {
     Pose head{};
     float radius=0,nearZ=.05f,numericalGuard=.002f;
     bool prepared=false,clear=false;
+    HeadQueryDiagnostic diagnostic;
 };
 static bool captureHeadQueryBinding(HeadVisibilityAttempt& h,roomscale::HeadQueryBinding& result) {
     auto& c=h.owner;
@@ -6576,13 +6627,20 @@ static void __cdecl queryHeadVolume(void* opaque) noexcept {
 }
 static bool __cdecl prepareAndQueryHeadVolume(void* opaque) {
     auto& h=*static_cast<HeadVisibilityAttempt*>(opaque);auto& c=h.owner;
-    if(!roomscalePhaseCurrent(c)||!roomscaleCleanupReady(c)||!captureHeadQueryBinding(h,h.binding))return false;
+    auto& d=h.diagnostic;
+    d.stage=HeadQueryStage::Phase;if(!roomscalePhaseCurrent(c))return false;
+    d.stage=HeadQueryStage::Cleanup;if(!roomscaleCleanupReady(c))return false;
+    d.stage=HeadQueryStage::Binding;if(!captureHeadQueryBinding(h,h.binding))return false;
+    d.categoryCount=h.binding.subject.categoryCount;
     const auto relative=relativeTracking(c.snapshot.origin,h.request.input.head);
+    d.stage=HeadQueryStage::RelativePose;
     if(!finite(relative)||!finite(c.anchorBefore))return false;
     const auto bounded=boundHeadTranslation(relative.p);
+    d.stage=HeadQueryStage::Translation;
     if(bounded.x!=relative.p.x||bounded.y!=relative.p.y||bounded.z!=relative.p.z)return false;
     h.head=worldHeadTracking(c.anchorBefore,c.snapshot.origin,c.snapshot.turn,h.request.input.head);
     h.nearZ=std::bit_cast<float>(headNearBits.load(std::memory_order_relaxed));
+    d.stage=HeadQueryStage::NearPose;
     if(!std::isfinite(h.nearZ)||h.nearZ<=0||!roomscale::bodyUnitQuaternion(c.anchorBefore.q)||
        !roomscale::bodyUnitQuaternion(c.snapshot.origin.q))return false;
     double radius=settings.headRadius;
@@ -6601,6 +6659,7 @@ static bool __cdecl prepareAndQueryHeadVolume(void* opaque) {
         const auto pose=worldEyeTracking(c.anchorBefore,c.snapshot.origin,c.snapshot.turn,
                                          h.request.input.head,h.request.eye[eye]);
         const auto f=h.request.fov[eye];
+        d.stage=HeadQueryStage::EyePoseFov;
         if(!finite(pose)||!roomscale::bodyUnitQuaternion(pose.q)||
            !std::isfinite(f.left)||!std::isfinite(f.right)||!std::isfinite(f.up)||!std::isfinite(f.down)||
            f.left>=f.right||f.down>=f.up||std::abs(f.left)>=1.5f||std::abs(f.right)>=1.5f||
@@ -6612,16 +6671,22 @@ static bool __cdecl prepareAndQueryHeadVolume(void* opaque) {
         radius=std::max(radius,eyeDistance+double(h.nearZ)*std::sqrt(1+x*x+y*y)+.001);
     }
     const double guard=std::max(.002,32*worldGrid+128*std::numeric_limits<float>::epsilon()*stageMagnitude);
+    d.computedGuard=guard;d.computedRadius=radius;d.stage=HeadQueryStage::Guard;
     if(!std::isfinite(guard)||guard>.25)return false;
     h.numericalGuard=roomscale::outwardFloat(guard);
     radius+=h.numericalGuard;
     radius+=settings.headClearanceMargin; // Explicit room for later tracked poses inside this clear volume.
+    d.computedRadius=radius;d.stage=HeadQueryStage::Radius;
     if(!std::isfinite(radius)||radius<=0||radius>.5)return false;
     h.radius=roomscale::outwardFloat(radius);
     c.cover=coverHeadVolumeSweep(h.binding.subject.categoryCount,c.anchorBefore.p,h.head.p,h.radius,.001f);
-    if(!c.cover.valid||!headQueryOwnerCurrent(&h))return false;
+    d.stage=HeadQueryStage::Cover;if(!c.cover.valid)return false;
+    d.stage=HeadQueryStage::Owner;if(!headQueryOwnerCurrent(&h))return false;
     c.reads.seal();h.prepared=true;
-    return runRoomscaleResourceScope(c.failed,c.thread,queryHeadVolume,&h)&&h.clear;
+    d.stage=HeadQueryStage::ResourceQuery;
+    const bool clear=runRoomscaleResourceScope(c.failed,c.thread,queryHeadVolume,&h)&&h.clear;
+    if(clear)d.stage=HeadQueryStage::Complete;
+    return clear;
 }
 static __attribute__((noinline)) void runPostSimulationHeadVisibility(SimulationInterval& interval) {
     if(!settings.headFade||!roomscaleConfigured||roomscaleBusy||roomscaleFaulted.load()||
@@ -6657,12 +6722,17 @@ static __attribute__((noinline)) void runPostSimulationHeadVisibility(Simulation
         c.brain=reinterpret_cast<uintptr_t>(resolve(c.brainHandle));
         if(!roomscalePhaseCurrent(c)||!trackingEligible(c.snapshot.player)||!isAlive(c.snapshot.player)||
            !nativeTrackingAnchor(c.snapshot.player,c.anchorBefore,&c.snapshot.rider))return;
-        const bool clear=runRoomscaleMathFrame(c.failed,c.thread,prepareAndQueryHeadVolume,&h)&&h.clear;
+        const bool mathReturned=runRoomscaleMathFrame(c.failed,c.thread,prepareAndQueryHeadVolume,&h);
+        const bool clear=mathReturned&&h.clear;
         const HeadVolumeObservation sample{c.anchorBefore,h.head,c.snapshot.playerHandle,
             h.request.trackingGeneration,h.request.session,h.request.reference,h.request.sequence,
             h.request.input.sequence,c.simulationSequence,c.snapshot.rigRevision,GetTickCount64(),
             h.radius,h.nearZ,h.numericalGuard,h.prepared,clear};
-        AcquireSRWLockExclusive(&laserLock);headVolumeObservation=sample;ReleaseSRWLockExclusive(&laserLock);
+        h.diagnostic.prepared=h.prepared;h.diagnostic.clear=h.clear;h.diagnostic.failed=c.failed;
+        h.diagnostic.mathReturned=mathReturned;h.diagnostic.coverValid=c.cover.valid;
+        AcquireSRWLockExclusive(&laserLock);
+        headVolumeObservation=sample;headQueryDiagnostic=h.diagnostic;
+        ReleaseSRWLockExclusive(&laserLock);
     },[&](bool aborted) noexcept {
         if(aborted) {nativeRayFaulted.store(true,std::memory_order_release);nativeInputFailed();}
         roomscaleBusy=false;

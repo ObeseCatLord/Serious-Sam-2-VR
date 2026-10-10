@@ -64,24 +64,40 @@ struct HeadVolumeObservation {
 };
 // Unlike the legacy optional lean fade, unavailable/stale clearance is opaque.
 // The same exact native anchor and requested head must be used for both eyes.
-inline bool headVolumeVisible(const HeadVolumeObservation& sample,const Pose& body,const Pose& head,
+enum class HeadVolumeVisibilityReason : uint32_t {
+    Clear, Unsampled, QueryBlocked, Owner, Input, Epoch, Sequence, Revision, Age, Volume, Body, Head
+};
+// This is the existing admission predicate, partitioned in its original order.
+// Returning the first failed group avoids evaluating it again for diagnostics.
+inline HeadVolumeVisibilityReason headVolumeVisibilityReason(const HeadVolumeObservation& sample,const Pose& body,const Pose& head,
     uint32_t owner,const Request& request,uint64_t simulationRevision,uint64_t rigRevision,uint64_t now) {
     const auto same=[](const Pose& a,const Pose& b) {
         return finite(a)&&finite(b)&&a.q.x==b.q.x&&a.q.y==b.q.y&&a.q.z==b.q.z&&a.q.w==b.q.w&&
             a.p.x==b.p.x&&a.p.y==b.p.y&&a.p.z==b.p.z;
     };
-    return sample.sampled&&sample.clear&&owner&&sample.owner==owner&&request.sequence&&
-        request.input.sequence&&request.trackingGeneration&&request.session&&request.reference&&
-        request.input.focused&&request.input.headValid&&finite(request.input.head)&&
-        sample.generation==request.trackingGeneration&&sample.session==request.session&&
-        sample.reference==request.reference&&request.input.session==request.session&&
-        request.input.reference==request.reference&&sample.requestSequence==request.sequence&&
-        sample.inputSequence==request.input.sequence&&sample.simulationRevision==simulationRevision&&
-        sample.rigRevision==rigRevision&&now>=sample.tickMs&&now-sample.tickMs<=100&&
-        std::isfinite(sample.radius)&&sample.radius>0&&std::isfinite(sample.nearZ)&&sample.nearZ>0&&
-        std::isfinite(sample.numericalGuard)&&sample.numericalGuard>=.002f&&
-        sample.numericalGuard<sample.radius&&same(sample.body,body)&&finite(sample.head)&&finite(head)&&
-        std::hypot(double(sample.head.p.x)-head.p.x,double(sample.head.p.y)-head.p.y,
-                   double(sample.head.p.z)-head.p.z)<=double(sample.numericalGuard)*.25;
+    using R=HeadVolumeVisibilityReason;
+    if(!sample.sampled)return R::Unsampled;
+    if(!sample.clear)return R::QueryBlocked;
+    if(!(owner&&sample.owner==owner))return R::Owner;
+    if(!(request.sequence&&request.input.sequence&&request.trackingGeneration&&request.session&&request.reference&&
+         request.input.focused&&request.input.headValid&&finite(request.input.head)))return R::Input;
+    if(!(sample.generation==request.trackingGeneration&&sample.session==request.session&&
+         sample.reference==request.reference&&request.input.session==request.session&&
+         request.input.reference==request.reference))return R::Epoch;
+    if(!(sample.requestSequence==request.sequence&&sample.inputSequence==request.input.sequence))return R::Sequence;
+    if(!(sample.simulationRevision==simulationRevision&&sample.rigRevision==rigRevision))return R::Revision;
+    if(!(now>=sample.tickMs&&now-sample.tickMs<=100))return R::Age;
+    if(!(std::isfinite(sample.radius)&&sample.radius>0&&std::isfinite(sample.nearZ)&&sample.nearZ>0&&
+         std::isfinite(sample.numericalGuard)&&sample.numericalGuard>=.002f&&sample.numericalGuard<sample.radius))return R::Volume;
+    if(!same(sample.body,body))return R::Body;
+    if(!(finite(sample.head)&&finite(head)&&
+         std::hypot(double(sample.head.p.x)-head.p.x,double(sample.head.p.y)-head.p.y,
+                    double(sample.head.p.z)-head.p.z)<=double(sample.numericalGuard)*.25))return R::Head;
+    return R::Clear;
+}
+inline bool headVolumeVisible(const HeadVolumeObservation& sample,const Pose& body,const Pose& head,
+    uint32_t owner,const Request& request,uint64_t simulationRevision,uint64_t rigRevision,uint64_t now) {
+    return headVolumeVisibilityReason(sample,body,head,owner,request,simulationRevision,rigRevision,now)==
+        HeadVolumeVisibilityReason::Clear;
 }
 } // namespace ss2vr

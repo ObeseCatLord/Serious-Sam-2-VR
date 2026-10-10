@@ -49,7 +49,7 @@ def verify(obj,root):
     require('headFramePrepared(puppet,slot.request)' in bridge and
             bridge.index('headFramePrepared(puppet,slot.request)')<bridge.index('chosen=i; request=slot.request; slot.state=SlotState::Rendering'),
             'Do not consume a request before its post-simulation query attempt')
-    for guard in ['headVolumeVisible(headVolumeObservation','slot.headClearance=eyeHeadClearance',
+    for guard in ['headVolumeVisibilityReason(headVolumeObservation','slot.headClearance=eyeHeadClearance',
                   'headVolumeDrawSafe','HeadClearanceMode::Opaque','headVolumeObservation.numericalGuard']:
         require(guard in engine,'Missing native head receipt guard: '+guard)
     for guard in ['validHeadClearance(slot.headClearance)','cachedClearance = clearance;',
@@ -58,7 +58,7 @@ def verify(obj,root):
     require(host.count('admitFinalWorld(layers, world, input, validViews,views)')==3,
             'Recheck head clearance after potentially waiting HUD uploads')
     ipc_abi = int(re.search(r'\bAbi\s*=\s*(\d+)', protocol).group(1))
-    require('Abi = 10' in protocol and 'static_assert(sizeof(HeadClearance)==40)' in protocol,
+    require(ipc_abi == 11 and 'static_assert(sizeof(HeadClearance)==40)' in protocol,
             'Versioned fixed-width head receipt ABI missing')
     require('!captureHeadQueryBinding(h,h.binding)' in engine and 'headQueryOwnerCurrent(&h)' in engine,
             'Head filters must use their separate owned binding, not a fabricated foot body')
