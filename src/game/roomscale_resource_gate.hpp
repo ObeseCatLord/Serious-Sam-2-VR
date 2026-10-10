@@ -19,4 +19,12 @@ bool runRoomscaleResourceScope(bool &unavailable, DWORD simulationThread,
 bool roomscaleResourceGatesUsable() noexcept;
 bool roomscaleResourceScopeUsable() noexcept;
 bool finishRoomscaleResourceScopeForCommit(bool &unavailable) noexcept;
+// Lab diagnostic only: the first gate that cancelled the current optional query
+// since reset. gate is the source line of its RESOURCE_GATE declaration; table is
+// the receiver/vtable pointer (not dereferenced when unrecognized).
+struct RoomscaleResourceCancel {
+    uint32_t gate=0,kind=0,resource=0,engineBase=0,flags=0,handle=0,type=0;
+};
+void resetRoomscaleResourceCancel() noexcept;
+RoomscaleResourceCancel roomscaleResourceCancel() noexcept;
 } // namespace ss2vr::game

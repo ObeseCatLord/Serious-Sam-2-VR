@@ -32,7 +32,9 @@ bool resourceGatesEnabled() noexcept {
 // exception, resource mutation, or output publication is permitted here.
 // 0 forwards native instructions; 1 takes a normal cancellation suffix;
 // 2 skips an originally clear replacement branch using its native destination.
-extern "C" int __cdecl ss2vrResourceDecision(const uint8_t *resource, unsigned kind) noexcept {
+namespace {
+RoomscaleResourceCancel firstCancel;
+inline int resourceDecision(const uint8_t *resource, unsigned kind) noexcept {
     if (kind==3) {
         if (!unavailable) return static_cast<int>(OptionalQueryDecision::original);
         if (*unavailable) return static_cast<int>(OptionalQueryDecision::cancel);
@@ -76,6 +78,27 @@ extern "C" int __cdecl ss2vrResourceDecision(const uint8_t *resource, unsigned k
         (!resource || (*reinterpret_cast<volatile const uint8_t*>(resource+4)&1u));
     return static_cast<int>(optionalQueryDecision(unavailable,pending,kind));
 }
+}
+void resetRoomscaleResourceCancel() noexcept {firstCancel={};}
+RoomscaleResourceCancel roomscaleResourceCancel() noexcept {return firstCancel;}
+// The pushed selector is (declaration line << 8) | kind. Recording copies only
+// values the decision already used; it stays a call-free leaf.
+extern "C" int __cdecl ss2vrResourceDecision(const uint8_t *resource, unsigned selector) noexcept {
+    const unsigned kind=selector&0xffu;
+    const bool open=unavailable&&!*unavailable;
+    const int result=resourceDecision(resource,kind);
+    if (open&&*unavailable&&!firstCancel.gate) {
+        firstCancel.gate=selector>>8;firstCancel.kind=kind;
+        firstCancel.resource=uint32_t(reinterpret_cast<uintptr_t>(resource));
+        firstCancel.engineBase=uint32_t(hullEngineBase);
+        if (kind==0&&resource)firstCancel.flags=*reinterpret_cast<volatile const uint8_t*>(resource+4);
+        if (kind==3&&resource) {
+            const auto *args=reinterpret_cast<volatile const int32_t*>(resource+4);
+            firstCancel.handle=uint32_t(args[0]);firstCancel.type=uint32_t(args[1]);
+        }
+    }
+    return result;
+}
 
 #define STRING_(x) #x
 #define STRING(x) STRING_(x)
@@ -88,7 +111,7 @@ extern "C" int __cdecl ss2vrResourceDecision(const uint8_t *resource, unsigned k
     extern "C" __attribute__((naked,used)) void name() { __asm__( \
         "pushfl\n\tpushal\n\tcld\n\tmovl %esp,%ebp\n\tandl $-16,%esp\n\tsubl $512,%esp\n\t" \
         "fxsave (%esp)\n\tfninit\n\tfldcw (%esp)\n\tsubl $8,%esp\n\t" \
-        "pushl $" STRING(kind) "\n\tpushl " STRING(receiverSlot) "(%ebp)\n\t" \
+        "pushl $(" STRING(__LINE__) "*256+" STRING(kind) ")\n\tpushl " STRING(receiverSlot) "(%ebp)\n\t" \
         "call _ss2vrResourceDecision\n\taddl $16,%esp\n\tcmpl $1,%eax\n\tje 1f\n\tcmpl $2,%eax\n\tje 2f\n\t" \
         "fxrstor (%esp)\n\tmovl %ebp,%esp\n\tpopal\n\tpopfl\n\tjmp *_" STRING(name) "_original\n\t" \
         "1: fxrstor (%esp)\n\tmovl %ebp,%esp\n\tpopal\n\tpopfl\n\tjmp *_" STRING(name) "_cancel\n\t" \
