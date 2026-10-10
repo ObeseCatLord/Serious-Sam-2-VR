@@ -1,5 +1,54 @@
 # Native gameplay VR investigation — 2026-10-07
 
+## 2026-10-10 — consume native PPM and reject opaque-world readiness
+
+The neutral runtime summary reads the observer's actual P6 RGB PPM files, removing
+the legacy collector's PNG conversion dependency. The observer now copies the
+existing40-byte head-clearance record from the same locked slot as its request
+and both pixel images, then serializes its mode, structural validity and values
+with the capture metadata. No native game callback, IPC layout or renderer was
+changed. Metadata and decoded image extents must agree; unknown, missing,
+invalid or Opaque clearance cannot pass the neutral readiness summary.
+
+Disabled/Clear mode is explicitly reported; Disabled is not collision proof.
+The clearance check covers the captured baseline pair, not every counted pair.
+Different pixels remain insufficient evidence of visible geometry, head motion
+or proper6DoF. V62's absent mode is not retrospectively inferred or filled in.
+Astra scoped source GO; current local Astra/xhigh routing verified, independent
+backend attestation unavailable. The strict x86 GUI/static observer builds and
+all68harness tests pass, including native-format and blocked-clearance controls.
+Native products remain61ce671/IPC11/wire7. Fixing this evidence gate does not
+repair the black-world cause; the bounded native head diagnostic remains next.
+
+
+## 2026-10-10 — scene and native pairs completed, but both world views are black
+
+Fresh quiet run20261010T164628 on sourcee59c6f19e9ec3b65bccb450fe82b66cd9ffe501c,
+compiled61ce671/IPC11/wire7, loaded the exact Jungle scene and completed private
+ID2grant/select/save preparation with Roomscale/HeadComfort/Melee enabled. It
+completed99native world/UI projection responses and normal native shutdown,
+with no native cleanup errors or termination requests. The private display
+stopped with no survivors or cleanup errors. No startup minidump was needed.
+
+The observer produced its actual1280x720RGB PPM eye captures. The new neutral
+consumer incorrectly expected PNGs that only the legacy collector generated.
+Lossless private conversion allowed actual inspection: both views are almost
+entirely black with HUD glyphs; world, weapons and lasers are not visible. Only
+2,336of921,600decoded RGB pixels differ. This establishes startup and transport
+for this attempt, not visible gameplayVR or a head-motion/collision pass.
+Earlier startup stalls remain unexplained; this run does not prove their cause.
+
+Astra's bounded investigation confirms that rejected head clearance can still
+publish a completed native pair while the bridge dims its world before UI.
+V62did not record the actual clearance mode, so this is a causal inference.
+The next source diagnostic is at most8matched query/eye receipts of existing
+values, including the first failing predicate and computed radius before rejection.
+Native near-plane overflow and an empty-read-lease defect are unproved. Keep
+requested features enabled; no changed bounds, fabricated clearance or fake
+world acceptance. Correct producer/consumer format and capture actual slot
+clearance metadata separately. All images/raw evidence remain private.
+
+
 ## 2026-10-10 — optional normal snapshot for failed initialization
 
 The existing private observer can write `MiniDumpNormal` for a failed, unloaded

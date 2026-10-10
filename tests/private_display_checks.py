@@ -134,10 +134,14 @@ class Checks(unittest.TestCase):
                     'distinct_neutral_complete_pairs':30,'shutdown_observed':True,
                     'cleanup_errors':[],'termination_requests':[],
                     'idle_fixture_preparation':{'native_id':2}}
-            left=directory/'baseline-left-private.png';right=directory/'baseline-right-private.png'
+            left=directory/'baseline-left.ppm';right=directory/'baseline-right.ppm'
             Image.new('RGB',(8,8),(10,20,30)).save(left)
             Image.new('RGB',(8,8),(11,20,30)).save(right)
             receipt=directory/'result.json';receipt.write_text(json.dumps(result))
+            metadata=directory/'baseline-metadata.json'
+            frame={'sequence':1,'presentation':1,'ui_requested':1,'width':8,'height':8,
+                   'head_clearance':{'mode':2,'valid':1,'reserved':0}}
+            metadata.write_text(json.dumps(frame))
             summary=display.neutral_runtime_summary(directory,cfg)
             self.assertTrue(summary['complete']);self.assertTrue(summary['different_eye_pixels'])
             for key in ('hardware_acceptance','head_translation_verified','head_rotation_verified',
@@ -153,6 +157,14 @@ class Checks(unittest.TestCase):
                 receipt.write_text(json.dumps(result|delta))
                 with self.subTest(delta=delta),self.assertRaises(RuntimeError):display.neutral_runtime_summary(directory,cfg)
             receipt.write_text(json.dumps(result))
+            for delta in ({'head_clearance':{'mode':1,'valid':1,'reserved':0}},
+                          {'head_clearance':{}},{'head_clearance':{'mode':3,'valid':1,'reserved':0}},
+                          {'head_clearance':{'mode':True,'valid':1,'reserved':0}},
+                          {'head_clearance':{'mode':2,'valid':0,'reserved':0}},
+                          {'presentation':0},{'ui_requested':0},{'width':9}):
+                metadata.write_text(json.dumps(frame|delta))
+                with self.subTest(delta=delta),self.assertRaises(RuntimeError):display.neutral_runtime_summary(directory,cfg)
+            metadata.write_text(json.dumps(frame))
             for mutation in ('identical','extent','truncated','symlink','missing'):
                 if right.exists() or right.is_symlink():right.unlink()
                 if mutation=='identical':right.write_bytes(left.read_bytes())

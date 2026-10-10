@@ -2,6 +2,7 @@
 #include "common/ipc.hpp"
 #include "common/frame_policy.hpp"
 #include "common/weapon_view.hpp"
+#include "common/head_clearance.hpp"
 #include "lab_window_focus.hpp"
 #include <cstdio>
 #include <tlhelp32.h>
@@ -469,7 +470,7 @@ int wmain(int argc,wchar_t **argv) {
     for(unsigned i=0;i<7;++i) {
         expected[i]=std::wcstof(argv[5+i],&end);if(!end||*end||!std::isfinite(expected[i]))return 2;
     }
-    Request request{};uint32_t presentation=0;bool found=false;
+    Request request{};HeadClearance clearance{};uint32_t presentation=0;bool found=false;
     const auto deadline=GetTickCount64()+15000;
     while(GetTickCount64()<deadline&&!found) {
         {Lock lock(channel,2);if(lock) {
@@ -494,7 +495,7 @@ int wmain(int argc,wchar_t **argv) {
                     (!best||s.request.sequence>best->request.sequence))best=&s;
             }
             if(best) {
-                request=best->request;presentation=best->presentation;
+                request=best->request;presentation=best->presentation;clearance=best->headClearance;
                 for(unsigned h=0;h<2;++h)std::memcpy(pixels[h].data(),best->pixels[h],size_t(request.width)*request.height*4);
                 found=true;
             }
@@ -532,7 +533,12 @@ int wmain(int argc,wchar_t **argv) {
         const auto &v=request.fov[h];
         std::fprintf(f,"[%.9g,%.9g,%.9g,%.9g]",v.left,v.right,v.up,v.down);
     }
-    std::fprintf(f,"]}\n");return std::fclose(f)==0?0:7;
+    std::fprintf(f,"],\"head_clearance\":{\"mode\":%u,\"valid\":%u,\"tick_ms\":%llu,"
+        "\"centre\":[%.9g,%.9g,%.9g],\"clear_radius\":%.9g,\"head_radius\":%.9g,\"near_z\":%.9g,\"reserved\":%u}}\n",
+        static_cast<unsigned>(clearance.mode),validHeadClearance(clearance),
+        static_cast<unsigned long long>(clearance.tickMs),clearance.centre.x,clearance.centre.y,clearance.centre.z,
+        clearance.clearRadius,clearance.headRadius,clearance.nearZ,clearance.reserved);
+    return std::fclose(f)==0?0:7;
 }
 
 // GUI subsystem avoids creating a console that can steal the owned game's focus.

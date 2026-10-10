@@ -46,21 +46,32 @@ def neutral_runtime_summary(directory,cfg):
     if cfg.get('prepare_idle_fixture') or cfg.get('prepare_sniper_fixture'):
         if not isinstance(preparation,dict) or preparation.get('native_id')!=cfg.get('idle_native_id'):
             raise RuntimeError('Neutral native preparation identity differs')
+    metadata=directory/'baseline-metadata.json'
+    if metadata.is_symlink() or not metadata.is_file() or not 0<metadata.stat().st_size<=2*1024*1024:
+        raise RuntimeError('Neutral pair metadata is absent, redirected or unbounded')
+    frame=json.loads(metadata.read_text());clearance=frame.get('head_clearance',{})
+    mode=clearance.get('mode')
+    if type(mode) is not int or mode not in (0,2) or type(clearance.get('valid')) is not int or clearance['valid']!=1 or type(clearance.get('reserved')) is not int or clearance['reserved']!=0:
+        raise RuntimeError('Neutral world clearance is unavailable, invalid or opaque')
+    if frame.get('presentation')!=1 or frame.get('ui_requested')!=1 or type(frame.get('sequence')) is not int or frame['sequence']<=0:
+        raise RuntimeError('Neutral pair metadata is not a native world/UI projection response')
     images=[];captures=[]
     for eye in ('left','right'):
-        path=directory/('baseline-'+eye+'-private.png')
+        path=directory/('baseline-'+eye+'.ppm')
         if path.is_symlink() or not path.is_file() or not 0<path.stat().st_size<=32*1024*1024:
             raise RuntimeError('Neutral eye capture is absent, redirected or unbounded')
         with Image.open(path) as image:
-            if image.format!='PNG' or not all(1<=n<=2048 for n in image.size):
+            if image.format!='PPM' or image.mode!='RGB' or not all(1<=n<=2048 for n in image.size):
                 raise RuntimeError('Neutral eye capture has an invalid format or extent')
+            if image.size!=(frame.get('width'),frame.get('height')):
+                raise RuntimeError('Neutral image extent differs from its pair metadata')
             image.load();images.append(image.convert('RGB'))
             captures.append({'eye':eye,'file':path.name,'width':image.width,'height':image.height})
     if images[0].size!=images[1].size or ImageChops.difference(*images).getbbox() is None:
         raise RuntimeError('Neutral eyes are mismatched or contain identical pixels')
     return {'schema':1,'evidence_scope':'native-neutral-runtime','complete':True,
             'distinct_native_projection_pairs':pairs,'eye_captures':captures,
-            'different_eye_pixels':True,'head_translation_verified':False,
+            'different_eye_pixels':True,'head_clearance_mode':mode,'head_translation_verified':False,
             'head_rotation_verified':False,'hardware_acceptance':False,
             'physical_grasp_verified':False,'native_release_verified':False}
 
