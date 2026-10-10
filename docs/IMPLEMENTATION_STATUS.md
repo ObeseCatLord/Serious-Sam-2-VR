@@ -11,7 +11,7 @@ provider-owned static buffers (format 0x1f) locked through Engine's exported
 `_gfxLockStaticVertexBuffer` slot, which the admission rejected as an unknown
 provider. The guard then correctly masked the world before UI.
 
-`c31220a` admits format 0x1f only when both Engine slots hold the fingerprinted
+`911f803` admits format 0x1f only when both Engine slots hold the fingerprinted
 GfxD3D pair (RVA 92D0: `IDirect3DVertexBuffer9::Lock` with `D3DLOCK_READONLY`
 for read type 0x93; RVA 9350: `Unlock`), the buffer is not already locked and the
 request fits. Other providers, write access and held buffers still cancel. The
@@ -27,7 +27,7 @@ main thread and the former background hook worker blocked on Serious Engine
 `CSyncMutex` locks (allocator / string table) during world loading. The worker
 attached at an arbitrary point: it called engine string-ID functions from a
 foreign thread and suspended the loading thread for MinHook patching.
-`4f077d9` runs attach once on the device-owning thread at the start of an outer
+`e3c4b99` runs attach once on the device-owning thread at the start of an outer
 native Present, after the modules load. Ten consecutive fresh private captures
 (V71–V80) then completed cleanly with Clear receipts; before it, four of roughly
 eleven attempts stalled. This is strong but statistical evidence.
