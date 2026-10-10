@@ -8,11 +8,11 @@ Codex must not continue those probes under the current instruction.
 
 ## Current candidate — 2026-10-10
 
-- Version `0.2.11-dev.0aaec65a9c5a`, source fingerprint
-  `0aaec65a9c5a8135c6e7b19c54b924f757fdfc9fb94afd052e4552ec476a1f05`, source commit
-  `30a01ef`, IPC11/wire7. The package is supplied privately; binaries are not published.
-- Product SHA-256: `Bin/d3d9.dll` `478a78cb…a1d4`, `Bin/SS2VRServer.dll`
-  `711ed021…ab41`, `Bin/SS2VR/ss2vr_host.exe` `1688679c…e473`,
+- Version `0.2.11-dev.03844aa528939`, source fingerprint
+  `03844aa528939fa920c6c52a0a865720df7c3784a5cebbd0033abd62178fde8a`, source commit
+  `483259c`, IPC11/wire7. The package is supplied privately; binaries are not published.
+- Product SHA-256: `Bin/d3d9.dll` `9dffbe73…688b`, `Bin/SS2VRServer.dll`
+  `db455e26…62ea`, `Bin/SS2VR/ss2vr_host.exe` `0af37fa0…24cb`,
   `Bin/SS2VR/openxr_loader.dll` `bb011caa…bd1d`. Compare against the package
   `manifest.json`; the installer refuses mismatches.
 - Pre-handoff evidence (simulated Monado, fixed neutral pose, no input): with
