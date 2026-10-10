@@ -22,6 +22,7 @@ struct NativeQueries {
         return init&&setRay&&maximum&&minimum&&radius&&category&&thickCategory&&avatar&&mechanism&&fluids&&check&&hit;
     }
 } native;
+SphereQueryOutcome outcome;
 struct Query {
     const roomscale::SphereQuerySubject &subject;
     const roomscale::BodySweepCover &cover;
@@ -32,12 +33,12 @@ struct Query {
     bool clear=false;
     static void __cdecl run(void *opaque) noexcept {
         auto& q=*static_cast<Query*>(opaque);
-        if(!roomscaleResourceScopeUsable()||!q.current(q.context)) {q.scope.failed=true;return;}
+        if(!roomscaleResourceScopeUsable()||!q.current(q.context)) {q.scope.failed=true;outcome.ownerLost=true;return;}
         const auto& sphere=q.cover.body.hulls[q.hull].sphere[q.index];
         native.init();
         // init has only the two validated native scalar cleanup callbacks and
         // native unlink. Recheck ownership before touching the fresh ray state.
-        if(!roomscaleResourceScopeUsable()||!q.current(q.context)) {q.scope.failed=true;return;}
+        if(!roomscaleResourceScopeUsable()||!q.current(q.context)) {q.scope.failed=true;outcome.ownerLost=true;return;}
         const roomscale::Ray ray{sphere.centre,q.cover.direction};
         native.setRay(ray);native.maximum(q.cover.maximumParameter);native.minimum(0);
         native.radius(sphere.radius);
@@ -47,11 +48,12 @@ struct Query {
         native.mechanism(reinterpret_cast<void*>(q.subject.mechanism));
         native.fluids(0);
         native.check();
-        const bool clear=native.hit()==0;
+        const int hit=native.hit();outcome.hit=hit;
+        const bool clear=hit==0;
         // Failure does not permit unknown cleanup callbacks. The native normal
         // traversal already retired its visited hulls; don't fabricate repair
         // if the owner or inspected list became invalid during that traversal.
-        if(!q.current(q.context)) {q.scope.failed=true;return;}
+        if(!q.current(q.context)) {q.scope.failed=true;outcome.ownerLost=true;return;}
         native.init();
         q.clear=clear&&!q.scope.failed&&roomscaleResourceScopeUsable()&&q.current(q.context);
     }
@@ -78,8 +80,11 @@ bool configureRoomscaleSweepQueries(HMODULE engine) noexcept {
     native=next;return true;
 }
 void resetRoomscaleSweepQueriesAfterQuiescence() noexcept {native={};}
+SphereQueryOutcome lastSphereQueryOutcome() noexcept {return outcome;}
+void resetSphereQueryOutcome() noexcept {outcome={};}
 bool __attribute__((noinline)) runOwnedSphereQueries(const roomscale::SphereQuerySubject& subject,const roomscale::BodySweepCover& cover,
     float contactDepthBudget,DWORD thread,RoomscaleQueryOwnerCurrent current,void *context,bool& failed,bool rejectInitialContact) noexcept {
+    outcome={};outcome.stage=1;
     if(!roomscale::arithmeticSupported()) {failed=true;return false;}
     const double directionNorm=double(cover.direction.x)*cover.direction.x+
         double(cover.direction.y)*cover.direction.y+double(cover.direction.z)*cover.direction.z;
@@ -91,7 +96,7 @@ bool __attribute__((noinline)) runOwnedSphereQueries(const roomscale::SphereQuer
        std::abs(directionNorm-1)>32*std::numeric_limits<float>::epsilon()||
        cover.body.hullCount!=subject.categoryCount||!std::isfinite(cover.maximumParameter)||cover.maximumParameter<=0||
        !std::isfinite(contactDepthBudget)||contactDepthBudget<0) {failed=true;return false;}
-    unsigned count=0;
+    unsigned count=0;outcome.stage=2;
     for(unsigned hull=0;hull<subject.categoryCount;++hull) {
         const auto& spheres=cover.body.hulls[hull];
         if(!spheres.valid||!spheres.count||spheres.count>spheres.sphere.size()) {failed=true;return false;}
@@ -101,13 +106,18 @@ bool __attribute__((noinline)) runOwnedSphereQueries(const roomscale::SphereQuer
                !std::isfinite(sphere.radius)||sphere.radius<=contactDepthBudget) {failed=true;return false;}
             roomscale::QueryScope scope{cover.maximumParameter,contactDepthBudget,false,true,rejectInitialContact};
             Query query{subject,cover,current,context,scope,hull,index};
-            if(!runRoomscaleModelQueryScope(scope,thread,Query::run,&query)||!query.clear) {
+            outcome.stage=3;
+            outcome.scopeCompleted=runRoomscaleModelQueryScope(scope,thread,Query::run,&query);
+            outcome.scopeFailed=scope.failed;
+            if(!outcome.scopeCompleted||!query.clear) {
                 failed=true;return false;
             }
-            ++count;
+            ++count;outcome.completed=count;outcome.stage=2;
         }
     }
+    outcome.stage=4;
     if(count!=cover.body.queryCount||!current(context)||!roomscaleResourceScopeUsable()) {failed=true;return false;}
+    outcome.stage=5;
     return true;
 }
 bool runRoomscaleSweepQueries(const roomscale::BodyGeometry& body,const roomscale::BodySweepCover& cover,

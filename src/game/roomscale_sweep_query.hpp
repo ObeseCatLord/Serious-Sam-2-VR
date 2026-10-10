@@ -20,6 +20,16 @@ void resetRoomscaleSweepQueriesAfterQuiescence() noexcept;
 bool runOwnedSphereQueries(const roomscale::SphereQuerySubject&,const roomscale::BodySweepCover&,
     float contactDepthBudget,DWORD simulationThread,RoomscaleQueryOwnerCurrent ownerCurrent,
     void *ownerContext,bool &failed,bool rejectInitialContact) noexcept;
+// Lab diagnostic only: where the last runOwnedSphereQueries call stopped.
+// stage 0 not run, 1 entry validation, 2 sphere validation, 3 scope/query,
+// 4 final owner/count, 5 clear. hit is the copied native rayIsHit value.
+struct SphereQueryOutcome {
+    uint32_t stage=0,completed=0;
+    int hit=-1;
+    bool scopeCompleted=false,scopeFailed=false,ownerLost=false;
+};
+SphereQueryOutcome lastSphereQueryOutcome() noexcept;
+void resetSphereQueryOutcome() noexcept;
 // Body-movement adapter retains each actually captured source-hull category.
 bool runRoomscaleSweepQueries(const roomscale::BodyGeometry&,const roomscale::BodySweepCover&,
     float contactDepthBudget,DWORD simulationThread,RoomscaleQueryOwnerCurrent ownerCurrent,

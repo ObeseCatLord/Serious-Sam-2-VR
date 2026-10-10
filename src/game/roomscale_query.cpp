@@ -9,6 +9,16 @@ static RoomscaleTriangleKernel originalTriangle=nullptr;
 static RoomscalePrimitiveKernel originalPrimitive=nullptr;
 static thread_local roomscale::QueryScope* activeScope=nullptr;
 static uintptr_t triangleEntry=0,primitiveEntry=0;
+static RoomscaleScopeFailure scopeFailure;
+void resetRoomscaleScopeFailure() noexcept {scopeFailure={};}
+RoomscaleScopeFailure roomscaleScopeFailure() noexcept {return scopeFailure;}
+static void noteScopeFailure(const roomscale::QueryScope& scope,uint32_t kind,const roomscale::Ray& ray,
+    float radius) noexcept {
+    scopeFailure.kind=kind;scopeFailure.ray=ray;scopeFailure.radius=radius;
+    scopeFailure.maxRayParameter=scope.maxRayParameter;scopeFailure.contactDepthBudget=scope.contactDepthBudget;
+    scopeFailure.requireWholePathClear=scope.requireWholePathClear;
+    scopeFailure.rejectInitialContact=scope.rejectInitialContact;
+}
 static bool installedKernel(uintptr_t entry,uintptr_t target) noexcept {
     if(!entry||!target||!readableMemory(reinterpret_cast<void*>(entry),5))return false;
     const auto* bytes=reinterpret_cast<const unsigned char*>(entry);
@@ -89,7 +99,13 @@ float __cdecl ss2vrRoomscaleTriangleQuery(const roomscale::Ray& ray,const roomsc
     // quiesce all callers. No concurrent rebind or lazy native symbol lookup.
     if (!activeScope) return originalTriangle(ray,a,b,c,normal,radius);
     try {
-        return roomscale::dispatch(activeScope,originalTriangle,ray,a,b,c,normal,radius);
+        const bool before=activeScope->failed;++scopeFailure.calls;
+        const float t=roomscale::dispatch(activeScope,originalTriangle,ray,a,b,c,normal,radius);
+        if(!before&&activeScope->failed&&!scopeFailure.kind) {
+            noteScopeFailure(*activeScope,1,ray,radius);
+            scopeFailure.a=a;scopeFailure.b=b;scopeFailure.c=c;scopeFailure.normal=normal;scopeFailure.result=t;
+        }
+        return t;
     } catch (...) {
         activeScope->failed=true;
         return 0; // Contain GNU errors; native SEH remains the outer finally's job.
@@ -100,7 +116,13 @@ roomscale::PrimitiveInterval* __cdecl ss2vrRoomscalePrimitiveQuery(roomscale::Pr
     const roomscale::Ray& ray,const roomscale::Primitive& shape,float radius) noexcept {
     if (!activeScope) return originalPrimitive(out,ray,shape,radius);
     try {
-        return roomscale::dispatchPrimitive(activeScope,originalPrimitive,out,ray,shape,radius);
+        const bool before=activeScope->failed;++scopeFailure.calls;
+        auto* result=roomscale::dispatchPrimitive(activeScope,originalPrimitive,out,ray,shape,radius);
+        if(!before&&activeScope->failed&&!scopeFailure.kind) {
+            noteScopeFailure(*activeScope,2,ray,radius);scopeFailure.shape=shape;
+            if(out){scopeFailure.entry=out->entry;scopeFailure.exit=out->exit;}
+        }
+        return result;
     } catch (...) {
         activeScope->failed=true;
         if (out) *out={roomscale::NativeMiss,-roomscale::NativeMiss};

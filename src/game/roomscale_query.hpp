@@ -27,6 +27,21 @@ bool queueRoomscalePrimitiveHook(HMODULE core,RoomscaleQueueHook registrar);
 // Only after all detours are disabled and removed, with callers quiescent.
 void resetRoomscaleTriangleHookAfterRemoval() noexcept;
 bool roomscaleCollisionKernelsUsable() noexcept;
+// Lab diagnostic only: the first kernel input that invalidated an active scope
+// since the last reset, plus the kernel calls observed. Simulation thread only.
+// Recording copies arguments already passed to the hook; no native read/call.
+struct RoomscaleScopeFailure {
+    uint32_t kind=0; // 0 none, 1 triangle, 2 primitive
+    uint32_t calls=0;
+    roomscale::Ray ray{};
+    roomscale::Vector a{},b{},c{},normal{};
+    roomscale::Primitive shape{};
+    float radius=0,result=0,entry=0,exit=0;
+    double maxRayParameter=0,contactDepthBudget=0;
+    bool requireWholePathClear=false,rejectInitialContact=false;
+};
+void resetRoomscaleScopeFailure() noexcept;
+RoomscaleScopeFailure roomscaleScopeFailure() noexcept;
 
 // Explicit experimental admission, NOT proof of shared native scratch ownership.
 // The caller must separately establish exclusive query scratch / stopped worker

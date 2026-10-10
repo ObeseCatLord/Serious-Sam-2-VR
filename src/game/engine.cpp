@@ -449,6 +449,8 @@ struct HeadQueryDiagnostic {
     double computedRadius=0,computedGuard=0;
     uint32_t categoryCount=0;
     bool prepared=false,clear=false,failed=false,mathReturned=false,coverValid=false;
+    SphereQueryOutcome sphere;
+    RoomscaleScopeFailure kernel;
 };
 static HeadQueryDiagnostic headQueryDiagnostic;
 static std::atomic<unsigned> headDiagnosticReceipts{0};
@@ -3220,6 +3222,14 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
                         s.body.p.x,s.body.p.y,s.body.p.z,s.body.q.x,s.body.q.y,s.body.q.z,s.body.q.w,
                         eyeAnchor.p.x,eyeAnchor.p.y,eyeAnchor.p.z,eyeAnchor.q.x,eyeAnchor.q.y,eyeAnchor.q.z,eyeAnchor.q.w,
                         s.head.p.x,s.head.p.y,s.head.p.z,head.p.x,head.p.y,head.p.z);
+                    const auto& q=d.sphere;const auto& k=d.kernel;
+                    log("Head clearance kernel receipt=%u sphereStage=%u completed=%u hit=%d scopeCompleted=%u scopeFailed=%u ownerLost=%u kind=%u calls=%u origin=(%.9g,%.9g,%.9g) direction=(%.9g,%.9g,%.9g) a=(%.9g,%.9g,%.9g) b=(%.9g,%.9g,%.9g) c=(%.9g,%.9g,%.9g) normal=(%.9g,%.9g,%.9g) shape=%u,%.9g,%.9g,%.9g radius=%.9g result=%.9g entry=%.9g exit=%.9g maxT=%.17g budget=%.17g whole=%u reject=%u",
+                        ordinal,q.stage,q.completed,q.hit,unsigned(q.scopeCompleted),unsigned(q.scopeFailed),unsigned(q.ownerLost),
+                        k.kind,k.calls,k.ray.origin.x,k.ray.origin.y,k.ray.origin.z,
+                        k.ray.direction.x,k.ray.direction.y,k.ray.direction.z,k.a.x,k.a.y,k.a.z,k.b.x,k.b.y,k.b.z,
+                        k.c.x,k.c.y,k.c.z,k.normal.x,k.normal.y,k.normal.z,k.shape.kind,k.shape.width,k.shape.height,
+                        k.shape.depth,k.radius,k.result,k.entry,k.exit,k.maxRayParameter,k.contactDepthBudget,
+                        unsigned(k.requireWholePathClear),unsigned(k.rejectInitialContact));
                 }
             }
         }
@@ -6684,7 +6694,9 @@ static bool __cdecl prepareAndQueryHeadVolume(void* opaque) {
     d.stage=HeadQueryStage::Owner;if(!headQueryOwnerCurrent(&h))return false;
     c.reads.seal();h.prepared=true;
     d.stage=HeadQueryStage::ResourceQuery;
+    resetSphereQueryOutcome();resetRoomscaleScopeFailure();
     const bool clear=runRoomscaleResourceScope(c.failed,c.thread,queryHeadVolume,&h)&&h.clear;
+    d.sphere=lastSphereQueryOutcome();d.kernel=roomscaleScopeFailure();
     if(clear)d.stage=HeadQueryStage::Complete;
     return clear;
 }
