@@ -7421,6 +7421,7 @@ bool attach(bool headless) {
     if(ok&&(settings.roomscale||settings.headFade)&&!headless) {
         ok=configureRoomscaleSweepQueries(e)&&queueRoomscaleTriangleHook(c,hook)&&
             queueRoomscalePrimitiveHook(c,hook)&&queueRoomscaleResourceGates(e,internalHook);
+        if(ok)configureRoomscaleProviderBuffers(graphics); // Fingerprinted by supported().
         if(ok&&settings.roomscale)ok=queueRoomscalePlacementHooks(e,hook,internalHook);
     }
     ok = multiplayer::initialize(e, c, g, hook) && ok;

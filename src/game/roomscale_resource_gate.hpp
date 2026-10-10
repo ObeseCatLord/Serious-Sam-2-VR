@@ -11,6 +11,9 @@ using RoomscaleResourceBody = void (__cdecl *)(void *);
 // query workers, provide fresh native query cleanup, and make
 // the entire result unusable if unavailable becomes true.
 bool queueRoomscaleResourceGates(HMODULE engine, RoomscaleInternalHook registrar);
+// graphics must be the startup-fingerprinted GfxD3D.dll, or null when headless.
+// Records its static vertex-buffer lock/unlock identities; installs nothing.
+void configureRoomscaleProviderBuffers(HMODULE graphics) noexcept;
 void resetRoomscaleResourceGatesAfterRemoval() noexcept;
 bool runRoomscaleResourceScope(bool &unavailable, DWORD simulationThread,
                                RoomscaleResourceBody body, void *context) noexcept;

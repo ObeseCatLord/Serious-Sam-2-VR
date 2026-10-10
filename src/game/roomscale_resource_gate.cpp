@@ -15,6 +15,7 @@ thread_local bool *unavailable = nullptr;
 bool gatesQueued = false;
 uintptr_t primitiveHullTable=0,modelHullTable=0,fluidHullTable=0,forceHullTable=0;
 uintptr_t hullEngineBase=0;
+uintptr_t providerLock=0,providerUnlock=0;
 struct InstalledGate { uintptr_t address=0,target=0; };
 std::array<InstalledGate,26> installedGates{};
 bool resourceGatesEnabled() noexcept {
@@ -50,11 +51,16 @@ inline int resourceDecision(const uint8_t *resource, unsigned kind) noexcept {
             const uint64_t offset=uint64_t(uint32_t(handle)-1u)*12u;
             if (table && handle<=count && uint64_t(table)+offset+12u<=(uint64_t(1)<<32)) {
                 const auto entry=table+static_cast<uintptr_t>(offset);
-                supported=optionalQueryBufferReadable(
-                    *reinterpret_cast<volatile const uint32_t*>(entry),
-                    *reinterpret_cast<volatile const int32_t*>(entry+4),
-                    *reinterpret_cast<volatile const int16_t*>(entry+8),
-                    *reinterpret_cast<volatile const uint8_t*>(entry+10),args[2],args[3]);
+                const uint32_t data=*reinterpret_cast<volatile const uint32_t*>(entry);
+                const int32_t bytes=*reinterpret_cast<volatile const int32_t*>(entry+4);
+                const int16_t locks=*reinterpret_cast<volatile const int16_t*>(entry+8);
+                const uint8_t format=*reinterpret_cast<volatile const uint8_t*>(entry+10);
+                supported=(format&0x3fu)==0x1fu ?
+                    optionalQueryProviderBufferLockable(data,bytes,locks,format,args[1],args[2],args[3],
+                        *reinterpret_cast<volatile const uint32_t*>(hullEngineBase+0x2e6324),
+                        *reinterpret_cast<volatile const uint32_t*>(hullEngineBase+0x2e6328),
+                        uint32_t(providerLock),uint32_t(providerUnlock)) :
+                    optionalQueryBufferReadable(data,bytes,locks,format,args[2],args[3]);
             }
         }
         return static_cast<int>(optionalQueryTargetDecision(unavailable,supported));
@@ -259,7 +265,14 @@ bool queueRoomscaleResourceGates(HMODULE engine, RoomscaleInternalHook registrar
     gatesQueued=true;
     return true;
 }
+void configureRoomscaleProviderBuffers(HMODULE graphics) noexcept {
+    // GfxD3D RVA 92D0 locks via vtable+2C (D3DLOCK_READONLY for type 0x93);
+    // RVA 9350 unlocks via vtable+30. The caller verified the whole module hash.
+    const auto base=reinterpret_cast<uintptr_t>(graphics);
+    providerLock=base?base+0x92d0:0;providerUnlock=base?base+0x9350:0;
+}
 void resetRoomscaleResourceGatesAfterRemoval() noexcept {
+    providerLock=providerUnlock=0;
     // The caller removes every queued detour, including partial registration,
     // and quiesces callers before this reset. No callback may remain active.
     gatesQueued=false;installedGates={};

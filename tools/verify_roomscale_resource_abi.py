@@ -17,6 +17,7 @@ import pefile
 
 ROOT=Path(__file__).resolve().parents[1]
 ENGINE_SHA='da6efc9f72637eb3b6f48eadca2107be89b09c00618b6e72d5d3632938a7d851'
+GFX_SHA='88749b79be36f0c0dccb623c4f1712685b5af603b451e25ed3c5029bedcdf3ed'
 RESOURCE_SITES={
     'resourceWorld':(0x29114,0x29146,24),
     'resourceModel':(0xda419,0xda439,24),
@@ -178,6 +179,41 @@ def verify(game):
         0x8fa72:('dec','word ptr [esi + 8]'),
         0xcba99:('push','0x93'),0xcba9e:('push','edi'),
     }.items():require(lock_instructions.get(rva)==instruction,'Vertex-buffer route changed: '+hex(rva))
+    # Provider-owned (format 0x1f) static buffers call the exported Engine slots.
+    lock_slot=0x102e6324;unlock_slot=0x102e6328
+    require(lock_instructions.get(0x8f96e)==('cmp','dword ptr [ebp + 8], 0x1f') and
+            lock_instructions.get(0x8f992)==('call','dword ptr [%#x]'%lock_slot) and
+            lock_instructions.get(0x8fa69)==('call','dword ptr [%#x]'%unlock_slot),'Provider lock slots changed')
+    exports={e.address:e.name for e in pe.DIRECTORY_ENTRY_EXPORT.symbols if e.name}
+    require(exports.get(lock_slot-base,b'').startswith(b'?_gfxLockStaticVertexBuffer@') and
+            exports.get(unlock_slot-base,b'').startswith(b'?_gfxUnlockStaticVertexBuffer@'),'Provider slot exports changed')
+    gfx_bytes=(game/'Bin/GfxD3D.dll').read_bytes()
+    require(hashlib.sha256(gfx_bytes).hexdigest()==GFX_SHA,'GfxD3D fingerprint differs')
+    gfx=pefile.PE(data=gfx_bytes);gbase=gfx.OPTIONAL_HEADER.ImageBase
+    def gfx_code(start,length):
+        out=[]
+        for i in md.disasm(gfx.get_data(start,length),gbase+start):
+            out.append((i.address-gbase,i.mnemonic,i.op_str))
+            if i.mnemonic=='ret':break
+        return out
+    install=[(m,o) for _,m,o in gfx_code(0x4c62,0x17)]
+    require(install[:4]==[('mov','eax, dword ptr [0x1000c24c]'),('mov','dword ptr [eax], %#x'%(gbase+0x92d0)),
+                          ('mov','ecx, dword ptr [0x1000c248]'),('mov','dword ptr [ecx], %#x'%(gbase+0x9350))],
+            'GfxD3D provider installation changed')
+    imports={i.address:i.name for d in gfx.DIRECTORY_ENTRY_IMPORT for i in d.imports if i.name}
+    require(imports.get(0x1000c24c,b'').startswith(b'?_gfxLockStaticVertexBuffer@') and
+            imports.get(0x1000c248,b'').startswith(b'?_gfxUnlockStaticVertexBuffer@'),'GfxD3D provider imports changed')
+    locker=[(m,o) for _,m,o in gfx_code(0x92d0,0x80)]
+    require(('cmp','ecx, 0x93') in locker and ('setne','al') in locker and ('and','eax, 0x10') in locker and
+            [x for x in locker if x[0]=='call']==[('call','dword ptr [edx + 0x2c]')],
+            'GfxD3D lock must be one IDirect3DVertexBuffer9::Lock, read-only for type 0x93')
+    unlocker=[(m,o) for _,m,o in gfx_code(0x9350,0x60)]
+    require(sorted(x for x in unlocker if x[0]=='call')==[('call','dword ptr [ecx + 0x30]'),('call','dword ptr [edx + 0x30]')],
+            'GfxD3D unlock must be IDirect3DVertexBuffer9::Unlock only')
+    # No optional-query resource gate may cancel between the collision lock and unlock.
+    span=[i.address-base for i in md.disasm(pe.get_data(0xcbaa4,0xcbb2e-0xcbaa4),base+0xcbaa4)]
+    require(0xcbb29 in span and not any(0xcbaa4<=site[0]<0xcbb2e for site in RESOURCE_SITES.values()),
+            'A cancellation gate lies inside the provider lock span')
     # Native save/cleanup contracts; no recovery from arbitrary allocator faults.
     suffixes={
         0x52918:'5f5e33c05b8be55dc3',
@@ -242,7 +278,7 @@ def verify(game):
         require(not any(x.startswith('call ') for x in code(decision)),'Decision must be a call-free leaf')
         object_hash=hashlib.sha256(obj.read_bytes()).hexdigest()
     return {'runtime_executed':False,'hooks_activated':False,'native_resource_branches':len(RESOURCE_SITES),
-            'hull_dispatch_gates':1,'vertex_buffer_admission_gates':1,'post_call_cancellation_sites':len(RETURN_SITES),'engine_sha256':ENGINE_SHA,'compiled_object_sha256':object_hash,
+            'hull_dispatch_gates':1,'pinned_provider_buffer_lock':True,'vertex_buffer_admission_gates':1,'post_call_cancellation_sites':len(RETURN_SITES),'engine_sha256':ENGINE_SHA,'compiled_object_sha256':object_hash,
             'source_sha256':hashlib.sha256(source.encode()).hexdigest(),
             'model_preparation_direct_edge_checks':{'gates':9,'old_sites_rejected':2,
                                                    'encoded_branch_mutations_rejected':2},
