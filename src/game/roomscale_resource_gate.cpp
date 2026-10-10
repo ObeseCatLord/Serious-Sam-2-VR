@@ -95,6 +95,21 @@ extern "C" int __cdecl ss2vrResourceDecision(const uint8_t *resource, unsigned s
         if (kind==3&&resource) {
             const auto *args=reinterpret_cast<volatile const int32_t*>(resource+4);
             firstCancel.handle=uint32_t(args[0]);firstCancel.type=uint32_t(args[1]);
+            firstCancel.requested=uint32_t(args[2]);firstCancel.offset=uint32_t(args[3]);
+            const int32_t handle=args[0];
+            if (hullEngineBase && handle>0) {
+                const auto table=*reinterpret_cast<volatile const uintptr_t*>(hullEngineBase+0x2e68e4);
+                const int32_t count=*reinterpret_cast<volatile const int32_t*>(hullEngineBase+0x2e68e8);
+                firstCancel.count=uint32_t(count);
+                const uint64_t offset=uint64_t(uint32_t(handle)-1u)*12u;
+                if (table && handle<=count && uint64_t(table)+offset+12u<=(uint64_t(1)<<32)) {
+                    const auto entry=table+static_cast<uintptr_t>(offset);
+                    firstCancel.data=*reinterpret_cast<volatile const uint32_t*>(entry);
+                    firstCancel.bytes=uint32_t(*reinterpret_cast<volatile const int32_t*>(entry+4));
+                    firstCancel.locks=uint32_t(uint16_t(*reinterpret_cast<volatile const int16_t*>(entry+8)));
+                    firstCancel.format=*reinterpret_cast<volatile const uint8_t*>(entry+10);
+                }
+            }
         }
     }
     return result;

@@ -3225,9 +3225,10 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
                         eyeAnchor.p.x,eyeAnchor.p.y,eyeAnchor.p.z,eyeAnchor.q.x,eyeAnchor.q.y,eyeAnchor.q.z,eyeAnchor.q.w,
                         s.head.p.x,s.head.p.y,s.head.p.z,head.p.x,head.p.y,head.p.z);
                     const auto& q=d.sphere;const auto& k=d.kernel;
-                    log("Head clearance owner receipt=%u ownerFailure=%u phaseFailure=%u cancelGate=%u cancelKind=%u cancelResource=%08x engineBase=%08x cancelFlags=%u cancelHandle=%u cancelType=%u",
+                    log("Head clearance owner receipt=%u ownerFailure=%u phaseFailure=%u cancelGate=%u cancelKind=%u cancelResource=%08x engineBase=%08x cancelFlags=%u cancelHandle=%u cancelType=%u data=%08x bytes=%u locks=%u format=%u requested=%d offset=%d count=%u",
                         ordinal,d.ownerFailure,d.phaseFailure,d.cancel.gate,d.cancel.kind,d.cancel.resource,
-                        d.cancel.engineBase,d.cancel.flags,d.cancel.handle,d.cancel.type);
+                        d.cancel.engineBase,d.cancel.flags,d.cancel.handle,d.cancel.type,d.cancel.data,d.cancel.bytes,
+                        d.cancel.locks,d.cancel.format,int(d.cancel.requested),int(d.cancel.offset),d.cancel.count);
                     log("Head clearance kernel receipt=%u sphereStage=%u completed=%u hit=%d scopeCompleted=%u scopeFailed=%u ownerLost=%u kind=%u calls=%u origin=(%.9g,%.9g,%.9g) direction=(%.9g,%.9g,%.9g) a=(%.9g,%.9g,%.9g) b=(%.9g,%.9g,%.9g) c=(%.9g,%.9g,%.9g) normal=(%.9g,%.9g,%.9g) shape=%u,%.9g,%.9g,%.9g radius=%.9g result=%.9g entry=%.9g exit=%.9g maxT=%.17g budget=%.17g whole=%u reject=%u",
                         ordinal,q.stage,q.completed,q.hit,unsigned(q.scopeCompleted),unsigned(q.scopeFailed),unsigned(q.ownerLost),
                         k.kind,k.calls,k.ray.origin.x,k.ray.origin.y,k.ray.origin.z,

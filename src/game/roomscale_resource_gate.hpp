@@ -24,6 +24,7 @@ bool finishRoomscaleResourceScopeForCommit(bool &unavailable) noexcept;
 // the receiver/vtable pointer (not dereferenced when unrecognized).
 struct RoomscaleResourceCancel {
     uint32_t gate=0,kind=0,resource=0,engineBase=0,flags=0,handle=0,type=0;
+    uint32_t data=0,bytes=0,locks=0,format=0,requested=0,offset=0,count=0;
 };
 void resetRoomscaleResourceCancel() noexcept;
 RoomscaleResourceCancel roomscaleResourceCancel() noexcept;
