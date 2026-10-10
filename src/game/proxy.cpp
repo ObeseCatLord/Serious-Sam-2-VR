@@ -130,11 +130,18 @@ template <class T> static void proxyHook(void *address, void *detour, T &origina
         logHook(name, "enable", enabled, enableOk, enableFailed);
     }
 }
+static void attachAtPresentation(IDirect3DDevice9 *d);
 static __attribute__((noinline)) HRESULT WINAPI present(IDirect3DDevice9 *d, const RECT *src, const RECT *dst, HWND window,
                               const RGNDATA *region) {
     const auto caller = reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
     HRESULT hr = D3DERR_INVALIDCALL;
     const bool outer = presentationDepth == 0;
+    if (outer) {
+        // The fingerprinted GfxD3D device Present site (the same one
+        // nativePresentationCaller admits once hooks are ready).
+        const auto gfx = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"GfxD3D.dll"));
+        if (gfx && caller == gfx + 0x1c75u) attachAtPresentation(d);
+    }
     ++presentationDepth;
     ss2vr::game::withNativeFinally([&] {
         if (outer) ss2vr::game::presentDevice(d, caller, src, dst, window, region);
@@ -146,17 +153,18 @@ static __attribute__((noinline)) HRESULT WINAPI present(IDirect3DDevice9 *d, con
 }
 static INIT_ONCE initialize = INIT_ONCE_STATIC_INIT;
 static bool vrEnabled = false, minHookReady = false, stockRenderer = false, labIsolationRequested = false;
-static DWORD WINAPI hookThread(void *) {
-    for (int i = 0; i < 600; i++) {
-        if (GetModuleHandleW(L"Sam2Game.dll") && GetModuleHandleW(L"Engine.dll") &&
-            GetModuleHandleW(L"Core.dll")) {
-            ss2vr::game::attach();
-            return 0;
-        }
-        Sleep(50);
-    }
-    ss2vr::game::log("Native modules unavailable; desktop retained");
-    return 0;
+// Native attach runs on the device-owning main thread between frames. A
+// background worker raced world loading: it called engine string/allocator
+// functions from a foreign thread and suspended the loading thread to patch,
+// which intermittently deadlocked startup on Serious Engine mutexes.
+static std::atomic<bool> attachPending{false};
+static void attachAtPresentation(IDirect3DDevice9 *d) {
+    if (!attachPending.load(std::memory_order_relaxed) || !ss2vr::game::presentationDeviceOwner(d) ||
+        !GetModuleHandleW(L"Sam2Game.dll") || !GetModuleHandleW(L"Engine.dll") || !GetModuleHandleW(L"Core.dll"))
+        return;
+    attachPending.store(false, std::memory_order_relaxed);
+    ss2vr::game::log("Startup native attach on presentation thread=%lu", GetCurrentThreadId());
+    ss2vr::game::attach();
 }
 static BOOL CALLBACK init(PINIT_ONCE, PVOID, PVOID *) {
     // Detours outlive graphics backend reloads; their owning DLL must stay mapped.
@@ -192,13 +200,7 @@ static BOOL CALLBACK init(PINIT_ONCE, PVOID, PVOID *) {
     vrEnabled = minHookReady && !stockRenderer;
     ss2vr::game::log("Startup MinHook initialize status=%d", static_cast<int>(hookStatus));
     if(stockRenderer) ss2vr::game::log("Lab stock renderer selected before VR worker creation; graphics hooks disabled");
-    if (vrEnabled) {
-        HANDLE thread = CreateThread(nullptr, 0, hookThread, nullptr, 0, nullptr);
-        const DWORD error = thread ? ERROR_SUCCESS : GetLastError();
-        ss2vr::game::log("Startup hook worker created=%d error=%lu", thread != nullptr, error);
-        if (thread)
-            CloseHandle(thread);
-    }
+    if (vrEnabled) attachPending.store(true, std::memory_order_relaxed);
     return TRUE;
 }
 static HRESULT WINAPI reset(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *p) {
