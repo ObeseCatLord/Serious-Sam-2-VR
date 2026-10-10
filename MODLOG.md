@@ -1,5 +1,25 @@
 # Mod journal
 
+## 2026-10-10 — expose existing startup observations before host creation
+
+The private observer now shares its existing native loading/input/activation JSON
+fields between channel status and pre-host stock status. Module and menu-table
+numbers come from values already read by the same owned-process observer. The
+change adds no native reads, writes, method calls, lifecycle or readiness policy.
+This fills the actual V60 evidence gap before a host/channel exists, using the
+existing polling and exact process ownership rather than adding a launcher.
+
+Short-circuit or failed reads can leave zero values. Repetition/admission flags
+are observations, not atomic coherence, lifetime pins or permission for new
+input. The diagnostic fields do not change activation or loading-continuation
+checks. Astra scoped source GO; current local Astra/xhigh routing verified,
+independent backend attestation unavailable. Strict x86 GUI/static observer
+compile and all63existing harness checks pass normally and under optimized
+Python. Native products remain61ce671/IPC11/wire7; this is tooling-only source.
+A fresh neutral run is required before interpreting the new fields. No new
+startup recovery, world-rendering, motion, firing or hardware pass is claimed.
+
+
 ## 2026-10-10 — repaired full-feature run timed out before scene readiness
 
 Fresh private neutral run20261010T160619 used source

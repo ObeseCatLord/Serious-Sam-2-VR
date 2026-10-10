@@ -123,6 +123,14 @@ static bool loadingOwner(DWORD pid,const wchar_t *path,OwnedLoading &out) {
     if(ok){out.window=window;out.thread=thread;out.stage=4;}
     return ok;
 }
+static void writeLoadingState(FILE *output,const OwnedLoading &loading) {
+    std::fprintf(output,",\"native_state_repeated\":%u,\"native_simulation\":%u,\"native_world_start_blocked\":%u,\"native_input_exclusive\":%u,\"native_input_enabled\":%u,\"native_ok_dispatch_enabled\":%u,\"native_current_menu\":%u",
+        loading.nativeState,loading.simulation,loading.blocked,loading.exclusive,loading.inputEnabled,loading.dispatcher,loading.menu);
+    std::fprintf(output,",\"native_activation_repeated\":%u,\"native_instance\":%u,\"native_running\":%u,\"native_simulation_present\":%u,\"native_exclusive_block\":%u,\"native_core_foreground\":%u,\"native_host_window\":%u,\"native_host_hwnd\":%u,\"native_canvas_window\":%u,\"native_workbench_window\":%u,\"native_keyboard_window\":%u,\"native_host_foreground\":%u,\"native_host_visible\":%u,\"native_host_iconic\":%u",
+        loading.activationRepeated,loading.instance,loading.running,loading.simulationPresent,loading.inputBlock,loading.coreForeground,
+        loading.hostWindow,loading.hostHwnd,loading.canvasWindow,loading.workbenchWindow,loading.keyboardWindow,loading.hostForeground,loading.hostVisible,loading.hostIconic);
+    std::fprintf(output,",\"native_game_module\":%u,\"native_loading_menu_table\":%u",loading.module,loading.table);
+}
 struct OwnedStockProcess {
     HANDLE handle=nullptr; DWORD pid=0; uint64_t creation=0;
     ~OwnedStockProcess(){if(handle)CloseHandle(handle);}
@@ -297,9 +305,11 @@ static int stockCommand(int argc,wchar_t **argv) {
         OwnedLoading loading{};const bool ready=loadingOwner(process.pid,argv[2],loading);
         bool onlineNull=false;const bool local=stockTransport(process,onlineNull);
         const auto camera=stockCameraRead(process);
-        std::fprintf(file,"{\"game_pid\":%u,\"process_creation\":%llu,\"tick_ms\":%llu,\"local_transport\":%u,\"online_interface_null\":%u,\"loading_ready\":%u,\"loading_stage\":%u,\"loading_error\":%u,\"loading_table_rva\":%u,\"loading_native_ready\":%u,\"menu_clear\":%u,\"camera_repeated_equal\":%u,\"view_pose_match\":%u,\"perspective_projection\":%u,\"mouse_zero\":%u,\"camera\":",
+        std::fprintf(file,"{\"game_pid\":%u,\"process_creation\":%llu,\"tick_ms\":%llu,\"local_transport\":%u,\"online_interface_null\":%u,\"loading_ready\":%u,\"loading_stage\":%u,\"loading_error\":%u,\"loading_table_rva\":%u,\"loading_native_ready\":%u,\"menu_clear\":%u,\"camera_repeated_equal\":%u,\"view_pose_match\":%u,\"perspective_projection\":%u,\"mouse_zero\":%u",
             static_cast<unsigned>(process.pid),static_cast<unsigned long long>(process.creation),static_cast<unsigned long long>(GetTickCount64()),local,onlineNull,ready,loading.stage,loading.error,
             loading.module&&loading.table?loading.table-loading.module:0,loading.ready,camera.menuClear,camera.equal,camera.viewMatches,camera.perspective,camera.mouseZero);
+        writeLoadingState(file,loading);
+        std::fprintf(file,",\"camera\":");
         pose(file,camera.camera);std::fprintf(file,",\"projection\":[");
         for(unsigned i=0;i<16;++i)std::fprintf(file,"%s%.9g",i?",":"",camera.projection.m[i]);
         std::fprintf(file,"]}\n");
@@ -381,11 +391,7 @@ int wmain(int argc,wchar_t **argv) {
             ui.fireSequence[0],ui.fireSequence[1],ui.wheel[0].open,ui.wheel[1].open);
         OwnedLoading loading{};
         const bool ready=argc==5&&loadingOwner(s.gamePid,argv[4],loading);
-        std::fprintf(output,",\"native_state_repeated\":%u,\"native_simulation\":%u,\"native_world_start_blocked\":%u,\"native_input_exclusive\":%u,\"native_input_enabled\":%u,\"native_ok_dispatch_enabled\":%u,\"native_current_menu\":%u",
-            loading.nativeState,loading.simulation,loading.blocked,loading.exclusive,loading.inputEnabled,loading.dispatcher,loading.menu);
-        std::fprintf(output,",\"native_activation_repeated\":%u,\"native_instance\":%u,\"native_running\":%u,\"native_simulation_present\":%u,\"native_exclusive_block\":%u,\"native_core_foreground\":%u,\"native_host_window\":%u,\"native_host_hwnd\":%u,\"native_canvas_window\":%u,\"native_workbench_window\":%u,\"native_keyboard_window\":%u,\"native_host_foreground\":%u,\"native_host_visible\":%u,\"native_host_iconic\":%u",
-            loading.activationRepeated,loading.instance,loading.running,loading.simulationPresent,loading.inputBlock,loading.coreForeground,
-            loading.hostWindow,loading.hostHwnd,loading.canvasWindow,loading.workbenchWindow,loading.keyboardWindow,loading.hostForeground,loading.hostVisible,loading.hostIconic);
+        writeLoadingState(output,loading);
         std::fprintf(output,",\"slots\":[%u,%u],\"loading_ready\":%u,\"loading_stage\":%u,\"loading_error\":%u,\"loading_table_rva\":%u,\"loading_native_ready\":%u}\n",static_cast<unsigned>(s.slot[0].state),static_cast<unsigned>(s.slot[1].state),ready,loading.stage,loading.error,loading.module&&loading.table?loading.table-loading.module:0,loading.ready);
 
         return output==stdout ? (std::fflush(output)==0?0:7) : (std::fclose(output)==0?0:7);
