@@ -6300,8 +6300,8 @@ static void drawSteeringWheel() {
             const size_t front=i+k,back=Count+i+(2-k);
             position[front]=position[back]=p;
             uv[front][0]=uv[back][0]=v.u;uv[front][1]=uv[back][1]=v.v;
-            color[front]=shade(.38f+.62f*std::max(0.f,lit));
-            color[back]=shade(.38f+.62f*std::max(0.f,-lit));
+            color[front]=shade(.62f+.5f*std::max(0.f,lit));
+            color[back]=shade(.62f+.5f*std::max(0.f,-lit));
         }
     ortho();
     activateView(rootView);
