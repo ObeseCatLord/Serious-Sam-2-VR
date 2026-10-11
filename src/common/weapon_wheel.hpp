@@ -127,6 +127,26 @@ struct WheelRing {
 private:
     float angle[WheelSlotCount]{};
 };
+// Floating weapon meshes are about 9.5 cm long, smaller only on a crowded ring.
+inline float wheelModelSize(float itemSize, bool hovered) {
+    return std::min(.095f, 1.7f * itemSize) * (hovered ? 1.3f : 1.f);
+}
+// A mesh whose unit-stretch box has this centre and longest extent: uniformly
+// scaled to `size`, spun about the ring's upright axis, box centred on the slot.
+struct WheelModelPlacement {
+    Pose pose;
+    float scale = 0;
+};
+inline WheelModelPlacement wheelModelPlacement(Pose ring, Vec3 slot, Vec3 centre, float extent, float size,
+                                               float spin) {
+    if (!std::isfinite(extent) || extent <= 0 || !std::isfinite(size) || size <= 0 || !std::isfinite(spin) ||
+        !finite(ring))
+        return {};
+    const float scale = size / extent;
+    const Quat orientation = normalize(multiply(ring.q, yaw(spin)));
+    const Pose pose{orientation, ring.p + rotate(ring.q, slot) - rotate(orientation, centre * scale)};
+    return finite(pose) && std::isfinite(scale) ? WheelModelPlacement{pose, scale} : WheelModelPlacement{};
+}
 // One hand's sampled pointer for the ring: the weapon grip point and the head,
 // both from the same input sample. Invalid samples cannot hover by position.
 struct WheelPointer {

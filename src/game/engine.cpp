@@ -357,6 +357,25 @@ static WeaponIcon nativeWeaponIcon = nullptr;
 static WeaponMenuSlot nativeWeaponMenuDirection = nullptr, nativeWeaponMenuOrder = nullptr;
 static int *blendSource = nullptr, *blendDestination = nullptr;
 static BlendFunction *setBlendFunction = nullptr;
+// Native model entries for the wheel's floating weapon meshes (optional pinned
+// Engine exports; CBaseWeaponEntity::Render draws its own model the same way).
+struct WheelModelBox {
+    Vec3 min, max; // Native Box3f.
+};
+using ModelInstanceCreate = void *(__cdecl *)();
+using ModelInstanceDelete = void(__cdecl *)(void *);
+using ModelInstanceConfigure = void(__cdecl *)(void *, void *);
+using ModelInstanceStretch = void(__cdecl *)(void *, const Vec3 &);
+using ModelInstanceBox = WheelModelBox *(__cdecl *)(WheelModelBox *, const void *);
+using ModelInstanceRender = void(__cdecl *)(void *, const Matrix34 &, float, int);
+static ModelInstanceCreate createModelInstance = nullptr;
+static ModelInstanceDelete deleteModelInstance = nullptr;
+static ModelInstanceConfigure configureModelInstance = nullptr;
+static ModelInstanceStretch stretchModelInstance = nullptr;
+static ModelInstanceBox modelInstanceBox = nullptr;
+static ModelInstanceRender renderModelInstance = nullptr;
+static void **modelDataType = nullptr;
+static uintptr_t modelConfigurationVtable = 0;
 static MatrixPose matrixPose = nullptr;
 static SRWLOCK snapshotLock = SRWLOCK_INIT;
 struct Calibration {
@@ -6441,26 +6460,31 @@ static bool steeringWheelTextureReady(void *texture) {
     uintptr_t table=0;std::memcpy(&table,texture,4);
     return table==staticTextureVtable && !(static_cast<const uint8_t*>(texture)[4]&1u);
 }
-// Main thread only. The texture Ptr is owned at &texture for the process.
-static bool obtainStaticTexture(void *&texture,const char *path) {
-    if(!resourceObtain || !textureDataType || !*textureDataType || !smartAddRef || !smartRemRef)return false;
-    // Mirror the game's own immediate texture wrapper (sniper mask): method 0,
-    // null name, then replace a pending proxy by its loaded object. The Ptr owner
-    // address is &texture throughout, as for the native AddRef/RemRef pairs.
+// Main thread only. The resource Ptr is owned at &resource for the process.
+static bool obtainNativeResource(void *&resource,void *dataType,const char *path) {
+    if(!resourceObtain || !dataType || !smartAddRef || !smartRemRef)return false;
+    // Mirror the game's own immediate resource wrappers (sniper mask texture,
+    // Sam2Game model loader at RVA 475B0): method 0, null name, then replace a
+    // pending proxy by its loaded object. The Ptr owner address is &resource
+    // throughout, as for the native AddRef/RemRef pairs.
     const bool completed=withNativeFinally([&] {
-        resourceObtain(&texture,*textureDataType,0,1,1,path,nullptr);
-        void *proxy=texture;
+        resourceObtain(&resource,dataType,0,1,1,path,nullptr);
+        void *proxy=resource;
         if(proxy && readableMemory(proxy,8) && (static_cast<const uint8_t*>(proxy)[4]&1u)) {
             using Replacement=void *(__thiscall *)(void *);
             auto **table=*static_cast<Replacement **>(proxy);
             void *loaded=table[3](proxy);
-            if(loaded)smartAddRef(loaded,&texture);
-            texture=loaded;
-            smartRemRef(proxy,&texture);
+            if(loaded)smartAddRef(loaded,&resource);
+            resource=loaded;
+            smartRemRef(proxy,&resource);
         }
     },[](bool) noexcept {});
-    if(!completed)texture=nullptr;
-    return completed && steeringWheelTextureReady(texture);
+    if(!completed)resource=nullptr;
+    return completed;
+}
+static bool obtainStaticTexture(void *&texture,const char *path) {
+    return textureDataType && *textureDataType && obtainNativeResource(texture,*textureDataType,path) &&
+           steeringWheelTextureReady(texture);
 }
 static void loadSteeringWheelTexture() {
     auto &w=steeringWheel;
@@ -6583,10 +6607,12 @@ static void drawSteeringWheel() {
     (*setDepthComparison)(priorComparison);
 }
 // Hand weapon wheels, drawn in each eye after the root world like the lasers.
-// Translucent bubbles carry the game's own weapon icons (samGetWeaponIcon) and
-// face the head. Colours are native constant RGBA; icon tint is only grey and
-// alpha. Depth testing is off so an open wheel stays readable over the held
-// weapon and nearby geometry. Main thread only; gfx state is restored after.
+// Translucent bubbles face the head and carry the stock weapon display meshes,
+// slowly spinning; a weapon whose mesh is unavailable shows the game's own icon
+// (samGetWeaponIcon). Colours are native constant RGBA; icon tint is only grey
+// and alpha. Bubbles ignore depth so an open wheel stays readable over the held
+// weapon; meshes are depth tested like world models. Main thread only; gfx
+// state is restored after.
 struct WeaponWheelTextures {
     void *netricsa=nullptr;
     bool tried=false;
@@ -6598,6 +6624,76 @@ static void loadWeaponWheelTextures(const Snapshot &s) {
     t.tried=true;
     const bool ready=obtainStaticTexture(t.netricsa,"Content/SeriousSam2/Textures/Interface/Hud/netricsa.tex");
     log("Weapon wheel Netricsa icon %s",ready ? "loaded" : "unavailable; using a drawn symbol");
+}
+// Stock weapon display meshes: the per-weapon pickups the combo-weapons item
+// shows (ComboWeapons_Item.mdl children). The flamer has no pickup model and
+// uses its plain weapon model. Indexed by native WeaponIndex.
+static const char *const wheelModelPaths[WeaponCount]={
+    "Content/SeriousSam2/Models/Weapons/CircularSaw/CircularSaw_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/ZapGun/ZapGun_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/AutoShotgun/AutoShotgun_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/DoubleShotgun/DoubleShotgun_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/Uzi/Uzi_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/Minigun/Minigun_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/RocketLauncher/RocketLauncher_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/GrenadeLauncher/GrenadeLauncher_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/PlasmaRifle/PlasmaRifle_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/Klodovik/Klodovik_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/Cannon/Cannon_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/SeriousBomb/SeriousBomb_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/Colt/Colt_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/Sniper/Sniper_Pickup.mdl",
+    nullptr, // Unused index.
+    "Content/SeriousSam2/Models/Weapons/BeamGun/BeamGun_Pickup.mdl",
+    "Content/SeriousSam2/Models/Weapons/Flamer/Flamer.mdl"};
+// Process-lifetime display instances: the configuration Ptr is owned at
+// &configuration and the bare CModelInstance (no renderable, mechanism or
+// animation) only by this table. Its unit-stretch box normalises the size.
+struct WheelModel {
+    void *configuration=nullptr,*instance=nullptr;
+    Vec3 centre{};
+    float extent=0;
+    bool tried=false,ready=false;
+};
+static WheelModel wheelModels[WeaponCount];
+static bool wheelModelConfigurationReady(void *configuration) {
+    if(!configuration || !modelConfigurationVtable || !readableMemory(configuration,8))return false;
+    uintptr_t table=0;std::memcpy(&table,configuration,4);
+    return table==modelConfigurationVtable && !(static_cast<const uint8_t*>(configuration)[4]&1u);
+}
+// One model per input poll once gameplay runs, so loading never stalls one frame
+// for long; a weapon keeps its icon until (or unless) its mesh is ready.
+static void loadWeaponWheelModels(const Snapshot &s) {
+    if(!s.ui.gameplay || !nativeMainThread || !nativeMainThread() || !modelDataType || !*modelDataType ||
+       !createModelInstance || !deleteModelInstance || !configureModelInstance || !modelInstanceBox ||
+       !renderModelInstance || !stretchModelInstance)return;
+    for(uint32_t id=0;id!=WeaponCount;++id) {
+        auto &m=wheelModels[id];
+        if(m.tried || !wheelModelPaths[id])continue;
+        m.tried=true;
+        WheelModelBox box{};
+        bool boxed=false;
+        if(obtainNativeResource(m.configuration,*modelDataType,wheelModelPaths[id]) &&
+           wheelModelConfigurationReady(m.configuration))
+            withNativeFinally([&] {
+                m.instance=createModelInstance();
+                if(!m.instance)return;
+                configureModelInstance(m.instance,m.configuration);
+                boxed=modelInstanceBox(&box,m.instance)==&box;
+            },[](bool) noexcept {});
+        const Vec3 size=box.max-box.min;
+        m.extent=std::max({size.x,size.y,size.z});
+        m.centre=(box.min+box.max)*.5f;
+        m.ready=m.instance && boxed && std::isfinite(m.extent) && m.extent>.001f && m.extent<50.f &&
+            std::isfinite(m.centre.x) && std::isfinite(m.centre.y) && std::isfinite(m.centre.z);
+        if(m.instance && !m.ready) {
+            void *instance=m.instance;
+            m.instance=nullptr;
+            withNativeFinally([&] {deleteModelInstance(instance);},[](bool) noexcept {});
+        }
+        log("Weapon wheel model %u %s extent=%.3f",id,m.ready ? "loaded" : "unavailable; using its icon",m.extent);
+        return;
+    }
 }
 struct WheelBillboard {
     Vec3 centre,right,up;
@@ -6704,10 +6800,13 @@ static void drawWheelSymbol(WheelBubble bubble,const WheelBillboard &b,float s) 
 }
 // Both eyes of one request draw the same copy of the published wheels.
 static struct {
-    uint64_t sequence=0;
+    uint64_t sequence=0,tick=0;
     uint32_t session=0;
     WheelPresentation wheel[2];
 } eyeWheels;
+static bool wheelModelReady(int32_t weapon) {
+    return weapon>=0 && uint32_t(weapon)<WeaponCount && wheelModels[weapon].ready;
+}
 static void drawWeaponWheel(unsigned hand,const Pose &head) {
     const auto &view=eyeWheels.wheel[hand];
     const auto &ui=eyeSnapshot.ui.wheel[hand];
@@ -6759,8 +6858,10 @@ static void drawWeaponWheel(unsigned hand,const Pose &head) {
            ui.weapon[slot.index]==slot.weapon)
             rounds=ui.ammo[slot.index];
         const bool empty=rounds==0,held=eyeSnapshot.ui.currentWeapon[hand]==slot.weapon;
-        wheelBatch.ring(hovered ? 0x3a2c14e8u : 0x161d27d0u,b,0,radius);
+        const bool mesh=wheelModelReady(slot.weapon); // Drawn after this pass.
+        wheelBatch.ring(hovered ? (mesh ? 0x3a2c1490u : 0x3a2c14e8u) : (mesh ? 0x161d2770u : 0x161d27d0u),b,0,radius);
         wheelBatch.ring(hovered ? gold : held ? handColour : empty ? 0xb83c3cffu : 0x8c99a8e0u,b,radius*.9f,radius);
+        if(mesh)return;
         void *icon=nativeWeaponIcon ? nativeWeaponIcon(slot.weapon) : nullptr;
         float halfWidth=0,halfHeight=0;
         if(wheelIconExtent(icon,radius*1.8f,radius*1.2f,halfWidth,halfHeight))
@@ -6769,6 +6870,29 @@ static void drawWeaponWheel(unsigned hand,const Pose &head) {
     for(uint32_t i=0;i!=ring.count;++i)
         if(int(i)!=view.hoverSlot)drawItem(i);
     if(view.hoverSlot>=0 && uint32_t(view.hoverSlot)<ring.count)drawItem(uint32_t(view.hoverSlot));
+}
+// Second pass: the floating meshes, each scaled by its unit-stretch box about
+// the slot centre and spinning about the ring's (upright) axis. Stretch is set
+// per draw, as CBaseWeaponEntity::Render does for mirrored weapons; LOD
+// distance 0 and no shadows also match that native weapon draw.
+static void drawWeaponWheelModels(unsigned hand) {
+    const auto &view=eyeWheels.wheel[hand];
+    const auto &ring=view.ring;
+    if(!eyeSnapshot.ui.wheel[hand].open || !view.open || !ring.anchored || !ring.count ||
+       ring.count>WheelSlotCount || !std::isfinite(ring.itemSize))return;
+    const Pose frame=worldHandTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head,ring.frame);
+    if(!finite(frame))return;
+    for(uint32_t i=0;i!=ring.count;++i) {
+        const auto &slot=ring.slot[i];
+        if(slot.bubble!=WheelBubble::None || !wheelModelReady(slot.weapon))continue;
+        const auto &model=wheelModels[slot.weapon];
+        const float spin=2*Pi*float(eyeWheels.tick%6000)/6000.f+.9f*float(i); // One turn per 6 s.
+        const auto placed=wheelModelPlacement(frame,ring.slotPosition(i),model.centre,model.extent,
+            wheelModelSize(ring.itemSize,int(i)==view.hoverSlot),spin);
+        if(!(placed.scale>0))continue;
+        stretchModelInstance(model.instance,Vec3{placed.scale,placed.scale,placed.scale});
+        renderModelInstance(model.instance,matrix(placed.pose),0.f,0);
+    }
 }
 static void drawWeaponWheels() {
     if(!eyeAnchorReady || !nativeMainThread || !nativeMainThread() || !eyeSnapshot.ui.gameplay ||
@@ -6782,6 +6906,7 @@ static void drawWeaponWheels() {
         std::copy_n(wheelPresentation,2,eyeWheels.wheel);
         ReleaseSRWLockShared(&wheelPresentationLock);
         eyeWheels.sequence=eyeRequest.sequence;eyeWheels.session=eyeRequest.session;
+        eyeWheels.tick=GetTickCount64();
     }
     if(!eyeWheels.wheel[0].open && !eyeWheels.wheel[1].open)return;
     const Pose head=worldHeadTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head);
@@ -6790,7 +6915,7 @@ static void drawWeaponWheels() {
     activateView(rootView);
     const bool wasDepth=*depthEnabled!=0,wasWrite=*depthWriting!=0;
     const bool wasBlend=*blending!=0,wasAlpha=*alphaTesting!=0;
-    const int priorSource=*blendSource,priorDestination=*blendDestination;
+    const int priorSource=*blendSource,priorDestination=*blendDestination,priorComparison=*depthComparison;
     (*disableDepth)();(*disableDepthWrite)();(*disableAlpha)();
     nativeBlendType(501); // GFU_BT_TRANSLUCENT: source alpha over the frame.
     (*unbindVertexBuffers)();
@@ -6798,11 +6923,26 @@ static void drawWeaponWheels() {
     for(unsigned h=0;h!=2;++h)drawWeaponWheel(h,head);
     wheelBatch.flush();
     (*unbindVertexBuffers)(); // Leave no client arrays bound to later native draws.
+    if(renderModelInstance && stretchModelInstance) {
+        // World-like opaque state for the meshes; their materials set the rest.
+        (*enableDepth)();(*enableDepthWrite)();(*disableBlend)();
+        (*setDepthComparison)(42); // LESSEQUAL, as for the lasers.
+        for(unsigned h=0;h!=2;++h)drawWeaponWheelModels(h);
+        (*unbindVertexBuffers)();
+        useSimpleShader(0);
+        ortho(); // Identity model again, then this root's view/projection.
+        activateView(rootView);
+    }
     (*setBlendFunction)(priorSource,priorDestination);
-    if(!wasBlend)(*disableBlend)();
+    if(wasBlend)(*enableBlend)();
+    else (*disableBlend)();
     if(wasDepth)(*enableDepth)();
+    else (*disableDepth)();
     if(wasWrite)(*enableDepthWrite)();
+    else (*disableDepthWrite)();
     if(wasAlpha)(*enableAlpha)();
+    else (*disableAlpha)();
+    (*setDepthComparison)(priorComparison);
 }
 // Core's activity test selects the inactive frame cap and input routing. A live
 // VR session owns the game regardless of which desktop window has focus.
@@ -6935,6 +7075,7 @@ static void __fastcall poll(void *b, void *) {
                 s.input.primaryInputGeneration[h], s.input.sequence);
     updateSteeringWheel(s); // Before controlsLock: may load a native texture.
     loadWeaponWheelTextures(s);
+    loadWeaponWheelModels(s);
     const bool respawn = respawnRoute(s), netricsa = netricsaOpen(s);
     AcquireSRWLockExclusive(&controlsLock);
     playerBindings = b;
@@ -8017,6 +8158,30 @@ bool attach(bool headless) {
         if (!weaponWheelSymbols) {
             setBlendFunction = nullptr;
             log("Weapon wheel drawing disabled: native icon/blend entries unavailable");
+        }
+        // Floating meshes are optional on top of that: without them, icons remain.
+        bool weaponMeshSymbols = weaponWheelSymbols;
+#define WEAPON_MESH(module, name, out) weaponMeshSymbols = symbol(module, name, out) && weaponMeshSymbols
+        WEAPON_MESH(e, "?md_pdtDataType@CModelConfiguration@SeriousEngine@@2PAVCDataType@2@A", modelDataType);
+        {
+            void *table=nullptr;
+            WEAPON_MESH(e, "??_7CModelConfiguration@SeriousEngine@@6B@", table);
+            modelConfigurationVtable=reinterpret_cast<uintptr_t>(table);
+        }
+        WEAPON_MESH(e, "?mdlCreateModelInstance@SeriousEngine@@YAPAVCModelInstance@1@XZ", createModelInstance);
+        WEAPON_MESH(e, "?mdlDeleteModelInstance@SeriousEngine@@YAXPAVCModelInstance@1@@Z", deleteModelInstance);
+        WEAPON_MESH(e, "?mdlModelInstanceSetConfiguration@SeriousEngine@@YAXPAVCModelInstance@1@PAVCModelConfiguration@1@@Z",
+          configureModelInstance);
+        WEAPON_MESH(e, "?mdlModelInstanceSetStretch@SeriousEngine@@YAXPAVCModelInstance@1@ABVVector3f@1@@Z",
+          stretchModelInstance);
+        WEAPON_MESH(e, "?mdlModelInstanceGetBoundingBox@SeriousEngine@@YA?AVBox3f@1@PBVCModelInstance@1@@Z",
+          modelInstanceBox);
+        WEAPON_MESH(e, "?mdlRenderModel@SeriousEngine@@YAXPAVCModelInstance@1@ABVMatrix34f@1@MH@Z", renderModelInstance);
+#undef WEAPON_MESH
+        if (!weaponMeshSymbols) {
+            renderModelInstance = nullptr;
+            stretchModelInstance = nullptr;
+            log("Weapon wheel meshes disabled: native model entries unavailable; icons remain");
         }
         if (!symbol(g, "?samGetWeaponsMenuDir@SeriousEngine@@YAJW4WeaponIndex@1@@Z", nativeWeaponMenuDirection) ||
             !symbol(g, "?samGetWeaponsMenuOrder@SeriousEngine@@YAJW4WeaponIndex@1@@Z", nativeWeaponMenuOrder))

@@ -237,6 +237,38 @@ void inventoryChange() {
     assert(bad.update(true, 0, 0, Ids, WeaponCount + 1, true, at(Hand)) == -1 && !bad.open);
 }
 
+void meshPlacement() {
+    WeaponWheel w;
+    w.update(true, 0, 0, Ids, Count, true, at(Hand), WheelAllBubbles);
+    const WheelRing &ring = w.ring;
+    // A pickup mesh whose origin is off its box centre (centre .3 m forward, 0.6 m long).
+    const Vec3 boxMin{-.1f, -.05f, .0f}, boxMax{.1f, .05f, .6f};
+    const Vec3 centre = (boxMin + boxMax) * .5f;
+    const float extent = .6f;
+    for (float spin : {0.f, 1.f, 2.5f}) {
+        const float size = wheelModelSize(ring.itemSize, false);
+        const auto placed = wheelModelPlacement(ring.frame, ring.slotPosition(3), centre, extent, size, spin);
+        assert(placed.scale > 0 && near(placed.scale * extent, size));
+        // The box centre lands on the slot whatever the spin.
+        const Vec3 at = placed.pose.p + rotate(placed.pose.q, centre * placed.scale);
+        const Vec3 slot = slotPoint(w, 3);
+        assert(near(at.x, slot.x) && near(at.y, slot.y) && near(at.z, slot.z));
+        // Spinning keeps the mesh upright about the ring's vertical axis.
+        assert(near(rotate(placed.pose.q, {0, 1, 0}).y, 1));
+    }
+    // About 9.5 cm, larger when hovered, smaller only on a crowded ring.
+    assert(near(wheelModelSize(.065f, false), .095f) && near(wheelModelSize(.065f, true), .095f * 1.3f));
+    int all[WeaponCount];
+    for (uint32_t i = 0; i != WeaponCount; ++i) all[i] = int(i);
+    WheelRing crowded;
+    crowded.layout(all, WeaponCount, WheelAllBubbles);
+    assert(wheelModelSize(crowded.itemSize, false) < .095f && wheelModelSize(crowded.itemSize, false) > .07f);
+    // Degenerate boxes and non-finite input never place a mesh.
+    assert(wheelModelPlacement(ring.frame, {}, {}, 0, .1f, 0).scale == 0);
+    assert(wheelModelPlacement(ring.frame, {}, {}, NAN, .1f, 0).scale == 0);
+    assert(wheelModelPlacement(ring.frame, {}, {}, 1, .1f, INFINITY).scale == 0);
+}
+
 void inputSample() {
     // Full Input path: grip position is the pointer, epochs and admission apply.
     Input input{};
@@ -282,6 +314,7 @@ int main() {
     grabPriority();
     stickFallback();
     inventoryChange();
+    meshPlacement();
     inputSample();
-    std::puts("Weapon wheel layout, hover, release, cancel, bubble and grab-priority checks passed");
+    std::puts("Weapon wheel layout, hover, release, cancel, bubble, grab-priority and mesh placement checks passed");
 }
