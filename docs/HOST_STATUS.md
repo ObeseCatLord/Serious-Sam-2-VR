@@ -31,18 +31,22 @@ COM, Win32, GDI and OpenXR objects have owned teardown. Normal STOPPING invalida
 
 ## Controller bindings
 
-Profile/component paths were checked against pinned Khronos xr.xml. Triggers are independent float actions; sticks/trackpads are vector actions. Touch/Index squeeze values above 0.65 and Vive/Microsoft squeeze clicks open the respective wheel. The runtime may remap or reject profile suggestions; rejected suggestions are logged.
+Profile/component paths were checked against pinned Khronos xr.xml. Triggers are independent float actions; sticks/trackpads are vector actions. The grips (Touch/Index/Frame squeeze values above 0.65, Vive/Microsoft squeeze clicks) jump while held on foot, unless that squeeze picks up a takeable object (carry wins); in vehicles they grasp the steering wheel or handles, and both grips plus the left stick/trackpad click recenter. Each hand's weapon wheel opens while its own wheel button (below) is held; a wheel button lost or disallowed while held blocks that wheel until it is released, so the loss never selects. Netricsa, the game menu and quick save/load are weapon-wheel bubbles. The runtime may remap or reject profile suggestions; rejected suggestions are logged.
 
-| Profile | Axes | Use | Jump | Menu | Sprint | Reload | Netricsa |
+| Profile | Axes | Weapon wheel (left / right) | Use | Jump | Menu | Sprint | Reload |
 |---|---|---|---|---|---|---|---|
-| Oculus Touch | Thumbsticks | A | B | Left menu | Either stick click | X | Y |
-| Valve Index | Thumbsticks | Right A | Right B | Left B | Either stick click | Left A | Left trackpad press |
-| HTC Vive | Trackpads | Right menu | Right trackpad click | Left menu | Left trackpad click | — | — |
-| Microsoft Motion | Thumbsticks | Left trackpad click | Right trackpad click | Either menu | Either stick click | — | — |
-| Valve Frame (extension advertised) | Thumbsticks | Right A | Right B | Left view / right menu | Either stick click | Left D-pad down | Left D-pad up |
+| Oculus Touch | Thumbsticks | Y / B | A | Grip | Left menu | Either stick click | X |
+| Valve Index | Thumbsticks | Trackpad press, each hand | Right A | Grip, right B | Left B | Either stick click | Left A |
+| HTC Vive | Trackpads | Trackpad click, each hand | Right menu | Grip | Left menu | Left trackpad click | — |
+| Microsoft Motion | Thumbsticks | Trackpad click, each hand | Left menu | Grip | Right menu | Either stick click | — |
+| Valve Frame (extension advertised) | Thumbsticks | Left D-pad up / right B | Right A | Grip | Left view / right menu | Either stick click | Left D-pad down |
+
+The Vive right hand has no free button for its contextual sniper zoom (formerly
+the right trackpad jump), so sniper zoom is unavailable on that hand.
 
 Menus: point and pull a trigger to select; Use/A confirms, Menu/B goes back, the
-left stick moves the selection, Reload/Netricsa act as the X/Y menu functions.
+left stick moves the selection, Reload and the wheel button act as the X/Y menu
+functions (F1/F2); the wheel button also closes the Netricsa screen.
 While VR is live the menus show the game's own controller prompts (A/B/X/Y) and
 the game does not need window focus: menu keys go through the native menu
 dispatcher, and the engine is kept in its foreground state.

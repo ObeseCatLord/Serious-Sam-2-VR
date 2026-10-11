@@ -10,7 +10,11 @@ constexpr uint32_t Magic = 0x32565253, Abi = 13, MaxDimension = 16384, WeaponCou
 constexpr unsigned PixelBufferCount = 5, MenuPixelBuffer = 4;
 constexpr unsigned slotPixelBuffer(unsigned slot, unsigned eye) { return slot * 2 + eye; }
 constexpr uint64_t pixelBufferBytes(uint32_t width, uint32_t height) { return uint64_t(width) * height * 4; }
-enum Button : uint32_t { Wheel = 1, Use = 2, Jump = 4, Menu = 8, Recenter = 16, Sprint = 32, Reload = 64, Netricsa = 128 };
+// Wheel is the grip (squeeze): grasp, carry, recenter chord and on-foot jump.
+// WheelOpen is the separate hold-to-open weapon wheel button.
+enum Button : uint32_t {
+    Wheel = 1, Use = 2, Jump = 4, Menu = 8, Recenter = 16, Sprint = 32, Reload = 64, Netricsa = 128, WheelOpen = 256
+};
 enum FramePresentation : uint32_t { NativeUiComplete = 1 };
 enum class SlotState : uint32_t { Empty, Requested, Rendering, Ready };
 #pragma pack(push, 8)

@@ -232,20 +232,44 @@ void bubbles() {
     }
 }
 
-void grabPriority() {
-    WeaponWheel w;
-    w.update(false, 0, 0, Ids, Count, true, at(Hand), WheelAllBubbles);
-    assert(w.update(true, 0, 0, Ids, Count, true, at(Hand), WheelAllBubbles, true) == -1 && !w.open);
-    // The press that started a grab never opens the wheel later, even once the
-    // object no longer has priority; its release commits nothing.
-    w.update(true, 0, 0, Ids, Count, true, at(Hand), WheelAllBubbles, false);
-    assert(!w.open);
-    assert(w.update(false, 0, 0, Ids, Count, true, at(Hand), WheelAllBubbles) == -1 && w.action == WheelBubble::None);
-    // A fresh press without priority opens normally; priority gained while open does not close it.
-    w.update(true, 0, 0, Ids, Count, true, at(Hand), WheelAllBubbles, false);
-    assert(w.open);
-    w.update(true, 0, 0, Ids, Count, true, at(slotPoint(w, 0)), WheelAllBubbles, true);
-    assert(w.open && w.hoverSlot == 0);
+// The wheel button gate: a loss or disallowed sample while held is not a release.
+void wheelOpenGate() {
+    WheelOpenGate gate;
+    assert(!gate.sample(true, false, true) && !gate.down);
+    assert(!gate.sample(true, true, true) && gate.down);
+    // Losing the action while held blocks and withholds the button...
+    assert(gate.sample(false, false, true) && !gate.down);
+    // ...through recovery while still held, until a real release is seen.
+    assert(gate.sample(true, true, true) && !gate.down);
+    assert(!gate.sample(true, false, true) && !gate.down);
+    assert(!gate.sample(true, true, true) && gate.down);
+    // A disallowed sample (recenter, tracking) while held also blocks.
+    assert(gate.sample(true, true, false) && !gate.down);
+    assert(!gate.sample(true, false, true));
+    // An unbound or idle action never blocks the hand (zoom and lasers stay usable).
+    WheelOpenGate idle;
+    for (int i = 0; i != 3; ++i)
+        assert(!idle.sample(false, false, true) && !idle.sample(true, false, false));
+}
+
+// Grip jump: fresh admitted squeezes on foot only; carry and vehicles win.
+void gripJump() {
+    GripJump j;
+    assert(!j.update(false, true, true, false));
+    assert(j.update(true, true, true, false) && j.update(true, true, true, false)); // Held: keeps jumping.
+    assert(!j.update(false, true, true, false));
+    assert(!j.update(true, true, true, true)); // This press starts a carry.
+    assert(!j.update(true, true, true, false)); // Carry ended, still the same press.
+    assert(!j.update(false, true, true, false) && j.update(true, true, true, false));
+    assert(!j.update(true, true, true, true) && !j.update(true, true, true, false)); // Carry mid-jump ends it.
+    j.update(false, true, true, false);
+    assert(!j.update(true, true, false, false)); // Vehicle grasp, not a jump.
+    assert(!j.update(true, true, true, false));  // Leaving the vehicle while held.
+    j.update(false, true, true, false);
+    assert(!j.update(true, false, true, false)); // Unadmitted squeeze (interrupted source).
+    assert(!j.update(true, true, true, false));  // Admission returns while held: still no jump.
+    j.update(false, true, true, false);
+    assert(j.update(true, true, true, false));
 }
 
 void stickFallback() {
@@ -351,35 +375,50 @@ void meshBounds() {
 }
 
 void inputSample() {
-    // Full Input path: grip position is the pointer, epochs and admission apply.
+    // Full Input path: WheelOpen opens, the grip point and aim pose point, and
+    // a blocked hand (the producer's loss/disallow gate) cancels.
     Input input{};
     input.headValid = 1;
     input.head = Head;
     input.handValid[1] = input.gripValid[1] = 1;
     input.hand[1] = {{0, 0, 0, 1}, Hand + Vec3{0, .05f, -.08f}}; // Aim pose ahead of the grip.
     input.grip[1] = {{0, 0, 0, 1}, Hand};
-    input.wheelInputEpoch[1] = 1;
-    input.wheelAdmissionMask = 2;
     WeaponWheel w;
     assert(w.sample(input, 1, Ids, Count, true, WheelAllBubbles) == -1 && !w.open);
-    input.buttons[1] = Wheel;
+    input.buttons[1] = Wheel; // The grip alone (jump/carry) never opens the wheel.
+    assert(w.sample(input, 1, Ids, Count, true, WheelAllBubbles) == -1 && !w.open);
+    input.buttons[1] = 0;
     w.sample(input, 1, Ids, Count, true, WheelAllBubbles);
-    assert(w.open && near(w.ring.frame.p.x, Hand.x) && near(w.ring.frame.p.y, Hand.y));
+    input.buttons[1] = WheelOpen;
+    w.sample(input, 1, Ids, Count, true, WheelAllBubbles);
+    assert(w.open && near(w.ring.frame.p.x, Hand.x) && near(w.ring.frame.p.y, Hand.y) && w.outer > 0);
     const int menu = slotOf(w.ring, -1, WheelBubble::Menu);
+    assert(w.ring.slotPosition(uint32_t(menu)).x > 0); // Right hand: bubbles on the right.
     input.grip[1].p = slotPoint(w, uint32_t(menu));
     w.sample(input, 1, Ids, Count, true, WheelAllBubbles);
     assert(w.hover == wheelBubbleHover(WheelBubble::Menu));
-    // A new squeeze epoch (action loss) cancels before any release can commit.
-    input.wheelInputEpoch[1] = 2;
+    // A blocked hand cancels before any release can commit, and stays closed
+    // while the button is held through recovery.
+    input.blockedWheels = 2;
     input.buttons[1] = 0;
     assert(w.sample(input, 1, Ids, Count, true, WheelAllBubbles) == -1 && w.action == WheelBubble::None);
     assert(!w.open);
-    // The other hand's wheel is independent.
+    input.blockedWheels = 0;
+    input.buttons[1] = WheelOpen;
+    w.sample(input, 1, Ids, Count, true, WheelAllBubbles);
+    input.blockedWheels = 2;
+    w.sample(input, 1, Ids, Count, true, WheelAllBubbles);
+    input.blockedWheels = 0;
+    w.sample(input, 1, Ids, Count, true, WheelAllBubbles);
+    assert(!w.open); // Held across the block: no new press, no reopen.
+    input.buttons[1] = 0;
+    assert(w.sample(input, 1, Ids, Count, true, WheelAllBubbles) == -1 && w.action == WheelBubble::None);
+    // The other hand's wheel is independent and mirrors its bubbles to the left.
     WeaponWheel left;
-    assert(left.sample(input, 0, Ids, Count, true, WheelAllBubbles) == -1 && !left.open);
+    assert(left.sample(input, 0, Ids, Count, true, WheelAllBubbles) == -1 && !left.open && left.outer < 0);
     // An invalid head leaves the wheel stick-only, never anchored at a stale pose.
     input.headValid = 0;
-    input.buttons[1] = Wheel;
+    input.buttons[1] = WheelOpen;
     w.sample(input, 1, Ids, Count, true, WheelAllBubbles);
     assert(w.open && !w.ring.anchored && w.ring.pickHand(Hand, -1) == -1);
 }
@@ -393,11 +432,12 @@ int main() {
     releaseSelect();
     cancel();
     bubbles();
-    grabPriority();
+    wheelOpenGate();
+    gripJump();
     stickFallback();
     inventoryChange();
     meshPlacement();
     meshBounds();
     inputSample();
-    std::puts("Weapon wheel layout, hover, release, cancel, bubble, grab-priority, mesh placement and mesh bounds checks passed");
+    std::puts("Weapon wheel layout, hover, release, cancel, bubble, wheel-button gate, grip jump, mesh placement and mesh bounds checks passed");
 }

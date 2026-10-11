@@ -543,6 +543,7 @@ static void clearCalibration(int h) {
     ReleaseSRWLockExclusive(&snapshotLock);
 }
 static WeaponWheel wheels[2];
+static GripJump gripJumps[2]; // Game thread only.
 // Game-local presentation of each open wheel; WheelUi is its fixed IPC subset.
 // Kept beside the copied Snapshot rather than growing every snapshot copy.
 struct WheelPresentation {
@@ -1448,7 +1449,7 @@ static void update(void *p) {
             w.cancel();
     }
     float ax = input.axis[1][0];
-    bool turningAllowed = enabled && !resettingControls && !(input.buttons[1] & Button::Wheel);
+    bool turningAllowed = enabled && !resettingControls && !(input.buttons[1] & Button::WheelOpen);
     if (std::abs(ax) < .3f || !turningAllowed)
         turnLatched = false;
     if (turningAllowed && std::abs(ax) > .75f && !turnLatched) {
@@ -1478,7 +1479,6 @@ static void update(void *p) {
         orderWheelWeapons(ui);
         bool valid = enabled && !resettingControls && input.handValid[h] && finite(input.hand[h]);
         bool wheelAllowed = valid && rider.handheld() && !(input.blockedWheels & (1u << h));
-        // A squeeze that starts a carry pickup on this hand never opens its wheel.
         const bool gripDown = valid && (input.buttons[h] & Wheel);
         if (gripDown && !gripCarry.gripDown[h] && rider.handheld() && gripCarry.hand < 0 &&
             gripCarry.requestHand < 0 && !wheels[h].open && gripCarryAuthority(p)) {
@@ -1510,9 +1510,10 @@ static void update(void *p) {
             }
         }
         gripCarry.gripDown[h] = gripDown;
-        const bool grabPriority = gripCarry.requestHand == h || gripCarry.hand == h;
-        int selected = wheels[h].sample(input, unsigned(h), ui.weapon, ui.count, wheelAllowed,
-                                        wheelBubbles(), grabPriority);
+        // Carry wins over jump; in vehicles the grip grasps instead.
+        gripJumps[h].update(gripDown, (input.wheelAdmissionMask & (1u << h)) != 0, rider.handheld(),
+                            gripCarry.requestHand == h || gripCarry.hand == h);
+        int selected = wheels[h].sample(input, unsigned(h), ui.weapon, ui.count, wheelAllowed, wheelBubbles());
         ui.open = wheels[h].open;
         ui.hover = wheels[h].hover;
         publishWheelPresentation(unsigned(h), wheels[h]);
@@ -1613,7 +1614,7 @@ static void update(void *p) {
     for (unsigned h=0;h<2;++h)
         contextualButtons |= contextualSniperButtons(input,h,
             enabled && rider.handheld() && !aliased(s) && nativeSniper(s.handle[h] ? resolve(s.handle[h]) : nullptr));
-    s.jump = enabled && !resettingControls && (contextualButtons & Button::Jump);
+    s.jump = enabled && !resettingControls && ((contextualButtons & Button::Jump) || gripJumps[0].jumping || gripJumps[1].jumping);
     s.sprint = enabled && !resettingControls && (contextualButtons & Button::Sprint);
     lastButtons[0] = input.buttons[0];
     lastButtons[1] = input.buttons[1];
@@ -7382,7 +7383,8 @@ static void __fastcall poll(void *b, void *) {
             respawnValues[7] = ((s.input.buttons[0] | s.input.buttons[1]) & Use) ? 1 : 0;
         }
         if (netricsa)
-            respawnValues[15] = ((s.input.buttons[0] | s.input.buttons[1]) & Netricsa) ? 1 : 0;
+            // The wheel-open button (Netricsa's old Touch Y / Index trackpad) also closes it.
+            respawnValues[15] = ((s.input.buttons[0] | s.input.buttons[1]) & (Netricsa | WheelOpen)) ? 1 : 0;
         respawnTick = GetTickCount64();
     } else {
         std::fill(std::begin(respawnPrior), std::end(respawnPrior), 0);

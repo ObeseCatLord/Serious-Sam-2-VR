@@ -449,7 +449,7 @@ struct Actions {
     XrActionSet set = XR_NULL_HANDLE;
     XrPath hand[2]{};
     XrAction aim{}, grip{}, haptic{}, trigger{}, stick{}, wheel{}, wheelValue{}, use{}, jump{}, menu{}, reload{}, netricsa{},
-        recenter{}, sprint{};
+        recenter{}, sprint{}, wheelOpen{};
     XrSpace aimSpace[2]{}, gripSpace[2]{};
     // XR_EXT_eye_gaze_interaction: one gaze pose without subaction paths.
     XrAction gaze{};
@@ -458,8 +458,10 @@ struct Actions {
     XrPath viveProfile = XR_NULL_PATH, currentProfile[2]{};
     ActionStream primaryStream[2], zoomStream[2], gripPoseStream[2];
     SqueezeAdmission squeeze[2];
+    WheelOpenGate wheelGate[2];
     void invalidateStreams() {
         for (unsigned h = 0; h != 2; ++h) {
+            wheelGate[h].sample(false, false, false);
             primaryStream[h].invalidate();
             zoomStream[h].invalidate();
             gripPoseStream[h].invalidate();
@@ -527,10 +529,11 @@ struct Actions {
         haptic = action(api, "feedback", "Weapon and damage feedback", XR_ACTION_TYPE_VIBRATION_OUTPUT);
         trigger = action(api, "trigger", "Fire trigger", XR_ACTION_TYPE_FLOAT_INPUT);
         stick = action(api, "stick", "Move turn and wheel axis", XR_ACTION_TYPE_VECTOR2F_INPUT);
-        wheel = action(api, "wheel_click", "Weapon wheel grip click", XR_ACTION_TYPE_BOOLEAN_INPUT);
-        wheelValue = action(api, "wheel_value", "Weapon wheel grip value", XR_ACTION_TYPE_FLOAT_INPUT);
+        wheel = action(api, "wheel_click", "Grip: jump, carry and vehicle grasp (click)", XR_ACTION_TYPE_BOOLEAN_INPUT);
+        wheelValue = action(api, "wheel_value", "Grip: jump, carry and vehicle grasp (value)", XR_ACTION_TYPE_FLOAT_INPUT);
+        wheelOpen = action(api, "wheel_open", "Hold for the weapon wheel", XR_ACTION_TYPE_BOOLEAN_INPUT);
         use = action(api, "use", "Use", XR_ACTION_TYPE_BOOLEAN_INPUT);
-        jump = action(api, "jump", "Jump / Vive right sniper zoom", XR_ACTION_TYPE_BOOLEAN_INPUT);
+        jump = action(api, "jump", "Jump (the grip also jumps on foot)", XR_ACTION_TYPE_BOOLEAN_INPUT);
         menu = action(api, "menu", "Pause and menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
         recenter = action(api, "recenter_chord", "Recenter with both grips", XR_ACTION_TYPE_BOOLEAN_INPUT);
         sprint = action(api, "sprint", "Sprint / sniper zoom", XR_ACTION_TYPE_BOOLEAN_INPUT);
@@ -594,13 +597,14 @@ struct Actions {
             const std::string click = std::string(profile.axis) + "/click";
             bind(sprint, 0, click);
             bind(recenter, 0, click); // Same button, activated only with both grips held.
+            // The grip jumps on foot (game side); Netricsa is a weapon-wheel bubble.
             switch (profile.kind) {
             case 0:
                 bind(sprint, 1, click);
                 bind(reload, 0, "x/click");
                 bind(use, 1, "a/click");
-                bind(netricsa, 0, "y/click");
-                bind(jump, 1, "b/click");
+                bind(wheelOpen, 0, "y/click");
+                bind(wheelOpen, 1, "b/click");
                 bind(menu, 0, "menu/click"); // Touch has no right menu component.
                 break;
             case 1:
@@ -609,18 +613,22 @@ struct Actions {
                 bind(use, 1, "a/click");
                 bind(jump, 1, "b/click");
                 bind(menu, 0, "b/click");
-                bind(netricsa, 0, "trackpad/force");
+                bind(wheelOpen, 0, "trackpad/force");
+                bind(wheelOpen, 1, "trackpad/force");
                 break;
             case 2:
                 bind(menu, 0, "menu/click");
                 bind(use, 1, "menu/click");
-                bind(jump, 1, "trackpad/click");
+                bind(wheelOpen, 0, "trackpad/click");
+                bind(wheelOpen, 1, "trackpad/click");
                 break;
             case 3:
+                // Both trackpads open the wheels, so Use moves to the left menu
+                // button and the pause menu stays on the right one.
                 bind(sprint, 1, click);
-                bind(use, 0, "trackpad/click");
-                bind(jump, 1, "trackpad/click");
-                bind(menu, 0, "menu/click");
+                bind(use, 0, "menu/click");
+                bind(wheelOpen, 0, "trackpad/click");
+                bind(wheelOpen, 1, "trackpad/click");
                 bind(menu, 1, "menu/click");
                 break;
             case 4:
@@ -629,8 +637,8 @@ struct Actions {
                 bind(sprint, 1, click);
                 bind(reload, 0, "dpad_down/click");
                 bind(use, 1, "a/click");
-                bind(netricsa, 0, "dpad_up/click");
-                bind(jump, 1, "b/click");
+                bind(wheelOpen, 0, "dpad_up/click");
+                bind(wheelOpen, 1, "b/click");
                 bind(menu, 0, "view/click");
                 bind(menu, 1, "menu/click");
                 break;
@@ -683,6 +691,7 @@ struct Actions {
             input.focused = 0;
             for (unsigned h = 0; h != 2; ++h) {
                 squeeze[h].sample(0, false, false, false);
+                if (wheelGate[h].sample(false, false, false)) input.blockedWheels |= 1u << h;
                 gripPoseStream[h].sample(false);
                 input.wheelInputEpoch[h] = squeeze[h].epoch;
             }
@@ -690,7 +699,7 @@ struct Actions {
         }
         api.check(result, "xrSyncActions");
         uint32_t squeezeSources[2]{};
-        bool squeezeValuesValid[2]{};
+        bool squeezeValuesValid[2]{}, wheelOpenActive[2]{}, wheelOpenDown[2]{};
         for (unsigned h = 0; h != 2; ++h) {
             XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
             api.check(api.GetCurrentInteractionProfile(session, hand[h], &profile), "xrGetCurrentInteractionProfile");
@@ -714,6 +723,7 @@ struct Actions {
                 zoomStream[h].invalidate();
                 gripPoseStream[h].invalidate();
                 squeeze[h].invalidate();
+                wheelGate[h].sample(false, false, false); // A profile change is a loss, not a release.
             }
             auto info = get(aim, h);
             XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE};
@@ -766,6 +776,9 @@ struct Actions {
             squeezeSources[h] = rawSqueeze.sources;
             squeezeValuesValid[h] = rawSqueeze.valid;
             if (rawSqueeze.down) input.buttons[h] |= Wheel;
+            const auto openState = booleanState(api, session, wheelOpen, h);
+            wheelOpenActive[h] = openState.isActive != XR_FALSE;
+            wheelOpenDown[h] = wheelOpenActive[h] && openState.currentState;
             if (boolean(api, session, use, h))
                 input.buttons[h] |= Use;
             const auto jumpState = booleanState(api, session, jump, h);
@@ -798,6 +811,10 @@ struct Actions {
                 input.focused && input.headValid && input.handValid[h] && validViews && !recenterHeld(input));
             input.wheelInputEpoch[h] = squeeze[h].epoch;
             if (admitted) input.wheelAdmissionMask |= 1u << h;
+            if (wheelGate[h].sample(wheelOpenActive[h], wheelOpenDown[h],
+                    input.focused && input.headValid && input.handValid[h] && validViews && !recenterHeld(input)))
+                input.blockedWheels |= 1u << h;
+            if (wheelGate[h].down) input.buttons[h] |= WheelOpen;
         }
     }
     bool pulse(Api &api, XrSession session, unsigned handIndex, float amplitude, XrDuration duration) {

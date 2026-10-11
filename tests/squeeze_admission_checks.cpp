@@ -7,10 +7,44 @@
 #endif
 using namespace ss2vr;
 
+// A latest-value squeeze consumer with the contract the grip consumers
+// (steering wheel, ride grips, carry) follow: a fresh admitted press starts a
+// hold, an epoch change or lost admission cancels it without a release, and
+// only a release seen within the same epoch completes it (returning 2).
+struct HoldConsumer {
+    bool open = false, previousHold = false;
+    uint32_t epoch = 0;
+    int sample(const Input &input, unsigned hand, bool allowed) {
+        if (epoch != input.wheelInputEpoch[hand]) {
+            epoch = input.wheelInputEpoch[hand];
+            open = previousHold = false;
+        }
+        const bool held = (input.buttons[hand] & Wheel) != 0;
+        if (!epoch || !(input.wheelAdmissionMask & (1u << hand))) {
+            open = previousHold = false;
+            return -1;
+        }
+        if (!allowed) {
+            open = false;
+            previousHold = held;
+            return -1;
+        }
+        int result = -1;
+        if (held && !previousHold)
+            open = true;
+        else if (!held && previousHold && open) {
+            open = false;
+            result = 2;
+        }
+        previousHold = held;
+        return result;
+    }
+};
+
 int main() {
     const int ids[]{2, 5};
     SqueezeAdmission producer[2];
-    WeaponWheel consumer[2];
+    HoldConsumer consumer[2];
     Input input{};
     input.axis[0][1] = input.axis[1][1] = 1;
     auto publish = [&](unsigned hand, SqueezeSample raw, bool allowed = true) {
@@ -22,7 +56,7 @@ int main() {
         ++input.sequence;
     };
     auto deliver = [&](unsigned hand, bool comfort = true) {
-        return consumer[hand].sample(input, hand, ids, 2, comfort);
+        return consumer[hand].sample(input, hand, comfort);
     };
     const auto released = squeezeSample(true, 0, false, 0);
     const auto held = squeezeSample(true, 1, false, 0);
@@ -56,17 +90,17 @@ int main() {
     publish(0, released); assert(deliver(0) == 2);
 
     SqueezeAdmission initialProducer;
-    WeaponWheel initialConsumer;
+    HoldConsumer initialConsumer;
     Input first{};
     first.axis[0][1] = 1;
     first.buttons[0] = Wheel;
     initialProducer.sample(1, true, true, true);
     first.wheelInputEpoch[0] = initialProducer.epoch;
-    assert(initialConsumer.sample(first, 0, ids, 2, true) == -1 && !initialConsumer.open);
+    assert(initialConsumer.sample(first, 0, true) == -1 && !initialConsumer.open);
     initialProducer.sample(1, true, false, true); // Consumer misses release.
     assert(initialProducer.sample(1, true, true, true));
     first.wheelAdmissionMask = 1;
-    assert(initialConsumer.sample(first, 0, ids, 2, true) == -1 && initialConsumer.open);
+    assert(initialConsumer.sample(first, 0, true) == -1 && initialConsumer.open);
 
     // A held recovery remains unavailable until a genuine current release.
     publish(0, held); assert(deliver(0) == -1 && consumer[0].open);

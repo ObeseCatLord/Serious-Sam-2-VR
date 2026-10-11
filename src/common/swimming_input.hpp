@@ -39,7 +39,7 @@ struct SwimmingStrokes {
             now < input.tickMs || now - input.tickMs > 100 ||
             !input.gripValid[0] || !input.gripValid[1] ||
             !validPosition(input.grip[0]) || !validPosition(input.grip[1]) ||
-            ((input.buttons[0] | input.buttons[1]) & (Wheel | Menu | Recenter)) ||
+            ((input.buttons[0] | input.buttons[1]) & (Wheel | WheelOpen | Menu | Recenter)) ||
             (waterPose != 3 && waterPose != 4)) {
             reset(); return 0;
         }
