@@ -13,6 +13,11 @@ bool scopeGpuRoutingCurrent(IDirect3DDevice9 *) noexcept;
 bool scopeGpuMappingObservationCurrent(IDirect3DDevice9 *) noexcept;
 // Partial successful outputs are owned references; the caller retains them
 // above NativeFinally and releases them on every path.
+unsigned scopeColorFailure() noexcept;
+const uint32_t *scopeColorStates() noexcept;
+double scopeCapError() noexcept; // Diagnostic: last cap position error (clip-scaled).
+unsigned scopeImageDraws() noexcept;
+const float *scopeEyeInOptic() noexcept; // Diagnostic: last eye position in the optic frame. // Diagnostic: lens image draws so far.
 bool scopeGpuEyeOwner(IDirect3DDevice9 *, IUnknown *&color, IUnknown *&depth,
                      UINT &width, UINT &height) noexcept;
 // Reuse the bridge's existing resource epoch and unconditional pair fault.

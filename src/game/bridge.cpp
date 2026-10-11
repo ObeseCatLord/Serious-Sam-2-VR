@@ -389,6 +389,9 @@ struct PerfClock {
     // First failing stereo stage per lost pair: begin, scope, setup, world,
     // uiProjection, eyeInvalid, target, postlude, readback, restore.
     unsigned stage[10]{};
+    unsigned scopeNeeded = 0, scopeCandidates = 0, scopeBegun = 0, scopeReady = 0, scopeHalted = 0;
+    unsigned scopeCallbacks = 0, scopeCopied = 0, scopeFinished = 0;
+    float scopeLuma = -1;
     unsigned publishLock = 0, publishCancelled = 0, publishState = 0, publishRequest = 0, publishImages = 0,
         publishCommit = 0, finishNotCurrent = 0;
     bool lostWorldOk = false, lostUi = false, lostOverlaySeen = false, lostComplete = false;
@@ -1202,9 +1205,20 @@ static void releaseSharedImages() {
     }
     sharedGeneration = 0;
 }
+// Scope lens resources live across frames (a full-size render target per zoomed
+// frame was allocation churn); released with the eye targets on loss/Reset.
+static IDirect3DTexture9 *scopeImageCache[2]{};
+static IDirect3DPixelShader9 *scopeShaderCache = nullptr;
+static IDirect3DDevice9 *scopeCacheDevice = nullptr;
+static void releaseScopeCache() noexcept {
+    for (auto *&texture : scopeImageCache) { if (texture) texture->Release(); texture = nullptr; }
+    if (scopeShaderCache) scopeShaderCache->Release();
+    scopeShaderCache = nullptr; scopeCacheDevice = nullptr;
+}
 static void releaseMenuScaled();
 static void releaseTargets() {
     ++resourceGeneration;
+    releaseScopeCache();
     releaseMenuScaled();
     gpuProfile.release();
     releaseSharedImages();
@@ -1890,6 +1904,12 @@ static void presentBody(IDirect3DDevice9 *d) {
                 log("Perf publish rejected: lock=%u cancelled=%u state=%u request=%u images=%u commit=%u notCurrent=%u",
                     perf.publishLock, perf.publishCancelled, perf.publishState, perf.publishRequest, perf.publishImages,
                     perf.publishCommit, perf.finishNotCurrent);
+            if (perf.scopeNeeded || scopeSourcesHalted)
+                log("Perf scope: needed=%u candidates=%u begun=%u ready=%u halted=%u callbacks=%u copied=%u finished=%u "
+                "drawn=%u luma=%.1f eyeInOptic=%.3f,%.3f,%.3f", perf.scopeNeeded, perf.scopeCandidates,
+                perf.scopeBegun, perf.scopeReady, unsigned(scopeSourcesHalted), perf.scopeCallbacks, perf.scopeCopied,
+                perf.scopeFinished, scopeImageDraws(), double(perf.scopeLuma), double(scopeEyeInOptic()[0]),
+                double(scopeEyeInOptic()[1]), double(scopeEyeInOptic()[2]));
             log("Perf draws per pair: eyes=%.0f hud duplicates=%.0f; other per frame=%.0f",
                 perf.pairs ? double(perf.eyeDraws) / perf.pairs : 0., perf.pairs ? double(perf.hudDuplicates) / perf.pairs : 0.,
                 double(perf.desktopDraws) / perf.frames);
@@ -2519,6 +2539,7 @@ static bool scopeCaptureTransferCurrent(void *opaque) noexcept {
     return scopeCaptureCurrent(opaque) && scopeSourceExecuting() && scopeGpuTransactionCurrent(uiFrame.device);
 }
 static __attribute__((force_align_arg_pointer)) void __cdecl captureNativeScope(void *opaque) noexcept {
+    ++perf.scopeCallbacks;
     if (!scopeCaptureCurrent(opaque) || !scopeSourceExecuting()) return;
     if (!scopeCaptureFrame.once.enter()) { scopeCaptureFrame.copied = false; return; }
     if (!scopeGpuTransactionBegin(uiFrame.device)) return;
@@ -2554,9 +2575,33 @@ static bool prepareScopeScratch() {
         SUCCEEDED(d->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER|
             (hasStencil ? D3DCLEAR_STENCIL : 0),0xff000000,1,0));
 }
+// Diagnostic only (SS2VR_SCOPE_PROBE=1): mean luma of the central quarter of the
+// scope source image, read back once per perf window (stalls the GPU).
+static void probeScopeImage(IDirect3DDevice9 *d,IDirect3DTexture9 *image,const Request &request) noexcept {
+    static const bool enabled = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_SCOPE_PROBE", value, 2) == 1 && value[0] == L'1'; }();
+    if (!enabled || perf.scopeLuma >= 0 || !image) return;
+    IDirect3DSurface9 *level = nullptr, *read = nullptr;
+    D3DLOCKED_RECT locked{};
+    D3DSURFACE_DESC desc{};
+    if (SUCCEEDED(image->GetSurfaceLevel(0,&level)) && SUCCEEDED(level->GetDesc(&desc)) &&
+        SUCCEEDED(d->CreateOffscreenPlainSurface(desc.Width,desc.Height,desc.Format,D3DPOOL_SYSTEMMEM,&read,nullptr)) &&
+        SUCCEEDED(d->GetRenderTargetData(level,read)) && SUCCEEDED(read->LockRect(&locked,nullptr,D3DLOCK_READONLY))) {
+        double sum = 0; unsigned n = 0;
+        for (UINT y = request.height*3/8; y < request.height*5/8; ++y) {
+            const auto *row = static_cast<const uint8_t *>(locked.pBits) + size_t(y)*locked.Pitch;
+            for (UINT x = request.width*3/8; x < request.width*5/8; ++x, ++n)
+                sum += .114*row[x*4] + .587*row[x*4+1] + .299*row[x*4+2];
+        }
+        read->UnlockRect();
+        perf.scopeLuma = n ? float(sum/n) : 0.f;
+    }
+    if (read) read->Release();
+    if (level) level->Release();
+}
 static bool renderScopeSources(void *puppet,void(__thiscall *original)(void *),const Request &request) {
     const auto generation = graphicsResourceGeneration();
     if (scopeSourcesHalted || !scopePreviewNeeded(puppet,request)) return true;
+    ++perf.scopeNeeded;
     auto *d = uiFrame.device;
     D3DCAPS9 caps{};
     constexpr DWORD required = D3DPS20CAPS_ARBITRARYSWIZZLE | D3DPS20CAPS_GRADIENTINSTRUCTIONS |
@@ -2567,8 +2612,12 @@ static bool renderScopeSources(void *puppet,void(__thiscall *original)(void *),c
         caps.PS20Caps.NumTemps < 22 || caps.PS20Caps.NumInstructionSlots < 512 ||
         (caps.PS20Caps.Caps & required) != required ||
         (colorFormat != D3DFMT_A8R8G8B8 && colorFormat != D3DFMT_X8R8G8B8)) return true;
-    if (FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(ScopeImageOpaqueProgram),&uiFrame.scopeShader)) ||
-        !uiFrame.scopeShader) return true;
+    if (scopeCacheDevice != d) releaseScopeCache();
+    scopeCacheDevice = d;
+    if (!scopeShaderCache &&
+        (FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(ScopeImageOpaqueProgram),&scopeShaderCache)) ||
+         !scopeShaderCache)) return true;
+    if (!uiFrame.scopeShader) { uiFrame.scopeShader = scopeShaderCache; scopeShaderCache->AddRef(); }
     activeEye = 0; eyeInvalid = false; renderRequest = request;
     beginScopePreview(puppet,request);
     bool ok = prepareScopeScratch();
@@ -2580,19 +2629,33 @@ static bool renderScopeSources(void *puppet,void(__thiscall *original)(void *),c
     endEye(); activeEye = -1;
     for (unsigned hand=0;hand<2 && ok;++hand) {
         if (!candidate[hand]) continue;
-        if (FAILED(d->CreateTexture(request.width,request.height,1,D3DUSAGE_RENDERTARGET,colorFormat,
-                                   D3DPOOL_DEFAULT,&uiFrame.scopeImage[hand],nullptr)) || !uiFrame.scopeImage[hand]) continue;
+        ++perf.scopeCandidates;
+        // The source copy needs the eye target's exact format (zero-copy shared
+        // targets are A8R8G8B8; the pixel fallback uses the backbuffer format).
+        D3DSURFACE_DESC eyeDesc{}, cached{};
+        if (!uiFrame.target[0] || FAILED(uiFrame.target[0]->GetDesc(&eyeDesc))) continue;
+        auto *&image = scopeImageCache[hand];
+        if (image && (FAILED(image->GetLevelDesc(0,&cached)) || cached.Width != request.width ||
+                      cached.Height != request.height || cached.Format != eyeDesc.Format)) {
+            image->Release(); image = nullptr;
+        }
+        if (!image && (FAILED(d->CreateTexture(request.width,request.height,1,D3DUSAGE_RENDERTARGET,eyeDesc.Format,
+                                              D3DPOOL_DEFAULT,&image,nullptr)) || !image)) { image = nullptr; continue; }
+        if (!uiFrame.scopeImage[hand]) { uiFrame.scopeImage[hand] = image; image->AddRef(); }
         scopeCaptureFrame = {hand,uiFrame.generation,true,false,{}};
         scopeScratch = true; eyeInvalid = false;
         const bool begun = beginScopeSource(puppet,request,uiFrame.scopeView[hand],captureNativeScope,
                                             scopeCaptureCurrent,&scopeCaptureFrame);
         if (begun) {
+            ++perf.scopeBegun;
             ok = prepareScopeScratch();
             if (ok) original(puppet);
             if (generation != graphicsResourceGeneration()) return false;
             const bool finished = endScopeSource(ok && !eyeInvalid);
+            perf.scopeFinished += finished; perf.scopeCopied += scopeCaptureFrame.copied;
             uiFrame.scopeReady[hand] = scopeCaptureFrame.once.complete(finished,scopeCaptureFrame.copied) &&
                 scopeCaptureCurrent(&scopeCaptureFrame) && nativeUiFrameCurrent(puppet,request);
+            if (uiFrame.scopeReady[hand]) { ++perf.scopeReady; probeScopeImage(d,uiFrame.scopeImage[hand],request); }
         }
         scopeCaptureFrame.active = false;
         scopeScratch = false;

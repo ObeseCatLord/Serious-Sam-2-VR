@@ -542,54 +542,65 @@ static bool boundProgram(bool idle=false,bool ride=false) {
 // Optional color admission is independent of the existing geometry/UV path.
 // All COM output owners live in ProbeOwner before calls, including partial
 // getter results and the extra MRT probe. No getters execute while VB is locked.
+// Diagnostics: the last failing boundColor step (0 = none), plus 90 cap position.
+static unsigned lastColorFailure = 0;
+static double lastCapError = -1;
+double scopeCapError() noexcept { return lastCapError; }
+static uint32_t lastColorStates[16]{};
+unsigned scopeColorFailure() noexcept { return lastColorFailure; }
+const uint32_t *scopeColorStates() noexcept { return lastColorStates; }
 static bool boundColor(IDirect3DDevice9 *d,BoundColor &b,bool program) {
     if (!probe.raster.opaqueMode || !currentScopeQueryBoundary() ||
         !scopeGpuEyeOwner(d,b.identity[3],b.identity[4],b.width,b.height) ||
         FAILED(d->GetRenderTarget(0,&b.target)) || !b.target || !identity(b.target,b.identity[1]) ||
         FAILED(d->GetDepthStencilSurface(&b.depth)) || !b.depth || !identity(b.depth,b.identity[2]) ||
         b.identity[1]!=b.identity[3] || b.identity[2]!=b.identity[4] ||
-        FAILED(d->GetViewport(&b.viewport))) return false;
+        FAILED(d->GetViewport(&b.viewport))) { lastColorFailure=1; return false; }
     const auto &vp=b.viewport;
     if (vp.X || vp.Y || vp.Width!=b.width || vp.Height!=b.height ||
         !std::isfinite(vp.MinZ) || !std::isfinite(vp.MaxZ) ||
         vp.MinZ!=probe.raster.nearDepth || vp.MaxZ!=probe.raster.farDepth ||
-        vp.MinZ<0 || vp.MaxZ>1 || vp.MaxZ<=vp.MinZ) return false;
+        vp.MinZ<0 || vp.MaxZ>1 || vp.MaxZ<=vp.MinZ) { lastColorFailure=2; return false; }
     D3DSURFACE_DESC target{},depth{};
-    if (FAILED(b.target->GetDesc(&target)) || FAILED(b.depth->GetDesc(&depth))) return false;
+    if (FAILED(b.target->GetDesc(&target)) || FAILED(b.depth->GetDesc(&depth))) { lastColorFailure=3; return false; }
     for (const auto &surface:{target,depth})
         if (surface.Type!=D3DRTYPE_SURFACE || surface.Width!=b.width || surface.Height!=b.height ||
-            surface.MultiSampleType!=D3DMULTISAMPLE_NONE || surface.MultiSampleQuality) return false;
-    if (!(target.Usage&D3DUSAGE_RENDERTARGET) || !(depth.Usage&D3DUSAGE_DEPTHSTENCIL)) return false;
+            surface.MultiSampleType!=D3DMULTISAMPLE_NONE || surface.MultiSampleQuality) { lastColorFailure=4; return false; }
+    if (!(target.Usage&D3DUSAGE_RENDERTARGET) || !(depth.Usage&D3DUSAGE_DEPTHSTENCIL)) { lastColorFailure=5; return false; }
     D3DCAPS9 caps{};
     if (FAILED(d->GetDeviceCaps(&caps)) || !caps.NumSimultaneousRTs || caps.NumSimultaneousRTs>4 ||
-        caps.MaxUserClipPlanes>6) return false;
+        caps.MaxUserClipPlanes>6) { lastColorFailure=6; return false; }
     for (DWORD i=1;i<caps.NumSimultaneousRTs;++i) {
         const HRESULT result=d->GetRenderTarget(i,&b.extra);
         const bool extra=b.extra!=nullptr;
         release(b.extra);
-        if (extra || (FAILED(result) && result!=D3DERR_NOTFOUND)) return false;
+        if (extra || (FAILED(result) && result!=D3DERR_NOTFOUND)) { lastColorFailure=7; return false; }
     }
     for (size_t i=0;i<colorStates.size();++i)
-        if (FAILED(d->GetRenderState(colorStates[i],&b.states[i]))) return false;
+        if (FAILED(d->GetRenderState(colorStates[i],&b.states[i]))) { lastColorFailure=8; return false; }
     const auto &s=b.states;
-    if (s[0]!=D3DZB_TRUE || s[1]!=TRUE || s[2]!=D3DCMP_LESSEQUAL || s[3] || s[4] || s[5] || s[6] ||
+    // Fog may be on (world-pass weapons draw inside the level's fog); the lens
+    // draw keeps it, so the image fogs exactly like the native cap it replaces.
+    if (s[0]!=D3DZB_TRUE || s[1]!=TRUE || s[2]!=D3DCMP_LESSEQUAL || s[3] || s[4] || s[5] || s[6]>1 ||
         (s[7]&7)!=7 || (s[7]&~15u) || s[8]!=D3DFILL_SOLID || s[9]<D3DCULL_NONE || s[9]>D3DCULL_CCW ||
         s[10]>1 || (s[11]&~((1u<<caps.MaxUserClipPlanes)-1)) || s[14]!=TRUE || s[15]>1 ||
-        !std::isfinite(std::bit_cast<float>(s[12])) || !std::isfinite(std::bit_cast<float>(s[13]))) return false;
+        !std::isfinite(std::bit_cast<float>(s[12])) || !std::isfinite(std::bit_cast<float>(s[13]))) {
+        lastColorFailure=9; std::copy(s.begin(),s.end(),lastColorStates); return false;
+    }
     if (s[10] && (FAILED(d->GetScissorRect(&b.scissor)) || b.scissor.left<0 || b.scissor.top<0 ||
         b.scissor.right<=b.scissor.left || b.scissor.bottom<=b.scissor.top ||
-        uint32_t(b.scissor.right)>b.width || uint32_t(b.scissor.bottom)>b.height)) return false;
+        uint32_t(b.scissor.right)>b.width || uint32_t(b.scissor.bottom)>b.height)) { lastColorFailure=10; return false; }
     for (unsigned i=0;i<b.clipPlanes.size();++i) if (s[11]&(1u<<i)) {
-        if (FAILED(d->GetClipPlane(i,b.clipPlanes[i].data()))) return false;
-        for (float value:b.clipPlanes[i]) if (!std::isfinite(value)) return false;
+        if (FAILED(d->GetClipPlane(i,b.clipPlanes[i].data()))) { lastColorFailure=11; return false; }
+        for (float value:b.clipPlanes[i]) if (!std::isfinite(value)) { lastColorFailure=12; return false; }
     }
-    if (FAILED(d->GetPixelShader(&b.shader)) || !b.shader || !identity(b.shader,b.identity[0])) return false;
+    if (FAILED(d->GetPixelShader(&b.shader)) || !b.shader || !identity(b.shader,b.identity[0])) { lastColorFailure=13; return false; }
     if (program) {
         UINT size=0;
-        if (FAILED(b.shader->GetFunction(nullptr,&size)) || size<8 || size%4 || size>sizeof(probe.colorProgram)) return false;
+        if (FAILED(b.shader->GetFunction(nullptr,&size)) || size<8 || size%4 || size>sizeof(probe.colorProgram)) { lastColorFailure=14; return false; }
         const UINT expected=size;
         if (FAILED(b.shader->GetFunction(probe.colorProgram.data(),&size)) || size!=expected ||
-            !scopeColorProgram(std::span(probe.colorProgram).first(size/4))) return false;
+            !scopeColorProgram(std::span(probe.colorProgram).first(size/4))) { lastColorFailure=15; return false; }
     }
     b.valid=true;
     return true;
@@ -853,6 +864,13 @@ static bool prepareImage(IDirect3DDevice9 *d) {
         coordinates.rows != probe.sourceView.pose.imageCoordinates.rows || !scopeImageEye(eye) ||
         !scopeShaderConstants(optic,probe.sourceView.opticalProjection,coordinates,eye,1,0,0,probe.imageConstants))
         return false;
+    // Forgiving eye box: the sniper's scope rides well above the controller, so
+    // a strict exit pupil (about 8 degrees at 4x) blacks the lens unless the
+    // head is exactly behind it. Only a quarter of the eye's sideways offset
+    // drives parallax; the lens still shifts naturally as the head moves.
+    constexpr float EyeBoxParallax = .25f;
+    probe.imageConstants.rows[3][0] *= EyeBoxParallax;
+    probe.imageConstants.rows[3][1] *= EyeBoxParallax;
     Vec3 target;
     if (scopeImageTarget(probe.raster.hand,target))
         scopeReticleTarget(optic,probe.sourceView.opticalProjection,target,.001f,.012f,probe.imageConstants);
@@ -862,8 +880,13 @@ static bool prepareImage(IDirect3DDevice9 *d) {
         if (FAILED(d->GetSamplerState(0,imageSamplerStates[i],&probe.sampler[i]))) return false;
     return imageCurrent(d) && d->TestCooperativeLevel() == D3D_OK;
 }
+static unsigned imageDraws = 0;
+static std::array<float,4> lastEyeInOptic{};
+unsigned scopeImageDraws() noexcept { return imageDraws; }
+const float *scopeEyeInOptic() noexcept { return lastEyeInOptic.data(); }
 static bool drawImage(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base,UINT minimum,UINT vertices,
                       UINT start,ScopeIndexedForward forward,ScopeDrawRange range) noexcept {
+    ++imageDraws; lastEyeInOptic = probe.imageConstants.rows[3];
     probe.imageChanged = true;
     bool ok = SUCCEEDED(d->SetPixelShader(probe.imageShader)) && SUCCEEDED(d->SetTexture(0,probe.image)) &&
         SUCCEEDED(d->SetPixelShaderConstantF(0,probe.imageConstants.rows[0].data(),7));
@@ -909,6 +932,7 @@ static HRESULT probeScopeDraw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
         if(probe.submissionOwner)probe.paletteApiSlot=probe.submissionOwner->reservePaletteApi(probe.submissionSlot);
         bool colorCandidate=false;
         bool admitted=currentScopeRaster(probe.raster) && nativeUiDeviceCurrent(d);
+        if (probe.raster.pose.valid) lastColorFailure = admitted ? 100 : 101;
         // Establish the borrowed ID1 trace before the first retained COM call,
         // so reentry during AddRef also rejects the outer observation.
         const bool idleCandidate=!probe.raster.pose.valid && currentIdleRaster(probe.idle.raster,probe.idleTrace);
@@ -928,6 +952,7 @@ static HRESULT probeScopeDraw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
             ScopeCopyRanges ranges;
             admitted=boundInputs(d,probe.bindings[0],draw) &&
                 scopeBufferRanges(probe.bindings[0].values,std::span(probe.bindings[0].elements).first(probe.bindings[0].count),ranges) && boundProgram();
+            if (!admitted) lastColorFailure = 102;
             if (admitted) colorCandidate=boundColor(d,probe.bindings[0].color,true);
             const std::array<std::span<uint8_t>,5> bytes{std::span(probe.positions).first(ScopeVertices*12),
                 std::span(probe.indices).first(ScopeTriangles*6),std::span(probe.weights).first(ScopeVertices*4),
@@ -952,10 +977,13 @@ static HRESULT probeScopeDraw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
                     sameColor(probe.bindings[0].color,probe.bindings[1].color);
             }
             if (admitted) admitted=hashSlices(); // Hash ONLY owned copies, after all unlocks.
+            const bool colorBefore = colorCandidate && admitted;
             colorCandidate = colorCandidate && admitted && probe.raster.capClipValid &&
                 scopeCapPosition(std::span(probe.program).first(probe.programWords),
                     std::span(probe.bindings[0].constants).first(probe.bindings[0].constantCount),
-                    probe.cap,probe.bindings[0].values.weights.object != 0,probe.raster.capClip);
+                    probe.cap,probe.bindings[0].values.weights.object != 0,probe.raster.capClip,&lastCapError);
+            if (colorBefore && !colorCandidate) lastColorFailure = probe.raster.capClipValid ? 91 : 90;
+            else if (colorCandidate) lastColorFailure = 0;
             // Keep the first immutable identities through the whole optional
             // transaction; resample after hashing, getters and source retention.
             if (admitted && colorCandidate && probe.transaction && prepareImage(d)) {

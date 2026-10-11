@@ -43,13 +43,15 @@ inline constexpr WeaponGrip WeaponGrips[] = {
 // Per-weapon display scale, as a percentage of the revolvers (the base: 1.49x
 // the flat first-person model). Weapons with Sam's hand are sized so the hand
 // matches the revolvers' hand (forearm behind the glove cuff, V111/V152 side
-// views at equal distance): zap gun, uzi, Klodovik, Serious bomb. Most weapons
+// views at equal distance): zap gun and uzi. Klodovik and the Serious bomb hold
+// their arm differently; sized by eye at 1.5x that match (user: looked too
+// small next to the other weapons). Most weapons
 // have no hand mesh; they are sized so their grip fits that same hand (grip
 // length and depth against the revolver grip). Saw, double shotgun, cannon and
 // flamer have no comparable grip and take the handless average (x1.26).
 inline constexpr float RevolverDisplayScale = 1.49f;
 inline constexpr float WeaponScalePercentOfRevolver[WeaponCount] = {
-    83, 262, 112, 128, 268, 89, 86, 93, 141, 58, 74, 87, 100, 83, 67, 102, 101};
+    83, 262, 112, 128, 268, 89, 86, 93, 141, 87, 74, 130, 100, 83, 67, 102, 101};
 inline constexpr float WeaponDisplayScales[WeaponCount] = {
 #define SS2VR_SCALE(i) RevolverDisplayScale * WeaponScalePercentOfRevolver[i] / 100
     SS2VR_SCALE(0), SS2VR_SCALE(1), SS2VR_SCALE(2), SS2VR_SCALE(3), SS2VR_SCALE(4), SS2VR_SCALE(5),

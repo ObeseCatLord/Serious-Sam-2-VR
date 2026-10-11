@@ -1,6 +1,7 @@
 #ifdef NDEBUG
 #error Position admission checks require assertions
 #endif
+#include <cmath>
 #include "common/scope_position_program.hpp"
 #include <cassert>
 #include <fstream>
@@ -146,8 +147,14 @@ int main(int argc,char **argv) {
      assert(!scopeCapPosition(unknown,constants,cap,true,expected));} // Declared but unproved 7/8 never receive invented seeds.
     for (size_t size=0;size<program.size();++size)
         assert(!scopeCapPosition(std::span(program).first(size),constants,cap,true,expected));
+    {double worst=0; // Float rounding through native products stays admitted, with a measured margin.
+     const float saved=constants[21][3]; constants[21][3]=std::nextafter(std::nextafter(saved,1.f),1.f);
+     assert(scopeCapPosition(program,constants,cap,true,expected,&worst) && worst>=0 && worst<1e-4);
+     constants[21][3]=saved;}
     constants[21][3]+=.01f;
     assert(!scopeCapPosition(program,constants,cap,true,expected)); constants[21][3]-=.01f;
+    constants[21][3]+=.001f; // One millimetre of cap displacement is a different pose.
+    assert(!scopeCapPosition(program,constants,cap,true,expected)); constants[21][3]-=.001f;
     auto bad=program; bad.insert(bad.end()-1,{1,0xc0010000,0x90000003});
     assert(!scopeCapPosition(bad,constants,cap,true,expected)); // UV replacing clip X.
     bad=program; bad.insert(bad.end()-1,{1,0xc00f0000,0x80e4000b});

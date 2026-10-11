@@ -258,7 +258,7 @@ def display_timing_probe(cfg,env,deadline,run_dir,window_observation=None):
                         'target':target,'sample':sample,'owner_before_launch':before_launch,'owner_before':before,
                         'owner_during':during,'owner_after':after,'interval_covered':covered,
                         'baseline_present':baseline,'conclusive':bool(baseline and covered)})
-            code=process.wait(timeout=remaining(deadline,30))
+            code=process.wait(timeout=remaining(deadline,90))
         # Native file output is independent of Proton/Wine console routing.
         # Launcher exit alone never certifies the native program's result.
         if code!=0 or receipt.is_symlink() or not receipt.is_file() or not 1<=receipt.stat().st_size<=4096:
@@ -1022,7 +1022,7 @@ def interactive_hold(cfg,env,token,deadline,run_dir,owned_game):
         with (run_dir/'hold-status.jsonl').open('w') as out:
             while time.monotonic()<end and not stop.exists():
                 if not still_owned(owned_game):raise RuntimeError('Owned game exited during interactive hold')
-                try:state=observer(cfg,env,'status',token,timeout=remaining(end,2),deadline=end)
+                try:state=observer(cfg,env,'status',token,timeout=remaining(end,6),deadline=end)
                 except ObserverError as error:
                     if error.code==4:
                         time.sleep(.05);continue
@@ -1268,7 +1268,7 @@ def run(cfg):
                     # X11 calls can block; keep them in a deadline-bounded child.
                     focus=subprocess.run([sys.executable,str(Path(__file__)),
                         '--focus-owned',str(owned_game['pid']),'--start',owned_game['start'],'--lab',str(lab)],
-                        capture_output=True,text=True,timeout=remaining(deadline,2))
+                        capture_output=True,text=True,timeout=remaining(deadline,10))
                     if focus.returncode:
                         # Preserve the concrete child failure in private evidence;
                         # a generic focus error cannot diagnose native startup.
@@ -1418,7 +1418,7 @@ def run(cfg):
             subprocess.run([sys.executable,str(Path(__file__)),
                 '--focus-owned',str(owned_game['pid']),'--start',owned_game['start'],
                 '--lab',str(lab),'--capture-owned',str(desktop),'--private-root',str(private)],
-                capture_output=True,text=True,check=True,timeout=remaining(deadline,5))
+                capture_output=True,text=True,check=True,timeout=remaining(deadline,15))
             after=observer(cfg,env,'stock-status',stock_token,timeout=remaining(deadline),deadline=deadline)
             (run_dir/'stock-camera-after.json').write_text(json.dumps(after,indent=2))
             if after['process_creation']!=stock_creation:raise RuntimeError('Stock capture process incarnation changed')
@@ -1497,7 +1497,7 @@ def run(cfg):
                 captured=subprocess.run([sys.executable,str(Path(__file__)),
                     '--focus-owned',str(owned_game['pid']),'--start',owned_game['start'],
                     '--lab',str(lab),'--capture-owned',str(desktop),'--private-root',str(private)],
-                    capture_output=True,text=True,timeout=remaining(deadline,5))
+                    capture_output=True,text=True,timeout=remaining(deadline,15))
                 if captured.returncode:
                     manifest.setdefault('desktop_capture_errors',[]).append({'pose':step['name'],
                         'returncode':captured.returncode,'stderr':captured.stderr[-4096:]})

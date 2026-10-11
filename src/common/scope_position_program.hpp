@@ -2,6 +2,7 @@
 #include "scope_program.hpp"
 #include "scope_geometry.hpp"
 #include "scope_buffer_layout.hpp"
+#include <algorithm>
 #include <bit>
 
 namespace ss2vr {
@@ -196,23 +197,32 @@ inline bool scopeCapClip(const Matrix44 &projection,const Matrix34 &view,const M
 // Preconditions: exact admitted position/UV/zero-index/one-weight stock bytes
 // and matching stream declarations; immutable program and actual constants.
 // CPU float evaluation is an offline/admission bound, not GPU precision proof.
+// The program runs in float through several native matrix products, so the
+// comparison is scaled by the vertex's clip magnitude (at least |w|): 1e-4 of it
+// is far above float rounding yet far below any wrong pose or constant.
 inline bool scopeCapPosition(std::span<const uint32_t> program,std::span<const std::array<float,4>> constants,
-                             const ScopeCapGeometry &cap,bool weightsBound,const Matrix44 &expected) noexcept {
+                             const ScopeCapGeometry &cap,bool weightsBound,const Matrix44 &expected,
+                             double *worst=nullptr) noexcept {
+    if (worst) *worst = -1;
     if (!cap.valid || constants.empty() || constants.size()>256 || !scopeUvProgram(program)) return false;
     for (float v:expected.m) if (!std::isfinite(v)) return false;
+    double largest=0;
     for (size_t vertex=0;vertex<cap.positions.size();++vertex) {
         std::array<float,4> actual{};
         const auto p=cap.positions[vertex];
         if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
             !scope_position::position(program,constants,p,cap.uv[vertex],weightsBound,actual)) return false;
+        std::array<double,4> reference{};
+        double scale=1e-3;
         for (unsigned row=0;row<4;++row) {
-            const double reference=double(expected.m[row*4])*p.x + double(expected.m[row*4+1])*p.y +
+            reference[row]=double(expected.m[row*4])*p.x + double(expected.m[row*4+1])*p.y +
                 double(expected.m[row*4+2])*p.z + expected.m[row*4+3];
-            if (!std::isfinite(reference) || !std::isfinite(actual[row]) ||
-                std::abs(actual[row]-reference)>1e-5+1e-5*std::max(std::abs(double(actual[row])),std::abs(reference)))
-                return false;
+            if (!std::isfinite(reference[row]) || !std::isfinite(actual[row])) return false;
+            scale=std::max({scale,std::abs(reference[row]),std::abs(double(actual[row]))});
         }
+        for (unsigned row=0;row<4;++row) largest=std::max(largest,std::abs(actual[row]-reference[row])/scale);
     }
-    return true;
+    if (worst) *worst = largest;
+    return largest<=1e-4;
 }
 } // namespace ss2vr

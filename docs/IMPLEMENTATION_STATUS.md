@@ -1,5 +1,29 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-11 (late) — sniper scope lens, zoom on the physical hand, sizes
+
+- Sniper zoom follows the hand that physically holds the rifle (the stick click
+  of that controller), and contextual buttons follow the physical hand too.
+- The magnified scope lens now works (lab V162-V166). Three admissions were
+  wrong for the VR pipeline: the weapon draws inside the level's fog (fog is now
+  allowed; the lens draw keeps it), the cap-position check compared float GPU
+  arithmetic against a 1e-5 tolerance (measured error 3.4e-5; now 1e-4 of the
+  vertex's clip magnitude, 1 mm displacement still rejects), and the lens source
+  texture used the backbuffer format while zero-copy eye targets are A8R8G8B8,
+  so the copy only worked on pixel-fallback frames. The lens texture and shader
+  are cached across frames (released on device loss/Reset).
+- Forgiving eye box: only a quarter of the eye's sideways offset drives lens
+  parallax, so the magnified view stays visible without the head exactly behind
+  the scope (the rifle's scope rides ~0.3 m above the controller).
+- Cost while zoomed: two extra world passes (pose preview + scope source),
+  about +7 ms CPU per frame in the lab; nothing when not zoomed.
+- Klodovik and the Serious Bomb are 1.5x larger (87% / 130% of the revolver).
+- HeadComfort stays disabled by default; when enabled it now darkens only when a
+  fresh probe actually finds the head inside geometry.
+- Diagnostics: `Scope view` reasons, `Perf scope` counters; `SS2VR_SCOPE_PROBE=1`
+  reads back the lens source luminance once per perf window (lab only).
+
+
 ## 2026-10-11 (night) — frame pacing; first real-headset numbers
 
 - Frame pacing: while pairs stream, the next game frame starts once the host has

@@ -1649,15 +1649,32 @@ static void update(void *p) {
     for (unsigned h = 0; h < 2; ++h) {
         void *weapon = s.handle[h] ? resolve(s.handle[h]) : nullptr;
         const bool sniper = enabled && rider.handheld() && !aliased(s) && nativeSniper(weapon);
-        s.zoom[h] = zoomInputs[h].sample(input,h,
-            sniper && !resettingControls && !(input.blockedWheels & (1u<<h)) && !s.ui.wheel[h].open && pendingSelection[h] < 0,
+        // A lone two-handed sniper sits in native slot 0 but is mounted on the hand
+        // that chose it: zoom comes from that physical hand's button.
+        const unsigned physical = mountHand(s, h);
+        s.zoom[h] = zoomInputs[h].sample(input,physical,
+            sniper && !resettingControls && !(input.blockedWheels & (1u<<physical)) && !s.ui.wheel[physical].open &&
+                pendingSelection[h] < 0,
             s.handle[h],s.networkGeneration,inputProducer,GetTickCount64());
+        static uint32_t lastZoomKey[2]{~0u,~0u};
+        const uint32_t zoomKey=(uint32_t(s.zoom[h])) | (((input.zoomDownMask>>physical)&1u)<<1) |
+            (((input.zoomActiveMask>>physical)&1u)<<2) | (uint32_t(sniper)<<3) | (uint32_t(input.handValid[physical])<<4);
+        if(zoomKey!=lastZoomKey[h]) {
+            lastZoomKey[h]=zoomKey;
+            log("Zoom slot=%u hand=%u zoom=%u down=%u active=%u sniper=%u handValid=%u generation=%u",h,physical,
+                zoomKey&1u,(zoomKey>>1)&1u,(zoomKey>>2)&1u,(zoomKey>>3)&1u,(zoomKey>>4)&1u,input.zoomInputGeneration[physical]);
+        }
     }
     s.use = enabled && !resettingControls && ((input.buttons[0] | input.buttons[1]) & Button::Use);
     uint32_t contextualButtons = 0;
     for (unsigned h=0;h<2;++h)
+    {
+        // Physical hand h: the native slot mounted on it (a lone two-handed sniper
+        // in slot 0 may be mounted on the right hand).
+        const unsigned slot = s.handle[h] ? h : (mountHand(s, 1 - h) == h ? 1 - h : h);
         contextualButtons |= contextualSniperButtons(input,h,
-            enabled && rider.handheld() && !aliased(s) && nativeSniper(s.handle[h] ? resolve(s.handle[h]) : nullptr));
+            enabled && rider.handheld() && !aliased(s) && nativeSniper(s.handle[slot] ? resolve(s.handle[slot]) : nullptr));
+    }
     s.jump = enabled && !resettingControls && ((contextualButtons & Button::Jump) || gripJumps[0].jumping || gripJumps[1].jumping);
     s.sprint = enabled && !resettingControls && (contextualButtons & Button::Sprint);
     lastButtons[0] = input.buttons[0];
@@ -3687,7 +3704,16 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
                     eyeSnapshot.playerHandle,request,simulationRevision,eyeSnapshot.rigRevision,checkedAt);
                 clear=visibilityReason==HeadVolumeVisibilityReason::Clear;
             }
-            eyeHeadClearance.mode=HeadClearanceMode::Opaque;
+            // Darken only on evidence: a recent probe for this player that found the
+            // head inside geometry. A missing or stale probe (it is matched to an exact
+            // request, which pacing and late-latching often miss) leaves the world
+            // visible and the pair unprotected, as with HeadComfort off; treating that
+            // as a hit blacked out ordinary play.
+            const bool recentProbe=renderGate==3 && headVolumeObservation.sampled &&
+                headVolumeObservation.owner==eyeSnapshot.playerHandle && checkedAt>=headVolumeObservation.tickMs &&
+                checkedAt-headVolumeObservation.tickMs<=150;
+            const bool blocked=recentProbe && !headVolumeObservation.clear;
+            eyeHeadClearance.mode=blocked ? HeadClearanceMode::Opaque : HeadClearanceMode::Disabled;
             if(clear) eyeHeadClearance={headVolumeObservation.tickMs,request.input.head.p,
                 headVolumeObservation.radius-headVolumeObservation.numericalGuard,settings.headRadius,headVolumeObservation.nearZ,
                 HeadClearanceMode::Clear,0};
@@ -3697,7 +3723,7 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
                 diagnosticSample=headVolumeObservation;diagnosticQuery=headQueryDiagnostic;diagnostic=true;
             }
             ReleaseSRWLockShared(&laserLock);
-            eyeWorldVisibility = clear ? 1.f : 0.f;
+            eyeWorldVisibility = blocked && !clear ? 0.f : 1.f;
             // Environment lookup, formatting and I/O occur outside the lock.
             if(diagnostic&&labDualTrace()&&headDiagnosticReceipts.load(std::memory_order_relaxed)<8) {
                 const unsigned ordinal=headDiagnosticReceipts.fetch_add(1,std::memory_order_relaxed);
@@ -5475,6 +5501,8 @@ bool currentScopeQueryBoundary() {
     std::memcpy(&query,reinterpret_cast<void *>(laserEngineBase+0x2c3f34),4);
     return query==-1;
 }
+static unsigned scopeOpaqueDetail = 0xffu; // Diagnostic only: why the last recorded geometry had no color candidate.
+static uint32_t scopeOpaqueGlobals[3]{};
 bool currentScopeRaster(ScopeRasterObservation &out) {
     out = {};
     ScopeDrawBinding binding;
@@ -5509,6 +5537,7 @@ bool currentScopeRaster(ScopeRasterObservation &out) {
         std::memcpy(&special,reinterpret_cast<void *>(laserEngineBase+0x2c36ec),4);
         std::memcpy(&mode,reinterpret_cast<void *>(laserEngineBase+0x2e494c),4);
         out.opaqueMode=!forced && special<0 && !mode;
+        scopeOpaqueGlobals[0]=forced; scopeOpaqueGlobals[1]=uint32_t(special); scopeOpaqueGlobals[2]=mode;
     }
     return true;
 }
@@ -5548,6 +5577,8 @@ bool recordScopeGeometry(const ScopeRasterObservation &sample, const ScopeCapGeo
     // state through this DIP, image permission, source resource or transfer.
     physicalWeapon->scopePose.opaqueColorCandidate=opaqueColorCandidate && sample.opaqueMode && now.opaqueMode &&
         sample.nearDepth==now.nearDepth && sample.farDepth==now.farDepth;
+    scopeOpaqueDetail = (opaqueColorCandidate ? 0u : 1u) | (sample.opaqueMode ? 0u : 2u) | (now.opaqueMode ? 0u : 4u) |
+        (sample.nearDepth==now.nearDepth && sample.farDepth==now.farDepth ? 0u : 8u);
     return true;
 }
 bool scopeImageTarget(unsigned hand,Vec3 &out) noexcept {
@@ -5578,19 +5609,44 @@ void beginScopePreview(void *player, const Request &request) {
     beginEye(player,request,0);
     scopePreview = true;
 }
-bool copyScopeSourceView(unsigned hand, ScopeSourceView &out) {
+static bool copyScopeSourceViewChecked(unsigned hand, ScopeSourceView &out, unsigned &reason) {
     out = {};
-    if (!scopePreview || eyeIndex != 0 || !observedScopePose(hand,out.pose) ||
-        !out.pose.opaqueColorCandidate || !out.pose.imageCoordinates.valid ||
-        !scopeOpticalFrameValid(out.pose.opticalFrame)) return false;
+    reason = 1; if (!scopePreview || eyeIndex != 0) return false;
+    reason = 2; if (!observedScopePose(hand,out.pose)) return false;
+    reason = 3; if (!out.pose.opaqueColorCandidate) return false;
+    reason = 4; if (!out.pose.imageCoordinates.valid) return false;
+    reason = 5; if (!scopeOpticalFrameValid(out.pose.opticalFrame)) return false;
     float magnification = 0;
-    if (!scopeNativeMagnification(out.pose.nativeBaseFovRadians,out.pose.zoom,magnification) ||
-        !scopeOpticalProjection(out.pose.opticalFrame,settings.scopeEyeRelief,magnification,out.opticalProjection) ||
+    reason = 6; if (!scopeNativeMagnification(out.pose.nativeBaseFovRadians,out.pose.zoom,magnification)) return false;
+    reason = 7; if (!scopeOpticalProjection(out.pose.opticalFrame,settings.scopeEyeRelief,magnification,out.opticalProjection) ||
         !scopeOpticalFov(out.opticalProjection,out.fov)) return false;
     matrixPose(&out.camera,out.pose.opticalFrame.camera);
-    if (!finite(out.camera) || !sameWeaponView(matrix(out.camera),out.pose.opticalFrame.camera)) return false;
+    reason = 8; if (!finite(out.camera) || !sameWeaponView(matrix(out.camera),out.pose.opticalFrame.camera)) return false;
     out.hand = hand;
+    reason = 0;
     return true;
+}
+bool copyScopeSourceView(unsigned hand, ScopeSourceView &out) {
+    unsigned reason = 0;
+    const bool ok = copyScopeSourceViewChecked(hand, out, reason);
+    // Diagnostics: the first failing condition, rate-limited (1 preview/eye, 2 no
+    // observed pose, 3 colour, 4 image coords, 5 optical frame, 6 magnification,
+    // 7 projection, 8 camera).
+    static uint64_t lastLog[2]{};
+    static unsigned lastReason[2]{~0u,~0u};
+    const uint64_t now = GetTickCount64();
+    if (hand < 2 && (reason != lastReason[hand] || now - lastLog[hand] > 5000) && (reason != 2 || hand == 1)) {
+        lastReason[hand] = reason; lastLog[hand] = now;
+        log("Scope view hand=%u reason=%u zoomValid=%u zoomEnd=%.3f baseFov=%.3f colorFailure=%u capError=%.3g opaque=%x "
+            "globals=%x/%x/%x", hand, reason, unsigned(out.pose.zoom.valid), double(out.pose.zoom.endMultiplier),
+            double(out.pose.nativeBaseFovRadians), scopeColorFailure(), scopeCapError(), scopeOpaqueDetail, scopeOpaqueGlobals[0],
+            scopeOpaqueGlobals[1], scopeOpaqueGlobals[2]);
+        const uint32_t *st = scopeColorStates();
+        if (scopeColorFailure() == 9) log("Scope color states z=%x zw=%x zf=%x ab=%x at=%x st=%x fog=%x cw=%x fill=%x cull=%x sc=%x clip=%x "
+            "bias=%x slope=%x clipping=%x srgb=%x", st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8],
+            st[9], st[10], st[11], st[12], st[13], st[14], st[15]);
+    }
+    return ok;
 }
 bool beginScopeSource(void *player, const Request &request, const ScopeSourceView &view,
                       ScopeCaptureCallback callback, ScopeCaptureCurrent currentSource, void *context) {

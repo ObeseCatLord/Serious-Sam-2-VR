@@ -23,8 +23,9 @@ Current cloud source now connects magnified per-hand scope images through native
 pre-bloom scene capture and an ordered RGB-only lens pass. This supports a strict
 stock-geometry, opaque PS2, direct non-MSAA UNORM-target subset; unsupported
 render paths keep the native draw. Surrounding headset FOV and native zoom timing
-stay unchanged. No game/headset runtime or visual/performance validation has been
-performed. See [scope source integration](docs/SCOPE_SOURCE_INTEGRATION.md).
+stay unchanged. The lens is verified in the simulated-headset lab (4x image on the
+zero-copy path, forgiving eye box, about +7 ms CPU per frame while zoomed); it has
+not yet been tried on a real headset. See [scope source integration](docs/SCOPE_SOURCE_INTEGRATION.md).
 This does not update the historical development archive described below.
 
 Current source uses IPC11 and multiplayer wire7. Matching host/game/server products preserve independent raw actions, acknowledged hand epochs and native shot/zoom context. Wire7 adds physical gesture fields separately from manual firing, release and zoom. The default-off unique-saw adapter now connects local, authoritative and remote-observer native consumers; short remote gestures are retained per hand until native consumption or explicit discard. Original ClientAction transport, manual history and native combat remain unchanged. See [melee source review](docs/PHYSICAL_MELEE_CONSUMPTION.md).
