@@ -18,6 +18,7 @@ struct VrSettings {
     float uiAspect = 16.f / 9; // Aspect the game lays out its 2D view (menus, HUD, movies) at in VR.
     bool labWeaponAudit = false; // Private lab: cycle every weapon and log its hand references.
     int labWeaponAuditHand = 1;  // Hand whose selection the audit simulates.
+    int labHoldWeapon = -1;      // With WeaponAudit: select this native weapon once and keep it.
     float scopeEyeRelief = .1f; // Optical presentation parameter, not native zoom timing.
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;

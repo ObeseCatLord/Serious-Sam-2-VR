@@ -1592,7 +1592,14 @@ static void update(void *p) {
             static uint64_t next = 0;
             static int index = -1;
             if (!given && giveAllWeapons) { giveAllWeapons(p, 1); given = true; next = GetTickCount64() + 5000; }
-            if (given && GetTickCount64() >= next && pendingSelection[h] < 0) {
+            static bool held = false;
+            if (given && settings.labHoldWeapon >= 0 && !held && GetTickCount64() >= next && pendingSelection[h] < 0) {
+                held = true;
+                pendingSelection[h] = settings.labHoldWeapon;
+                selectionTick[h] = GetTickCount64();
+                log("Weapon audit hold id=%d hand=%d", settings.labHoldWeapon, h);
+            }
+            if (given && settings.labHoldWeapon < 0 && GetTickCount64() >= next && pendingSelection[h] < 0) {
                 next = GetTickCount64() + 5000;
                 for (int step = 0; step < int(WeaponCount); ++step) {
                     index = (index + 1) % int(WeaponCount);
