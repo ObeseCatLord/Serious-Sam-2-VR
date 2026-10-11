@@ -8,7 +8,7 @@ int main() {
     assert(still.valid&&still.body.hullCount==2&&still.body.queryCount==2);
     assert(still.maximumParameter>0&&still.direction.x==1);
     assert(still.body.hulls[0].sphere[0].radius>=.12f);
-    assert(!coverHeadVolumeSweep(body.hullCount,{},{4,0,0},.12f,.001f).valid);
+    assert(!coverHeadVolumeSweep(body.hullCount,{},{10,0,0},.12f,.001f).valid);
     assert(!coverHeadVolumeSweep(body.hullCount,{},{NAN,0,0},.12f,.001f).valid);
     assert(!coverHeadVolumeSweep(body.hullCount,{},{},0,.001f).valid);
     assert(!coverHeadVolumeSweep(body.hullCount,{},{},.12f,0).valid);

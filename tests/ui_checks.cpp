@@ -248,7 +248,7 @@ int main() {
               near(probe.length, std::sqrt(1.34f)),
           "Native head probe retains the full deep crouch and diagonal lean segment");
     check(!makeHeadProbe(leanBody, leanBody).valid && !makeHeadProbe({}, Pose{{}, {.0005f, 0, 0}}).valid &&
-              !makeHeadProbe({}, Pose{{}, {3, 0, 0}}).valid,
+              !makeHeadProbe({}, Pose{{}, {MaximumHeadTranslation + 1, 0, 0}}).valid,
           "Zero/tiny or out-of-rig segments never manufacture a containment result");
     const auto sampleLean = [&](bool hit, float distance) {
         return recordHeadObstruction(leanBody, leanHead, 7, leanRequest, 1000, probe, hit, distance);

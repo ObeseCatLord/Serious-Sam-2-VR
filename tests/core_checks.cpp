@@ -401,12 +401,12 @@ int main() {
     auto relative = relativeTracking(origin, tracked);
     check(near(relative.p.x, b.p.x) && near(relative.p.z, b.p.z),
           "Recenter preserves relative controller position");
-    Pose distantHead{{}, {1, 0, 0}};
-    Pose physicalLeft{{}, {.968f, 0, 0}}, physicalRight{{}, {1.032f, 0, 0}};
+    Pose distantHead{{}, {HeadHorizontalLimit + .25f, 0, 0}};
+    Pose physicalLeft{{}, {HeadHorizontalLimit + .218f, 0, 0}}, physicalRight{{}, {HeadHorizontalLimit + .282f, 0, 0}};
     auto clippedLeft = worldEyeTracking({}, {}, 0, distantHead, physicalLeft);
     auto clippedRight = worldEyeTracking({}, {}, 0, distantHead, physicalRight);
     check(near(clippedRight.p.x - clippedLeft.p.x, .064f) &&
-              near((clippedRight.p.x + clippedLeft.p.x) * .5f, .75f),
+              near((clippedRight.p.x + clippedLeft.p.x) * .5f, HeadHorizontalLimit),
           "Bounded head translation preserves the physical eye separation");
     for (Vec3 displacement : {Vec3{.2f, 0, 0}, Vec3{0, -.2f, 0}, Vec3{0, 0, .2f}}) {
         Pose moved{{}, displacement};

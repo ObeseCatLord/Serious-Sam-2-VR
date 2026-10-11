@@ -119,12 +119,12 @@ static void rawCaptureChecks() {
     first.physicalDownMask = first.fireMask = 1;
     first.primaryNeutralSampleMask = 2;
     auto left = fixtureCapture(first, 1000);
-    left.head = pose(1.2f, -2.2f, 0);
-    left.grip[0] = pose(3, -2.2f, 0);
-    left.grip[1] = pose(1.2f, -2.2f, 0);
+    left.head = pose(HeadHorizontalLimit + .45f, -HeadDownLimit - .4f, 0);
+    left.grip[0] = pose(HeadHorizontalLimit + .45f + 1.8f, -HeadDownLimit - .4f, 0);
+    left.grip[1] = pose(HeadHorizontalLimit + .45f, -HeadDownLimit - .4f, 0);
     check(composeLocalPose(first, left, 1000), "raw clamp fixture composes through current rig");
-    check(nearPose(first.head, pose(.75f, -1.8f, 0)) &&
-              nearPose(first.grip[0], pose(2.05f, -1.8f, 0)),
+    check(nearPose(first.head, pose(HeadHorizontalLimit, -HeadDownLimit, 0)) &&
+              nearPose(first.grip[0], pose(HeadHorizontalLimit + HandReachLimit, -HeadDownLimit, 0)),
           "raw head and reach clamps use the existing production limits");
     const auto originalLeftPacket = encodePose(first);
     PendingIntents taps;
@@ -1113,7 +1113,7 @@ int main() {
     invalid.pose = p;
     check(!encode(invalid, wire), "held zoom requires active raw-down evidence in the transport original");
     p = validPose();
-    p.head.p.x = .751f;
+    p.head.p.x = HeadHorizontalLimit + .001f;
     invalid.pose = p;
     check(!encode(invalid, wire), "head body-relative translation is bounded");
     p = validPose();

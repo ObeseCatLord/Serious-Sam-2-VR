@@ -59,7 +59,7 @@ int main() {
         }
         assert(close(worldHeadTracking(anchor,origin,turn,head).p,initialWorld.p,.001));
     }
-    Pose origin{},head{{0,0,0,1},{1,0,0}},before{},after{{0,0,0,1},{.1f,0,0}};
+    Pose origin{},head{{0,0,0,1},{HeadHorizontalLimit+.25f,0,0}},before{},after{{0,0,0,1},{.1f,0,0}};
     assert(!settleTranslatedAnchor(origin,0,head,before,after,.2f,.001f).valid);
     head.p.x=.1f;after.p.x=NAN;
     assert(!settleTranslatedAnchor(origin,0,head,before,after,.2f,.001f).valid);

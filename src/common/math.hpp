@@ -87,11 +87,15 @@ inline Vec3 boundTranslation(Vec3 p, float bound) {
     float n = std::sqrt(dot(p, p));
     return n > bound ? p * (bound / n) : p;
 }
-// These are tracking-volume limits, not native body collision. Vertical head
-// travel stays independent of horizontal lean so a deep crouch remains 1:1.
-constexpr float HeadHorizontalLimit = .75f, HeadDownLimit = 1.8f, HeadUpLimit = 1.f;
+// Numerical sanity bounds for room-scale tracking, not a comfort or safety limit:
+// head motion inside a play space is applied 1:1 and never blacks out the view.
+// Only actual geometry contact (head clearance) can hide the world.
+constexpr float HeadHorizontalLimit = 4.f, HeadDownLimit = 2.5f, HeadUpLimit = 2.5f;
 constexpr float HandReachLimit = 1.3f, TrackingBoundsSlack = .0002f;
-constexpr float MaximumHeadTranslation = 1.95f, MaximumHandTranslation = 3.25f;
+constexpr float MaximumHeadTranslation = 4.75f, MaximumHandTranslation = 6.05f;
+static_assert(MaximumHeadTranslation * MaximumHeadTranslation >=
+              HeadHorizontalLimit * HeadHorizontalLimit + HeadUpLimit * HeadUpLimit);
+static_assert(MaximumHandTranslation >= MaximumHeadTranslation + HandReachLimit);
 inline Vec3 boundHeadTranslation(Vec3 p) {
     Vec3 horizontal = boundTranslation({p.x, 0, p.z}, HeadHorizontalLimit);
     return {horizontal.x, std::clamp(p.y, -HeadDownLimit, HeadUpLimit), horizontal.z};

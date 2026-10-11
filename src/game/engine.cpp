@@ -13,6 +13,7 @@
 #include "roomscale_math_frame.hpp"
 #include "roomscale_placement.hpp"
 #include "roomscale_sweep_query.hpp"
+#include "common/wear_calibration.hpp"
 #include "steering_wheel_mesh.hpp"
 #include "common/swimming_input.hpp"
 #include "common/native_zoom.hpp"
@@ -373,6 +374,7 @@ static uint32_t primaryField(const void *object,unsigned offset) noexcept;
 static RigRevision rigPublication;
 static thread_local unsigned snapshotNativeReadDepth=0;
 static thread_local bool rigMutationActive=false;
+static WearCalibration wearCalibration; // Main thread: snapshot updates only.
 struct Snapshot {
     void *player = nullptr;
     RiderIdentity rider;
@@ -1149,10 +1151,17 @@ static void update(void *p) {
         recoverRigForNewOrigin(s);
         s.origin = {yaw(horizontalHeading(input.head.q)), input.head.p};
         s.initialized = true;
+        wearCalibration.captureOrigin(input.head, input.tickMs);
     }
     bool resettingControls = enabled && recenterHeld(input);
     bool recenter = resettingControls && !((lastButtons[0] | lastButtons[1]) & Button::Recenter);
-    if (recenter) {
+    // An origin captured from a motionless (unworn) headset is replaced once the
+    // headset has been put on; a manual recentre always wins.
+    const bool wornRecenter = enabled && !recenter && s.initialized && input.headValid &&
+        wearCalibration.sample(input.head, input.tickMs, s.origin.p);
+    if (recenter) wearCalibration.reset();
+    if (wornRecenter) log("Tracking origin recentred after the headset was put on");
+    if (recenter || wornRecenter) {
         recoverRigForNewOrigin(s);
         s.origin = {yaw(horizontalHeading(input.head.q, horizontalHeading(s.origin.q))), input.head.p};
         s.turn = 0;
