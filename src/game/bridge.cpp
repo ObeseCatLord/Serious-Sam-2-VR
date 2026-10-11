@@ -1442,6 +1442,25 @@ static void startChannel() {
     }
 }
 static uint64_t lastMenuCopy = 0, menuSequence = 0;
+// The region of the canvas the game draws its 2D view into: ForceAspectRatio
+// letterboxes the drawport to gfx_fAspectRatio (Sam2Game RVA 3F9DE0).
+struct UiBand { uint32_t x = 0, y = 0, width = 0, height = 0; };
+static UiBand uiBand(uint32_t width, uint32_t height) {
+    UiBand band{0, 0, width, height};
+    static const auto sam = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"Sam2Game.dll"));
+    float aspect = 0;
+    if (sam) memcpy(&aspect, reinterpret_cast<void *>(sam + 0x3f9de0), sizeof(aspect));
+    if (!std::isfinite(aspect) || aspect < .25f || aspect > 4 || !width || !height ||
+        std::abs(float(width) / float(height) - aspect) <= .001f) return band;
+    if (float(width) / float(height) > aspect) {
+        band.width = std::min(width, uint32_t(float(height) * aspect));
+        band.x = (width - band.width) / 2;
+    } else {
+        band.height = std::min(height, uint32_t(float(width) / aspect));
+        band.y = (height - band.height) / 2;
+    }
+    return band;
+}
 static MenuNavigation menuNavigation;
 static WORD pendingKey = 0;
 static uint64_t releaseKeyAt = 0;
@@ -1694,14 +1713,18 @@ void present(IDirect3DDevice9 *d) {
         uint8_t *target = pixelStore.matches(pixelStore.generation, copyWidth, copyHeight) ?
             pixelStore.buffer(MenuPixelBuffer) : nullptr;
         if (!target) return;
+        // The game letterboxes its 2D view to gfx_fAspectRatio inside the (eye-
+        // sized) canvas; the flat screen shows only that band, at its own aspect.
+        const UiBand band = uiBand(copyWidth, copyHeight);
         held = channel.lock();
         if (!held) return;
         auto &m = channel.shared->menu;
-        for (uint32_t y = 0; y < copyHeight; ++y)
-            memcpy(target + size_t(y) * copyWidth * 4,
-                static_cast<uint8_t *>(pixels.pBits) + size_t(y) * pixels.Pitch, copyWidth * 4);
-        for (size_t pixel = 3; pixel < size_t(copyWidth) * copyHeight * 4; pixel += 4) target[pixel] = 255;
-        m.width = copyWidth; m.height = copyHeight; m.tickMs = now;
+        for (uint32_t y = 0; y < band.height; ++y)
+            memcpy(target + size_t(y) * band.width * 4,
+                static_cast<uint8_t *>(pixels.pBits) + size_t(y + band.y) * pixels.Pitch + size_t(band.x) * 4,
+                band.width * 4);
+        for (size_t pixel = 3; pixel < size_t(band.width) * band.height * 4; pixel += 4) target[pixel] = 255;
+        m.width = band.width; m.height = band.height; m.tickMs = now;
         m.pixelGeneration = pixelStore.generation; m.pixelReserved = 0;
         m.sequence = ++menuSequence; m.interactionGeneration = menuGeneration; m.visible = 1;
     }, [&](bool aborted) noexcept {

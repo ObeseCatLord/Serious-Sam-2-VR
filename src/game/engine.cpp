@@ -1179,6 +1179,10 @@ static void publishSnapshot(const Snapshot &s) {
 }
 static void prepareLocalGestureSource(Snapshot &);
 static void appendLocalGesturePose(const Snapshot &, network::PosePacket &);
+// Private-lab weapon audit natives (see auditWeaponAnchor).
+static int(__cdecl *boneAbsolute)(void *, uint32_t, Matrix34 &) = nullptr;
+static void(__thiscall *giveAllWeapons)(void *, int) = nullptr;
+static uint32_t boneHandIdent = 0, bonePalmIdent = 0, boneArmIdent = 0;
 // Grip carry. A grip squeeze beside a takeable prop picks it up with that hand
 // through the native carry: CPuppetEntity::TakeObject (slot 0x290) connects a
 // manipulator joint that pulls the object toward a desired placement. Each
@@ -1538,6 +1542,24 @@ static void update(void *p) {
               *reinterpret_cast<int *>(static_cast<uint8_t *>(weapon) + 0xb4) == pendingSelection[h]) ||
              GetTickCount64() - selectionTick[h] > 1500))
             pendingSelection[h] = -1;
+        if (settings.labWeaponAudit && h == 1 && valid && rider.handheld() && singlePlayer()) {
+            // Private lab: own every weapon once, then hold each in the right hand for 2.5 s.
+            static bool given = false;
+            static uint64_t next = 0;
+            static int index = -1;
+            if (!given && giveAllWeapons) { giveAllWeapons(p, 1); given = true; next = GetTickCount64() + 2500; }
+            if (given && GetTickCount64() >= next && pendingSelection[h] < 0) {
+                next = GetTickCount64() + 2500;
+                for (int step = 0; step < int(WeaponCount); ++step) {
+                    index = (index + 1) % int(WeaponCount);
+                    if (index != 14 && inInventory(static_cast<uint8_t *>(p) + 0x8f8, index)) {
+                        pendingSelection[h] = index;
+                        selectionTick[h] = GetTickCount64();
+                        break;
+                    }
+                }
+            }
+        }
         if (pendingSelection[h] >= 0 && !multiplayer::remoteClient() && canChange(p, h) &&
             nativeRiderCurrent(p, rider)) {
             setWeapon(p, pendingSelection[h], h, 1);
@@ -5551,6 +5573,30 @@ bool observedScopePose(unsigned hand, ScopePoseObservation &out) {
 // One-time evidence per weapon: native model extent and the applied scale.
 struct Box3 { Vec3 min, max; }; // Native Box3f.
 static Box3 *(__cdecl *modelBounds)(Box3 *, const void *) = nullptr;
+// Private-lab weapon audit: each weapon's native first-person pose relative to
+// the camera and its model-space hand/palm bones, logged once per weapon.
+static void auditWeaponAnchor(void *w, int nativeId, const Pose &cameraRelative) {
+    static bool traced[64]{};
+    if (!settings.labWeaponAudit || nativeId < 0 || nativeId >= 64 || traced[nativeId]) return;
+    traced[nativeId] = true;
+    void *instance = resolve(primaryField(w, 0x24));
+    Box3 box{};
+    if (instance && modelBounds) modelBounds(&box, instance);
+    char bones[256] = "";
+    for (const auto &[name, ident] : {std::pair{"Hand", boneHandIdent}, std::pair{"Palm", bonePalmIdent},
+                                      std::pair{"Arm", boneArmIdent}}) {
+        Matrix34 m{};
+        if (instance && boneAbsolute && ident && boneAbsolute(instance, ident, m)) {
+            const size_t used = std::strlen(bones);
+            std::snprintf(bones + used, sizeof(bones) - used, " %s=%.4f,%.4f,%.4f", name, m.m[3], m.m[7], m.m[11]);
+        }
+    }
+    const auto &q = cameraRelative.q;
+    const auto &p = cameraRelative.p;
+    log("Weapon audit id=%d camera=%.4f,%.4f,%.4f q=%.4f,%.4f,%.4f,%.4f box=%.3f,%.3f,%.3f..%.3f,%.3f,%.3f%s",
+        nativeId, p.x, p.y, p.z, q.x, q.y, q.z, q.w, box.min.x, box.min.y, box.min.z, box.max.x, box.max.y,
+        box.max.z, bones);
+}
 static void traceWeaponModel(void *w, int nativeId, float scale) {
     static bool traced[64]{};
     if (nativeId < 0 || nativeId >= 64 || traced[nativeId] || !modelBounds) return;
@@ -5651,6 +5697,8 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
         return reject();
     if (calibrated)
         matrixPose(&flatPose, flatModel);
+    if (calibrated && h == 1 && finite(flatPose))
+        auditWeaponAnchor(w, nativeId, compose(inverse(nativeCamera), flatPose));
     if (!calibrated || invalidFlatCharge || !finite(flatPose)) {
         invalidateMatchingCalibration(s, unsigned(h),6,caller);
         return reject();
@@ -8160,6 +8208,14 @@ bool attach(bool headless) {
         settings=loadSettings(settingsDirectory+L"SS2VR\\SS2VR.ini");
     auto g = GetModuleHandleW(L"Sam2Game.dll"), e = GetModuleHandleW(L"Engine.dll"),
          c = GetModuleHandleW(L"Core.dll");
+    if (g && !headless) {
+        // gfx_fAspectRatio (Sam2Game RVA 3F9DE0): the game letterboxes its whole 2D
+        // view to this aspect. The eye-sized canvas is square, so use a widescreen
+        // layout; the flat screen and HUD panel show exactly that band.
+        auto *aspect = reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(g) + 0x3f9de0);
+        log("2D aspect %.4f -> %.4f", *aspect, settings.uiAspect);
+        *aspect = settings.uiAspect;
+    }
     const auto graphics = headless ? nullptr : GetModuleHandleW(L"GfxD3D.dll");
     roomscaleConfigured=false;
     meleeConfigured=false;
@@ -8327,6 +8383,8 @@ bool attach(bool headless) {
         symbol(e, "?GetBody@CHull@SeriousEngine@@QAEPAVCBody@2@XZ", hullBody);
         symbol(e, "?SetDesiredPlacements@CManipulatorJoint@SeriousEngine@@QAEXABVQuatVect@2@0@Z", jointPlacements);
         symbol(e, "?SetMaxLinVel@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxLinVel);
+        symbol(e, "?mdlGetBoneAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z", boneAbsolute);
+        symbol(g, "?OnGiveAll@CPlayerPuppetEntity@SeriousEngine@@QAEXH@Z", giveAllWeapons);
         symbol(c, "?memPreDeleteArrayRC_internal@SeriousEngine@@YAXPBXPAVCDataType@1@@Z", preDeleteArray);
         symbol(c, "?memDeleteArray_internal@SeriousEngine@@YAXPAX@Z", deleteArray);
         symbol(c, "?memPostDeleteArrayRC_internal@SeriousEngine@@YAXPAVCDataType@1@@Z", postDeleteArray);
@@ -8474,6 +8532,9 @@ bool attach(bool headless) {
         toId(&bulletCategory, "bullet");
         toId(&headQueryCategory, "player");
         toId(&laserIdleAttachment, "Barrel01");
+        toId(&boneHandIdent, "Hand");
+        toId(&bonePalmIdent, "Palm");
+        toId(&boneArmIdent, "Arm");
     }
 #define H(module, name, fn, orig)                                                                            \
     ok = hook(module, name, reinterpret_cast<void *>(fn), reinterpret_cast<void **>(&orig)) && ok

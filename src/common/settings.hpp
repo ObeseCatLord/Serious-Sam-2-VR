@@ -12,6 +12,8 @@ struct VrSettings {
     float laserDistance = 100.f;
     float renderScale = 1.f; // Multiplier on the runtime's recommended per-eye size.
     FoveationSettings foveation;
+    float uiAspect = 16.f / 9; // Aspect the game lays out its 2D view (menus, HUD, movies) at in VR.
+    bool labWeaponAudit = false; // Private lab: cycle every weapon and log its hand references.
     float scopeEyeRelief = .1f; // Optical presentation parameter, not native zoom timing.
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;

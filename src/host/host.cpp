@@ -915,30 +915,6 @@ struct WheelBitmap {
         if (!result)
             throw std::runtime_error("GDI wheel label drawing failed");
     }
-    void stats(const Ui &ui) {
-        GdiFlush();
-        std::memset(bits, 0, size_t(size) * height * 4);
-        // Compact rectangular card, with independent lines rather than one long weapon string.
-        for (uint32_t y = 0; y < height; ++y)
-            for (uint32_t x = 0; x < size; ++x) {
-                auto *p = bits + (size_t(y) * size + x) * 4;
-                p[0] = 24;
-                p[1] = 18;
-                p[2] = 15;
-                p[3] = 220;
-            }
-        wchar_t line[96];
-        std::swprintf(line, 96, L"HEALTH %d    ARMOR %d", ui.health, ui.armor);
-        text(line, size * .5f, height * .06f, label, RGB(255, 255, 255), size * .94f);
-        std::swprintf(line, 96, L"LEFT   %ls    %d", weaponName(ui.currentWeapon[0]), ui.currentAmmo[0]);
-        text(line, size * .5f, height * .36f, label, RGB(190, 225, 255), size * .94f);
-        std::swprintf(line, 96, L"RIGHT   %ls    %d", weaponName(ui.currentWeapon[1]), ui.currentAmmo[1]);
-        text(line, size * .5f, height * .66f, label, RGB(255, 225, 170), size * .94f);
-        GdiFlush();
-        // GDI clears text alpha; keep the whole card's straight alpha predictable.
-        for (size_t i = 0; i < size_t(size) * height; i++)
-            bits[i * 4 + 3] = 220;
-    }
     // Compact card at the centre of the in-world ring (drawn by the game): the
     // hovered item's name and ammunition, or how to choose and cancel.
     void draw(const WheelUi &ui, unsigned hand) {
@@ -1033,7 +1009,7 @@ struct Host {
     bool feedbackSeeded = false, hapticsAvailable = true;
     Fov currentFov[2];
     bool recenterWasHeld = false, recenterUi = false;
-    Swapchain menuChain, hudChain, cursorChain;
+    Swapchain menuChain, cursorChain;
     // Foveated readback: eye[] carries the downsampled full view, inset[] the
     // full-resolution crop submitted as a second projection layer.
     Swapchain inset[2];
@@ -1042,13 +1018,10 @@ struct Host {
     Vec3 lastGaze{};
     ULONGLONG lastGazeTick = 0;
     bool cursorUploaded = false;
-    WheelBitmap hudBitmap;
     std::vector<uint8_t> menuSourcePixels;
     uint64_t menuSequence = 0;
     MenuPointer presentedPointer;
     int cursorX = -1, cursorY = -1;
-    Ui drawnHud{};
-    bool hudUploaded = false;
     PendingRequest outstanding[2];
     Request cachedRequest;
     HeadClearance cachedClearance;
@@ -1077,7 +1050,6 @@ struct Host {
             for (auto &wheel : wheels)
                 wheel.chain.abandon();
             menuChain.abandon();
-            hudChain.abandon();
             cursorChain.abandon();
             for (auto &chain : inset)
                 chain.abandon();
@@ -1092,7 +1064,6 @@ struct Host {
         for (auto &wheel : wheels)
             wheel.chain.destroy();
         menuChain.destroy();
-        hudChain.destroy();
         cursorChain.destroy();
         for (auto &chain : inset)
             chain.destroy();
@@ -1323,8 +1294,6 @@ struct Host {
             wheel.chain.create(api, session, wheelSize, wheelSize / 4);
             wheel.bitmap.create(wheelSize, wheelSize / 4);
         }
-        hudChain.create(api, session, wheelSize, wheelSize / 4);
-        hudBitmap.create(wheelSize, wheelSize / 4);
         cursorChain.create(api, session, CursorSize, CursorSize);
         cursorUploaded = false;
         log.write("OpenXR D3D11 HMD session initialized; awaiting runtime READY and game dimensions");
@@ -1717,7 +1686,6 @@ struct Host {
     }
     void finishSessionAcquisitions() {
         invalidate();
-        hudUploaded = false;
         menuSequence = 0;
         const uint64_t deadline = GetTickCount64() + 500;
         for (;;) {
@@ -1727,7 +1695,6 @@ struct Host {
             for (auto &wheel : wheels)
                 retiredAll = wheel.chain.releaseAcquired() && retiredAll;
             retiredAll = menuChain.releaseAcquired() && retiredAll;
-            retiredAll = hudChain.releaseAcquired() && retiredAll;
             retiredAll = cursorChain.releaseAcquired() && retiredAll;
             for (auto &chain : inset)
                 retiredAll = chain.releaseAcquired() && retiredAll;
@@ -2105,40 +2072,6 @@ struct Host {
                                 menuGeneration, 1, hand, hit.u, hit.v, input.trigger[hand],
                                 input.primaryInputGeneration[hand]};
     }
-    void hudLayer(const Ui &ui, const Input &input, XrCompositionLayerQuad &layer,
-                  std::vector<const XrCompositionLayerBaseHeader *> &output) {
-        const ULONGLONG now = GetTickCount64();
-        if (!ui.gameplay || !input.focused || !input.headValid || !ui.tickMs || now < ui.tickMs ||
-            now - ui.tickMs > UiFreshMs)
-            return;
-        bool changed = !hudUploaded || ui.health != drawnHud.health || ui.armor != drawnHud.armor ||
-                       std::memcmp(ui.currentWeapon, drawnHud.currentWeapon, sizeof(ui.currentWeapon)) ||
-                       std::memcmp(ui.currentAmmo, drawnHud.currentAmmo, sizeof(ui.currentAmmo));
-        if (changed) {
-            hudBitmap.stats(ui);
-            hudUploaded = false;
-            if (!hudChain.upload(context.p, hudBitmap.bits))
-                return;
-            drawnHud = ui;
-            hudUploaded = true;
-        }
-        if (!hudChain.ownership.previousImageAvailable() || !hudAnchor.initialized)
-            return;
-        const Pose panel = hudAnchor.panel({0, -.38f, -settings.hudDistance});
-        if (!comfortablePanel(panel, input.head)) {
-            hudAnchor.reset();
-            return;
-        }
-        layer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-        layer.space = local;
-        layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-        layer.subImage = hudChain.subimage();
-        layer.pose = xrPose(panel);
-        layer.size = {settings.hudWidth, settings.hudWidth / 4};
-        layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
-                           XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
-        output.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&layer));
-    }
     void feedback(const Ui &ui, const Input &input, bool menuVisible) {
         bool valid = !quit && running && hapticsAvailable && ui.gameplay && input.focused &&
                      input.headValid && !menuVisible && ui.tickMs && GetTickCount64() >= ui.tickMs &&
@@ -2248,7 +2181,7 @@ struct Host {
             XrCompositionLayerProjection projectionLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             XrCompositionLayerProjection insetLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             std::array<XrCompositionLayerQuad, 2> quadLayers;
-            XrCompositionLayerQuad menuQuad{}, hudQuad{}, cursorQuad{};
+            XrCompositionLayerQuad menuQuad{}, cursorQuad{};
             presentedPointer = {};
             if (published && !quit && !api.lossPending && frameState.shouldRender) {
                 if (snapshot.renderer && !snapshot.menuVisible && validViews && input.focused &&
@@ -2342,22 +2275,9 @@ struct Host {
                 layers.clear();
             const auto *world = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projectionLayer);
             const auto *insetWorld = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&insetLayer);
+            // Only the game's own HUD is shown (composited into the stereo pair);
+            // there is no substitute panel when a pair arrives without it.
             bool worldPresented = admitFinalWorld(layers, world, input, validViews,views, insetWorld);
-            const bool canDrawHud = published && !quit && !api.lossPending && frameState.shouldRender &&
-                                    !snapshot.menuVisible;
-            bool fallbackDrawn = false;
-            if (canDrawHud && (!worldPresented || cachedPresentation != NativeUiComplete)) {
-                hudLayer(snapshot.ui, input, hudQuad, layers);
-                fallbackDrawn = true;
-            }
-            // A fallback upload may wait for an image. Recheck the world after it
-            // completes so an expired pair is never resubmitted.
-            worldPresented = admitFinalWorld(layers, world, input, validViews,views, insetWorld);
-            if (canDrawHud && !worldPresented && !fallbackDrawn) {
-                hudLayer(snapshot.ui, input, hudQuad, layers);
-                fallbackDrawn = true;
-                worldPresented = admitFinalWorld(layers, world, input, validViews,views, insetWorld);
-            }
             worldPresented=finalNativeUiLayers(quit,api.lossPending,layers,worldPresented);
             if (worldPresented) {
                 ++submissions;
