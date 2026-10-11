@@ -72,8 +72,11 @@ Beyond's controller model determines its bindings. Use the current package's
 3. Keep the controllers still. Move your head left/right, up/down and forward/back
    without turning; nearby and distant objects must show different parallax.
    Then test yaw, pitch and roll independently. The world must remain stable.
-4. Turn with the right stick, move with the left stick, recenter, pause/resume,
-   change level and load a test save. Check for stale frames, double movement,
+4. Turn with the right stick (smooth by default), move with the left stick while
+   looking in different directions (forward must follow your head), recenter,
+   pause/resume, change level and load a test save. Note how smooth the world looks
+   while walking and turning; the `Perf` lines in `Bin/SS2VR.log` and the
+   `Host perf` lines in `Bin/SS2VR/ss2vr_host.log` record pairs per second. Check for stale frames, double movement,
    eye disagreement, wrong scale or an origin jump after each transition.
 5. Approach a wall with physical head movement and ordinary joystick movement.
    Test the enabled body/head collision behavior, corners, stairs and low roofs.

@@ -1,5 +1,32 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-11 (later) — performance, weapon feel, controls
+
+Measured in the simulated lab with five-second `Perf` lines (game) and `Host perf`
+lines (host); a Fable performance review drove the plan.
+- Request pipelining: the host keeps a second request queued while the game holds
+  the other slot. Before, about half of all game frames were flat frames the headset
+  never saw (16 → 30 pairs/s at 1344x1512).
+- Zero-copy eye images (ABI 14): pairs render into D3D9 shared render targets
+  (DXVK KMT handles, one per slot and eye) that the host opens with
+  `OpenSharedResource` and copies on the GPU. A pair is Ready at once and gpuReady
+  when its D3D9 event query completes (polled, never waited); the host waits for its
+  own copy before the slot is reused. Readback (a 4-10 ms drain per eye in DXVK),
+  row copies, the alpha pass and the host upload are gone (→ ~40 pairs/s). A
+  lab-only probe writes one zero-copy frame as a PPM; captures request pixel pairs.
+- The desktop window mirrors the left eye; the third, desktop-only world render is
+  skipped (`[Render] DesktopWorld=1` restores it). The wheel's mesh materials left
+  fog on for the HUD; fog is now restored through the engine's switches.
+- Remaining lab cost is the window Present into the lab's software (pixman)
+  compositor, ~10 ms per frame, which a real desktop does on the GPU.
+- Weapons follow the controller (flat viewmodel tilt dropped; authored quarter/half
+  turns kept by snapping), muzzle and lasers follow the barrel, lasers are red,
+  each trigger fires its own gun (combo weapons), the saw is held by its trigger
+  handle, and hands are the same size across weapons (V111/V123 side captures).
+- Movement follows head yaw; smooth turning by default; the wheel opens on its own
+  button and grips jump on foot (carry wins).
+
+
 ## 2026-10-11 — user feedback: 2D aspect, gray HUD, weapon grips
 
 - 2D aspect: SS2 letterboxes its whole 2D view to `gfx_fAspectRatio` (Sam2Game
