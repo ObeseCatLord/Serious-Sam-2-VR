@@ -68,6 +68,10 @@ static void logPointer(bool same, bool source, bool ready, bool held, uintptr_t 
         read32(base + 0x3fe214), held, unsigned(menu), unsigned(capturedMenu), generation, pointerGeneration,
         publishedGeneration, static_cast<unsigned long long>(pointerSequence), static_cast<unsigned long long>(menuSequence));
 }
+// A withdrawn pointer (generation 0) or one for the current menu identity.
+static bool sameMenuGeneration(const MenuPointer &pointer) {
+    return !pointer.interactionGeneration || pointer.interactionGeneration == generation;
+}
 static void __cdecl poll() {
     originalPoll(); // Preserve the normal keyboard, mouse and menu event ordering.
     if (!hooksReady.load(std::memory_order_acquire) || !channel.shared)
@@ -136,6 +140,15 @@ static void __cdecl poll() {
     float x = readFloat(base + 0x3fe20c), y = readFloat(base + 0x3fe210);
     allowed =
         allowed && std::isfinite(sensitivity) && sensitivity > .0001f && std::isfinite(x) && std::isfinite(y);
+    // The host withdraws the pointer for an XR frame that did not submit the
+    // menu quad (upload in flight, dropped frame). Hold the click state across
+    // such a short gap on the same menu instead of releasing a press mid-click.
+    static uint64_t lastAllowed = 0;
+    const uint64_t now = GetTickCount64();
+    if (allowed)
+        lastAllowed = now;
+    else if (menu && menu == capturedMenu && sameMenuGeneration(pointer) && now - lastAllowed < 150)
+        return;
     bool held = trigger.update(pointer.trigger, allowed);
     if (menu) logPointer(sameMenu, sourceEligible, nativeReady, held, menu, pointer.interactionGeneration,
                          publishedGeneration, pointer.menuSequence, menuSequence);

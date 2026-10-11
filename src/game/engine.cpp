@@ -2014,6 +2014,9 @@ static void appendLocalGesturePose(const Snapshot &source, network::PosePacket &
     }
     ReleaseSRWLockShared(&snapshotLock);
 }
+// Two weapons the native couples to one Fire command (dual pistols without
+// combo weapons): either trigger then fires, as the native alternates guns.
+static std::atomic<bool> coupledNativeFire{false};
 // Bounded transition trace of the per-interval primary (fire) preparation.
 static void tracePrimary(const char *stage, uint8_t fire, const PreparedPlayer &entry) {
     static unsigned traced = 0;
@@ -2040,6 +2043,7 @@ static void preparePrimary(PreparedPlayer &entry, bool authoritative) {
     // command hooks, so firing keeps native semantics instead of going silent.
     const auto unclaimed = [&](const char *stage, uint8_t fire) {
         entry.primary = {};
+        coupledNativeFire.store(entry.hands == 3, std::memory_order_relaxed);
         tracePrimary(stage, fire, entry);
     };
     if (!capturePrimaryBinding(entry)) return unclaimed("binding", 0);
@@ -2054,6 +2058,7 @@ static void preparePrimary(PreparedPlayer &entry, bool authoritative) {
     if (!nativeInputHealthy() || !primaryBindingsCurrent(entry)) return tracePrimary("live", fire, entry);
     entry.primary = nativePrimaryProjection(entry.hands, fire & liveFire,
         entry.button[0], entry.button[1], entry.combo && entry.dual);
+    coupledNativeFire.store(false, std::memory_order_relaxed);
     if (entry.revoked) entry.primary.bits = 0;
     tracePrimary(entry.revoked ? "revoked" : "projected", fire & liveFire, entry);
     if (!entry.revoked) prepareMelee(entry, sourceCurrent);
@@ -3516,12 +3521,39 @@ static Matrix44 *__fastcall project(void *p, void *, Matrix44 *out) {
     }
     return out;
 }
+// The flat game draws first-person weapons with their own (narrower) FOV, which
+// magnifies them against the world. Automatic VR scale restores that apparent
+// size: tan(worldFov/2) / tan(weaponFov/2), from the native frustum arguments.
+static std::atomic<float> nativeWorldFov{0}, nativeWeaponFov[64]{};
+static void noteWorldFov(float fov) {
+    constexpr float degree = Pi / 180;
+    if (std::isfinite(fov) && fov >= 45 * degree && fov <= 135 * degree && fov > nativeWorldFov.load())
+        nativeWorldFov = fov; // The widest observation is the unzoomed camera.
+}
+static void noteWeaponFov(uint32_t id, float fov) {
+    constexpr float degree = Pi / 180;
+    if (id < 64 && std::isfinite(fov) && fov >= 20 * degree && fov <= 135 * degree && !nativeWeaponFov[id].load()) {
+        nativeWeaponFov[id] = fov;
+        log("Weapon native fov id=%u weapon=%.1f world=%.1f degrees", id, fov / degree, nativeWorldFov.load() / degree);
+    }
+}
+static float weaponModelScale(const VrSettings &s, int id) {
+    float base = s.weaponScale;
+    if (base <= 0) { // Automatic.
+        const float world = nativeWorldFov.load(), weapon = id >= 0 && id < 64 ? nativeWeaponFov[id].load() : 0;
+        base = world > 0 && weapon > 0 ? std::clamp(std::tan(world / 2) / std::tan(weapon / 2), 1.f, 2.5f) : 1.f;
+    }
+    return id >= 0 && id < int(WeaponCount) ? base * s.weaponScaleById[id] : base;
+}
 static Matrix44 *__cdecl weaponFrustum(Matrix44 *out, float fov, float aspect, float nz, float fz) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
 #else
     const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 #endif
+    if (caller == nativeFrustumReturn) noteWorldFov(fov);
+    else if (caller == weaponFrustumReturn && physicalWeapon && physicalWeapon->weapon)
+        noteWeaponFov(primaryField(physicalWeapon->weapon, 0xb4), fov);
     if (auto *sample = nativeProjectionObservation; sample && caller == nativeFrustumReturn) {
         if (sample->seen || out != sample->output || sample->player != eyePlayer || eyeIndex < 0)
             sample->rejected = true;
@@ -6072,7 +6104,11 @@ static bool currentControls(int index, const Snapshot &snapshot, const ControlSa
         return false;
     if (index != 5 && index != 6)
         return true;
-    const unsigned hand = index == 5 ? 1u : 0u;
+    unsigned hand = index == 5 ? 1u : 0u;
+    // Coupled dual weapons: the left trigger also drives native Fire (see poll).
+    if (index == 5 && active && !snapshot.fire[1] && snapshot.fire[0] &&
+        coupledNativeFire.load(std::memory_order_relaxed))
+        hand = 0;
     if ((active && !snapshot.fire[hand]) || !primaryActionEligible(captured.input, hand) ||
         !primaryActionEligible(snapshot.input, hand) || !trackedHandCurrent(captured.input, snapshot.input, hand) ||
         captured.input.primaryInputGeneration[hand] != snapshot.input.primaryInputGeneration[hand])
@@ -6629,8 +6665,9 @@ static void __fastcall poll(void *b, void *) {
         values[2] = std::max(0.f, direction.z);
         values[3] = std::max(0.f, -direction.z);
         values[4] = s.jump ? 1 : 0;
-        values[5] = fire[1] ? 1 : 0;
-        values[6] = fire[0] ? 1 : 0;
+        const bool coupled = coupledNativeFire.load(std::memory_order_relaxed) && s.handle[0] && s.handle[1];
+        values[5] = (fire[1] || (coupled && fire[0])) ? 1 : 0;
+        values[6] = (fire[0] && !coupled) ? 1 : 0;
         values[7] = s.use ? 1 : 0;
         values[8] = s.sprint ? 1 : 0;
         const uint32_t buttons = s.input.buttons[0] | s.input.buttons[1];
