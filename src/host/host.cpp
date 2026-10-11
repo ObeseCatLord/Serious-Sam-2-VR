@@ -1778,7 +1778,17 @@ struct Host {
             throw std::runtime_error("Runtime returned a non-stereo view count");
         if ((validity.viewStateFlags & needed) != needed) {
             ++invalidViews;
-            return false;
+            if (!settings.labFixedPose)
+                return false;
+            // Measurement only ([Lab] FixedPose): an untracked headset (e.g. base
+            // stations off) gets a fixed head at the origin with the runtime's FOV.
+            for (unsigned h = 0; h != 2; ++h) {
+                auto &view = views[h];
+                view.pose = {{0, 0, 0, 1}, {h ? .032f : -.032f, 0, 0}};
+                auto &f = view.fov;
+                if (!std::isfinite(f.angleLeft) || f.angleLeft >= f.angleRight || f.angleDown >= f.angleUp)
+                    f = {-.8f, .8f, .8f, -.8f};
+            }
         }
         for (const auto &view : views) {
             const auto &f = view.fov;

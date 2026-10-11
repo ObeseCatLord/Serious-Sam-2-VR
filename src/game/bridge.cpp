@@ -1202,8 +1202,10 @@ static void releaseSharedImages() {
     }
     sharedGeneration = 0;
 }
+static void releaseMenuScaled();
 static void releaseTargets() {
     ++resourceGeneration;
+    releaseMenuScaled();
     gpuProfile.release();
     releaseSharedImages();
     sharedFailed = false;
@@ -1656,6 +1658,17 @@ static void startChannel() {
     }
 }
 static uint64_t lastMenuCopy = 0, menuSequence = 0;
+// The flat screen is a ~2 m panel: a 1920-wide image is all a headset resolves on
+// it. Its band is scaled on the GPU before readback instead of copying the whole
+// eye-sized canvas (50 MB at 3561^2) through the CPU every copy.
+static IDirect3DSurface9 *menuScaled = nullptr, *menuScaledRead = nullptr;
+static uint32_t menuScaledWidth = 0, menuScaledHeight = 0;
+static void releaseMenuScaled() {
+    if (menuScaled) menuScaled->Release();
+    if (menuScaledRead) menuScaledRead->Release();
+    menuScaled = menuScaledRead = nullptr;
+    menuScaledWidth = menuScaledHeight = 0;
+}
 // The region of the canvas the game draws its 2D view into: ForceAspectRatio
 // letterboxes the drawport to gfx_fAspectRatio (Sam2Game RVA 3F9DE0).
 struct UiBand { uint32_t x = 0, y = 0, width = 0, height = 0; };
@@ -2002,25 +2015,39 @@ static void presentBody(IDirect3DDevice9 *d) {
     const uint32_t copyWidth = width, copyHeight = height;
     IDirect3DSurface9 *backbuffer = nullptr, *cpu = nullptr;
     bool locked = false, lockAttempted = false, lockReturned = false, held = false;
+    // The game letterboxes its 2D view to gfx_fAspectRatio inside the (eye-
+    // sized) canvas; the flat screen shows only that band, at its own aspect.
+    const UiBand source = uiBand(copyWidth, copyHeight);
+    const float fit = std::min({1.f, 1920.f / float(std::max(1u, source.width)), 1080.f / float(std::max(1u, source.height))});
+    const uint32_t outWidth = std::max(2u, uint32_t(float(source.width) * fit)) & ~1u,
+                   outHeight = std::max(2u, uint32_t(float(source.height) * fit)) & ~1u;
     withNativeFinally([&] {
-        if (FAILED(sourceBackbuffer(&backbuffer)) || !readback[0]) return;
-        cpu = readback[0]; cpu->AddRef();
-        if (FAILED(device->GetRenderTargetData(backbuffer, cpu)) ||
+        if (FAILED(sourceBackbuffer(&backbuffer))) return;
+        if (menuScaledWidth != outWidth || menuScaledHeight != outHeight || !menuScaled || !menuScaledRead) {
+            releaseMenuScaled();
+            if (FAILED(device->CreateRenderTarget(outWidth, outHeight, colorFormat, D3DMULTISAMPLE_NONE, 0, FALSE,
+                                                  &menuScaled, nullptr)) ||
+                FAILED(device->CreateOffscreenPlainSurface(outWidth, outHeight, colorFormat, D3DPOOL_SYSTEMMEM,
+                                                           &menuScaledRead, nullptr))) { releaseMenuScaled(); return; }
+            menuScaledWidth = outWidth; menuScaledHeight = outHeight;
+        }
+        const RECT bandRect{LONG(source.x), LONG(source.y), LONG(source.x + source.width), LONG(source.y + source.height)};
+        if (FAILED(originalStretch(device, backbuffer, &bandRect, menuScaled, nullptr, D3DTEXF_LINEAR))) return;
+        cpu = menuScaledRead; cpu->AddRef();
+        if (FAILED(device->GetRenderTargetData(menuScaled, cpu)) ||
             generation != resourceGeneration.load(std::memory_order_acquire)) return;
         backbuffer->Release(); backbuffer = nullptr;
         D3DLOCKED_RECT pixels{};
         lockAttempted = true;
         const auto result = cpu->LockRect(&pixels, nullptr, D3DLOCK_READONLY);
         lockReturned = true; locked = SUCCEEDED(result);
-        if (!locked || !pixels.pBits || pixels.Pitch < int(copyWidth * 4) ||
+        if (!locked || !pixels.pBits || pixels.Pitch < int(outWidth * 4) ||
             generation != resourceGeneration.load(std::memory_order_acquire)) return;
         uint8_t *target = pixelStore.matches(pixelStore.generation, copyWidth, copyHeight) ?
             pixelStore.buffer(MenuPixelBuffer) : nullptr;
         if (!target) return;
-        // The game letterboxes its 2D view to gfx_fAspectRatio inside the (eye-
-        // sized) canvas; the flat screen shows only that band, at its own aspect.
-        const UiBand band = uiBand(copyWidth, copyHeight);
-        held = channel.lock();
+        const UiBand band{0, 0, outWidth, outHeight};
+        held = channel.lock(5);
         if (!held) return;
         auto &m = channel.shared->menu;
         for (uint32_t y = 0; y < band.height; ++y)
