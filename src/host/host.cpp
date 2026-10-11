@@ -986,6 +986,7 @@ struct Host {
     ComfortAnchor menuAnchor, hudAnchor;
     VrSettings settings;
     uint32_t lastFire[2]{}, lastDamage = 0;
+    int32_t lastHover[2]{-1, -1};
     bool feedbackSeeded = false, hapticsAvailable = true;
     Fov currentFov[2];
     bool recenterWasHeld = false, recenterUi = false;
@@ -1992,16 +1993,23 @@ struct Host {
             for (unsigned h = 0; h != 2; ++h) {
                 bool hurt = ui.damageSequence != lastDamage;
                 bool fired = ui.fireSequence[h] != lastFire[h];
+                // A light tick as an open wheel's hover moves onto another item.
+                const bool hovered = ui.wheel[h].open && ui.wheel[h].hover != -1 && ui.wheel[h].hover != lastHover[h];
                 float amplitude =
                     std::max(hurt ? settings.damageHaptic : 0.f, fired ? settings.fireHaptic : 0.f);
+                const bool tick = amplitude <= 0 && hovered;
+                if (tick)
+                    amplitude = .25f;
                 if (hapticsAvailable && amplitude > 0 && input.handValid[h])
                     hapticsAvailable =
                         actions.pulse(api, session, h, amplitude,
-                                      hurt && settings.damageHaptic > 0 ? 80'000'000 : 40'000'000);
+                                      hurt && settings.damageHaptic > 0 ? 80'000'000 : tick ? 15'000'000 : 40'000'000);
             }
         }
-        for (unsigned h = 0; h != 2; ++h)
+        for (unsigned h = 0; h != 2; ++h) {
             lastFire[h] = ui.fireSequence[h];
+            lastHover[h] = ui.wheel[h].open ? ui.wheel[h].hover : -1;
+        }
         lastDamage = ui.damageSequence;
         feedbackSeeded = true;
     }
