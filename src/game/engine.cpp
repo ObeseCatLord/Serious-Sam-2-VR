@@ -1153,6 +1153,166 @@ static void publishSnapshot(const Snapshot &s) {
 }
 static void prepareLocalGestureSource(Snapshot &);
 static void appendLocalGesturePose(const Snapshot &, network::PosePacket &);
+// Grip carry. A grip squeeze beside a takeable prop picks it up with that hand
+// through the native carry: CPuppetEntity::TakeObject (slot 0x290) connects a
+// manipulator joint that pulls the object toward a desired placement. Each
+// carry tick that target becomes the hand, and releasing the grip drops the
+// object (slot 0x29C, stock events and weapon restore) with the hand's velocity.
+// Native Use/Fire carrying is unchanged. Single player and server only.
+struct NativeHulls { int32_t allocated = 0; void **data = nullptr; int32_t count = 0, step = 16; };
+static void(__cdecl *hullsInRange)(const Vec3 &, float, NativeHulls &) = nullptr;
+static void *(__thiscall *hullOwner)(void *) = nullptr;
+static void *(__thiscall *hullBody)(void *) = nullptr;
+static void(__thiscall *jointPlacements)(void *, const Pose &, const Pose &) = nullptr;
+static void(__thiscall *jointMaxLinVel)(void *, float) = nullptr;
+static void(__cdecl *preDeleteArray)(const void *, void *) = nullptr;
+static void(__cdecl *deleteArray)(void *) = nullptr;
+static void(__cdecl *postDeleteArray)(void *) = nullptr;
+static void(__thiscall *originalCarrying)(void *) = nullptr;
+template <class R, class... A> static R virtualCall(void *object, unsigned offset, A... args) {
+    uintptr_t table = 0;
+    memcpy(&table, object, sizeof(table));
+    R(__thiscall *function)(void *, A...) = nullptr;
+    memcpy(&function, reinterpret_cast<void *>(table + offset), sizeof(function));
+    return function(object, args...);
+}
+struct GripCarry {
+    int requestHand = -1, hand = -1;
+    uint32_t requestHull = 0, joint = 0;
+    Pose requestPose{};
+    bool gripDown[2]{};
+    struct Sample { double time; Vec3 p; } history[16]{};
+    unsigned samples = 0;
+};
+static GripCarry gripCarry; // Game thread only.
+static std::atomic<bool> gripCarrying{false};
+static constexpr float GripReach = .2f, ThrowBoost = 1.25f;
+static bool gripCarryAuthority(void *player) {
+    return hooksReady.load(std::memory_order_acquire) && hullsInRange && hullOwner && hullBody && jointPlacements &&
+        deleteArray && preDeleteArray && postDeleteArray && player && local(player) &&
+        (singlePlayer() || multiplayer::server());
+}
+static bool handWorldPose(const Snapshot &s, void *player, unsigned h, Pose &out) {
+    Pose body;
+    const auto &in = s.input;
+    if (h >= 2 || !in.handValid[h] || !trackingAnchor(player, body)) return false;
+    const Pose tracked = in.gripValid[h] && finite(in.grip[h]) ? in.grip[h] : in.hand[h];
+    out = worldHandTracking(body, s.origin, s.turn, in.head, tracked);
+    return finite(out);
+}
+// Handle of the nearest takeable hull whose shape reaches within `reach` of `at`.
+static uint32_t nearestCarryable(void *player, Vec3 at, float reach) {
+    NativeHulls hulls;
+    uint32_t best = 0;
+    float bestDistance = 1e30f;
+    hullsInRange(at, reach, hulls);
+    for (int32_t i = 0; hulls.data && i < hulls.count; ++i) {
+        void *hull = hulls.data[i];
+        void *owner = hull ? hullOwner(hull) : nullptr;
+        if (!owner || owner == player || !(virtualCall<int>(owner, 0x108) & 2)) continue; // Takeable.
+        if (primaryField(owner, 0x84) & 4) continue; // A prop someone already carries.
+        void *body = hullBody(hull);
+        if (!body) continue;
+        Pose placement;
+        memcpy(&placement, static_cast<uint8_t *>(body) + 0x2c, sizeof(placement));
+        const Vec3 d = placement.p - at;
+        if (dot(d, d) < bestDistance) {
+            bestDistance = dot(d, d);
+            best = pointerHandle(hull);
+        }
+    }
+    if (hulls.allocated && hulls.data) {
+        preDeleteArray(hulls.data, nullptr);
+        deleteArray(hulls.data);
+        postDeleteArray(nullptr);
+    }
+    return best;
+}
+static double carryClock() {
+    LARGE_INTEGER frequency{}, now{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    return double(now.QuadPart) / double(frequency.QuadPart);
+}
+static Vec3 carryVelocity() {
+    // Average over the last ~80 ms of carry ticks; the latest sample alone is noisy.
+    const auto &g = gripCarry;
+    if (g.samples < 2) return {};
+    const auto &last = g.history[(g.samples - 1) % 16];
+    for (unsigned back = 2; back <= std::min(g.samples, 16u); ++back) {
+        const auto &first = g.history[(g.samples - back) % 16];
+        const double dt = last.time - first.time;
+        if (dt >= .08 || back == std::min(g.samples, 16u))
+            return dt > .005 ? (last.p - first.p) * float(1 / dt) : Vec3{};
+    }
+    return {};
+}
+static void releaseGripCarry(void *puppet, bool throwIt) {
+    const uint32_t bodyHandle = primaryField(puppet, 0x36c);
+    const Vec3 velocity = carryVelocity() * ThrowBoost;
+    virtualCall<void>(puppet, 0x29c); // DropObject: stock ObjectThrown events and weapon restore.
+    if (void *body = throwIt && bodyHandle ? resolve(bodyHandle) : nullptr) {
+        if (std::isfinite(velocity.x) && std::isfinite(velocity.y) && std::isfinite(velocity.z)) {
+            virtualCall<void>(body, 0x4c, &velocity); // CBody::SetVelocity
+            virtualCall<void>(body, 0x2c);            // Wake the body.
+        }
+    }
+    log("Grip carry released hand=%d velocity=%.2f,%.2f,%.2f", gripCarry.hand, velocity.x, velocity.y, velocity.z);
+    gripCarry.hand = -1;
+    gripCarry.joint = 0;
+    gripCarry.samples = 0;
+    gripCarrying = false;
+}
+static void __fastcall carryStep(void *puppet, void *) {
+    const auto s = copySnapshot();
+    const bool ours = puppet == s.player && gripCarryAuthority(puppet);
+    if (!ours) {
+        originalCarrying(puppet);
+        return;
+    }
+    auto &g = gripCarry;
+    const bool live = vrSession(s) && fresh(s.input) && s.ui.gameplay && !recenterHeld(s.input);
+    if (g.hand >= 0) {
+        if (!primaryField(puppet, 0x564)) { // Ended natively: Use, death, object destroyed.
+            g.hand = -1; g.samples = 0; gripCarrying = false;
+        } else if (!live || !(s.input.buttons[g.hand] & Wheel)) {
+            releaseGripCarry(puppet, live);
+        }
+    }
+    if (g.requestHand >= 0) {
+        const unsigned h = unsigned(g.requestHand);
+        g.requestHand = -1;
+        if (g.hand < 0 && live && !primaryField(puppet, 0x564) && (s.input.buttons[h] & Wheel) &&
+            resolve(g.requestHull)) {
+            virtualCall<void>(puppet, 0x290, g.requestHull, g.requestPose); // TakeObject(hull, world grab pose)
+            if (primaryField(puppet, 0x564)) {
+                g.hand = int(h); g.samples = 0; g.joint = 0;
+                gripCarrying = true;
+                log("Grip carry taken hand=%u object=%u", h, primaryField(puppet, 0x564));
+            }
+        }
+    }
+    originalCarrying(puppet); // Creates the joint and computes the native camera target.
+    Pose hand;
+    if (g.hand < 0 || !primaryField(puppet, 0x564) || !handWorldPose(s, puppet, unsigned(g.hand), hand)) return;
+    void *joint = resolve(primaryField(puppet, 0x374));
+    void *body = resolve(primaryField(puppet, 0x118));
+    if (!joint || !body) return;
+    Pose own;
+    memcpy(&own, static_cast<uint8_t *>(body) + 0x2c, sizeof(own));
+    Pose grab;
+    memcpy(&grab, static_cast<uint8_t *>(puppet) + 0x56c, sizeof(grab));
+    if (!finite(own) || !finite(grab)) return;
+    const uint32_t jointHandle = primaryField(puppet, 0x374);
+    if (jointHandle != g.joint) {
+        g.joint = jointHandle;
+        if (jointMaxLinVel) jointMaxLinVel(joint, 40.f); // Keep up with a moving hand.
+    }
+    // The joint holds the grab frame (object space) at the hand (player-body space).
+    jointPlacements(joint, compose(inverse(own), hand), grab);
+    g.history[g.samples % 16] = {carryClock(), hand.p};
+    ++g.samples;
+}
 static void update(void *p) {
     validateLabOnlineIsolation(false);
     if (rigMutationActive || !hooksReady.load(std::memory_order_acquire) || !channel.shared || !local(p))
@@ -1274,7 +1434,36 @@ static void update(void *p) {
         bool valid = enabled && !resettingControls && input.handValid[h] && finite(input.hand[h]);
         bool wheelAllowed = valid && rider.handheld() && !(input.blockedWheels & (1u << h));
         // A squeeze that starts a carry pickup on this hand never opens its wheel.
-        const bool grabPriority = false;
+        const bool gripDown = valid && (input.buttons[h] & Wheel);
+        if (gripDown && !gripCarry.gripDown[h] && rider.handheld() && gripCarry.hand < 0 &&
+            gripCarry.requestHand < 0 && !wheels[h].open && gripCarryAuthority(p)) {
+            Snapshot reach = s;
+            reach.input = input;
+            Pose hand;
+            if (handWorldPose(reach, p, unsigned(h), hand)) {
+                if (const uint32_t hull = nearestCarryable(p, hand.p, GripReach)) {
+                    gripCarry.requestHand = h;
+                    gripCarry.requestHull = hull;
+                    gripCarry.requestPose = hand;
+                } else {
+                    // Bounded evidence: where the nearest takeable object is from this hand.
+                    static unsigned traced = 0;
+                    if (traced < 12) {
+                        ++traced;
+                        const uint32_t nearby = nearestCarryable(p, hand.p, 8.f);
+                        void *hull = nearby ? resolve(nearby) : nullptr;
+                        void *body = hull ? hullBody(hull) : nullptr;
+                        Pose placement{};
+                        if (body) memcpy(&placement, static_cast<uint8_t *>(body) + 0x2c, sizeof(placement));
+                        const Vec3 d = placement.p - hand.p;
+                        log("Grip carry none in reach hand=%d at=%.2f,%.2f,%.2f nearest8m=%u offset=%.2f,%.2f,%.2f",
+                            h, hand.p.x, hand.p.y, hand.p.z, nearby, d.x, d.y, d.z);
+                    }
+                }
+            }
+        }
+        gripCarry.gripDown[h] = gripDown;
+        const bool grabPriority = gripCarry.requestHand == h || gripCarry.hand == h;
         int selected = wheels[h].sample(input, unsigned(h), ui.weapon, ui.count, wheelAllowed,
                                         wheelBubbles(), grabPriority);
         ui.open = wheels[h].open;
@@ -6980,8 +7169,10 @@ static void __fastcall poll(void *b, void *) {
         values[3] = std::max(0.f, -direction.z);
         values[4] = s.jump ? 1 : 0;
         const bool coupled = coupledNativeFire.load(std::memory_order_relaxed) && s.handle[0] && s.handle[1];
-        values[5] = (fire[1] || (coupled && fire[0])) ? 1 : 0;
-        values[6] = (fire[0] && !coupled) ? 1 : 0;
+        // A grip-held object is thrown by releasing the grip, never by the native Fire charge.
+        const bool carrying = gripCarrying.load(std::memory_order_relaxed);
+        values[5] = (!carrying && (fire[1] || (coupled && fire[0]))) ? 1 : 0;
+        values[6] = (!carrying && fire[0] && !coupled) ? 1 : 0;
         values[7] = s.use ? 1 : 0;
         values[8] = s.sprint ? 1 : 0;
         const uint32_t buttons = s.input.buttons[0] | s.input.buttons[1];
@@ -7961,6 +8152,14 @@ bool attach(bool headless) {
         S(e, "?GetModelInstance@CModelRenderable@SeriousEngine@@QAEPAVCModelInstance@2@XZ", laserModelInstance);
         S(e, "?mdlGetAttachmentAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z", laserAttachment);
         symbol(e, "?mdlModelInstanceGetBoundingBox@SeriousEngine@@YA?AVBox3f@1@PBVCModelInstance@1@@Z", modelBounds);
+        symbol(e, "?cldGetHullsInRange@SeriousEngine@@YAXABVVector3f@1@MAAV?$CDynamicContainer@VCHull@SeriousEngine@@@1@@Z", hullsInRange);
+        symbol(e, "?GetOwner@CAspect@SeriousEngine@@QAEPAVCEntity@2@XZ", hullOwner);
+        symbol(e, "?GetBody@CHull@SeriousEngine@@QAEPAVCBody@2@XZ", hullBody);
+        symbol(e, "?SetDesiredPlacements@CManipulatorJoint@SeriousEngine@@QAEXABVQuatVect@2@0@Z", jointPlacements);
+        symbol(e, "?SetMaxLinVel@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxLinVel);
+        symbol(c, "?memPreDeleteArrayRC_internal@SeriousEngine@@YAXPBXPAVCDataType@1@@Z", preDeleteArray);
+        symbol(c, "?memDeleteArray_internal@SeriousEngine@@YAXPAX@Z", deleteArray);
+        symbol(c, "?memPostDeleteArrayRC_internal@SeriousEngine@@YAXPAVCDataType@1@@Z", postDeleteArray);
         S(g, "?RenderNavigationalBeacons@CPuppetEntity@SeriousEngine@@QAEXABVMatrix34f@2@ABVMatrix44f@2@ABVVector2l@2@M@Z", nativeNavigation);
         S(g, "?RenderMissionObjectives@CPuppetEntity@SeriousEngine@@QAEXABVMatrix34f@2@ABVMatrix44f@2@ABVVector2l@2@M@Z", nativeObjectives);
         S(g, "?samGetWorldInfo@SeriousEngine@@YAPAVCWorldInfoEntity@1@XZ", nativeWorldInfo);
@@ -8177,6 +8376,7 @@ bool attach(bool headless) {
                           reinterpret_cast<void **>(&originalDepthRange)) && ok;
         H(g, "?ProcessPlayerControls@CPlayerBrainEntity@SeriousEngine@@UAEXEVVector3f@2@0@Z",
           waterPlayerControls, originalPlayerControls);
+        H(g, "?HandleObjectCarrying@CPuppetEntity@SeriousEngine@@QAEXXZ", carryStep, originalCarrying);
         H(e, "?PollValues@CInputBindings@SeriousEngine@@QAEXXZ", poll, originalPoll);
         H(e, "?GetCommandValue@CInputBindings@SeriousEngine@@QAEMVIDENT@2@@Z", commandValue, originalValue);
         H(e, "?IsCommandDown@CInputBindings@SeriousEngine@@QAEHVIDENT@2@@Z", commandDown, originalDown);
