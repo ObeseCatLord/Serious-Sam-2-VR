@@ -463,7 +463,7 @@ int wmain(int argc,wchar_t **argv) {
         EnumWindows(closeWindow,static_cast<LPARAM>(pid));return 0;
     }
     if(wcscmp(argv[1],L"capture")!=0||argc!=12)return 2;
-    std::vector<uint8_t> pixels[2];for(auto &p:pixels)p.resize(EyeBytes);
+    std::vector<uint8_t> pixels[2];PixelStore store;
     wchar_t *end=nullptr;
     const auto minimumInput=std::wcstoull(argv[4],&end,10);if(!end||*end)return 2;
     float expected[7]{};
@@ -494,9 +494,14 @@ int wmain(int argc,wchar_t **argv) {
                     s.request.width<=MaxDimension&&s.request.height<=MaxDimension&&
                     (!best||s.request.sequence>best->request.sequence))best=&s;
             }
-            if(best) {
+            const auto &sections=shared.pixels;
+            if(best&&(store.matches(sections.generation,sections.width,sections.height)||
+                      store.open(channel.token,sections.generation,sections.width,sections.height,false))&&
+               store.matches(best->pixelGeneration,best->request.width,best->request.height)) {
                 request=best->request;presentation=best->presentation;clearance=best->headClearance;
-                for(unsigned h=0;h<2;++h)std::memcpy(pixels[h].data(),best->pixels[h],size_t(request.width)*request.height*4);
+                const unsigned index=unsigned(best-shared.slot);
+                for(unsigned h=0;h<2;++h)pixels[h].assign(store.buffer(slotPixelBuffer(index,h)),
+                    store.buffer(slotPixelBuffer(index,h))+size_t(request.width)*request.height*4);
                 found=true;
             }
         }}

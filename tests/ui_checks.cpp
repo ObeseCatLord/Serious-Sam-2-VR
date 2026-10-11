@@ -155,9 +155,13 @@ int main() {
     pointer.trigger = 1;
     check(pointerTrigger.update(pointer.trigger, menuPointerEligible(pointer, menuInput, 20, 4, 101)),
           "Presented press activates coordinates from its own input sample");
-    check(!menuPointerEligible(pointer, menuInput, 21, 4, 101) &&
+    check(menuPointerEligible(pointer, menuInput, 21, 4, 101) &&
+              menuPointerEligible(pointer, menuInput, 20 + MenuPointerFrameLag, 4, 101),
+          "A republished copy of the same menu keeps the presented pointer within the bounded lag");
+    check(!menuPointerEligible(pointer, menuInput, 21 + MenuPointerFrameLag, 4, 101) &&
+              !menuPointerEligible(pointer, menuInput, 19, 4, 101) &&
               !menuPointerEligible(pointer, menuInput, 20, 5, 101),
-          "Changed visual frame or menu identity rejects the old presented pointer");
+          "A stale or future visual frame, or a changed menu identity, rejects the old pointer");
     menuInput.primaryActiveMask = 0;
     check(!menuPointerEligible(pointer, menuInput, 20, 4, 101),
           "Inactive trigger with tracked hand cannot click or supply a menu neutral");

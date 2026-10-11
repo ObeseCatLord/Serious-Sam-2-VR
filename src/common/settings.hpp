@@ -9,6 +9,7 @@ struct VrSettings {
     float fireHaptic = .35f, damageHaptic = .55f;
     bool lasers = true;
     float laserDistance = 100.f;
+    float renderScale = 1.f; // Multiplier on the runtime's recommended per-eye size.
     float scopeEyeRelief = .1f; // Optical presentation parameter, not native zoom timing.
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;

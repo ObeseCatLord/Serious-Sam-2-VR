@@ -33,6 +33,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.lasers = number(L"Laser", L"Enabled", 1, 0, 1) >= .5f;
     settings.laserDistance = number(L"Laser", L"MaxDistanceMeters", 100, 5, 200);
     settings.scopeEyeRelief = number(L"Scope", L"EyeReliefMeters", .1f, .02f, .3f);
+    settings.renderScale = number(L"Render", L"Scale", 1, .25f, 2);
     settings.roomscale = number(L"Roomscale", L"Enabled", 0, 0, 1) >= .5f;
     settings.physicalMelee = number(L"Melee", L"Enabled", 0, 0, 1) >= .5f;
     settings.immersiveSwimming = number(L"Swimming", L"Immersive", 0, 0, 1) >= .5f;

@@ -104,10 +104,16 @@ inline Vec3 horizontalStickMovement(const Input &input, bool blocked, float turn
 }
 // Coordinates and trigger belong to the same submitted XR input sample.
 // Newer input may invalidate focus/tracking, but cannot supply another click.
+// The game republishes an unchanged menu every ~33 ms while the host presents
+// at display rate, so the presented frame normally trails the newest copy by a
+// frame or two. The menu identity (interaction generation) pins the layout; a
+// short bounded lag keeps clicks working, older or future frames are rejected.
+inline constexpr uint64_t MenuPointerFrameLag = 8;
 inline bool menuPointerEligible(const MenuPointer &pointer, const Input &input, uint64_t menuSequence,
                                 uint32_t generation, uint64_t now) {
     return pointer.active && pointer.hand < 2 && pointer.inputSequence && pointer.menuSequence &&
-           pointer.menuSequence == menuSequence && generation &&
+           pointer.menuSequence <= menuSequence && menuSequence - pointer.menuSequence <= MenuPointerFrameLag &&
+           generation &&
            pointer.interactionGeneration == generation && input.focused && input.headValid &&
            input.handValid[pointer.hand] && primaryActionEligible(input, pointer.hand) &&
            pointer.primaryInputGeneration == input.primaryInputGeneration[pointer.hand] &&

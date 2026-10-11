@@ -23,6 +23,10 @@ void validateLabOnlineIsolation(bool gameplay);
 bool labOnlineIsolationInstalled() noexcept;
 bool foregroundGame();
 bool vrInputLive() noexcept;
+// Native eye canvas at the runtime's recommended size (installed before the
+// engine creates its window canvas; applied on the main thread's input poll).
+void installEyeCanvas() noexcept;
+void applyEyeCanvas() noexcept;
 void deviceReady(IDirect3DDevice9 *device);
 void deviceCreated(IDirect3DDevice9 *device);
 void deviceResetSucceeded(IDirect3DDevice9 *device);

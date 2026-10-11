@@ -70,6 +70,7 @@ static void __cdecl poll() {
     if (!hooksReady.load(std::memory_order_acquire) || !channel.shared)
         return;
     pollThread = GetCurrentThreadId();
+    applyEyeCanvas(); // Frame-start main-thread point, like the native window-resize event.
     // Sam2Game input mode (RVA 3FDFE8): 1 keyboard, 2 gamepad. It only selects
     // menu/loading prompts (A/B/X/Y icons and "press A" text), so a live VR
     // session shows the game's own controller prompts instead of PC keys.

@@ -2034,12 +2034,20 @@ static void preparePrimary(PreparedPlayer &entry, bool authoritative) {
     if (!entry.recognized || entry.revoked || entry.prepared) return;
     entry.prepared = true; // One attempt, including failed/neutral preparation.
     entry.authoritative = authoritative;
-    if (!capturePrimaryBinding(entry)) return tracePrimary("binding", 0, entry);
+    // A topology the per-hand projection cannot represent (no binding, or
+    // coupled native dual wielding without combo weapons) is left unclaimed:
+    // the native manual commands already carry the VR triggers through the
+    // command hooks, so firing keeps native semantics instead of going silent.
+    const auto unclaimed = [&](const char *stage, uint8_t fire) {
+        entry.primary = {};
+        tracePrimary(stage, fire, entry);
+    };
+    if (!capturePrimaryBinding(entry)) return unclaimed("binding", 0);
     bool sourceCurrent = false;
     const uint8_t fire = primarySourceHands(entry, true, &sourceCurrent) & entry.hands;
     if (!fire && !meleePreparationAllowed(entry)) return tracePrimary("idle", fire, entry);
-    if (!primaryTopology(entry, !entry.topologyCaptured)) return tracePrimary("topology", fire, entry);
-    if (!primaryWeaponReferences(entry, fire)) return tracePrimary("weapons", fire, entry);
+    if (!primaryTopology(entry, !entry.topologyCaptured)) return unclaimed("topology", fire);
+    if (!primaryWeaponReferences(entry, fire)) return unclaimed("weapons", fire);
     if (!nativeInputHealthy() || !primaryBindingsCurrent(entry)) return tracePrimary("bindings", fire, entry);
     entry.topologyCaptured = true;
     const uint8_t liveFire = primarySourceHands(entry, false);

@@ -1029,7 +1029,7 @@ struct Host {
     uint64_t cachedDeadline = 0;
     uint32_t cachedPresentation = 0;
     bool cachedValid = false, viewsTracked = false;
-    std::vector<uint8_t> pixels[2];
+    PixelStore pixels; // The game's current pixel sections, reopened per generation.
     std::vector<XrTime> referenceChanges;
     uint32_t sessionGeneration = 0, referenceGeneration = 1;
     uint64_t inputSequence = 0, requestSequence = 0;
@@ -1514,6 +1514,9 @@ struct Host {
             quit ? emptyInput() : input; // Independent of render slot availability and renderer readiness.
         for(unsigned h=0;h<2;++h)shared.gripPoseGeneration[h]=quit?0:actions.gripPoseStream[h].generation;
         shared.worldSubmission=worldSubmission.value;
+        const auto eyeSize = recommendedEye();
+        shared.recommendedWidth = eyeSize.first;
+        shared.recommendedHeight = eyeSize.second;
         reapLocked();
         snapshot = {shared.width, shared.height, shared.rendererReady != 0, shared.ui,
                     shared.menu.visible && GetTickCount64() - shared.menu.tickMs < 250};
@@ -1528,9 +1531,41 @@ struct Host {
             throw std::runtime_error("World feedback IPC ownership changed");
         shared.worldSubmission=worldSubmission.value;
     }
+    // OpenXR recommendedImageRect for the stereo views (the larger of the two),
+    // scaled only by the user's [Render] Scale and bounded by the runtime maxima.
+    std::pair<uint32_t, uint32_t> recommendedEye() const {
+        uint32_t width = 0, height = 0, maxWidth = MaxDimension, maxHeight = MaxDimension;
+        for (const auto &v : viewConfiguration) {
+            width = std::max(width, v.recommendedImageRectWidth);
+            height = std::max(height, v.recommendedImageRectHeight);
+            maxWidth = std::min(maxWidth, v.maxImageRectWidth);
+            maxHeight = std::min(maxHeight, v.maxImageRectHeight);
+        }
+        const auto &g = systemProperties.graphicsProperties;
+        maxWidth = std::min(maxWidth, g.maxSwapchainImageWidth);
+        maxHeight = std::min(maxHeight, g.maxSwapchainImageHeight);
+        if (!width || !height || !maxWidth || !maxHeight) return {0, 0};
+        const double scale = settings.renderScale;
+        return {std::clamp(uint32_t(std::lround(width * scale)), 1u, maxWidth),
+                std::clamp(uint32_t(std::lround(height * scale)), 1u, maxHeight)};
+    }
+    // Reopen the game's pixel sections when it publishes a new generation.
+    bool currentPixels(const PixelSections &published) {
+        if (!published.generation) return false;
+        if (pixels.matches(published.generation, published.width, published.height)) return true;
+        if (!pixels.open(channel.token, published.generation, published.width, published.height, false)) {
+            log.write("Pixel sections unavailable; frame skipped");
+            return false;
+        }
+        char message[128];
+        std::snprintf(message, sizeof(message), "Pixel sections generation=%u %ux%u", published.generation,
+                      published.width, published.height);
+        log.write(message);
+        return true;
+    }
     void eyeChains(uint32_t width, uint32_t height) {
         if (!width || !height || width > MaxDimension || height > MaxDimension)
-            throw std::runtime_error("Game dimensions outside IPC bounds (1..2048)");
+            throw std::runtime_error("Game dimensions outside IPC bounds");
         for (const auto &v : viewConfiguration) {
             if (width > v.maxImageRectWidth || height > v.maxImageRectHeight || v.maxSwapchainSampleCount < 1)
                 throw std::runtime_error("Game dimensions exceed stereo runtime view limits");
@@ -1546,10 +1581,8 @@ struct Host {
             throw std::runtime_error("GPU did not drain before eye swapchain resize");
         for (auto &chain : eye)
             chain.destroy();
-        for (unsigned h = 0; h != 2; ++h) {
+        for (unsigned h = 0; h != 2; ++h)
             eye[h].create(api, session, width, height);
-            pixels[h].resize(size_t(width) * height * 4);
-        }
         char message[128];
         std::snprintf(message, sizeof(message), "Stereo BGRA eye swapchains: %u x %u", width, height);
         log.write(message);
@@ -1660,6 +1693,7 @@ struct Host {
         uint64_t deadline = 0;
         uint32_t presentation = 0;
         bool accepted = false;
+        const uint8_t *source[2]{};
         {
             Mutex lock(channel, 0);
             if (lock) {
@@ -1677,17 +1711,19 @@ struct Host {
                     clearance=slot.headClearance;
                     deadline = tracked.deadline;
                     presentation = slot.presentation;
-                    const size_t bytes = size_t(reply.width) * reply.height * 4;
+                    // The pair is uploaded straight from its pixel sections after the
+                    // lock: only this thread can request the slot again afterwards.
+                    accepted = currentPixels(channel.shared->pixels) &&
+                        pixels.matches(slot.pixelGeneration, reply.width, reply.height);
                     for (unsigned h = 0; h < 2; h++)
-                        std::memcpy(pixels[h].data(), slot.pixels[h], bytes);
+                        source[h] = accepted ? pixels.buffer(slotPixelBuffer(candidate, h)) : nullptr;
                     slot.state = SlotState::Empty;
                     slot.cancelled = 0;
                     slot.presentation = 0;
                     slot.presentationReserved = 0;
                     slot.headClearance = {};
                     tracked = {};
-                    ++completed;
-                    accepted = true;
+                    if (accepted) ++completed;
                 }
             }
         }
@@ -1696,8 +1732,8 @@ struct Host {
             return;
         }
         invalidateCachedPair(); // A failure between releases must never expose a mixed pair.
-        eye[0].uploadWaited(context.p, pixels[0].data());
-        eye[1].uploadWaited(context.p, pixels[1].data());
+        eye[0].uploadWaited(context.p, source[0]);
+        eye[1].uploadWaited(context.p, source[1]);
         hresult(device->GetDeviceRemovedReason(), "D3D11 device removed", log);
         if (!api.lossPending) {
             cachedRequest = reply;
@@ -1860,9 +1896,11 @@ struct Host {
             height = menu.height;
             sequence = menu.sequence;
             menuGeneration = menu.interactionGeneration;
+            if (!currentPixels(channel.shared->pixels) || !pixels.matches(menu.pixelGeneration, width, height))
+                return;
             if (sequence != menuSequence || menuChain.width != width || menuChain.height != height) {
                 menuSourcePixels.resize(size_t(width) * height * 4);
-                std::memcpy(menuSourcePixels.data(), menu.pixels, menuSourcePixels.size());
+                std::memcpy(menuSourcePixels.data(), pixels.buffer(MenuPixelBuffer), menuSourcePixels.size());
             }
         }
         if (menuChain.width != width || menuChain.height != height) {

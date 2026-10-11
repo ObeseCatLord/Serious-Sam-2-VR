@@ -265,6 +265,7 @@ extern "C" __declspec(dllexport) IDirect3D9 *WINAPI Direct3DCreate9(UINT version
     if (!reported.exchange(true, std::memory_order_relaxed))
         ss2vr::game::log("Startup Direct3DCreate9 initialized=%d api=%p hooksEnabled=%d thread=%lu",
                         static_cast<int>(initialized), static_cast<void *>(api), vrEnabled, GetCurrentThreadId());
+    if (api && vrEnabled) ss2vr::game::installEyeCanvas(); // Before the engine creates its canvas.
     if (api && vrEnabled && !originalCreate) {
         auto v = *reinterpret_cast<void ***>(api);
         proxyHook(v[16], reinterpret_cast<void *>(createDevice), originalCreate, "CreateDevice");

@@ -87,6 +87,46 @@ struct Channel {
         mapping = mutex = ready = nullptr;
     }
 };
+// One section per pixel buffer: a 32-bit game never needs a single huge view.
+struct PixelStore {
+    HANDLE mapping[PixelBufferCount]{};
+    uint8_t *view[PixelBufferCount]{};
+    uint32_t generation = 0, width = 0, height = 0;
+    PixelStore() = default;
+    PixelStore(const PixelStore &) = delete;
+    PixelStore &operator=(const PixelStore &) = delete;
+    ~PixelStore() { close(); }
+    static std::wstring name(const std::wstring &token, uint32_t generation, unsigned buffer) {
+        return L"Local\\SS2VR-" + token + L"-pixels-" + std::to_wstring(generation) + L"-" + std::to_wstring(buffer);
+    }
+    uint64_t bytes() const { return pixelBufferBytes(width, height); }
+    uint8_t *buffer(unsigned index) const { return index < PixelBufferCount ? view[index] : nullptr; }
+    bool matches(uint32_t g, uint32_t w, uint32_t h) const { return view[0] && generation == g && width == w && height == h; }
+    bool open(const std::wstring &token, uint32_t g, uint32_t w, uint32_t h, bool create) {
+        close();
+        const uint64_t size = pixelBufferBytes(w, h);
+        if (!g || !w || !h || w > MaxDimension || h > MaxDimension || size > SIZE_MAX) return false;
+        for (unsigned i = 0; i < PixelBufferCount; ++i) {
+            const auto n = name(token, g, i);
+            mapping[i] = create ? CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                                     DWORD(size >> 32), DWORD(size), n.c_str())
+                                : OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, n.c_str());
+            view[i] = mapping[i] ? static_cast<uint8_t *>(MapViewOfFile(mapping[i], FILE_MAP_ALL_ACCESS, 0, 0,
+                                                                        size_t(size))) : nullptr;
+            if (!view[i]) { close(); return false; }
+        }
+        generation = g; width = w; height = h;
+        return true;
+    }
+    void close() {
+        for (unsigned i = 0; i < PixelBufferCount; ++i) {
+            if (view[i]) UnmapViewOfFile(view[i]);
+            if (mapping[i]) CloseHandle(mapping[i]);
+            view[i] = nullptr; mapping[i] = nullptr;
+        }
+        generation = width = height = 0;
+    }
+};
 struct Lock {
     Channel &c;
     bool held;

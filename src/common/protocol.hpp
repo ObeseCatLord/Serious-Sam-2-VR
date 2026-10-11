@@ -3,8 +3,13 @@
 #include <cstdint>
 #include <type_traits>
 namespace ss2vr {
-constexpr uint32_t Magic = 0x32565253, Abi = 11, MaxDimension = 2048, WeaponCount = 17;
-constexpr size_t EyeBytes = size_t(MaxDimension) * MaxDimension * 4;
+// MaxDimension only bounds sanity checks: images travel in pixel sections sized
+// to the current canvas, which follows the runtime's recommended eye size.
+constexpr uint32_t Magic = 0x32565253, Abi = 12, MaxDimension = 16384, WeaponCount = 17;
+// Pixel sections: slot0 left/right, slot1 left/right, then the mono menu frame.
+constexpr unsigned PixelBufferCount = 5, MenuPixelBuffer = 4;
+constexpr unsigned slotPixelBuffer(unsigned slot, unsigned eye) { return slot * 2 + eye; }
+constexpr uint64_t pixelBufferBytes(uint32_t width, uint32_t height) { return uint64_t(width) * height * 4; }
 enum Button : uint32_t { Wheel = 1, Use = 2, Jump = 4, Menu = 8, Recenter = 16, Sprint = 32, Reload = 64, Netricsa = 128 };
 enum FramePresentation : uint32_t { NativeUiComplete = 1 };
 enum class SlotState : uint32_t { Empty, Requested, Rendering, Ready };
@@ -84,13 +89,19 @@ struct Slot {
     uint32_t presentation = 0, presentationReserved = 0;
     Request request;
     HeadClearance headClearance;
-    uint8_t pixels[2][EyeBytes];
+    // Pixel section generation holding this pair (see Shared::pixels).
+    uint32_t pixelGeneration = 0, pixelReserved = 0;
 };
 // Explicitly mono menu/loading frame; never eligible for a projection layer.
 struct MenuFrame {
     uint64_t sequence = 0, tickMs = 0;
     uint32_t visible = 0, width = 0, height = 0, interactionGeneration = 0;
-    uint8_t pixels[EyeBytes];
+    uint32_t pixelGeneration = 0, pixelReserved = 0;
+};
+// The game creates one section per buffer for its current canvas extent and
+// publishes it here; readers reopen when the generation changes.
+struct PixelSections {
+    uint32_t generation = 0, width = 0, height = 0, reserved = 0;
 };
 struct MenuPointer {
     uint64_t inputSequence = 0, tickMs = 0, menuSequence = 0;
@@ -119,6 +130,10 @@ struct Shared {
     // mutex; feedback can advance independently after xrEndFrame succeeds.
     uint32_t gripPoseGeneration[2]{};
     WorldSubmission worldSubmission;
+    // ABI12: dynamically sized image sections and the runtime's recommended
+    // per-eye image size (the larger of the two views), published by the host.
+    PixelSections pixels;
+    uint32_t recommendedWidth = 0, recommendedHeight = 0;
 };
 #pragma pack(pop)
 static_assert(sizeof(Vec3) == 12 && sizeof(Quat) == 16 && sizeof(Pose) == 28);
@@ -126,5 +141,6 @@ static_assert(std::is_trivially_copyable_v<Request> && std::is_standard_layout_v
 static_assert(offsetof(Shared, latest) == 48);
 static_assert(sizeof(Input) == 272 && sizeof(Request) == 440);
 static_assert(sizeof(MenuPointer) == 64);
-static_assert(sizeof(WorldSubmission)==40);
+static_assert(sizeof(WorldSubmission)==40 && sizeof(PixelSections)==16);
+static_assert(sizeof(Shared) == 1856 && offsetof(Shared, pixels) == 1832); // Same on x86 and x64.
 } // namespace ss2vr

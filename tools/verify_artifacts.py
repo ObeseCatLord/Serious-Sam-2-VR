@@ -102,7 +102,7 @@ def verify(game):
     for name in re.findall(r'"(\?[^"\n]+)"',plugin):
         if name not in symbols['Core.dll']:raise ValueError('Missing server startup API: '+name)
     layouts=[]
-    expected=(0x32565253,11,272,440,352,33554928,83887888,48,672,67110528)
+    expected=(0x32565253,12,272,440,352,504,1856,48,672,1680)
     for prefix,folder in [('i686','build-game'),('x86_64','build-host')]:
         # Concurrent normal/optimized checks must not truncate each other's
         # compiler output between compile and objcopy. Only owned scratch files
@@ -115,7 +115,7 @@ def verify(game):
         if layout!=expected:raise ValueError('IPC ABI differs from frozen layout: '+prefix)
         layouts.append(layout)
     if layouts[0]!=layouts[1]:raise ValueError('IPC architecture mismatch')
-    report['ipc_layout']={'abi':layouts[0][1],'mapping_bytes':expected[6],'architectures_agree':True}
+    report['ipc_layout']={'abi':layouts[0][1],'mapping_bytes':expected[6],'pixel_sections':'per canvas extent','architectures_agree':True}
     print(json.dumps(report,indent=2))
 
 if __name__=='__main__':

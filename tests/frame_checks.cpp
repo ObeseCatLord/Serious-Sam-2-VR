@@ -49,8 +49,7 @@ int main() {
     auto &slot = slots[0];
     slot.request = request;
     slot.state = SlotState::Ready;
-    slot.pixels[0][0] = 11;
-    slot.pixels[1][0] = 22;
+    slot.pixelGeneration = 7;
     check(pollSlot(slot, pending, context) == PollResult::Ready,
           "Complete pair observed after 50ms must survive the former 35ms deadline");
     Request reply = slot.request;
@@ -72,7 +71,7 @@ int main() {
         changed.input.zoomInputGeneration[hand]=1;
         check(!sameRequest(changed,request),"Logical zoom stream generation belongs to immutable request");
     }
-    check(sameRequest(reply, request) && slot.pixels[0][0] == 11 && slot.pixels[1][0] == 22 &&
+    check(sameRequest(reply, request) && slot.pixelGeneration == 7 &&
               reply.eye[0].p.x != reply.eye[1].p.x,
           "Accepted eyes and metadata belong to the same immutable stereo request");
     slot.state = SlotState::Empty;

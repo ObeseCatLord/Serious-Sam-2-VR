@@ -347,6 +347,9 @@ static IDirect3DDevice9 *device = nullptr, *creationDevice = nullptr;
 static DWORD creationThread = 0;
 static IDirect3DSurface9 *eye[2]{}, *depth[2]{}, *readback[2]{};
 static uint32_t width = 0, height = 0;
+// Eye/menu pixel sections for the current canvas extent (see PixelStore).
+static PixelStore pixelStore;
+static uint32_t pixelGenerations = 0;
 // One admitted native output, beside the existing device/resource lifetime.
 // Surfaces are reacquired per transaction; only the chain identity is retained.
 static IDirect3DSwapChain9 *presentationChain = nullptr;
@@ -429,7 +432,9 @@ struct NativeUiFrame {
     Request request;
     Matrix44 projection[2];
     Pose panel[2];
-    std::vector<uint8_t> pixels[2];
+    uint8_t *pixels[2]{}; // The admitted slot's eye buffers in the current pixel sections.
+    size_t pixelBytes = 0;
+    uint32_t pixelGeneration = 0;
     void *player = nullptr;
     uint64_t generation = 0;
     uint32_t remoteOwner = 0;
@@ -1085,6 +1090,129 @@ static HRESULT sourceBackbuffer(IDirect3DSurface9 **out) {
         !nativePresentationThreadCurrent() || device->TestCooperativeLevel() != D3D_OK) return D3DERR_INVALIDCALL;
     return presentationChain->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, out);
 }
+// Native eye canvas. The engine sizes its window canvas, and so every eye
+// target, from Core's cached client rectangle (wndGetWindowClientRect), and its
+// shared windowed depth buffer from the desktop size (GfxD3D GetSystemMetrics).
+// For the game's main window report the runtime's recommended eye size instead;
+// Present scales the larger backbuffer into the desktop window. The size is
+// cached so the next launch creates its canvas and depth at it from the start.
+static std::atomic<uint32_t> canvasWidth{0}, canvasHeight{0};
+static std::atomic<bool> canvasResizePending{false};
+static uintptr_t canvasExe = 0, canvasGfx = 0, canvasGfxEnd = 0;
+static int32_t *(__cdecl *originalClientRect)(int32_t *, const void *) = nullptr;
+static int(WINAPI *originalSystemMetrics)(int) = nullptr;
+static int(__cdecl *nativeResizeCanvas)(void *) = nullptr;
+static std::wstring canvasCache() {
+    std::wstring directory;
+    return moduleDirectory(nullptr, directory) ? directory + L"SS2VR\\headset-view.ini" : std::wstring();
+}
+static void *mainCanvasWindow() noexcept {
+    void *window = nullptr;
+    if (canvasExe) memcpy(&window, reinterpret_cast<void *>(canvasExe + 0x8494), sizeof(window));
+    return window;
+}
+static int32_t *__cdecl eyeClientRect(int32_t *out, const void *window) {
+    int32_t *rect = originalClientRect(out, window);
+    const uint32_t w = canvasWidth.load(std::memory_order_relaxed), h = canvasHeight.load(std::memory_order_relaxed);
+    if (rect && w && h && window && window == mainCanvasWindow()) {
+        rect[0] = rect[1] = 0;
+        rect[2] = int32_t(w);
+        rect[3] = int32_t(h);
+    }
+    return rect;
+}
+static int WINAPI eyeSystemMetrics(int index) {
+    const int value = originalSystemMetrics(index);
+    const auto caller = reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
+    if ((index != SM_CXSCREEN && index != SM_CYSCREEN) || caller < canvasGfx || caller >= canvasGfxEnd) return value;
+    // Windowed depth is shared by every canvas; size it for any eye extent up to
+    // 4096 so a later recommendation can still be rendered without a restart.
+    const uint32_t eye = index == SM_CXSCREEN ? canvasWidth.load() : canvasHeight.load();
+    return std::max(value, int(std::max<uint32_t>(eye, 4096)));
+}
+void installEyeCanvas() noexcept {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    const HMODULE core = GetModuleHandleW(L"Core.dll"), gfx = GetModuleHandleW(L"GfxD3D.dll"),
+                  user = GetModuleHandleW(L"user32.dll"), exe = GetModuleHandleW(nullptr);
+    if (!core || !gfx || !user || !exe) { log("Eye canvas unavailable: modules missing"); return; }
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(gfx);
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(reinterpret_cast<const uint8_t *>(gfx) + dos->e_lfanew);
+    canvasGfx = reinterpret_cast<uintptr_t>(gfx);
+    canvasGfxEnd = canvasGfx + nt->OptionalHeader.SizeOfImage;
+    canvasExe = reinterpret_cast<uintptr_t>(exe);
+    const auto cache = canvasCache();
+    if (!cache.empty()) {
+        const UINT w = GetPrivateProfileIntW(L"View", L"Width", 0, cache.c_str());
+        const UINT h = GetPrivateProfileIntW(L"View", L"Height", 0, cache.c_str());
+        if (w && h && w <= MaxDimension && h <= MaxDimension) { canvasWidth = w; canvasHeight = h; }
+    }
+    void *clientRect = reinterpret_cast<void *>(GetProcAddress(core,
+        "?wndGetWindowClientRect@SeriousEngine@@YA?AVCTRect@1@ABVCWindow@1@@Z"));
+    void *metrics = reinterpret_cast<void *>(GetProcAddress(user, "GetSystemMetrics"));
+    bool ok = clientRect && metrics &&
+        MH_CreateHook(clientRect, reinterpret_cast<void *>(eyeClientRect), reinterpret_cast<void **>(&originalClientRect)) == MH_OK &&
+        MH_CreateHook(metrics, reinterpret_cast<void *>(eyeSystemMetrics), reinterpret_cast<void **>(&originalSystemMetrics)) == MH_OK &&
+        MH_EnableHook(clientRect) == MH_OK && MH_EnableHook(metrics) == MH_OK;
+    log("Eye canvas hooks=%d cached=%ux%u", ok, canvasWidth.load(), canvasHeight.load());
+}
+// Adopt the runtime's recommended eye size: remember it for the next launch and
+// let the main thread resize the native canvas at its next input poll.
+static void requestEyeCanvas(uint32_t w, uint32_t h) {
+    if (!w || !h || w > MaxDimension || h > MaxDimension || !originalClientRect ||
+        (w == canvasWidth.load() && h == canvasHeight.load())) return;
+    canvasWidth = w;
+    canvasHeight = h;
+    const auto cache = canvasCache();
+    if (!cache.empty()) {
+        WritePrivateProfileStringW(L"View", L"Width", std::to_wstring(w).c_str(), cache.c_str());
+        WritePrivateProfileStringW(L"View", L"Height", std::to_wstring(h).c_str(), cache.c_str());
+    }
+    canvasResizePending = true;
+    log("Eye canvas requested %ux%u (OpenXR recommended)", w, h);
+}
+void applyEyeCanvas() noexcept {
+    if (!canvasResizePending.exchange(false) || !canvasExe) return;
+    if (!nativeResizeCanvas)
+        if (const HMODULE engine = GetModuleHandleW(L"Engine.dll"))
+            nativeResizeCanvas = reinterpret_cast<int(__cdecl *)(void *)>(
+                GetProcAddress(engine, "?gfxResizeWindowCanvas@SeriousEngine@@YAHPAVCWindowCanvas@1@@Z"));
+    void *canvas = nullptr;
+    memcpy(&canvas, reinterpret_cast<void *>(canvasExe + 0x8498), sizeof(canvas));
+    if (!nativeResizeCanvas || !canvas) { canvasResizePending = true; return; }
+    const int result = nativeResizeCanvas(canvas); // The same call Sam2.exe makes for a window resize.
+    log("Eye canvas native resize result=%d", result);
+}
+// Pixel sections follow the canvas extent. A new generation is published before
+// the old one closes; readers keep their own mapping of an in-flight frame.
+static bool ensurePixelStore() {
+    if (pixelStore.width == width && pixelStore.height == height && pixelStore.generation) return true;
+    if (!channel.shared) return false;
+    PixelStore replacement;
+    const uint32_t generation = pixelGenerations + 1;
+    if (!replacement.open(channel.token, generation, width, height, true)) {
+        static unsigned failures = 0;
+        if (failures++ < 4) log("Pixel sections %ux%u unavailable error=%lu", width, height, GetLastError());
+        return false;
+    }
+    {
+        Lock l(channel, 50);
+        if (!l) return false;
+        channel.shared->pixels = {generation, width, height, 0};
+        for (auto &slot : channel.shared->slot)
+            if (slot.state == SlotState::Ready) slot.state = SlotState::Empty;
+            else if (slot.state == SlotState::Rendering) slot.cancelled = 1;
+        channel.shared->menu.visible = 0;
+    }
+    pixelGenerations = generation;
+    std::swap(pixelStore.mapping, replacement.mapping);
+    std::swap(pixelStore.view, replacement.view);
+    pixelStore.generation = generation; pixelStore.width = width; pixelStore.height = height;
+    log("Pixel sections generation=%u %ux%u (%llu MB each)", generation, width, height,
+        static_cast<unsigned long long>(pixelStore.bytes() >> 20));
+    return true;
+}
 static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 *&nativeDepth) {
     if (!device || !presentationChain || resetQuarantined)
         return false;
@@ -1104,6 +1232,7 @@ static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 
     }
     if (!readback[0] && FAILED(device->CreateOffscreenPlainSurface(width, height, colorFormat,
         D3DPOOL_SYSTEMMEM, &readback[0], nullptr))) return false;
+    if (!ensurePixelStore()) return false;
     if (!stereo) return readback[0] != nullptr;
     D3DSURFACE_DESC depthDesc{};
     if (FAILED(device->GetDepthStencilSurface(&nativeDepth)) || !nativeDepth)
@@ -1379,8 +1508,7 @@ static void admitPresentation(IDirect3DSwapChain9 *chain, uintptr_t caller, bool
         D3DVIEWPORT9 viewport{};
         if (FAILED(chain->GetPresentParameters(&params)) || FAILED(d->GetCreationParameters(&creation))) return;
         const HWND window = overrideWindow ? overrideWindow : params.hDeviceWindow;
-        if (!window || window != creation.hFocusWindow ||
-            (!presentationChain && GetForegroundWindow() != window)) return;
+        if (!window || window != creation.hFocusWindow) return;
         DWORD process = 0;
         if (!GetWindowThreadProcessId(window, &process) || process != GetCurrentProcessId()) return;
         if (FAILED(chain->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb ||
@@ -1447,13 +1575,17 @@ void present(IDirect3DDevice9 *d) {
     const bool stereoReady = allocate();
     Input input{};
     Ui ui{};
+    uint32_t recommendedWidth = 0, recommendedHeight = 0;
     {
         Lock l(channel);
         if (!l)
             return;
         input = channel.shared->latest;
         ui = channel.shared->ui;
+        recommendedWidth = channel.shared->recommendedWidth;
+        recommendedHeight = channel.shared->recommendedHeight;
     }
+    requestEyeCanvas(recommendedWidth, recommendedHeight);
     uint64_t now = GetTickCount64();
     bool gameplay = ui.gameplay && now >= ui.tickMs && now - ui.tickMs < 250;
     const bool nativeMenu = menus::active();
@@ -1542,14 +1674,18 @@ void present(IDirect3DDevice9 *d) {
         lockReturned = true; locked = SUCCEEDED(result);
         if (!locked || !pixels.pBits || pixels.Pitch < int(copyWidth * 4) ||
             generation != resourceGeneration.load(std::memory_order_acquire)) return;
+        uint8_t *target = pixelStore.matches(pixelStore.generation, copyWidth, copyHeight) ?
+            pixelStore.buffer(MenuPixelBuffer) : nullptr;
+        if (!target) return;
         held = channel.lock();
         if (!held) return;
         auto &m = channel.shared->menu;
         for (uint32_t y = 0; y < copyHeight; ++y)
-            memcpy(m.pixels + size_t(y) * copyWidth * 4,
+            memcpy(target + size_t(y) * copyWidth * 4,
                 static_cast<uint8_t *>(pixels.pBits) + size_t(y) * pixels.Pitch, copyWidth * 4);
-        for (size_t pixel = 3; pixel < size_t(copyWidth) * copyHeight * 4; pixel += 4) m.pixels[pixel] = 255;
+        for (size_t pixel = 3; pixel < size_t(copyWidth) * copyHeight * 4; pixel += 4) target[pixel] = 255;
         m.width = copyWidth; m.height = copyHeight; m.tickMs = now;
+        m.pixelGeneration = pixelStore.generation; m.pixelReserved = 0;
         m.sequence = ++menuSequence; m.interactionGeneration = menuGeneration; m.visible = 1;
     }, [&](bool aborted) noexcept {
         if (held) { channel.unlock(); held = false; }
@@ -1635,8 +1771,10 @@ static void releaseUiFrame() noexcept {
         if (uiFrame.z[i]) uiFrame.z[i]->Release();
         if (uiFrame.read[i]) uiFrame.read[i]->Release();
         uiFrame.target[i]=uiFrame.z[i]=uiFrame.read[i]=nullptr;
-        uiFrame.pixels[i].clear(); // Retain capacity; cleanup never allocates.
+        uiFrame.pixels[i] = nullptr;
     }
+    uiFrame.pixelBytes = 0;
+    uiFrame.pixelGeneration = 0;
     for (unsigned i=0;i<2;++i) {
         auto *texture = uiFrame.scopeImage[i]; uiFrame.scopeImage[i] = nullptr;
         if (texture) texture->Release();
@@ -1720,12 +1858,13 @@ static bool readUiEye(unsigned i,bool dim,float visibility) {
     bool ok=locked.pBits && locked.Pitch>=int(uiFrame.request.width*4);
     if (ok) {
         const size_t rowBytes=size_t(uiFrame.request.width)*4;
-        if (!dim) uiFrame.pixels[i].resize(rowBytes*uiFrame.request.height);
+        ok=dim || (uiFrame.pixels[i] && uiFrame.pixelBytes==rowBytes*uiFrame.request.height &&
+            pixelStore.generation==uiFrame.pixelGeneration);
         const auto dimming=makeOpaqueDimming(visibility);
         for (uint32_t row=0;row<uiFrame.request.height;++row) {
             auto *source=static_cast<uint8_t *>(locked.pBits)+size_t(row)*locked.Pitch;
             if (dim) dimRgbPixels(source,uiFrame.request.width,dimming);
-            else memcpy(uiFrame.pixels[i].data()+size_t(row)*rowBytes,source,rowBytes);
+            else if (ok) memcpy(uiFrame.pixels[i]+size_t(row)*rowBytes,source,rowBytes);
         }
     }
     ok = retireNativeUiLock(uiFrame.locked,
@@ -1746,8 +1885,11 @@ static bool publishUiFrame(uint32_t presentation) {
     bool accepted=false;
     withNativeFinally([&] {
         auto &slot=channel.shared->slot[uiFrame.slot];
-        if (!slot.cancelled && slot.state==SlotState::Rendering && sameRequest(slot.request,uiFrame.request)) {
-            for (unsigned i=0;i<2;++i) memcpy(slot.pixels[i],uiFrame.pixels[i].data(),uiFrame.pixels[i].size());
+        if (!slot.cancelled && slot.state==SlotState::Rendering && sameRequest(slot.request,uiFrame.request) &&
+            uiFrame.pixels[0] && uiFrame.pixels[1] && uiFrame.pixelGeneration==channel.shared->pixels.generation) {
+            // Eyes were read back straight into this slot's own pixel sections.
+            slot.pixelGeneration=uiFrame.pixelGeneration;
+            slot.pixelReserved=0;
             slot.presentation=presentation;
             slot.presentationReserved=0;
             accepted=commitStereo(uiFrame.player,uiFrame.request,slot,uiFrame.remoteOwner);
@@ -1815,7 +1957,7 @@ void nativeUiFinishOwner() {
     if(trace)log("Native UI readback left=%u right=%u",left,right);
     if (ok) {
         const auto opaque=makeOpaqueDimming(1);
-        for (auto &image:uiFrame.pixels) dimOpaquePixels(image.data(),image.size()/4,opaque);
+        for (auto *image:uiFrame.pixels) dimOpaquePixels(image,uiFrame.pixelBytes/4,opaque);
     }
     const bool valid=ok && uiCurrent();
     const bool published=valid && publishUiFrame(NativeUiComplete);
@@ -2055,6 +2197,11 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
     const bool traceDepth=labDepthTrace && depthTraceRequests<8;
     if(traceDepth) ++depthTraceRequests;
     uiFrame.slot=chosen;
+    uiFrame.pixelGeneration=pixelStore.generation;
+    uiFrame.pixelBytes=size_t(pixelStore.bytes());
+    for(unsigned i=0;i<2;++i)
+        uiFrame.pixels[i]=pixelStore.matches(pixelStore.generation,request.width,request.height) ?
+            pixelStore.buffer(slotPixelBuffer(unsigned(chosen),i)) : nullptr;
     admittedUiFrame=&uiFrame;
     uiFrame.request=request;
     uiFrame.player=puppet;
@@ -2196,7 +2343,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             retained=true; // Even a partial UI pair remains owned until enclosing cleanup.
         } else if(uiFrame.world) {
             const auto dimming=makeOpaqueDimming(visibility);
-            for(auto &image:uiFrame.pixels) dimOpaquePixels(image.data(),image.size()/4,dimming);
+            for(auto *image:uiFrame.pixels) if(image) dimOpaquePixels(image,uiFrame.pixelBytes/4,dimming);
             publishUiFrame(0);
         }
     },[&](bool aborted) noexcept {
