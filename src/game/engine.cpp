@@ -1208,6 +1208,23 @@ static void update(void *p) {
             !wheels[h].open && pendingSelection[h] < 0 && weapon != nullptr);
         s.fire[h] = gates[h].update(input.trigger[h], valid && primaryActionEligible(input, unsigned(h)) &&
             fireAllowed);
+        {
+            // Bounded transition trace of every fire admission term, per hand.
+            static unsigned traced = 0, previous[2]{~0u, ~0u};
+            const unsigned state = unsigned(input.trigger[h] > .65f) | unsigned(valid) << 1 |
+                unsigned(primaryActionEligible(input, unsigned(h))) << 2 | unsigned(rider.handheld()) << 3 |
+                unsigned(wheelAllowed) << 4 | unsigned(wheels[h].open) << 5 | unsigned(pendingSelection[h] >= 0) << 6 |
+                unsigned(weapon != nullptr) << 7 | unsigned(rider.seated()) << 8 | unsigned(s.fire[h]) << 9 |
+                unsigned(gates[h].armed) << 10;
+            if (state != previous[h] && traced < 160) {
+                previous[h] = state;
+                ++traced;
+                log("Input fire hand=%d trigger=%.2f valid=%d primary=%d handheld=%d wheelAllowed=%d wheelOpen=%d "
+                    "pending=%d weapon=%d seated=%d armed=%d fire=%d", h, input.trigger[h], valid,
+                    primaryActionEligible(input, unsigned(h)), rider.handheld(), wheelAllowed, wheels[h].open,
+                    pendingSelection[h] >= 0, weapon != nullptr, rider.seated(), gates[h].armed, s.fire[h]);
+            }
+        }
         // Native selection validates the inventory again and touches only the requested hand.
         if (!valid || !rider.handheld())
             pendingSelection[h] = -1;
@@ -1997,24 +2014,40 @@ static void appendLocalGesturePose(const Snapshot &source, network::PosePacket &
     }
     ReleaseSRWLockShared(&snapshotLock);
 }
+// Bounded transition trace of the per-interval primary (fire) preparation.
+static void tracePrimary(const char *stage, uint8_t fire, const PreparedPlayer &entry) {
+    static unsigned traced = 0;
+    static const char *previousStage = nullptr;
+    static unsigned previousState = ~0u;
+    const unsigned state = unsigned(fire) | unsigned(entry.primary.bits) << 2 | unsigned(entry.hands) << 4 |
+        unsigned(entry.button[0] + 1) << 6 | unsigned(entry.button[1] + 1) << 9;
+    if ((stage == previousStage && state == previousState) || traced >= 200) return;
+    previousStage = stage;
+    previousState = state;
+    ++traced;
+    log("Input primary stage=%s fire=%u hands=%u buttons=%d,%d combo=%d dual=%d bits=%u mask=%u", stage, fire,
+        entry.hands, entry.button[0], entry.button[1], entry.combo, entry.dual, entry.primary.bits, entry.primary.mask);
+}
 static void preparePrimary(PreparedPlayer &entry, bool authoritative) {
     // Recognition/neutral were reserved before update/authorityStep. Only this
     // initial preparation can introduce high; native reentry sees that neutral.
     if (!entry.recognized || entry.revoked || entry.prepared) return;
     entry.prepared = true; // One attempt, including failed/neutral preparation.
     entry.authoritative = authoritative;
-    if (!capturePrimaryBinding(entry)) return;
+    if (!capturePrimaryBinding(entry)) return tracePrimary("binding", 0, entry);
     bool sourceCurrent = false;
     const uint8_t fire = primarySourceHands(entry, true, &sourceCurrent) & entry.hands;
-    if (!fire && !meleePreparationAllowed(entry)) return;
-    if (!primaryTopology(entry, !entry.topologyCaptured) || !primaryWeaponReferences(entry, fire) ||
-        !nativeInputHealthy() || !primaryBindingsCurrent(entry)) return;
+    if (!fire && !meleePreparationAllowed(entry)) return tracePrimary("idle", fire, entry);
+    if (!primaryTopology(entry, !entry.topologyCaptured)) return tracePrimary("topology", fire, entry);
+    if (!primaryWeaponReferences(entry, fire)) return tracePrimary("weapons", fire, entry);
+    if (!nativeInputHealthy() || !primaryBindingsCurrent(entry)) return tracePrimary("bindings", fire, entry);
     entry.topologyCaptured = true;
     const uint8_t liveFire = primarySourceHands(entry, false);
-    if (!nativeInputHealthy() || !primaryBindingsCurrent(entry)) return;
+    if (!nativeInputHealthy() || !primaryBindingsCurrent(entry)) return tracePrimary("live", fire, entry);
     entry.primary = nativePrimaryProjection(entry.hands, fire & liveFire,
         entry.button[0], entry.button[1], entry.combo && entry.dual);
     if (entry.revoked) entry.primary.bits = 0;
+    tracePrimary(entry.revoked ? "revoked" : "projected", fire & liveFire, entry);
     if (!entry.revoked) prepareMelee(entry, sourceCurrent);
 }
 static void prepareObserverMelee(PreparedPlayer &entry) {
@@ -2095,12 +2128,23 @@ static NativePrimaryValue primaryAdmission(void *subject, uintptr_t caller, bool
     auto value = reserved;
     if (entry) entry->recognized = true;
     const auto *frame = zoomManagerFrame;
-    if (!entry || !entry->prepared || entry->revoked || !nativeInputHealthy() ||
-        caller != (held ? primaryHeldReturn : primaryOperatorReturn) ||
-        !frame || frame->previous || !frame->current || !frame->execution || frame->preparation ||
-        !simulationInterval || simulationInterval->previous || !hooksReady.load(std::memory_order_acquire) ||
-        !nativeMainThread || !nativeMainThread() || currentSimulation() != frame->simulation ||
-        currentWorld() != frame->world) return value;
+    const unsigned refused = !entry ? 1 : !entry->prepared ? 2 : entry->revoked ? 3 : !nativeInputHealthy() ? 4 :
+        caller != (held ? primaryHeldReturn : primaryOperatorReturn) ? 5 :
+        (!frame || frame->previous || !frame->current || !frame->execution || frame->preparation) ? 6 :
+        (!simulationInterval || simulationInterval->previous) ? 7 :
+        (!hooksReady.load(std::memory_order_acquire) || !nativeMainThread || !nativeMainThread()) ? 8 :
+        (currentSimulation() != frame->simulation || currentWorld() != frame->world) ? 9 : 0;
+    {
+        static unsigned traced = 0, previous[2]{~0u, ~0u};
+        const unsigned state = refused | unsigned(entry ? entry->primary.bits : 0) << 4;
+        if (state != previous[held] && traced < 200) {
+            previous[held] = state;
+            ++traced;
+            log("Input primary admission held=%d refused=%u bits=%u", held, refused,
+                entry ? entry->primary.bits : 0u);
+        }
+    }
+    if (refused) return value;
     refreshPrimary(*entry);
     if (!entry->revoked && nativeInputHealthy() && currentSimulation() == frame->simulation &&
         currentWorld() == frame->world && !entry->revoked) value = entry->primary;
@@ -4437,6 +4481,9 @@ static int __fastcall nativeFire(void *w, void *, float amount) {
     }
     int result = originalNativeFire(w, amount);
     if(receipt.active)logWeaponReceipt("fire",receipt,true,false,result);
+    static std::atomic<unsigned> traced{0};
+    if (hand >= 0 && traced.fetch_add(1, std::memory_order_relaxed) < 24)
+        log("Input native DoTheFiring hand=%d result=%d", hand, result);
     if (result && hand >= 0 && vrSession(s) && fresh(s.input) && s.ui.gameplay)
         fireFeedback[hand].fetch_add(1, std::memory_order_relaxed);
     return result; // Feedback observes the native event; it never initiates damage/fire.
@@ -6105,6 +6152,19 @@ static void __fastcall waterPlayerControls(void *brain, void *, uint8_t fire, Ve
 #endif
     LabControlObservation observation;
     collectLocalControls(brain,caller,observation);
+    {
+        // Which native producer ran (ordinary polled bindings, or the inactive
+        // route that passes zero fire/move) and the fire bits it submitted.
+        static unsigned traced = 0, previous = ~0u;
+        const unsigned route = caller == playerControlsReturn ? 1u : caller == inactivePlayerControlsReturn ? 2u : 3u;
+        const unsigned state = route | unsigned(fire) << 2;
+        if (state != previous && traced < 160) {
+            previous = state;
+            ++traced;
+            log("Input native controls route=%s fire=%u move=%.2f,%.2f,%.2f", route == 1 ? "ordinary" :
+                route == 2 ? "inactive" : "other", fire, move.x, move.y, move.z);
+        }
+    }
     // Inactive native submissions are kept separate from ordinary polling and
     // swimming history. No cached command values are borrowed for this route.
     if (hooksReady.load(std::memory_order_acquire) && caller==inactivePlayerControlsReturn &&
@@ -6552,7 +6612,18 @@ static void __fastcall poll(void *b, void *) {
         values[14] = (buttons & Reload) ? 1 : 0;
         values[15] = (buttons & Netricsa) ? 1 : 0;
     }
+    const unsigned traceState = unsigned(enabled) | unsigned(values[5] > 0) << 1 | unsigned(values[6] > 0) << 2 |
+        unsigned(values[7] > 0) << 3 | unsigned(values[4] > 0) << 4 | unsigned(respawn) << 5 | unsigned(netricsa) << 6;
     ReleaseSRWLockExclusive(&controlsLock);
+    static unsigned traced = 0, previousTrace = ~0u;
+    if (traceState != previousTrace && traced < 160) {
+        previousTrace = traceState;
+        ++traced;
+        log("Input poll enabled=%d live=%d init=%d fresh=%d recenter=%d gameplay=%d uiAge=%llu rider=%d fire=%d,%d use=%d "
+            "jump=%d respawn=%d netricsa=%d", enabled, livePlayer(s), s.initialized, fresh(s.input),
+            recenterHeld(s.input), s.ui.gameplay, static_cast<unsigned long long>(GetTickCount64() - s.ui.tickMs),
+            nativeRiderCurrent(s.player, s.rider), fire[1], fire[0], s.use, s.jump, respawn, netricsa);
+    }
 }
 static int commandIndex(void *b, uint32_t id) {
     if (b != playerBindings)

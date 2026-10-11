@@ -1301,14 +1301,19 @@ static uint64_t lastMenuCopy = 0, menuSequence = 0;
 static MenuNavigation menuNavigation;
 static WORD pendingKey = 0;
 static uint64_t releaseKeyAt = 0;
+// Core reads the keyboard from its own window messages (no DirectInput), so a
+// posted key reaches the game without focus and never leaks into another
+// application the way desktop-wide SendInput would.
 static void keyEvent(WORD key, bool up) {
-    INPUT event{};
-    event.type = INPUT_KEYBOARD;
-    event.ki.wScan = static_cast<WORD>(MapVirtualKeyW(key, MAPVK_VK_TO_VSC));
-    event.ki.dwFlags = KEYEVENTF_SCANCODE | (up ? KEYEVENTF_KEYUP : 0);
+    D3DDEVICE_CREATION_PARAMETERS params{};
+    if (!device || FAILED(device->GetCreationParameters(&params)) || !params.hFocusWindow)
+        return;
+    uint32_t bits = 1u | ((MapVirtualKeyW(key, MAPVK_VK_TO_VSC) & 0xffu) << 16);
     if (key == VK_UP || key == VK_DOWN || key == VK_LEFT || key == VK_RIGHT)
-        event.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-    SendInput(1, &event, sizeof(INPUT));
+        bits |= 1u << 24; // Extended key.
+    if (up)
+        bits |= 3u << 30; // Previous state down, transition up.
+    PostMessageW(params.hFocusWindow, up ? WM_KEYUP : WM_KEYDOWN, key, static_cast<LPARAM>(bits));
 }
 static void keyTap(WORD key) {
     if (pendingKey)
@@ -1467,49 +1472,48 @@ void present(IDirect3DDevice9 *d) {
     }
     bool valid = input.focused && input.headValid && now >= input.tickMs && now - input.tickMs < 200;
     if (valid) vrInputTick.store(now, std::memory_order_relaxed);
-    bool foreground = foregroundGame();
     const MenuAction action =
         menuNavigation.sample(input, menuVisible, valid, menus::pointerAvailable());
     WORD key = 0;
-    int nativeKey = 0; // Engine key ids from Core's key table.
+    int command = 0; // Sam2Game menu system commands (syscmdOk, syscmdBack, ...).
     switch (action) {
     case MenuAction::Back:
-        key = VK_ESCAPE; nativeKey = 0x60;
+        key = VK_ESCAPE; command = 0x0c;
         break;
     case MenuAction::Confirm:
-        key = VK_RETURN; nativeKey = 0x65;
+        key = VK_RETURN; command = 0x0b;
         break;
     case MenuAction::Up:
-        key = VK_UP; nativeKey = 0x80;
+        key = VK_UP; command = 0x0f;
         break;
     case MenuAction::Down:
-        key = VK_DOWN; nativeKey = 0x81;
+        key = VK_DOWN; command = 0x10;
         break;
     case MenuAction::Left:
-        key = VK_LEFT; nativeKey = 0x82;
+        key = VK_LEFT; command = 0x0d;
         break;
     case MenuAction::Right:
-        key = VK_RIGHT; nativeKey = 0x83;
+        key = VK_RIGHT; command = 0x0e;
         break;
     default:
         break;
     }
-    // Controller-prompt X/Y menu functions are F1/F2 in the PC menus (engine
-    // keys 0x51/0x52): Touch X/Y, Index left A / left trackpad.
+    // Controller-prompt X/Y menu functions are syscmdF1/F2 in the menus:
+    // Touch X/Y, Index left A / left trackpad.
     {
         static uint32_t previousExtras = 0;
         const uint32_t extras = valid ? ((input.buttons[0] | input.buttons[1]) & (Reload | Netricsa)) : 0;
         const uint32_t pressed = extras & ~previousExtras;
         previousExtras = extras;
         if (nativeMenu && !key && pressed)
-            menus::queueKey((pressed & Reload) ? 0x51 : 0x52);
+            menus::queueCommand((pressed & Reload) ? 0x15 : 0x16);
     }
-    // Native menus take keys through their own dispatcher (focus independent).
-    // Other flat screens fall back to OS keys only while the game owns focus,
-    // so input never leaks into another application.
-    if (key && !(nativeMenu && menus::queueKey(nativeKey)) && foreground)
+    // Native menus take commands through their own dispatcher. Other screens
+    // (gameplay pause, loading prompts, movies) get a key posted to the game
+    // window; neither path needs window focus.
+    if (key && !(nativeMenu && menus::queueCommand(command)))
         keyTap(key);
-    if ((!valid || !foreground) && pendingKey) {
+    if (!valid && pendingKey) {
         keyEvent(pendingKey, true);
         pendingKey = 0;
     }

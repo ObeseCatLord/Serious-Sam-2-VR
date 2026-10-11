@@ -23,8 +23,8 @@ static bool down = false;
 static unsigned selectedHand = 2;
 static uint32_t session = 0, reference = 0, pointerGeneration = 0;
 static uint32_t actionGeneration = 0;
-static std::atomic<int> queuedKey{0};
-static int heldKey = 0;
+static std::atomic<int> queuedCommand{0};
+static int heldCommand = 0;
 static uint32_t read32(uintptr_t address) {
     uint32_t result;
     std::memcpy(&result, reinterpret_cast<void *>(address), sizeof(result));
@@ -45,6 +45,26 @@ static bool nativePointerReady() {
            sensitivity > .0001f && std::isfinite(readFloat(base + 0x3fe20c)) &&
            std::isfinite(readFloat(base + 0x3fe210));
 }
+// Bounded runtime evidence for menu input; a user log shows why a selection
+// did or did not reach the native dispatcher.
+static void logCommand(int command, bool ready) {
+    static unsigned count = 0;
+    if (count < 64) {
+        ++count;
+        const uintptr_t instance = read32(base + 0x403350);
+        log("Menu command 0x%02x dispatched=%d menu=%d interactive=%d okEnabled=%u", command, ready,
+            current() != 0, current() ? interactive() : 0, instance ? read32(instance + 0x24) : 0u);
+    }
+}
+static void logPointer(bool same, bool source, bool ready, bool held) {
+    static unsigned count = 0, previous = ~0u;
+    const unsigned state = unsigned(same) | unsigned(source) << 1 | unsigned(ready) << 2 | unsigned(held) << 3;
+    if (state == previous || count >= 64) return;
+    previous = state;
+    ++count;
+    log("Menu pointer sameMenu=%d source=%d nativeReady=%d cursor=%u held=%d", same, source, ready,
+        read32(base + 0x3fe214), held);
+}
 static void __cdecl poll() {
     originalPoll(); // Preserve the normal keyboard, mouse and menu event ordering.
     if (!hooksReady.load(std::memory_order_acquire) || !channel.shared)
@@ -59,15 +79,17 @@ static void __cdecl poll() {
         auto *mode = reinterpret_cast<volatile int32_t *>(base + 0x3fdfe8);
         if (*mode == 1 || *mode == 2) *mode = 2;
     }
-    // Native menu keys: press on one poll, release on the next.
-    if (heldKey) {
-        release(heldKey);
-        heldKey = 0;
+    // Native menu commands: press on one poll, release on the next.
+    if (heldCommand) {
+        release(heldCommand);
+        heldCommand = 0;
     }
-    if (const int key = queuedKey.exchange(0)) {
-        if (current() && interactive()) {
-            press(key, 0);
-            heldKey = key;
+    if (const int command = queuedCommand.exchange(0)) {
+        const bool ready = current() && interactive();
+        logCommand(command, ready);
+        if (ready) {
+            press(command, 0);
+            heldCommand = command;
         }
     }
     MenuPointer pointer;
@@ -92,7 +114,8 @@ static void __cdecl poll() {
     AcquireSRWLockShared(&stateLock);
     bool sameMenu = menu && menu == capturedMenu && pointer.interactionGeneration == generation;
     ReleaseSRWLockShared(&stateLock);
-    bool allowed = sameMenu && sourceEligible && nativePointerReady();
+    const bool nativeReady = menu && nativePointerReady();
+    bool allowed = sameMenu && sourceEligible && nativeReady;
     if (selectedHand != pointer.hand || session != input.session || reference != input.reference ||
         pointerGeneration != pointer.interactionGeneration || actionGeneration != pointer.primaryInputGeneration) {
         allowed = false;
@@ -107,6 +130,7 @@ static void __cdecl poll() {
     allowed =
         allowed && std::isfinite(sensitivity) && sensitivity > .0001f && std::isfinite(x) && std::isfinite(y);
     bool held = trigger.update(pointer.trigger, allowed);
+    if (menu) logPointer(sameMenu, sourceEligible, nativeReady, held);
     if (down && !held) {
         // Native release clears its global mouse-held state and routes through
         // the current menu. Never retain a down state after focus/target loss.
@@ -171,10 +195,10 @@ bool pointerAvailable() {
     ReleaseSRWLockShared(&stateLock);
     return same && sourceEligible && nativePointerReady();
 }
-bool queueKey(int key) {
-    if (!key || !active())
+bool queueCommand(int command) {
+    if (!command || !active())
         return false;
-    queuedKey.store(key);
+    queuedCommand.store(command);
     return true;
 }
 bool initialize(HMODULE sam, HookInstaller install) {

@@ -739,6 +739,9 @@ def validate(cfg):
     if cfg.get('background_controls_probe') and (cfg.get('native_dual_probe') or
         cfg.get('renderer_mode','vr')!='vr' or cfg.get('native_input_probe')):
         raise ValueError('Background controls diagnostic requires a separate non-firing VR run')
+    hold=cfg.get('interactive_hold_seconds',0)
+    if type(hold) is not int or not 0<=hold<=150 or (hold and not cfg.get('neutral_runtime_probe')):
+        raise ValueError('Interactive hold is a bounded neutral-runtime extension only')
     if type(cfg.get('capture_desktop',True)) is not bool:
         raise ValueError('Desktop capture selection must be explicit boolean')
     if type(cfg.get('grip_resource_probe',False)) is not bool:
@@ -1001,6 +1004,35 @@ def native_dual_probe(cfg,env,token,deadline,run_dir,state):
             report['release_error']=str(error);report['result']='incomplete'
         (run_dir/'native-dual-probe.json').write_text(json.dumps(report,indent=2))
     return report
+
+def interactive_hold(cfg,env,token,deadline,run_dir,owned_game):
+    """Keep the owned neutral game running for operator-driven simulated input.
+
+    The operator drives the private remote controllers externally and reads the
+    game log; this only records observer status samples and always restores the
+    neutral baseline controls afterwards. Creating run_dir/hold-stop ends early.
+    """
+    stop=run_dir/'hold-stop'
+    end=min(deadline-15,time.monotonic()+cfg['interactive_hold_seconds'])
+    (run_dir/'hold-ready.json').write_text(json.dumps({'game_log':str(Path(cfg['game_lab'])/'Bin/SS2VR.log'),
+        'remote_port':cfg['remote_port'],'baseline_head':cfg['baseline_head'],
+        'seconds':max(0,end-time.monotonic())},indent=2))
+    samples=0
+    try:
+        with (run_dir/'hold-status.jsonl').open('w') as out:
+            while time.monotonic()<end and not stop.exists():
+                if not still_owned(owned_game):raise RuntimeError('Owned game exited during interactive hold')
+                try:state=observer(cfg,env,'status',token,timeout=remaining(end,2),deadline=end)
+                except ObserverError as error:
+                    if error.code==4:
+                        time.sleep(.05);continue
+                    raise
+                except (TimeoutError,subprocess.TimeoutExpired):break
+                out.write(json.dumps(state)+'\n');out.flush();samples+=1
+                time.sleep(.25)
+    finally:
+        subprocess.run([cfg['pose_driver'],str(cfg['remote_port']),*map(str,cfg['baseline_head'])],check=True,timeout=5)
+    return {'samples':samples,'stopped':stop.exists()}
 
 def finish_idle_capture(cfg,lab,run_dir,manifest):
     """Select postprocessing only; the caller retains the existing run/finally."""
@@ -1458,6 +1490,8 @@ def run(cfg):
                 if captured.returncode:
                     manifest.setdefault('desktop_capture_errors',[]).append({'pose':step['name'],
                         'returncode':captured.returncode,'stderr':captured.stderr[-4096:]})
+        if cfg.get('interactive_hold_seconds'):
+            manifest['interactive_hold']=interactive_hold(cfg,env,token,deadline,run_dir,owned_game)
         if finish_idle_capture(cfg,lab,run_dir,manifest):
             return run_dir
         if cfg.get('background_controls_probe'):

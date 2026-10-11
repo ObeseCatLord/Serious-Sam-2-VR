@@ -7,7 +7,8 @@ bool initialize(HMODULE sam, HookInstaller install);
 bool active();
 uint32_t captureGeneration();
 bool pointerAvailable();
-// Queue one native menu key (engine key id) for the next menu poll; no OS input,
+// Queue one native menu system command (syscmdOk 0x0B, syscmdBack 0x0C, Left/
+// Right/Up/Down 0x0D-0x10, F1/F2 0x15/0x16) for the next menu poll. No OS input,
 // so it works without window focus. Returns false when no native menu is open.
-bool queueKey(int key);
+bool queueCommand(int command);
 } // namespace ss2vr::game::menus
