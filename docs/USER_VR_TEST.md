@@ -20,6 +20,12 @@ Codex must not continue those probes under the current instruction.
   `Content/SeriousSam2/Sam2.ini`). Eye resolution follows the headset's OpenXR
   recommendation automatically; `[Render] Scale` adjusts it and `[Weapons] Scale`
   sizes hand-held weapons (0 = automatic).
+- Foveation: with an eye-tracked runtime (e.g. Steam Frame on SteamVR, if it
+  reports `XR_EXT_eye_gaze_interaction`) the host log says "Foveated readback
+  enabled ... eyeGaze=tracked". Look around with your eyes: the sharp region must
+  follow your gaze with no visible seam or offset between it and the softer
+  surroundings, and frame rate should improve over `[Render] Foveation=0`. Set
+  `Foveation=2` to try the centred variant on a headset without eye tracking.
 - Pre-handoff evidence (simulated Monado, fixed neutral pose, no input): with
   `[Roomscale]`, `[HeadComfort]` and `[Melee]` `Enabled=1`, fourteen consecutive
   fresh startups loaded Jungle, presented both native eyes with the visible world,

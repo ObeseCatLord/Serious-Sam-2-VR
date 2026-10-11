@@ -534,9 +534,12 @@ int wmain(int argc,wchar_t **argv) {
     }
     auto name=std::wstring(argv[3])+L"-metadata.json";
     auto *f=_wfopen(name.c_str(),L"wbx");if(!f)return 6;
-    std::fprintf(f,"{\"sequence\":%llu,\"input_sequence\":%llu,\"input_tick_ms\":%llu,\"width\":%u,\"height\":%u,\"presentation\":%u,\"session\":%u,\"reference\":%u,\"tracking_generation\":%u,\"ui_requested\":%u,\"head\":",
+    const bool foveatedImage=request.foveated&&request.lowWidth&&request.insetWidth;
+    std::fprintf(f,"{\"sequence\":%llu,\"input_sequence\":%llu,\"input_tick_ms\":%llu,\"width\":%u,\"height\":%u,\"image_width\":%u,\"image_height\":%u,\"foveated\":%u,\"presentation\":%u,\"session\":%u,\"reference\":%u,\"tracking_generation\":%u,\"ui_requested\":%u,\"head\":",
         static_cast<unsigned long long>(request.sequence),static_cast<unsigned long long>(request.input.sequence),
-        static_cast<unsigned long long>(request.input.tickMs),request.width,request.height,presentation,request.session,request.reference,request.trackingGeneration,request.uiRequested);
+        static_cast<unsigned long long>(request.input.tickMs),request.width,request.height,
+        foveatedImage?request.lowWidth:request.width,foveatedImage?request.lowHeight:request.height,unsigned(foveatedImage),
+        presentation,request.session,request.reference,request.trackingGeneration,request.uiRequested);
     pose(f,request.input.head);std::fprintf(f,",\"hands\":[");pose(f,request.input.hand[0]);std::fprintf(f,",");pose(f,request.input.hand[1]);
     std::fprintf(f,"],\"grip_valid\":[%u,%u],\"grips\":[",request.input.gripValid[0],request.input.gripValid[1]);pose(f,request.input.grip[0]);std::fprintf(f,",");pose(f,request.input.grip[1]);
     std::fprintf(f,"],\"eyes\":[");pose(f,request.eye[0]);std::fprintf(f,",");pose(f,request.eye[1]);

@@ -1,5 +1,21 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-10 (late) — grip carry, mesh weapon wheel, foveated readback
+
+- Grip pickup (`2db90d0`): a grip squeeze beside a takeable prop (Engine
+  `cldGetHullsInRange`, takeable flag 2) calls the native `TakeObject` (puppet
+  slot 0x290); a `HandleObjectCarrying` detour retargets the manipulator joint to
+  the hand each tick; releasing calls `DropObject` (0x29C) and sets the body
+  velocity from the hand. V97/V98: ball taken, held at the hand, thrown.
+- Hand weapon wheel with stock `*_Pickup.mdl` meshes via `mdlRenderModel`, sized by
+  render-mesh bounds, plus Netricsa/menu/quick save/quick load bubbles (V94/V98).
+- Foveated readback (ABI 13): downsampled full view + full-resolution inset per
+  eye, base + feathered inset projection layers, gaze from
+  `XR_EXT_eye_gaze_interaction`. V99 (forced mode 2): 672×756 base + 538×604
+  inset from a 1344×1512 eye, 3682 world submissions without rejection. Composite
+  appearance needs a headset; Monado builds before MR !2993 may ignore a projection
+  layer's FOV without timewarp.
+
 ## 2026-10-10 (late) — inputs, render size and weapon scale from user reports
 
 User reports after the first headset session: menu buttons and triggers did

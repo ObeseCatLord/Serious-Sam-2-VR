@@ -61,9 +61,10 @@ def neutral_runtime_summary(directory,cfg):
         if path.is_symlink() or not path.is_file() or not 0<path.stat().st_size<=32*1024*1024:
             raise RuntimeError('Neutral eye capture is absent, redirected or unbounded')
         with Image.open(path) as image:
-            if image.format!='PPM' or image.mode!='RGB' or not all(1<=n<=2048 for n in image.size):
+            if image.format!='PPM' or image.mode!='RGB' or not all(1<=n<=16384 for n in image.size):
                 raise RuntimeError('Neutral eye capture has an invalid format or extent')
-            if image.size!=(frame.get('width'),frame.get('height')):
+            # A foveated pair's base image is its downsampled full view.
+            if image.size!=(frame.get('image_width',frame.get('width')),frame.get('image_height',frame.get('height'))):
                 raise RuntimeError('Neutral image extent differs from its pair metadata')
             image.load();images.append(image.convert('RGB'))
             captures.append({'eye':eye,'file':path.name,'width':image.width,'height':image.height})
