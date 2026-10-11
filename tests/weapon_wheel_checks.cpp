@@ -269,6 +269,34 @@ void meshPlacement() {
     assert(wheelModelPlacement(ring.frame, {}, {}, 1, .1f, INFINITY).scale == 0);
 }
 
+void meshBounds() {
+    // Two render meshes (a body and a long barrel) and an authored configuration
+    // box that is far smaller, as on the stock rocket launcher pickup.
+    const WheelBox body{{-.2f, -.1f, -.3f}, {.2f, .3f, .4f}}, barrel{{-.1f, 0, -1.6f}, {.1f, .2f, -.2f}};
+    const WheelBox stored{{-.3f, -.3f, -.3f}, {.3f, .3f, .3f}};
+    const WheelBox both[]{body, barrel};
+    auto bounds = wheelModelBounds(both, 2, stored);
+    assert(bounds.fromMeshes && near(bounds.extent, 2.f) && near(bounds.centre.z, -.6f) &&
+           near(bounds.centre.y, .1f) && near(bounds.centre.x, 0));
+    // The drawn length is normalised from the meshes, never the stored box.
+    const float size = wheelModelSize(.065f, false);
+    const auto placed = wheelModelPlacement({}, {}, bounds.centre, bounds.extent, size, 0);
+    assert(near(placed.scale * 2.f, size) && placed.scale * 3 < size / (stored.max.x - stored.min.x));
+    // Invalid mesh boxes (non-finite, inverted, empty) are skipped.
+    const WheelBox junk[]{{{NAN, 0, 0}, {1, 1, 1}}, {{1, 1, 1}, {0, 0, 0}}, {{0, 0, 0}, {0, 0, 0}}, body};
+    bounds = wheelModelBounds(junk, 4, stored);
+    assert(bounds.fromMeshes && near(bounds.extent, .7f));
+    // Without any usable mesh box the stored configuration box is the fallback.
+    bounds = wheelModelBounds(junk, 3, stored);
+    assert(!bounds.fromMeshes && near(bounds.extent, .6f) && near(bounds.centre.x, 0));
+    bounds = wheelModelBounds(nullptr, 0, stored);
+    assert(!bounds.fromMeshes && near(bounds.extent, .6f));
+    // Nothing usable at all: no extent, so the weapon keeps its icon.
+    bounds = wheelModelBounds(junk, 3, WheelBox{});
+    assert(bounds.extent == 0 && !bounds.fromMeshes);
+    assert(!wheelBoxValid(WheelBox{{0, 0, 0}, {60, 1, 1}}));
+}
+
 void inputSample() {
     // Full Input path: grip position is the pointer, epochs and admission apply.
     Input input{};
@@ -315,6 +343,7 @@ int main() {
     stickFallback();
     inventoryChange();
     meshPlacement();
+    meshBounds();
     inputSample();
-    std::puts("Weapon wheel layout, hover, release, cancel, bubble, grab-priority and mesh placement checks passed");
+    std::puts("Weapon wheel layout, hover, release, cancel, bubble, grab-priority, mesh placement and mesh bounds checks passed");
 }

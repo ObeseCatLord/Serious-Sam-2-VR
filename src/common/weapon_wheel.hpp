@@ -127,6 +127,47 @@ struct WheelRing {
 private:
     float angle[WheelSlotCount]{};
 };
+// Axis-aligned model-space box in the native Box3f layout (min, then max).
+struct WheelBox {
+    Vec3 min{}, max{};
+};
+static_assert(sizeof(WheelBox) == 24);
+inline bool wheelBoxValid(const WheelBox &box) {
+    const Vec3 size = box.max - box.min;
+    return std::isfinite(box.min.x) && std::isfinite(box.min.y) && std::isfinite(box.min.z) &&
+           std::isfinite(box.max.x) && std::isfinite(box.max.y) && std::isfinite(box.max.z) && size.x >= 0 &&
+           size.y >= 0 && size.z >= 0 && std::max({size.x, size.y, size.z}) > .001f &&
+           std::max({size.x, size.y, size.z}) < 50.f;
+}
+// What a display mesh is normalised by. The render meshes' own boxes give the
+// drawn geometry: their union is what the engine's configuration recalculation
+// forms. A stock pickup's stored configuration box is authored independently
+// (larger or smaller than the mesh), so it is used only when no mesh box is.
+struct WheelModelBounds {
+    Vec3 centre{};
+    float extent = 0;
+    bool fromMeshes = false;
+};
+inline WheelModelBounds wheelModelBounds(const WheelBox *meshes, uint32_t count, const WheelBox &configuration) {
+    WheelBox merged{};
+    bool any = false;
+    for (uint32_t i = 0; meshes && i != count; ++i) {
+        if (!wheelBoxValid(meshes[i]))
+            continue;
+        merged = any ? WheelBox{{std::min(merged.min.x, meshes[i].min.x), std::min(merged.min.y, meshes[i].min.y),
+                                 std::min(merged.min.z, meshes[i].min.z)},
+                                {std::max(merged.max.x, meshes[i].max.x), std::max(merged.max.y, meshes[i].max.y),
+                                 std::max(merged.max.z, meshes[i].max.z)}}
+                     : meshes[i];
+        any = true;
+    }
+    if (!any)
+        merged = configuration;
+    if (!wheelBoxValid(merged))
+        return {};
+    const Vec3 size = merged.max - merged.min;
+    return {(merged.min + merged.max) * .5f, std::max({size.x, size.y, size.z}), any};
+}
 // Floating weapon meshes are about 9.5 cm long, smaller only on a crowded ring.
 inline float wheelModelSize(float itemSize, bool hovered) {
     return std::min(.095f, 1.7f * itemSize) * (hovered ? 1.3f : 1.f);

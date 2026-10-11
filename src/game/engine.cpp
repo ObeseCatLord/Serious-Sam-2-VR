@@ -359,21 +359,28 @@ static int *blendSource = nullptr, *blendDestination = nullptr;
 static BlendFunction *setBlendFunction = nullptr;
 // Native model entries for the wheel's floating weapon meshes (optional pinned
 // Engine exports; CBaseWeaponEntity::Render draws its own model the same way).
-struct WheelModelBox {
-    Vec3 min, max; // Native Box3f.
-};
 using ModelInstanceCreate = void *(__cdecl *)();
 using ModelInstanceDelete = void(__cdecl *)(void *);
 using ModelInstanceConfigure = void(__cdecl *)(void *, void *);
 using ModelInstanceStretch = void(__cdecl *)(void *, const Vec3 &);
-using ModelInstanceBox = WheelModelBox *(__cdecl *)(WheelModelBox *, const void *);
+using ModelInstanceBox = WheelBox *(__cdecl *)(WheelBox *, const void *);
 using ModelInstanceRender = void(__cdecl *)(void *, const Matrix34 &, float, int);
+// Render-mesh bounds, read as mdlModelConfigurationRecalculateBoundingBox
+// (RVA D3640) forms them, without storing anything into the shared resource.
+using ModelMeshCount = int32_t(__cdecl *)(void *);
+using ModelMesh = void *(__cdecl *)(void *, int32_t);
+using MeshRenderMesh = void *(__cdecl *)(void *);
+using RenderMeshBox = WheelBox *(__cdecl *)(WheelBox *, const void *);
 static ModelInstanceCreate createModelInstance = nullptr;
 static ModelInstanceDelete deleteModelInstance = nullptr;
 static ModelInstanceConfigure configureModelInstance = nullptr;
 static ModelInstanceStretch stretchModelInstance = nullptr;
 static ModelInstanceBox modelInstanceBox = nullptr;
 static ModelInstanceRender renderModelInstance = nullptr;
+static ModelMeshCount modelMeshCount = nullptr, renderMeshLodCount = nullptr;
+static ModelMesh modelMesh = nullptr;
+static MeshRenderMesh meshRenderMesh = nullptr;
+static RenderMeshBox renderMeshBox = nullptr;
 static void **modelDataType = nullptr;
 static uintptr_t modelConfigurationVtable = 0;
 static MatrixPose matrixPose = nullptr;
@@ -6844,7 +6851,9 @@ static const char *const wheelModelPaths[WeaponCount]={
     "Content/SeriousSam2/Models/Weapons/Flamer/Flamer.mdl"};
 // Process-lifetime display instances: the configuration Ptr is owned at
 // &configuration and the bare CModelInstance (no renderable, mechanism or
-// animation) only by this table. Its unit-stretch box normalises the size.
+// animation) only by this table. The union of its render meshes' boxes, at
+// unit stretch, normalises the size; the stored configuration box of a stock
+// pickup does not match its mesh (sniper 2.2 m box, rocket launcher too small).
 struct WheelModel {
     void *configuration=nullptr,*instance=nullptr;
     Vec3 centre{};
@@ -6862,12 +6871,15 @@ static bool wheelModelConfigurationReady(void *configuration) {
 static void loadWeaponWheelModels(const Snapshot &s) {
     if(!s.ui.gameplay || !nativeMainThread || !nativeMainThread() || !modelDataType || !*modelDataType ||
        !createModelInstance || !deleteModelInstance || !configureModelInstance || !modelInstanceBox ||
-       !renderModelInstance || !stretchModelInstance)return;
+       !renderModelInstance || !stretchModelInstance || !modelMeshCount || !modelMesh || !meshRenderMesh ||
+       !renderMeshLodCount || !renderMeshBox)return;
     for(uint32_t id=0;id!=WeaponCount;++id) {
         auto &m=wheelModels[id];
         if(m.tried || !wheelModelPaths[id])continue;
         m.tried=true;
-        WheelModelBox box{};
+        constexpr uint32_t MaximumMeshes=16;
+        WheelBox configured{},meshes[MaximumMeshes]{};
+        uint32_t meshCount=0;
         bool boxed=false;
         if(obtainNativeResource(m.configuration,*modelDataType,wheelModelPaths[id]) &&
            wheelModelConfigurationReady(m.configuration))
@@ -6875,19 +6887,29 @@ static void loadWeaponWheelModels(const Snapshot &s) {
                 m.instance=createModelInstance();
                 if(!m.instance)return;
                 configureModelInstance(m.instance,m.configuration);
-                boxed=modelInstanceBox(&box,m.instance)==&box;
+                boxed=modelInstanceBox(&configured,m.instance)==&configured; // Unit stretch: the stored box.
+                // A render mesh without LODs yields the native +-0.5 default box; skip it.
+                const int32_t count=modelMeshCount(m.configuration);
+                for(int32_t i=0;i<count && meshCount<MaximumMeshes;++i) {
+                    void *mesh=modelMesh(m.configuration,i);
+                    void *render=mesh ? meshRenderMesh(mesh) : nullptr;
+                    if(render && renderMeshLodCount(render)>0 && renderMeshBox(&meshes[meshCount],render)==&meshes[meshCount])
+                        ++meshCount;
+                }
             },[](bool) noexcept {});
-        const Vec3 size=box.max-box.min;
-        m.extent=std::max({size.x,size.y,size.z});
-        m.centre=(box.min+box.max)*.5f;
-        m.ready=m.instance && boxed && std::isfinite(m.extent) && m.extent>.001f && m.extent<50.f &&
-            std::isfinite(m.centre.x) && std::isfinite(m.centre.y) && std::isfinite(m.centre.z);
+        const auto bounds=wheelModelBounds(meshes,meshCount,boxed ? configured : WheelBox{});
+        m.extent=bounds.extent;
+        m.centre=bounds.centre;
+        m.ready=m.instance && m.extent>0;
         if(m.instance && !m.ready) {
             void *instance=m.instance;
             m.instance=nullptr;
             withNativeFinally([&] {deleteModelInstance(instance);},[](bool) noexcept {});
         }
-        log("Weapon wheel model %u %s extent=%.3f",id,m.ready ? "loaded" : "unavailable; using its icon",m.extent);
+        const Vec3 stored=configured.max-configured.min;
+        log("Weapon wheel model %u %s extent=%.3f source=%s meshes=%u configurationExtent=%.3f",id,
+            m.ready ? "loaded" : "unavailable; using its icon",m.extent,bounds.fromMeshes ? "meshes" : "configuration",
+            meshCount,std::max({stored.x,stored.y,stored.z}));
         return;
     }
 }
@@ -8383,6 +8405,11 @@ bool attach(bool headless) {
         WEAPON_MESH(e, "?mdlModelInstanceGetBoundingBox@SeriousEngine@@YA?AVBox3f@1@PBVCModelInstance@1@@Z",
           modelInstanceBox);
         WEAPON_MESH(e, "?mdlRenderModel@SeriousEngine@@YAXPAVCModelInstance@1@ABVMatrix34f@1@MH@Z", renderModelInstance);
+        WEAPON_MESH(e, "?mdlModelConfigGetMeshCount@SeriousEngine@@YAJPAVCModelConfiguration@1@@Z", modelMeshCount);
+        WEAPON_MESH(e, "?mdlModelConfigGetMesh@SeriousEngine@@YAPAVCMesh@1@PAVCModelConfiguration@1@J@Z", modelMesh);
+        WEAPON_MESH(e, "?mshGetRenderMesh@SeriousEngine@@YAPAVCRenderMesh@1@AAVCMesh@1@@Z", meshRenderMesh);
+        WEAPON_MESH(e, "?mdlGetRenderMeshLODCount@SeriousEngine@@YAJPAVCRenderMesh@1@@Z", renderMeshLodCount);
+        WEAPON_MESH(e, "?mdlGetRenderMeshBoundingBox@SeriousEngine@@YA?AVBox3f@1@PBVCRenderMesh@1@@Z", renderMeshBox);
 #undef WEAPON_MESH
         if (!weaponMeshSymbols) {
             renderModelInstance = nullptr;
