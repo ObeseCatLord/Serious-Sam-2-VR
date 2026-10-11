@@ -1187,6 +1187,13 @@ static void publishSnapshot(const Snapshot &s) {
 }
 static void prepareLocalGestureSource(Snapshot &);
 static void appendLocalGesturePose(const Snapshot &, network::PosePacket &);
+// Combo weapons: the game's mode where each hand's weapon has its own fire
+// button. In VR each trigger belongs to its hand, so the mode is on while the
+// headset drives the game.
+static IntThis originalComboWeapons = nullptr;
+static int __fastcall comboWeapons(void *game, void *) {
+    return vrInputLive() ? 1 : originalComboWeapons(game);
+}
 // Private-lab weapon audit natives (see auditWeaponAnchor).
 static int(__cdecl *boneAbsolute)(void *, uint32_t, Matrix34 &) = nullptr;
 static void(__thiscall *giveAllWeapons)(void *, int) = nullptr;
@@ -1356,6 +1363,13 @@ static void __fastcall carryStep(void *puppet, void *) {
     g.history[g.samples % 16] = {carryClock(), hand.p};
     ++g.samples;
 }
+// Stick walking follows where the head faces: snap/smooth turn plus the head's
+// yaw relative to the tracking origin's heading.
+static float moveHeading(const Input &input, const Pose &origin, float turn) {
+    const float head = yawAngle(input.head.q) - yawAngle(origin.q);
+    return std::isfinite(head) && input.headValid ? turn + head : turn;
+}
+static float moveHeading(const Snapshot &s) { return moveHeading(s.input, s.origin, s.turn); }
 static void update(void *p) {
     validateLabOnlineIsolation(false);
     if (rigMutationActive || !hooksReady.load(std::memory_order_acquire) || !channel.shared || !local(p))
@@ -1448,14 +1462,30 @@ static void update(void *p) {
             w.cancel();
     }
     float ax = input.axis[1][0];
-    bool turningAllowed = enabled && !resettingControls && !(input.buttons[1] & Button::Wheel);
+    bool turningAllowed = enabled && !resettingControls && !wheels[1].open && std::isfinite(ax);
+    static LARGE_INTEGER lastTurnClock{};
+    LARGE_INTEGER turnClock{}, turnFrequency{};
+    QueryPerformanceCounter(&turnClock);
+    QueryPerformanceFrequency(&turnFrequency);
+    const float turnDt = lastTurnClock.QuadPart ?
+        std::clamp(float(double(turnClock.QuadPart - lastTurnClock.QuadPart) / double(turnFrequency.QuadPart)), 0.f, .1f) : 0.f;
+    lastTurnClock = turnClock;
     if (std::abs(ax) < .3f || !turningAllowed)
         turnLatched = false;
-    if (turningAllowed && std::abs(ax) > .75f && !turnLatched) {
-        s.turn += (ax > 0 ? -1 : 1) * Pi / 6;
-        turnLatched = true;
-        s.networkGeneration = networkGenerations.advance();
-        advanceGeneration(s);
+    if (settings.snapTurn) {
+        if (turningAllowed && std::abs(ax) > .75f && !turnLatched) {
+            s.turn += (ax > 0 ? -1 : 1) * Pi / 6;
+            turnLatched = true;
+            s.networkGeneration = networkGenerations.advance();
+            advanceGeneration(s);
+        }
+    } else if (turningAllowed && std::abs(ax) > .15f) {
+        // Smooth turn: continuous, so it never invalidates the rendered frames
+        // the way a discrete snap (a new tracking generation) does.
+        const float deflection = (std::abs(std::clamp(ax, -1.f, 1.f)) - .15f) / .85f;
+        s.turn -= std::copysign(deflection * settings.smoothTurnRate * turnDt, ax);
+        if (s.turn > Pi) s.turn -= 2 * Pi;
+        if (s.turn < -Pi) s.turn += 2 * Pi;
     }
     for (int h = 0; h < 2; h++) {
         if (!nativeRiderCurrent(p, rider))
@@ -3881,12 +3911,8 @@ static void noteWeaponFov(uint32_t id, float fov) {
     }
 }
 static float weaponModelScale(const VrSettings &s, int id) {
-    float base = s.weaponScale;
-    if (base <= 0) { // Automatic.
-        const float world = nativeWorldFov.load(), weapon = id >= 0 && id < 64 ? nativeWeaponFov[id].load() : 0;
-        base = world > 0 && weapon > 0 ?
-            std::clamp(std::sqrt(std::tan(world / 2) / std::tan(weapon / 2)), 1.f, 1.6f) : 1.f;
-    }
+    // [Weapons] Scale multiplies the matched per-weapon sizes (0 or 1: as matched).
+    const float base = (s.weaponScale > 0 ? s.weaponScale : 1.f) * weaponDisplayScale(uint32_t(id));
     return id >= 0 && id < int(WeaponCount) ? base * s.weaponScaleById[id] : base;
 }
 static Matrix44 *__cdecl weaponFrustum(Matrix44 *out, float fov, float aspect, float nz, float fz) {
@@ -4249,11 +4275,10 @@ static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snap
                 }
                 Pose target;
                 if (calibrationAdmitted)
-                    target = retargetCalibratedMuzzle(nativeCamera, *out, c.nativeModelLocal.p,
-                                                      hand, c.nativeDisplacement, c.nativeAlignment,
-                                                      weaponModelScale(settings, primaryField(w, 0xb4)));
+                    target = handAlignedMuzzle(nativeCamera, *out, c.nativeModelLocal, c.nativeDisplacement,
+                                               c.nativeAlignment, hand, weaponModelScale(settings, primaryField(w, 0xb4)));
                 else
-                    target = {normalize(multiply(hand.q, multiply(inverse(nativeCamera.q), out->q))), hand.p};
+                    target = {normalize(hand.q), hand.p};
                 diagnosticRejection=17;
                 if (!finite(target) || !localWeaponCurrent(w, s, context.hand))
                     return;
@@ -4666,24 +4691,31 @@ static void drawLasers() {
         if (!a.valid) {
             laserTraceValue(LaserTraceStage::Draw,"sample-invalid",eyeSnapshot,h,eyeRequest.sequence,2);continue;
         }
-        const uint32_t color = h ? 0x40dfffffu : 0x60ff40ffu; // Native RGBA convention.
-        const Vec3 side = rotate(a.muzzle.q, {.001f, 0, 0});
+        // A laser-pointer red beam: a 2 mm bundle of lines, solid at any distance.
+        const uint32_t color = 0xff1a1affu; // Native RGBA convention.
         drawLine(a.muzzle.p, a.end, color, UINT32_MAX);
-        drawLine(a.muzzle.p + side, a.end + side, color, UINT32_MAX);
-        drawLine(a.muzzle.p - side, a.end - side, color, UINT32_MAX);
+        for (unsigned k = 0; k != 8; ++k) {
+            const float angle = k * Pi / 4;
+            const Vec3 side = rotate(a.muzzle.q, {.001f * std::cos(angle), .001f * std::sin(angle), 0});
+            drawLine(a.muzzle.p + side, a.end + side, color, UINT32_MAX);
+        }
         uint64_t order;
         if(laserTraceTicket(LaserTraceStage::Draw,order))
             log("Lab laser dispatch schema=1 order=%llu request=%llu input=%llu generation=%u owner=%u weapon=%u hand=%u eye=%d hit=%u muzzle=%.9g,%.9g,%.9g end=%.9g,%.9g,%.9g linesReturned=3 visible=unproved",
                 order,a.requestSequence,a.sequence,a.generation,a.owner,a.weapon,h,eyeIndex,unsigned(a.hit),
                 a.muzzle.p.x,a.muzzle.p.y,a.muzzle.p.z,a.end.x,a.end.y,a.end.z);
         if (a.hit) {
+            // A filled red dot at the hit, a constant ~0.3 degrees wide.
             const float distance = std::sqrt(dot(a.end - a.muzzle.p, a.end - a.muzzle.p));
-            const float radius = std::clamp(distance * .002f, .008f, .08f);
+            const float radius = std::clamp(distance * .0028f, .004f, .25f);
             const Vec3 center = a.end + rotate(a.muzzle.q, {0, 0, .005f});
-            const Vec3 right = rotate(a.muzzle.q, {radius, 0, 0});
-            const Vec3 up = rotate(a.muzzle.q, {0, radius, 0});
-            drawLine(center - right, center + right, color, UINT32_MAX);
-            drawLine(center - up, center + up, color, UINT32_MAX);
+            for (unsigned k = 0; k != 24; ++k) {
+                const float angle = k * Pi / 12;
+                const Vec3 spoke = rotate(a.muzzle.q, {radius * std::cos(angle), radius * std::sin(angle), 0});
+                drawLine(center - spoke, center + spoke, color, UINT32_MAX);
+                drawLine(center + spoke * .5f, center + rotate(a.muzzle.q, {radius * std::cos(angle + Pi / 12),
+                    radius * std::sin(angle + Pi / 12), 0}), color, UINT32_MAX);
+            }
         }
     }
     if (!wasDepth)
@@ -5692,8 +5724,10 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
     const Pose hand = worldHandTracking(
         body, s.origin, s.turn, tracking.head,
         calibratedGrip(tracking, mountHand(s, unsigned(h)), *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4), settings));
-    const Quat offset = multiply(inverse(suppliedCamera.q), native.q);
-    const Vec3 displacement = rotate(offset, charge);
+    // The weapon is held along the controller's aim axis: the flat viewmodel's
+    // tilt toward the screen centre is dropped so barrel, laser and shots agree.
+    const Quat offset{};
+    const Vec3 displacement = charge;
     Vec3 alignment;
     if(align && !alignmentDisplacement(modelBefore,offset,alignment)) {
         invalidateMatchingCalibration(s,unsigned(h),5,caller);return reject();
@@ -5701,7 +5735,7 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
     const int nativeId = *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4);
     const float scale = weaponModelScale(settings, nativeId);
     traceWeaponModel(w, nativeId, scale);
-    const Pose target{normalize(multiply(hand.q, offset)), hand.p + rotate(hand.q, (displacement+alignment) * scale)};
+    const Pose target{normalize(hand.q), hand.p + rotate(hand.q, (displacement+alignment) * scale)};
     if (!finite(target))
         return reject();
     const Matrix34 staged = scaledModel(matrix(target), scale); // Enlarged about the hand.
@@ -6377,7 +6411,7 @@ static bool inactiveJoystick(void *brain, uint8_t fire, Vec3 look, Vec3 nativeMo
                                                         primaryField(s.player,0x610))) return false;
     const ControlSample captured{s.rider,s.generation,{s.intentEpoch[0],s.intentEpoch[1]},
                                 s.input,s.origin,s.turn,multiplayer::remoteClient(),true};
-    const auto direction=horizontalStickMovement(s.input,false,s.turn);
+    const auto direction=horizontalStickMovement(s.input,false,moveHeading(s));
     const auto latest=copySnapshot();
     if (!vrSession(latest) || !fresh(latest.input) || !latest.ui.gameplay ||
         latest.ui.wheel[0].open || latest.ui.wheel[1].open ||
@@ -6669,7 +6703,7 @@ static void __fastcall waterPlayerControls(void *brain, void *, uint8_t fire, Ve
                 headLook.z = 0; // Head roll must not turn a lateral stroke into climbing.
                 // Poll already applied snap/smooth turn to the control vector.
                 // Remove it once; worldHeadTracking includes that same turn.
-                Vec3 local = rotate(yaw(-captured.turn), move);
+                Vec3 local = rotate(yaw(-moveHeading(captured.input, captured.origin, captured.turn)), move);
                 const bool joystickActive = !swimmingJoystickIdle(local);
                 const bool currentHands = snapshot.input.gripValid[0] && snapshot.input.gripValid[1] &&
                     finite(snapshot.input.grip[0]) && finite(snapshot.input.grip[1]) &&
@@ -7405,7 +7439,7 @@ static void __fastcall poll(void *b, void *) {
     std::fill(std::begin(values), std::end(values), 0);
     if (enabled) {
         auto direction = horizontalStickMovement(s.input, s.ui.wheel[0].open,
-                                                s.rider.seated() ? 0.f : s.turn);
+                                                s.rider.seated() ? 0.f : moveHeading(s));
         if (steeringWheel.steering == WheelSteering::Axis && steeringWheel.grasp.steering())
             direction.x = steeringWheel.grasp.steer(settings.steeringWheel); // Wheel replaces stick steering.
         // Verified native labels: X+ right, X- left, Z- forward, Z+ backward.
@@ -8665,6 +8699,7 @@ bool attach(bool headless) {
         H(g, "?ProcessPlayerControls@CPlayerBrainEntity@SeriousEngine@@UAEXEVVector3f@2@0@Z",
           waterPlayerControls, originalPlayerControls);
         H(g, "?HandleObjectCarrying@CPuppetEntity@SeriousEngine@@QAEXXZ", carryStep, originalCarrying);
+        H(g, "?IsComboWeaponsEnabled@CGameInfoEntity@SeriousEngine@@QAEHXZ", comboWeapons, originalComboWeapons);
         H(e, "?PollValues@CInputBindings@SeriousEngine@@QAEXXZ", poll, originalPoll);
         H(e, "?GetCommandValue@CInputBindings@SeriousEngine@@QAEMVIDENT@2@@Z", commandValue, originalValue);
         H(e, "?IsCommandDown@CInputBindings@SeriousEngine@@QAEHVIDENT@2@@Z", commandDown, originalDown);

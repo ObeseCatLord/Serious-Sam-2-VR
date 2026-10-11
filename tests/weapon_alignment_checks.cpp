@@ -1,4 +1,5 @@
 #include "common/weapon_alignment.hpp"
+#include "common/muzzle.hpp"
 #include <cassert>
 #include <limits>
 using namespace ss2vr;
@@ -118,5 +119,19 @@ int main() {
         const Vec3 expected=rotate(q,animatedLocalResidual);
         const Vec3 error=movedReference-expected;
         assert(dot(error,error)<1e-12f);
+    }
+    {
+        // Hand-aligned muzzle: a model-space shot point lands at hand + (anchor + point) * scale
+        // along the hand's axes, whatever the flat viewmodel's tilt and camera were.
+        const Pose camera{normalize(multiply(yaw(.4f),Quat{.05f,0,0,1})),{1,2,3}};
+        const Pose model{normalize(multiply(yaw(.2f),Quat{.1f,.08f,0,1})),{.2f,-.2f,-.3f}};
+        const Vec3 point{.01f,.03f,-.6f}, anchor{0,-.02f,.3f};
+        const Pose shot{camera.q,camera.p+rotate(camera.q,model.p+rotate(model.q,point))};
+        const Pose hand{yaw(-.7f),{4,1,-2}};
+        const Pose muzzle=handAlignedMuzzle(camera,shot,model,{},anchor,hand,1.5f);
+        const Vec3 expected=hand.p+rotate(hand.q,(anchor+point)*1.5f);
+        const Vec3 error=muzzle.p-expected;
+        assert(dot(error,error)<1e-8f);
+        assert(std::abs(dot(Vec3{muzzle.q.x,muzzle.q.y,muzzle.q.z},Vec3{hand.q.x,hand.q.y,hand.q.z})+muzzle.q.w*hand.q.w)>.99999f);
     }
 }

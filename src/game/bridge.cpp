@@ -1586,7 +1586,34 @@ void presentDevice(IDirect3DDevice9 *d, uintptr_t caller, const RECT *src, const
         if (aborted) { uiHalted = true; nestedNativePresentation(); }
     });
 }
+// Frame cost accounting, logged every five seconds: whole frame (present to
+// present), the stereo world/UI render and the eye readback within it.
+struct PerfClock {
+    double frame = 0, stereo = 0, readback = 0;
+    unsigned frames = 0, pairs = 0;
+    LARGE_INTEGER lastPresent{}, lastLog{};
+    static double seconds(LARGE_INTEGER a, LARGE_INTEGER b) {
+        static LARGE_INTEGER frequency{};
+        if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+        return double(b.QuadPart - a.QuadPart) / double(frequency.QuadPart);
+    }
+    static LARGE_INTEGER now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
+};
+static PerfClock perf;
 void present(IDirect3DDevice9 *d) {
+    {
+        const LARGE_INTEGER t = PerfClock::now();
+        if (perf.lastPresent.QuadPart) { perf.frame += PerfClock::seconds(perf.lastPresent, t); ++perf.frames; }
+        perf.lastPresent = t;
+        if (!perf.lastLog.QuadPart) perf.lastLog = t;
+        if (PerfClock::seconds(perf.lastLog, t) >= 5 && perf.frames) {
+            log("Perf frames=%u frame=%.1fms stereo=%.1fms readback=%.1fms pairs=%u size=%ux%u", perf.frames,
+                1000 * perf.frame / perf.frames, 1000 * perf.stereo / perf.frames,
+                perf.pairs ? 1000 * perf.readback / perf.pairs : 0., perf.pairs, width, height);
+            perf = PerfClock{};
+            perf.lastPresent = perf.lastLog = t;
+        }
+    }
     if (!presentationChain || resetQuarantined || !nativeUiDeviceCurrent(d) ||
         !nativePresentationThreadCurrent() || uiHalted || stopping) return;
     static std::atomic<bool> first{false};
@@ -2055,7 +2082,10 @@ void nativeUiFinishOwner() {
     }
     if (!current) { nativeUiFault(); return; }
     // UI and original full-field fades have now finished in BOTH owned eye RTs.
+    const LARGE_INTEGER readStart = PerfClock::now();
     const bool left=readUiEye(0,false,1),right=left && readUiEye(1,false,1);
+    perf.readback += PerfClock::seconds(readStart, PerfClock::now());
+    ++perf.pairs;
     bool ok=left && right;
     if(trace)log("Native UI readback left=%u right=%u",left,right);
     if (ok) {
@@ -2257,6 +2287,11 @@ static bool observedWorldRender(IDirect3DDevice9 *d,void *puppet,void(__thiscall
     return true;
 }
 void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRender) {
+    const LARGE_INTEGER stereoStart = PerfClock::now();
+    struct StereoTimer {
+        LARGE_INTEGER start;
+        ~StereoTimer() { perf.stereo += PerfClock::seconds(start, PerfClock::now()); }
+    } stereoTimer{stereoStart};
     const auto generation = graphicsResourceGeneration();
     if (uiFrame.slot>=0) {
         nativeUiFault();

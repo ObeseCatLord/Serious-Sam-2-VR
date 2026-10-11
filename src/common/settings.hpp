@@ -12,6 +12,8 @@ struct VrSettings {
     float laserDistance = 100.f;
     float renderScale = 1.f; // Multiplier on the runtime's recommended per-eye size.
     FoveationSettings foveation;
+    bool snapTurn = false;                 // Smooth stick turning unless enabled.
+    float smoothTurnRate = 150 * Pi / 180; // Radians per second at full deflection.
     float uiAspect = 16.f / 9; // Aspect the game lays out its 2D view (menus, HUD, movies) at in VR.
     bool labWeaponAudit = false; // Private lab: cycle every weapon and log its hand references.
     int labWeaponAuditHand = 1;  // Hand whose selection the audit simulates.

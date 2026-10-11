@@ -12,6 +12,17 @@ inline Pose retargetCalibratedMuzzle(Pose camera, Pose nativeShot, Vec3 nativeMo
     return retargetShot(camera, nativeShot, nativeModelLocal, hand, .5f,
                         nativeDisplacement, nativeAlignment, true, scale);
 }
+// Weapons held along the hand (no flat viewmodel tilt): the native shot point,
+// taken into model axes relative to the uncharged model origin, is placed from
+// the grip anchor offset; the shot leaves along the hand's forward axis.
+inline Pose handAlignedMuzzle(Pose camera, Pose nativeShot, Pose modelInCamera, Vec3 chargeInCamera,
+                              Vec3 anchorOffset, Pose hand, float scale) {
+    const Vec3 shot = compose(inverse(camera), nativeShot).p;
+    const Quat toModel = inverse(modelInCamera.q);
+    const Vec3 attachment = rotate(toModel, shot - (modelInCamera.p - chargeInCamera));
+    const Vec3 charge = rotate(toModel, chargeInCamera);
+    return {normalize(hand.q), hand.p + rotate(hand.q, (charge + anchorOffset + attachment) * scale)};
+}
 // Transient evidence from native ownership and the frozen authoritative sample.
 // This stores no policy across ticks and never resolves game pointers itself.
 struct MuzzleBinding {

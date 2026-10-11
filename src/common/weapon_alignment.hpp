@@ -40,6 +40,15 @@ inline constexpr WeaponGrip WeaponGrips[] = {
     {15, {0.f, .003f, -.113f}},      // Beam gun: rear grip
     {16, {0.f, 0.f, -.3f}},          // Flamer
 };
+// Per-weapon display scale so Sam's hands (and the guns with them) look as
+// large in VR as on the flat screen, where each weapon has its own FOV and
+// distance: scale ~ 1 / (|grip in camera space| * tan(weaponFov / 2)), normalised
+// to the revolvers at 1.49 (V101 audit: native weapon FOVs and first-person poses).
+inline constexpr float WeaponDisplayScales[WeaponCount] = {
+    .98f, 2.68f, 1.29f, 1.51f, 2.03f, .95f, .79f, 1.09f, 2.22f, .75f, .87f, .95f, 1.49f, 1.30f, 1.f, 1.14f, 1.2f};
+constexpr float weaponDisplayScale(uint32_t nativeId) {
+    return nativeId < WeaponCount ? WeaponDisplayScales[nativeId] : 1.f;
+}
 constexpr bool weaponAlignmentSupported(uint32_t nativeId) {
     for (const auto &grip : WeaponGrips)
         if (grip.nativeId == nativeId) return true;

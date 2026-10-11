@@ -36,6 +36,8 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.renderScale = number(L"Render", L"Scale", 1, .25f, 2);
     settings.foveation.mode = int(number(L"Render", L"Foveation", 1, 0, 2) + .5f);
     settings.uiAspect = number(L"Render", L"UiAspect", 16.f / 9, 1.f, 2.5f);
+    settings.snapTurn = number(L"Comfort", L"SnapTurn", 0, 0, 1) >= .5f;
+    settings.smoothTurnRate = number(L"Comfort", L"SmoothTurnDegreesPerSecond", 150, 30, 360) * Pi / 180;
     settings.labWeaponAudit = number(L"Lab", L"WeaponAudit", 0, 0, 1) >= .5f;
     settings.labWeaponAuditHand = number(L"Lab", L"WeaponAuditHand", 1, 0, 1) >= .5f ? 1 : 0;
     settings.foveation.inset = number(L"Render", L"FoveationInset", .4f, .25f, .7f);
