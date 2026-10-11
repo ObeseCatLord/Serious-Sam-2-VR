@@ -1,5 +1,21 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-11 — user feedback: 2D aspect, gray HUD, weapon grips
+
+- 2D aspect: SS2 letterboxes its whole 2D view to `gfx_fAspectRatio` (Sam2Game
+  RVA 3F9DE0, 4:3 by default) inside the canvas, which is now square (eye-sized).
+  VR sets `[Render] UiAspect` (16:9) and the flat screen copies only that band.
+- The host's substitute HUD panel (shown when a pair lacked the native HUD) is
+  removed. Host frame totals now count `ui_pairs` and `opaque_pairs`.
+- Weapon grips: the private `[Lab] WeaponAudit` mode logged every weapon's first-
+  person pose and Hand/Palm bones (V101). Every weapon now has a grip anchor
+  (`WeaponGrips`): Hand bones for revolvers/uzi/double shotgun, measured zap/
+  sniper handles, rear handles for big guns (V102-V105 captures with the
+  controller marked). A lone weapon follows the hand whose wheel chose it.
+- Wheel: bubbles moved to a separate arc, ring 15 cm ahead of the hand, held
+  weapon hidden while its wheel is open (V106/V107).
+- User installs keep `[HeadComfort]` off; its opaque fallback blacks out the world.
+
 ## 2026-10-10 (late) — grip carry, mesh weapon wheel, foveated readback
 
 - Grip pickup (`2db90d0`): a grip squeeze beside a takeable prop (Engine
