@@ -76,8 +76,13 @@ inline bool nativeUiProjection(const Matrix44 &source, const Matrix44 &eye,
             const double w = flat[3][0]*x + flat[3][1]*y + flat[3][3];
             const double z = flat[2][0]*x + flat[2][1]*y + flat[2][3];
             const double margin = std::max(1., std::abs(w)) * 1e-5;
-            if (!std::isfinite(w) || !std::isfinite(z) || w <= margin ||
-                z <= margin || w-z <= margin) return false;
+            if (!std::isfinite(w) || !std::isfinite(z)) return false;
+            if (w <= margin || z <= margin || w-z <= margin) {
+                // Part of the panel is behind this eye (a head turn the panel has
+                // not followed yet): nothing of it is drawn in this eye.
+                out = {}; out.empty = true;
+                return true;
+            }
             minimumW = std::min(minimumW, w);
         }
     // Source clip -> physical canvas -> stable panel. Positive source Y points

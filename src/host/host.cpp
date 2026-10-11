@@ -1044,7 +1044,7 @@ struct Host {
     // Zero-copy eye images opened from the game's shared handles (slot x eye).
     Com<ID3D11Texture2D> sharedEye[2][2];
     uint32_t sharedOpened = 0, sharedTried = 0, sharedWidth = 0, sharedHeight = 0;
-    uint64_t zeroCopyPairs = 0;
+    uint64_t zeroCopyPairs = 0, latched = 0;
     Actions actions;
     WorldSubmissionStream worldSubmission;
     Swapchain eye[2];
@@ -1085,7 +1085,7 @@ struct Host {
     uint64_t retired = 0, submissions = 0, reused = 0, lastSubmittedSequence = 0;
     ULONGLONG lastDiagnostics = 0, lastMutexDiagnostic = 0;
     // Host cost accounting for the 5 s diagnostics line (milliseconds sums).
-    double perfWait = 0, perfUpload = 0, perfLoop = 0, perfSubmit = 0;
+    double perfWait = 0, perfUpload = 0, perfLoop = 0, perfSubmit = 0, perfPairAge = 0;
     uint64_t perfLoops = 0, perfUploads = 0;
     LARGE_INTEGER perfLoopStart{};
     static double perfMs(LARGE_INTEGER a, LARGE_INTEGER b) {
@@ -1986,6 +1986,7 @@ struct Host {
                 throw std::runtime_error("Zero-copy eye copy did not complete");
             eye[0].releaseWaited();
             eye[1].releaseWaited();
+            perfPairAge += double(GetTickCount64() - (deadline - FrameAgeMs));
             if (++zeroCopyPairs == 600)
                 probeZeroCopy(sharedEye[candidate][0].p);
         } else {
@@ -2013,26 +2014,46 @@ struct Host {
         }
     }
     void requestEyes(Request request) {
-        Mutex lock(channel, 0);
+        Mutex lock(channel, 2);
         if (!lock)
             return;
         reapLocked();
         auto &shared = *channel.shared;
-        // One request may wait while the game holds the other slot (rendering it,
-        // or Ready and waiting for its GPU work or for this loop), so the game finds
-        // work as soon as it finishes a pair instead of drawing a frame the headset
-        // never sees. A request not yet taken, or an expiring slot, holds further ones.
-        unsigned active = 0;
-        for (unsigned i = 0; i != 2; ++i)
-            if (outstanding[i].active && (++active > 1 || outstanding[i].expired ||
-                                          shared.slot[i].state == SlotState::Requested || shared.slot[i].cancelled)) {
-                ++fullSlots;
-                return;
-            }
         request.trackingGeneration = trackingEpoch(shared);
         uint64_t deadline = GetTickCount64() + FrameAgeMs;
         if (shared.shutdown || !eligibleFrame(request, deadline, frameContext()))
             return;
+        // One request may wait while the game holds the other slot (rendering it,
+        // or Ready and waiting for its GPU work or for this loop), so the game finds
+        // work as soon as it finishes a pair instead of drawing a frame the headset
+        // never sees. A request the game has not taken yet is late-latched: it is
+        // replaced by this loop's newer poses, so the game always renders from the
+        // freshest prediction. Expiring/cancelled slots hold further requests.
+        unsigned active = 0;
+        int waiting = -1;
+        for (unsigned i = 0; i != 2; ++i) {
+            if (!outstanding[i].active)
+                continue;
+            ++active;
+            if (outstanding[i].expired || shared.slot[i].cancelled) {
+                ++fullSlots;
+                return;
+            }
+            if (shared.slot[i].state == SlotState::Requested)
+                waiting = int(i);
+        }
+        if (waiting >= 0) {
+            auto &slot = shared.slot[waiting];
+            outstanding[waiting] = {true, false, false, Expiry::None, deadline, request};
+            slot.request = request;
+            ++latched;
+            SetEvent(channel.ready);
+            return;
+        }
+        if (active > 1) {
+            ++fullSlots;
+            return;
+        }
         int index = -1;
         for (int i = 0; i < 2; i++)
             if (shared.slot[i].state == SlotState::Empty) {
@@ -2333,10 +2354,11 @@ struct Host {
         log.write(line);
         if (perfLoops) {
             std::snprintf(line, sizeof(line),
-                          "Host perf loops=%llu loop=%.2fms wait=%.2fms submit=%.2fms uploads=%llu upload=%.2fms zero_copy=%llu",
+                          "Host perf loops=%llu loop=%.2fms wait=%.2fms submit=%.2fms uploads=%llu upload=%.2fms pair_age=%.1fms zero_copy=%llu latched=%llu",
                           static_cast<unsigned long long>(perfLoops), perfLoop / perfLoops, perfWait / perfLoops,
                           perfSubmit / perfLoops, static_cast<unsigned long long>(perfUploads),
-                          perfUploads ? perfUpload / perfUploads : 0., static_cast<unsigned long long>(zeroCopyPairs));
+                          perfUploads ? perfUpload / perfUploads : 0., perfUploads ? perfPairAge / perfUploads : 0.,
+                          static_cast<unsigned long long>(zeroCopyPairs), static_cast<unsigned long long>(latched));
             log.write(line);
         }
         if (mutexStats.longHolds) {
@@ -2346,7 +2368,7 @@ struct Host {
             log.write(line);
             mutexStats = {};
         }
-        perfWait = perfUpload = perfLoop = perfSubmit = 0;
+        perfWait = perfUpload = perfLoop = perfSubmit = perfPairAge = 0;
         perfLoops = perfUploads = 0;
     }
     void run() {

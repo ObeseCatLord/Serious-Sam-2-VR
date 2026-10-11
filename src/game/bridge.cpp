@@ -385,6 +385,9 @@ struct PerfClock {
     unsigned lostNoWorld = 0, lostFault = 0, lostNoOverlay = 0, lostIncomplete = 0, lostOther = 0;
     const char *lostReason = "none";
     uintptr_t lostOrigin = 0;
+    // First failing stereo stage per lost pair: begin, scope, setup, world,
+    // uiProjection, eyeInvalid, target, postlude, readback, restore.
+    unsigned stage[10]{};
     unsigned publishLock = 0, publishCancelled = 0, publishState = 0, publishRequest = 0, publishImages = 0,
         publishCommit = 0, finishNotCurrent = 0;
     bool lostWorldOk = false, lostUi = false, lostOverlaySeen = false, lostComplete = false;
@@ -1801,6 +1804,7 @@ void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept {
     if (lastStereoEnd.QuadPart) perf.postStereo += PerfClock::seconds(lastStereoEnd, start);
     lastStereoEnd = {};
     lastPresentEnd = end;
+    pollSharedFences(); // Present flushed the frame: its pair is often complete already.
 }
 static void presentBody(IDirect3DDevice9 *d);
 void present(IDirect3DDevice9 *d) {
@@ -1821,6 +1825,12 @@ static void presentBody(IDirect3DDevice9 *d) {
                 log("Perf unpublished pairs: noWorld=%u fault=%u noOverlay=%u incomplete=%u other=%u lastFault=%s origin=+%lx world=%u ui=%u overlay=%u complete=%u",
                     perf.lostNoWorld, perf.lostFault, perf.lostNoOverlay, perf.lostIncomplete, perf.lostOther, perf.lostReason,
                     static_cast<unsigned long>(perf.lostOrigin), perf.lostWorldOk, perf.lostUi, perf.lostOverlaySeen, perf.lostComplete);
+            unsigned lostStages = 0;
+            for (unsigned k : perf.stage) lostStages += k;
+            if (lostStages)
+                log("Perf lost stereo stages: begin=%u scope=%u setup=%u world=%u uiProjection=%u eyeInvalid=%u target=%u postlude=%u readback=%u restore=%u",
+                    perf.stage[0],perf.stage[1],perf.stage[2],perf.stage[3],perf.stage[4],perf.stage[5],perf.stage[6],
+                    perf.stage[7],perf.stage[8],perf.stage[9]);
             if (perf.publishLock + perf.publishCancelled + perf.publishState + perf.publishRequest + perf.publishImages +
                 perf.publishCommit + perf.finishNotCurrent)
                 log("Perf publish rejected: lock=%u cancelled=%u state=%u request=%u images=%u commit=%u notCurrent=%u",
@@ -2696,7 +2706,11 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             log("Native world target admission ok=%u ui=%u source=%ux%u viewport=%ux%u",
                 ok,uiFrame.ui,cd.Width,cd.Height,vp.Width,vp.Height);
         }
+        bool stageNoted=false;
+        const auto noteStage=[&](unsigned which) { if(!ok && !stageNoted) { stageNoted=true; ++perf.stage[which]; } };
+        const bool admitted=ok;
         if(ok) ok=beginStereo(puppet,request,uiFrame.remoteOwner);
+        if(admitted) noteStage(0);
         if (!ok) {
             static unsigned beginDiagnostics = 0;
             if (beginDiagnostics < 4) { ++beginDiagnostics; log("Native world pair admission rejected"); }
@@ -2710,6 +2724,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         }
         if(traceDepth) traceStereoDepth(d,request,-1,"entry");
         if (ok) ok = renderScopeSources(puppet,original,request);
+        if(admitted) noteStage(1);
         if (generation != graphicsResourceGeneration()) { original(puppet); return; }
         static const bool labAlternateEyes=[] {
             wchar_t enabled[2]{},privateDisplay[2]{},weapon[3]{};
@@ -2735,11 +2750,13 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             ok=SUCCEEDED(d->SetScissorRect(&uiFrame.scissor)) && ok;
             ok=ok && SUCCEEDED(d->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER|
                 (hasStencil ? D3DCLEAR_STENCIL : 0),0xff000000,1,0));
+            noteStage(2);
             if(ok) {
                 if(traceDepth) traceStereoDepth(d,request,i,"before-world");
                 const LARGE_INTEGER eyeStart=PerfClock::now();
                 ok=observedWorldRender(d,puppet,original,request,i,traceDepth);
                 perf.eyeCpu[pass]+=PerfClock::seconds(eyeStart,PerfClock::now());
+                noteStage(3);
                 if(traceDepth && generation==graphicsResourceGeneration()) traceStereoDepth(d,request,i,"after-world");
             }
             if (generation != graphicsResourceGeneration()) { ok = false; break; }
@@ -2754,15 +2771,21 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                 Matrix44 identity{};
                 identity.m[0]=identity.m[5]=identity.m[10]=identity.m[15]=1;
                 NativeUiProjection admission;
+                // An empty projection means the HUD panel is not in front of this
+                // eye (a head turn it has not followed yet); HUD draws skip the eye.
                 ok=ok && nativeUiProjection(identity,uiFrame.projection[i],uiFrame.panel[i],
                     request.uiWidth,request.uiHeight,request.width,request.height,
-                    {0,0,request.width,request.height,0,1},false,{},admission) && !admission.empty;
+                    {0,0,request.width,request.height,0,1},false,{},admission);
                 if(traceEye) log("Native eye UI projection eye=%d admitted=%u empty=%u",i,ok,admission.empty);
+                noteStage(4);
             }
+            if(ok && eyeInvalid) { ok=false; noteStage(5); }
+            bool targetCurrent=true;
             ok=finishEyeRender(ok && !eyeInvalid,
                 [&]{
                     const bool current=generation==graphicsResourceGeneration() && !eyeInvalid && eyeTargetCurrent(i);
                     if(traceEye) log("Native eye target eye=%d current=%u",i,current);
+                    targetCurrent=current;
                     return current;
                 },
                 [&]{
@@ -2772,12 +2795,15 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                     if(traceEye) log("Native eye postlude eye=%d completed=%u",i,complete);
                     return complete;
                 });
+            if(!ok && !stageNoted) noteStage(targetCurrent ? 7 : 6);
             endEye(); activeEye=-1;
             gpuProfile.mark(pass+1);
             if(ok && generation == graphicsResourceGeneration() && !uiFrame.zeroCopy && (!uiFrame.ui || visibility!=1)) ok=readUiEye(i,uiFrame.ui,visibility);
+            noteStage(8);
         }
         activeEye=-1; endEye(); desktopTarget=desktopDepth=nullptr;
         ok=restoreUiFrame() && ok;
+        noteStage(9);
         // Native desktop rebuild remains exactly once; never replay brain/overlay.
         if(traceDepth && generation==graphicsResourceGeneration()) traceStereoDepth(d,request,-1,"before-desktop");
         const LARGE_INTEGER desktopStart=PerfClock::now();

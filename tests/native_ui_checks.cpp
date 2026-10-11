@@ -239,12 +239,15 @@ int main() {
     const Pose panel{{},{0,0,-2}};
     check(nativeUiProjection(source,eye,panel,width,height,1024,896,full,true,{9,9,8,8},output) && output.empty,
           "Empty clipped draw is a valid no-pixel result");
+    // A panel (partly) behind the eye, too near or beyond far is simply not drawn
+    // in this eye: a fast head turn must not drop the stereo pair.
+    for (Pose hidden : {Pose{{},{0,0,2}}, Pose{{},{0,0,-.04f}}, Pose{{},{0,0,-10001}}})
+        check(nativeUiProjection(source,eye,hidden,width,height,1024,896,full,false,{},output) && output.empty,
+              "Panel outside this eye's near/far range is an empty no-pixel result");
     output.constants.m[0] = 123;
-    for (Pose invalid : {Pose{{},{0,0,2}}, Pose{{},{0,0,-.04f}},
-                         Pose{{},{0,0,-10001}}, Pose{yaw(Pi/2),{0,0,-2}},
-                         Pose{Quat{0,0,0,0},{0,0,-2}}})
+    for (Pose invalid : {Pose{yaw(Pi/2),{0,0,-2}}, Pose{Quat{0,0,0,0},{0,0,-2}}})
         check(!nativeUiProjection(source,eye,invalid,width,height,1024,896,full,false,{},output) &&
-              output.constants.m[0]==123, "Rejected near/far/edge-on/invalid panel does not publish constants");
+              output.constants.m[0]==123, "Rejected edge-on/invalid panel does not publish constants");
     auto bad = source; bad.m[3] = std::numeric_limits<float>::quiet_NaN();
     check(!nativeUiProjection(bad,eye,panel,width,height,1024,896,full,false,{},output),
           "Nonfinite native constants reject before projection");
