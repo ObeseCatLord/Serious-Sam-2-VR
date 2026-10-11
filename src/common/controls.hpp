@@ -284,6 +284,7 @@ struct WeaponWheel {
     int selected = -1; // Weapon id committed by this update, else -1.
     WheelBubble action = WheelBubble::None; // Bubble committed by this update.
     int hoverSlot = -1;
+    float outer = 1; // Bubble side: +1 right hand, -1 left hand.
     WheelRing ring;
     void cancel() {
         open = false;
@@ -298,6 +299,7 @@ struct WeaponWheel {
     int sample(const Input &input, unsigned hand, const int *ids, uint32_t count, bool allowed,
                uint32_t bubbles = 0, bool grabPriority = false) {
         if (hand >= 2) { cancel(); return -1; }
+        outer = hand ? 1.f : -1.f;
         if (inputEpoch != input.wheelInputEpoch[hand]) {
             inputEpoch = input.wheelInputEpoch[hand];
             cancel(); // May have missed every intermediate unavailable sample.
@@ -325,14 +327,14 @@ struct WeaponWheel {
             hoverSlot = -1;
             // Anchored where the hand is now; without a pose only the stick hovers.
             ring.anchored = pointer.valid;
-            ring.frame = pointer.valid ? wheelRingFrame(pointer.hand, pointer.head) : Pose{};
+            ring.frame = pointer.valid ? wheelRingFrame(pointer) : Pose{};
             ring.count = 0;
         }
         if (open) {
             WheelSlot previous[WheelSlotCount];
             const uint32_t previousCount = ring.count;
             std::copy_n(ring.slot, previousCount, previous);
-            ring.layout(ids, count, bubbles & WheelAllBubbles);
+            ring.layout(ids, count, bubbles & WheelAllBubbles, outer);
             bool moved = ring.count != previousCount;
             for (uint32_t i = 0; !moved && i != ring.count; ++i)
                 moved = ring.slot[i].weapon != previous[i].weapon || ring.slot[i].bubble != previous[i].bubble;
@@ -340,7 +342,7 @@ struct WeaponWheel {
                 hoverSlot = -1; // Inventory changed under the ring; never keep a moved slot.
             const bool stick = std::sqrt(x * x + y * y) >= WheelStickDeadZone;
             hoverSlot = stick ? ring.pickStick(x, y, hoverSlot)
-                      : pointer.valid ? ring.pickHand(pointer.hand, hoverSlot) : -1;
+                      : pointer.valid ? ring.pick(pointer.hand, pointer.aim.p, pointer.aim.q, true, hoverSlot) : -1;
             hover = -1;
             if (hoverSlot >= 0) {
                 const auto &slot = ring.slot[hoverSlot];

@@ -32,19 +32,28 @@ inline const wchar_t *wheelBubbleName(WheelBubble bubble) {
     default: return L"";
     }
 }
-// Arc length per item; the radius grows with the item count within reach.
+// Arc length per weapon; the ring radius grows with the weapon count within reach.
 inline constexpr float WheelItemSpacing = .075f, WheelMinimumRadius = .12f, WheelMaximumRadius = .2f;
-// The hand must leave the centre (cancel) zone and stay near the ring plane.
-inline constexpr float WheelDeadZone = .4f, WheelOuterReach = .09f, WheelDepthReach = .16f;
+// The ring centre sits this far ahead of the opening hand, along its pointing
+// direction, so the user points or reaches into the wheel.
+inline constexpr float WheelForwardOffset = .15f;
+// Action bubbles form a separate short arc beyond the ring on the hand's outer
+// side (right of a right-hand ring, left of a left-hand one), top to bottom.
+inline constexpr float WheelBubbleGap = .11f, WheelBubbleSpacing = .06f, WheelBubbleSize = .048f;
+// A weapon hovers inside this radial band of the ring; a bubble near its centre.
+inline constexpr float WheelDeadZone = .4f, WheelOuterReach = .055f, WheelBubbleReach = .6f;
+// Reach mode: the hand within this depth of the ring plane hovers by position.
+// Nearer the user it points: its aim ray, up to WheelPointReach, hovers instead.
+inline constexpr float WheelDepthReach = .16f, WheelPointDepth = .04f, WheelPointReach = .8f;
 // Stick fallback keeps the original thumbstick selection threshold.
 inline constexpr float WheelStickDeadZone = .3f;
-// Ring frame in tracking reference space: origin at the opening hand, upright,
-// local +Z facing the user's head and +X to the user's right. A hand directly
-// below the head falls back to the head's heading.
-inline Pose wheelRingFrame(Vec3 hand, Pose head) {
-    const Vec3 away{hand.x - head.p.x, 0, hand.z - head.p.z};
+// Ring frame in tracking reference space: upright, local +Z facing the user's
+// head and +X to the user's right. A centre directly below the head falls back
+// to the head's heading.
+inline Pose wheelRingFrame(Vec3 centre, Pose head) {
+    const Vec3 away{centre.x - head.p.x, 0, centre.z - head.p.z};
     const float heading = dot(away, away) > .0025f ? std::atan2(-away.x, -away.z) : horizontalHeading(head.q);
-    return {yaw(heading), hand};
+    return {yaw(heading), centre};
 }
 struct WheelSlot {
     int32_t weapon = -1, index = -1; // Native weapon id and its WheelUi list index.
@@ -53,49 +62,55 @@ struct WheelSlot {
 struct WheelRing {
     Pose frame;
     float radius = 0, itemSize = 0;
-    uint32_t count = 0;
+    uint32_t count = 0, weapons = 0; // Weapon slots first, then bubbles.
     bool anchored = false;
     WheelSlot slot[WheelSlotCount];
-    // Bubbles sit together at the bottom, left to right in enum order; weapons
-    // run clockwise from just left of them, over the top. Without bubbles the
-    // first weapon is at the top, as on the original stick wheel.
-    void layout(const int *ids, uint32_t weapons, uint32_t bubbles) {
+    // Weapons run clockwise from the top. Bubbles sit on the arc beyond the
+    // ring on the outer side: outer > 0 for a right hand, < 0 for a left hand.
+    void layout(const int *ids, uint32_t weaponCount, uint32_t bubbles, float outer = 1) {
         count = 0;
+        weapons = std::min(weaponCount, WeaponCount);
+        const float step = weapons ? 2 * Pi / weapons : 0;
+        radius = std::clamp(weapons * WheelItemSpacing / (2 * Pi), WheelMinimumRadius, WheelMaximumRadius);
+        const float chord = weapons > 1 ? 2 * radius * std::sin(Pi / weapons) : 2 * radius;
+        itemSize = std::min(.065f, .82f * chord);
+        for (uint32_t i = 0; i != weapons; ++i) {
+            slot[count] = {ids[i], int32_t(i), WheelBubble::None};
+            angle[count] = float(i) * step;
+            position[count++] = {std::sin(float(i) * step) * radius, std::cos(float(i) * step) * radius, 0};
+        }
         uint32_t bubbleCount = 0;
         for (uint32_t b = 0; b != WheelBubbleCount; ++b)
             bubbleCount += (bubbles >> b) & 1u;
-        weapons = std::min(weapons, WeaponCount);
-        const uint32_t total = weapons + bubbleCount;
-        const float step = total ? 2 * Pi / total : 0;
-        const float leftmost = (float(bubbleCount) - 1) * .5f;
-        radius = std::clamp(total * WheelItemSpacing / (2 * Pi), WheelMinimumRadius, WheelMaximumRadius);
-        const float chord = total > 1 ? 2 * radius * std::sin(Pi / total) : 2 * radius;
-        itemSize = std::min(.065f, .82f * chord);
+        const float side = outer < 0 ? -1.f : 1.f, arc = radius + WheelBubbleGap;
+        const float centre = side > 0 ? Pi / 2 : 3 * Pi / 2, bubbleStep = WheelBubbleSpacing / arc;
         for (uint32_t b = 0, j = 0; b != WheelBubbleCount; ++b)
             if ((bubbles >> b) & 1u) {
+                const float a = centre - side * ((float(bubbleCount) - 1) * .5f - float(j++)) * bubbleStep;
                 slot[count] = {-1, -1, WheelBubble(b)};
-                angle[count++] = Pi + (leftmost - float(j++)) * step;
+                angle[count] = a;
+                position[count++] = {std::sin(a) * arc, std::cos(a) * arc, 0};
             }
-        for (uint32_t i = 0; i != weapons; ++i) {
-            slot[count] = {ids[i], int32_t(i), WheelBubble::None};
-            angle[count++] = bubbleCount ? Pi + (leftmost + 1 + float(i)) * step : float(i) * step;
-        }
     }
     // Clockwise from up, as seen by the user.
     float slotAngle(uint32_t i) const {
         return i < count ? angle[i] : 0;
     }
     Vec3 slotPosition(uint32_t i) const {
-        const float a = slotAngle(i);
-        return {std::sin(a) * radius, std::cos(a) * radius, 0};
+        return i < count ? position[i] : Vec3{};
     }
+    // Diameter of the slot's disc.
+    float slotSize(uint32_t i) const {
+        return i < weapons ? itemSize : WheelBubbleSize;
+    }
+    // Nearest weapon slot by direction; bubbles are not on the ring.
     int nearest(float direction, int current) const {
-        if (!count || !std::isfinite(direction))
+        if (!weapons || !std::isfinite(direction))
             return -1;
-        const float step = 2 * Pi / count;
+        const float step = 2 * Pi / weapons;
         int best = -1;
         float bestDistance = 0;
-        for (uint32_t i = 0; i != count; ++i) {
+        for (uint32_t i = 0; i != weapons; ++i) {
             const float distance = std::abs(std::remainder(direction - angle[i], 2 * Pi));
             if (int(i) == current && distance <= .6f * step)
                 return current; // Hysteresis: hovering survives a boundary jitter.
@@ -111,22 +126,83 @@ struct WheelRing {
             return -1;
         return nearest(std::atan2(x, y), current);
     }
-    // The hand's tracked point, in the same reference space as the frame.
+    // A point in the ring plane (frame-local x, y): a bubble near its centre,
+    // else a weapon sector within the ring's radial band, else nothing.
+    int pickPlanar(float x, float y, int current) const {
+        if (!std::isfinite(x) || !std::isfinite(y))
+            return -1;
+        int best = -1;
+        float bestDistance = 0;
+        for (uint32_t i = weapons; i < count; ++i) {
+            const float dx = x - position[i].x, dy = y - position[i].y;
+            const float distance = std::sqrt(dx * dx + dy * dy);
+            const float reach = WheelBubbleSpacing * (int(i) == current ? .75f : WheelBubbleReach);
+            if (distance <= reach && (best < 0 || distance < bestDistance)) {
+                best = int(i);
+                bestDistance = distance;
+            }
+        }
+        if (best >= 0)
+            return best;
+        const float planar = std::sqrt(x * x + y * y);
+        if (planar < WheelDeadZone * radius || planar > radius + WheelOuterReach)
+            return -1;
+        return nearest(std::atan2(x, y), current < int(weapons) ? current : -1);
+    }
+    // The hand's grip point, in the frame's reference space. Within the ring's
+    // depth band it hovers by position; nearer the user its aim ray points.
     int pickHand(Vec3 hand, int current) const {
+        return pick(hand, hand, Quat{}, false, current);
+    }
+    int pick(Vec3 hand, Vec3 aimOrigin, Quat aim, bool aimValid, int current) const {
         if (!anchored || !count || !finite(frame) || !std::isfinite(hand.x) || !std::isfinite(hand.y) ||
             !std::isfinite(hand.z))
             return -1;
-        const Vec3 local = rotate(inverse(frame.q), hand - frame.p);
-        const float planar = std::sqrt(local.x * local.x + local.y * local.y);
-        if (!std::isfinite(planar) || planar < WheelDeadZone * radius || planar > radius + WheelOuterReach ||
-            std::abs(local.z) > WheelDepthReach)
+        const Quat into = inverse(frame.q);
+        const Vec3 local = rotate(into, hand - frame.p);
+        if (std::abs(local.z) <= WheelPointDepth || (local.z < 0 && local.z >= -WheelDepthReach) ||
+            (local.z > 0 && local.z <= WheelDepthReach && !aimValid))
+            return pickPlanar(local.x, local.y, current);
+        if (local.z < 0 || !aimValid)
             return -1;
-        return nearest(std::atan2(local.x, local.y), current);
+        const Vec3 origin = rotate(into, aimOrigin - frame.p), direction = rotate(into, rotate(aim, {0, 0, -1}));
+        if (!std::isfinite(origin.z) || !std::isfinite(direction.z) || direction.z > -.2f)
+            return -1;
+        const float distance = -origin.z / direction.z;
+        if (!(distance >= 0) || distance > WheelPointReach)
+            return -1;
+        const Vec3 hit = origin + direction * distance;
+        return pickPlanar(hit.x, hit.y, current);
     }
 
 private:
     float angle[WheelSlotCount]{};
+    Vec3 position[WheelSlotCount]{};
 };
+// One hand's sampled pointer for the ring: the weapon grip point, the aim pose
+// and the head, all from the same input sample. Invalid samples cannot hover.
+struct WheelPointer {
+    bool valid = false;
+    Vec3 hand{};
+    Pose head{};
+    Pose aim{};
+};
+inline WheelPointer wheelPointer(const Input &input, unsigned hand) {
+    if (hand >= 2 || !input.handValid[hand] || !input.headValid)
+        return {};
+    const Pose tracked = weaponTracking(input, hand);
+    if (!finite(tracked) || !finite(input.head) || !finite(input.hand[hand]))
+        return {};
+    return {true, tracked.p, input.head, {normalize(input.hand[hand].q), input.hand[hand].p}};
+}
+// Where a wheel opened by this pointer is centred: ahead of the grip along the
+// aim direction, upright and facing the head.
+inline Pose wheelRingFrame(const WheelPointer &pointer) {
+    const Vec3 forward = rotate(pointer.aim.q, {0, 0, -1});
+    const float length = std::sqrt(dot(forward, forward));
+    const Vec3 ahead = std::isfinite(length) && length > .5f ? forward * (WheelForwardOffset / length) : Vec3{};
+    return wheelRingFrame(pointer.hand + ahead, pointer.head);
+}
 // Axis-aligned model-space box in the native Box3f layout (min, then max).
 struct WheelBox {
     Vec3 min{}, max{};
@@ -187,20 +263,5 @@ inline WheelModelPlacement wheelModelPlacement(Pose ring, Vec3 slot, Vec3 centre
     const Quat orientation = normalize(multiply(ring.q, yaw(spin)));
     const Pose pose{orientation, ring.p + rotate(ring.q, slot) - rotate(orientation, centre * scale)};
     return finite(pose) && std::isfinite(scale) ? WheelModelPlacement{pose, scale} : WheelModelPlacement{};
-}
-// One hand's sampled pointer for the ring: the weapon grip point and the head,
-// both from the same input sample. Invalid samples cannot hover by position.
-struct WheelPointer {
-    bool valid = false;
-    Vec3 hand{};
-    Pose head{};
-};
-inline WheelPointer wheelPointer(const Input &input, unsigned hand) {
-    if (hand >= 2 || !input.handValid[hand] || !input.headValid)
-        return {};
-    const Pose tracked = weaponTracking(input, hand);
-    if (!finite(tracked) || !finite(input.head))
-        return {};
-    return {true, tracked.p, input.head};
 }
 } // namespace ss2vr

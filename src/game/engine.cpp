@@ -7121,7 +7121,7 @@ static void drawWeaponWheel(unsigned hand,const Pose &head) {
     const auto drawItem=[&](uint32_t i) {
         const auto &slot=ring.slot[i];
         const bool hovered=int(i)==view.hoverSlot;
-        const float radius=ring.itemSize*(hovered ? .65f : .5f);
+        const float radius=ring.slotSize(i)*(hovered ? .65f : .5f);
         const auto b=billboard(frame.p+rotate(frame.q,ring.slotPosition(i)));
         if(hovered)
             for(unsigned g=0;g!=3;++g)

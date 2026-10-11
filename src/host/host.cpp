@@ -1935,7 +1935,7 @@ struct Host {
             }
             const WheelPointer pointer = wheelPointer(input, h);
             if (!wheel.anchored && pointer.valid) {
-                wheel.anchor = compose(wheelRingFrame(pointer.hand, pointer.head), Pose{{}, {0, 0, WheelCardLift}});
+                wheel.anchor = compose(wheelRingFrame(pointer), Pose{{}, {0, 0, WheelCardLift}});
                 wheel.anchored = true;
                 wheel.uploaded = false;
             }

@@ -147,11 +147,13 @@ must remain stable. Repeat on foot and in supported seats, separately from firin
 
 
 1. Hold each hand's grip: slowly spinning 3D weapon models (about 9.5 cm long,
-   lit like the scene) and four bubbles must appear on a ring around that hand,
-   upright and facing you. Reach onto a weapon (it grows and its disc glows; the
-   centre card names it and its ammo; empty weapons get a red rim) and release
-   to equip it. Return to the ring centre before release to cancel; a deflected
-   stick must still pick by direction. Open both wheels; models, cards and hover
+   lit like the scene) must appear on a ring about 15 cm ahead of that hand,
+   upright and facing you, with four bubbles on a short arc beyond the ring on
+   that hand's outer side, clear of the weapons. Point the controller at a
+   weapon, or reach into the ring (it grows and its disc glows; the centre card
+   names it and its ammo; empty weapons get a red rim) and release to equip it.
+   Point back at the ring centre before release to cancel; a deflected stick
+   must still pick weapons by direction. Open both wheels; models, cards and hover
    feedback must be readable and independently actionable. Release on each
    bubble: Netricsa opens, the game menu opens as with Menu, and (single player
    only) quick save then quick load act once each. Report any weapon that shows
