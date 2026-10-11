@@ -740,7 +740,7 @@ def validate(cfg):
         cfg.get('renderer_mode','vr')!='vr' or cfg.get('native_input_probe')):
         raise ValueError('Background controls diagnostic requires a separate non-firing VR run')
     hold=cfg.get('interactive_hold_seconds',0)
-    if type(hold) is not int or not 0<=hold<=150 or (hold and not cfg.get('neutral_runtime_probe')):
+    if type(hold) is not int or not 0<=hold<=600 or (hold and not cfg.get('neutral_runtime_probe')):
         raise ValueError('Interactive hold is a bounded neutral-runtime extension only')
     if type(cfg.get('capture_desktop',True)) is not bool:
         raise ValueError('Desktop capture selection must be explicit boolean')

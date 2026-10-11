@@ -18,6 +18,7 @@ struct VrSettings {
     float uiAspect = 16.f / 9; // Aspect the game lays out its 2D view (menus, HUD, movies) at in VR.
     bool labWeaponAudit = false; // Private lab: cycle every weapon and log its hand references.
     int labWeaponAuditHand = 1;  // Hand whose selection the audit simulates.
+    int labAuditSeconds = 5;     // Seconds each audited weapon is held.
     int labHoldWeapon = -1;      // With WeaponAudit: select this native weapon once and keep it.
     bool labFixedPose = false;   // Measurement only: untracked headset uses a fixed head pose.
     bool labAutoContinue = false; // Measurement only: confirm loading prompts/menus until gameplay.

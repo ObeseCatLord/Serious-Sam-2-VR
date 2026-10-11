@@ -1201,6 +1201,10 @@ static int __fastcall comboWeapons(void *game, void *) {
 static int(__cdecl *boneAbsolute)(void *, uint32_t, Matrix34 &) = nullptr;
 static void(__thiscall *giveAllWeapons)(void *, int) = nullptr;
 static uint32_t boneHandIdent = 0, bonePalmIdent = 0, boneArmIdent = 0;
+// Private weapon audit: every bone of a model (engine CStaticStackArray<BonePlacement>).
+struct BonePlacementArray { int32_t allocated = 0; uint8_t *data = nullptr; int32_t count = 0, step = 32; };
+static void(__cdecl *bonesAbsolute)(void *, BonePlacementArray &) = nullptr;
+static const char *(__cdecl *identToString)(uint32_t) = nullptr;
 // Grip carry. A grip squeeze beside a takeable prop picks it up with that hand
 // through the native carry: CPuppetEntity::TakeObject (slot 0x290) connects a
 // manipulator joint that pulls the object toward a desired placement. Each
@@ -1591,7 +1595,7 @@ static void update(void *p) {
             static bool given = false;
             static uint64_t next = 0;
             static int index = -1;
-            if (!given && giveAllWeapons) { giveAllWeapons(p, 1); given = true; next = GetTickCount64() + 5000; }
+            if (!given && giveAllWeapons) { giveAllWeapons(p, 1); given = true; next = GetTickCount64() + 1000ull * settings.labAuditSeconds; }
             static bool held = false;
             if (given && settings.labHoldWeapon >= 0 && !held && GetTickCount64() >= next && pendingSelection[h] < 0) {
                 held = true;
@@ -1600,7 +1604,7 @@ static void update(void *p) {
                 log("Weapon audit hold id=%d hand=%d", settings.labHoldWeapon, h);
             }
             if (given && settings.labHoldWeapon < 0 && GetTickCount64() >= next && pendingSelection[h] < 0) {
-                next = GetTickCount64() + 5000;
+                next = GetTickCount64() + 1000ull * settings.labAuditSeconds;
                 for (int step = 0; step < int(WeaponCount); ++step) {
                     index = (index + 1) % int(WeaponCount);
                     if (index != 14 && inInventory(static_cast<uint8_t *>(p) + 0x8f8, index)) {
@@ -5657,6 +5661,20 @@ static void auditWeaponAnchor(void *w, int nativeId, const Pose &cameraRelative)
             std::snprintf(bones + used, sizeof(bones) - used, " %s=%.4f,%.4f,%.4f", name, m.m[3], m.m[7], m.m[11]);
         }
     }
+    if (instance && bonesAbsolute && identToString) {
+        // Each BonePlacement: 4-byte IDENT then a 3x4 matrix (translation at 3, 7, 11).
+        BonePlacementArray all;
+        bonesAbsolute(instance, all);
+        for (int32_t i = 0; i < all.count && all.data; ++i) {
+            const uint8_t *entry = all.data + size_t(i) * 0x34;
+            uint32_t ident = 0;
+            float m[12]{};
+            std::memcpy(&ident, entry, 4);
+            std::memcpy(m, entry + 4, sizeof(m));
+            const char *name = identToString(ident);
+            log("Weapon bone id=%d index=%d name=%s at=%.4f,%.4f,%.4f", nativeId, i, name ? name : "?", m[3], m[7], m[11]);
+        }
+    }
     const auto &q = cameraRelative.q;
     const auto &p = cameraRelative.p;
     log("Weapon audit id=%d camera=%.4f,%.4f,%.4f q=%.4f,%.4f,%.4f,%.4f box=%.3f,%.3f,%.3f..%.3f,%.3f,%.3f%s",
@@ -8482,6 +8500,8 @@ bool attach(bool headless) {
         symbol(e, "?SetDesiredPlacements@CManipulatorJoint@SeriousEngine@@QAEXABVQuatVect@2@0@Z", jointPlacements);
         symbol(e, "?SetMaxLinVel@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxLinVel);
         symbol(e, "?mdlGetBoneAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z", boneAbsolute);
+        symbol(e, "?mdlGetBonesAbsPlacement@SeriousEngine@@YAXPAVCModelInstance@1@AAV?$CStaticStackArray@UBonePlacement@SeriousEngine@@@1@@Z", bonesAbsolute);
+        symbol(c, "?strConvertIDToString@SeriousEngine@@YAPBDVIDENT@1@@Z", identToString);
         symbol(g, "?OnGiveAll@CPlayerPuppetEntity@SeriousEngine@@QAEXH@Z", giveAllWeapons);
         symbol(c, "?memPreDeleteArrayRC_internal@SeriousEngine@@YAXPBXPAVCDataType@1@@Z", preDeleteArray);
         symbol(c, "?memDeleteArray_internal@SeriousEngine@@YAXPAX@Z", deleteArray);
