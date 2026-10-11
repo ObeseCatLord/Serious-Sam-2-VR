@@ -146,12 +146,15 @@ looking vertically, then return to the horizon; the previous horizontal referenc
 must remain stable. Repeat on foot and in supported seats, separately from firing.
 
 
-1. Hold each hand's grip: slowly spinning 3D weapon models (about 9.5 cm long,
+1. Hold each hand's weapon wheel button (Touch left Y / right B, Index or Vive
+   or Microsoft trackpad press, Frame left D-pad up / right B; see
+   HOST_STATUS.md): slowly spinning 3D weapon models (about 9.5 cm long,
    lit like the scene) must appear on a ring about 15 cm ahead of that hand,
    upright and facing you, with four bubbles on a short arc beyond the ring on
    that hand's outer side, clear of the weapons. Point the controller at a
    weapon, or reach into the ring (it grows and its disc glows; the centre card
-   names it and its ammo; empty weapons get a red rim) and release to equip it.
+   names it and its ammo; empty weapons get a red rim) and release the button
+   to equip it.
    Point back at the ring centre before release to cancel; a deflected stick
    must still pick weapons by direction. Open both wheels; models, cards and hover
    feedback must be readable and independently actionable. Release on each
@@ -161,11 +164,16 @@ must remain stable. Repeat on foot and in supported seats, separately from firin
    off-centre, oversized or flickering, or icons that are upside down or boxed.
    Grip pickup: squeeze a grip with the hand on or right beside a takeable
    object (one the game prompts "Press Use to take"). It must pick up into that
-   hand instead of opening the wheel, follow the hand (weapons are put away), and
+   hand instead of jumping, follow the hand (weapons are put away), and
    fly off with the hand's motion when the grip is released (a still hand just
    drops it). Use still picks up the native way, and Use while carrying drops.
-2. Lose squeeze availability/tracking while a wheel is open, then restore it
-   while still squeezing. It must cancel and require a real release/rearm.
+   Grip jump: on foot, away from takeable objects, squeezing either grip jumps
+   for as long as it is held; in a vehicle the grips only grasp. The grips no
+   longer open any wheel, and Touch B is no longer jump.
+2. Lose the wheel button's availability/tracking while a wheel is open, then
+   restore it while still holding. It must cancel and require a real
+   release/rearm; the loss must never select. Repeat with a squeeze held across
+   a tracking loss: it must not jump until released and squeezed again.
 3. Navigate the native menu using the pointer and buttons. The visible cursor
    must match the hit location; pause, back and confirmation must work without
    a desktop mouse. Holding a trigger across menu entry must not confirm an item.

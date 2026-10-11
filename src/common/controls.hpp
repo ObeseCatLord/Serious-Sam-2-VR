@@ -275,9 +275,44 @@ struct MenuNavigation {
         return direction;
     }
 };
-// Per-hand wheel on the squeeze action. A fresh press opens a ring anchored at
-// the hand; the hand (or a deflected thumbstick) hovers an item and release
-// commits it. Releasing over nothing cancels. Native code validates the choice.
+// The grip jumps on foot: an admitted fresh squeeze jumps while held, unless
+// that hand carries (or is starting to carry) an object. A squeeze held across
+// admission loss, a carry or a vehicle ride never jumps until pressed again.
+struct GripJump {
+    bool previous = false, jumping = false;
+    bool update(bool down, bool admitted, bool onFoot, bool carries) {
+        const bool pressed = down && !previous;
+        previous = down;
+        if (!down || !admitted || !onFoot || carries)
+            jumping = false;
+        else if (pressed)
+            jumping = true;
+        return jumping;
+    }
+};
+// Producer gate for the hold-to-open wheel button. A button lost or disallowed
+// while held is not a release: the hand stays blocked (WheelOpen withheld,
+// blockedWheels set) until the button is seen released again, so a consumer
+// that coalesces samples can never commit a selection on the loss itself.
+struct WheelOpenGate {
+    bool down = false, blocked = false;
+    // Returns whether this hand's wheel is blocked; `down` is the published bit.
+    bool sample(bool available, bool pressed, bool allowed) {
+        if (!available || !allowed) {
+            blocked = blocked || down;
+            down = false;
+            return blocked;
+        }
+        if (blocked && !pressed)
+            blocked = false;
+        down = pressed && !blocked;
+        return blocked;
+    }
+};
+// Per-hand wheel on its WheelOpen button. A fresh press opens a ring ahead of
+// the hand; pointing at (or reaching to) an item, or a deflected thumbstick,
+// hovers it and release commits it. Releasing over nothing cancels. Native
+// code validates the choice.
 struct WeaponWheel {
     bool open = false, previousHold = false;
     int hover = -1;    // WheelUi encoding: weapon list index or wheelBubbleHover().
@@ -293,28 +328,16 @@ struct WeaponWheel {
         action = WheelBubble::None;
         ring.anchored = false;
     }
-    uint32_t inputEpoch = 0;
-    // grabPriority: this hand's squeeze belongs to a carry pickup. Only a fresh
-    // press opens the wheel, so a press that started a grab never opens it later.
     int sample(const Input &input, unsigned hand, const int *ids, uint32_t count, bool allowed,
-               uint32_t bubbles = 0, bool grabPriority = false) {
+               uint32_t bubbles = 0) {
         if (hand >= 2) { cancel(); return -1; }
         outer = hand ? 1.f : -1.f;
-        if (inputEpoch != input.wheelInputEpoch[hand]) {
-            inputEpoch = input.wheelInputEpoch[hand];
-            cancel(); // May have missed every intermediate unavailable sample.
-            previousHold = false; // Producer may already have observed release and a new press.
-        }
-        if (!inputEpoch || !(input.wheelAdmissionMask & (1u << hand))) {
-            cancel();
-            previousHold = false;
-            return -1;
-        }
-        return update((input.buttons[hand] & Wheel) != 0, input.axis[hand][0], input.axis[hand][1],
-                      ids, count, allowed, wheelPointer(input, hand), bubbles, grabPriority);
+        return update((input.buttons[hand] & WheelOpen) != 0, input.axis[hand][0], input.axis[hand][1],
+                      ids, count, allowed && !(input.blockedWheels & (1u << hand)), wheelPointer(input, hand),
+                      bubbles);
     }
     int update(bool held, float x, float y, const int *ids, uint32_t count, bool allowed,
-               const WheelPointer &pointer = {}, uint32_t bubbles = 0, bool grabPriority = false) {
+               const WheelPointer &pointer = {}, uint32_t bubbles = 0) {
         selected = -1;
         action = WheelBubble::None;
         if (!allowed || !std::isfinite(x) || !std::isfinite(y) || count > WeaponCount) {
@@ -322,7 +345,7 @@ struct WeaponWheel {
             previousHold = held;
             return -1;
         }
-        if (held && !previousHold && !grabPriority) {
+        if (held && !previousHold) {
             open = true;
             hoverSlot = -1;
             // Anchored where the hand is now; without a pose only the stick hovers.

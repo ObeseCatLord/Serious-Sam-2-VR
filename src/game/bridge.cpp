@@ -1697,7 +1697,8 @@ void present(IDirect3DDevice9 *d) {
     // Touch X/Y, Index left A / left trackpad.
     {
         static uint32_t previousExtras = 0;
-        const uint32_t extras = valid ? ((input.buttons[0] | input.buttons[1]) & (Reload | Netricsa)) : 0;
+        // The wheel-open button took over Touch Y / Index left trackpad: still F2 here.
+        const uint32_t extras = valid ? ((input.buttons[0] | input.buttons[1]) & (Reload | Netricsa | WheelOpen)) : 0;
         const uint32_t pressed = extras & ~previousExtras;
         previousExtras = extras;
         if (nativeMenu && !key && pressed)

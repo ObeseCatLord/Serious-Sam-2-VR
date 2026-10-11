@@ -543,6 +543,7 @@ static void clearCalibration(int h) {
     ReleaseSRWLockExclusive(&snapshotLock);
 }
 static WeaponWheel wheels[2];
+static GripJump gripJumps[2]; // Game thread only.
 // Game-local presentation of each open wheel; WheelUi is its fixed IPC subset.
 // Kept beside the copied Snapshot rather than growing every snapshot copy.
 struct WheelPresentation {
@@ -1462,7 +1463,8 @@ static void update(void *p) {
             w.cancel();
     }
     float ax = input.axis[1][0];
-    bool turningAllowed = enabled && !resettingControls && !wheels[1].open && std::isfinite(ax);
+    bool turningAllowed = enabled && !resettingControls && !wheels[1].open &&
+        !(input.buttons[1] & Button::WheelOpen) && std::isfinite(ax);
     static LARGE_INTEGER lastTurnClock{};
     LARGE_INTEGER turnClock{}, turnFrequency{};
     QueryPerformanceCounter(&turnClock);
@@ -1508,7 +1510,6 @@ static void update(void *p) {
         orderWheelWeapons(ui);
         bool valid = enabled && !resettingControls && input.handValid[h] && finite(input.hand[h]);
         bool wheelAllowed = valid && rider.handheld() && !(input.blockedWheels & (1u << h));
-        // A squeeze that starts a carry pickup on this hand never opens its wheel.
         const bool gripDown = valid && (input.buttons[h] & Wheel);
         if (gripDown && !gripCarry.gripDown[h] && rider.handheld() && gripCarry.hand < 0 &&
             gripCarry.requestHand < 0 && !wheels[h].open && gripCarryAuthority(p)) {
@@ -1540,9 +1541,10 @@ static void update(void *p) {
             }
         }
         gripCarry.gripDown[h] = gripDown;
-        const bool grabPriority = gripCarry.requestHand == h || gripCarry.hand == h;
-        int selected = wheels[h].sample(input, unsigned(h), ui.weapon, ui.count, wheelAllowed,
-                                        wheelBubbles(), grabPriority);
+        // Carry wins over jump; in vehicles the grip grasps instead.
+        gripJumps[h].update(gripDown, (input.wheelAdmissionMask & (1u << h)) != 0, rider.handheld(),
+                            gripCarry.requestHand == h || gripCarry.hand == h);
+        int selected = wheels[h].sample(input, unsigned(h), ui.weapon, ui.count, wheelAllowed, wheelBubbles());
         ui.open = wheels[h].open;
         ui.hover = wheels[h].hover;
         publishWheelPresentation(unsigned(h), wheels[h]);
@@ -1643,7 +1645,7 @@ static void update(void *p) {
     for (unsigned h=0;h<2;++h)
         contextualButtons |= contextualSniperButtons(input,h,
             enabled && rider.handheld() && !aliased(s) && nativeSniper(s.handle[h] ? resolve(s.handle[h]) : nullptr));
-    s.jump = enabled && !resettingControls && (contextualButtons & Button::Jump);
+    s.jump = enabled && !resettingControls && ((contextualButtons & Button::Jump) || gripJumps[0].jumping || gripJumps[1].jumping);
     s.sprint = enabled && !resettingControls && (contextualButtons & Button::Sprint);
     lastButtons[0] = input.buttons[0];
     lastButtons[1] = input.buttons[1];
@@ -5798,7 +5800,14 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
         return reject();
     return result;
 }
+static bool heldUnderOpenWheel(void *w) {
+    if (eyeIndex < 0) return false;
+    const int h = handOf(w, eyeSnapshot);
+    return h >= 0 && eyeSnapshot.ui.wheel[mountHand(eyeSnapshot, unsigned(h))].open;
+}
 static void renderTrackedWeapon(void *w, Matrix34 m, bool sniper, uintptr_t caller) {
+    // A hand with its weapon wheel open shows the wheel, not the held gun.
+    if (heldUnderOpenWheel(w)) return;
     const unsigned previousRenderDepth=nativeWeaponRenderDepth;
     if(previousRenderDepth!=UINT_MAX)++nativeWeaponRenderDepth;
     const WeaponRenderRoute *previousRoute=nullptr;
@@ -5891,17 +5900,10 @@ static void renderTrackedWeapon(void *w, Matrix34 m, bool sniper, uintptr_t call
 }
 // While a hand's wheel is open its held weapon is not drawn in the eyes, so it
 // cannot hide the floating weapon models it is choosing between.
-static bool heldUnderOpenWheel(void *w) {
-    if (eyeIndex < 0) return false;
-    const int h = handOf(w, eyeSnapshot);
-    return h >= 0 && eyeSnapshot.ui.wheel[mountHand(eyeSnapshot, unsigned(h))].open;
-}
 static void __fastcall weaponRender(void *w, void *, Matrix34 m) {
-    if (heldUnderOpenWheel(w)) return;
     renderTrackedWeapon(w, m, false,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 }
 static void __fastcall sniperRender(void *w, void *, Matrix34 m) {
-    if (heldUnderOpenWheel(w)) return;
     // Native zoom overlay stays on desktop; XR retains the native gun/hand mesh.
     renderTrackedWeapon(w, m, true,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 }
@@ -7416,7 +7418,8 @@ static void __fastcall poll(void *b, void *) {
             respawnValues[7] = ((s.input.buttons[0] | s.input.buttons[1]) & Use) ? 1 : 0;
         }
         if (netricsa)
-            respawnValues[15] = ((s.input.buttons[0] | s.input.buttons[1]) & Netricsa) ? 1 : 0;
+            // The wheel-open button (Netricsa's old Touch Y / Index trackpad) also closes it.
+            respawnValues[15] = ((s.input.buttons[0] | s.input.buttons[1]) & (Netricsa | WheelOpen)) ? 1 : 0;
         respawnTick = GetTickCount64();
     } else {
         std::fill(std::begin(respawnPrior), std::end(respawnPrior), 0);
