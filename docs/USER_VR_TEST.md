@@ -140,15 +140,17 @@ looking vertically, then return to the horizon; the previous horizontal referenc
 must remain stable. Repeat on foot and in supported seats, separately from firing.
 
 
-1. Hold each hand's grip: weapon icons and four bubbles must appear on a ring
-   around that hand, upright and facing you. Reach onto a weapon (it grows and
-   glows; the centre card names it and its ammo; empty weapons are dimmed) and
-   release to equip it. Return to the ring centre before release to cancel; a
-   deflected stick must still pick by direction. Open both wheels; icons, cards
-   and hover feedback must be readable and independently actionable. Release on
-   each bubble: Netricsa opens, the game menu opens as with Menu, and (single
-   player only) quick save then quick load act once each. The icons must not be
-   upside down or show a solid box around them.
+1. Hold each hand's grip: slowly spinning 3D weapon models (about 9.5 cm long,
+   lit like the scene) and four bubbles must appear on a ring around that hand,
+   upright and facing you. Reach onto a weapon (it grows and its disc glows; the
+   centre card names it and its ammo; empty weapons get a red rim) and release
+   to equip it. Return to the ring centre before release to cancel; a deflected
+   stick must still pick by direction. Open both wheels; models, cards and hover
+   feedback must be readable and independently actionable. Release on each
+   bubble: Netricsa opens, the game menu opens as with Menu, and (single player
+   only) quick save then quick load act once each. Report any weapon that shows
+   a flat icon instead of a model (the log names it), a model that is black,
+   off-centre, oversized or flickering, or icons that are upside down or boxed.
 2. Lose squeeze availability/tracking while a wheel is open, then restore it
    while still squeezing. It must cancel and require a real release/rearm.
 3. Navigate the native menu using the pointer and buttons. The visible cursor
