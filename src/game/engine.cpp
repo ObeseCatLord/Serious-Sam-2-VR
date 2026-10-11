@@ -5855,10 +5855,19 @@ static void renderTrackedWeapon(void *w, Matrix34 m, bool sniper, uintptr_t call
         emitIdleProjectionOpportunities(*idleStorage);
     },[](bool) noexcept {});
 }
+// While a hand's wheel is open its held weapon is not drawn in the eyes, so it
+// cannot hide the floating weapon models it is choosing between.
+static bool heldUnderOpenWheel(void *w) {
+    if (eyeIndex < 0) return false;
+    const int h = handOf(w, eyeSnapshot);
+    return h >= 0 && eyeSnapshot.ui.wheel[mountHand(eyeSnapshot, unsigned(h))].open;
+}
 static void __fastcall weaponRender(void *w, void *, Matrix34 m) {
+    if (heldUnderOpenWheel(w)) return;
     renderTrackedWeapon(w, m, false,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 }
 static void __fastcall sniperRender(void *w, void *, Matrix34 m) {
+    if (heldUnderOpenWheel(w)) return;
     // Native zoom overlay stays on desktop; XR retains the native gun/hand mesh.
     renderTrackedWeapon(w, m, true,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 }
