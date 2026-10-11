@@ -162,6 +162,8 @@ static int *depthEnabled = nullptr, *depthWriting = nullptr;
 static RayInit *enableBlend = nullptr, *disableBlend = nullptr, *enableAlpha = nullptr,
                *disableAlpha = nullptr;
 static int *blending = nullptr, *alphaTesting = nullptr, *depthComparison = nullptr;
+static RayInit *enableFog = nullptr, *disableFog = nullptr;
+static int *fogging = nullptr;
 using RasterComparison = void(__cdecl *)(int);
 static RasterComparison *setDepthComparison = nullptr;
 static RayInit ortho = nullptr;
@@ -6146,6 +6148,16 @@ static void __thiscall presentedRender(void *p) {
         remote_render::completeMonoPresentation(owner,true);
     },[&](bool) noexcept {remote_render::retirePresentation(owner);});
 }
+// VR frames skip the native desktop render (the window mirrors the left eye),
+// but its multiplayer presentation bookkeeping still runs once per frame.
+void monoPresentationWithoutRender(void *p) {
+    uint32_t owner=0;
+    withNativeFinally([&] {
+        if(nativeRenderExtentCurrent())
+            owner=remote_render::beginMonoPresentation(uiOwner.player==p?uiOwner.playerHandle:0);
+        remote_render::completeMonoPresentation(owner,true);
+    },[&](bool) noexcept {remote_render::retirePresentation(owner);});
+}
 static void __fastcall render(void *p,void *) {
     const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     const auto previousDepth=nativeWorldRenderDepth;
@@ -7246,6 +7258,7 @@ static void drawWeaponWheels() {
     activateView(rootView);
     const bool wasDepth=*depthEnabled!=0,wasWrite=*depthWriting!=0;
     const bool wasBlend=*blending!=0,wasAlpha=*alphaTesting!=0;
+    const bool fogControl=fogging && enableFog && disableFog && *enableFog && *disableFog, wasFog=fogControl && *fogging!=0;
     const int priorSource=*blendSource,priorDestination=*blendDestination,priorComparison=*depthComparison;
     (*disableDepth)();(*disableDepthWrite)();(*disableAlpha)();
     nativeBlendType(501); // GFU_BT_TRANSLUCENT: source alpha over the frame.
@@ -7274,6 +7287,12 @@ static void drawWeaponWheels() {
     if(wasAlpha)(*enableAlpha)();
     else (*disableAlpha)();
     (*setDepthComparison)(priorComparison);
+    // Mesh materials turn fog on; the HUD drawn after this eye must find it as
+    // the world left it (a fogged HUD draw is rejected and drops the pair).
+    if(fogControl) {
+        if(wasFog)(*enableFog)();
+        else (*disableFog)();
+    }
 }
 // Core's activity test selects the inactive frame cap and input routing. A live
 // VR session owns the game regardless of which desktop window has focus.
@@ -8516,6 +8535,9 @@ bool attach(bool headless) {
         bool weaponMeshSymbols = weaponWheelSymbols;
 #define WEAPON_MESH(module, name, out) weaponMeshSymbols = symbol(module, name, out) && weaponMeshSymbols
         WEAPON_MESH(e, "?md_pdtDataType@CModelConfiguration@SeriousEngine@@2PAVCDataType@2@A", modelDataType);
+        WEAPON_MESH(e, "?_gfxEnableFog@SeriousEngine@@3P6AXXZA", enableFog);
+        WEAPON_MESH(e, "?_gfxDisableFog@SeriousEngine@@3P6AXXZA", disableFog);
+        WEAPON_MESH(e, "?_gfx_bFogging@SeriousEngine@@3HA", fogging);
         {
             void *table=nullptr;
             WEAPON_MESH(e, "??_7CModelConfiguration@SeriousEngine@@6B@", table);

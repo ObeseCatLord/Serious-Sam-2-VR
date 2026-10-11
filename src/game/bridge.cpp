@@ -378,7 +378,13 @@ static std::atomic<bool> stopping = false;
 // 4 end of the frame's native UI (just before readback).
 struct PerfClock {
     double frame = 0, stereo = 0, mono = 0, eyeCpu[2]{}, desktopCpu = 0;
-    double readTarget = 0, lock = 0, copy = 0, dim = 0, publish = 0, wait = 0;
+    double readTarget = 0, lock = 0, copy = 0, dim = 0, publish = 0, wait = 0, presentCall = 0, presentHook = 0;
+    double preStereo = 0, postStereo = 0; // Present end -> stereo start, stereo end -> present start.
+    uint64_t eyeDraws = 0, desktopDraws = 0, hudDuplicates = 0;
+    // Pairs rendered but not published, by the state they ended in.
+    unsigned lostNoWorld = 0, lostFault = 0, lostNoOverlay = 0, lostIncomplete = 0, lostOther = 0;
+    const char *lostReason = "none";
+    unsigned stereoCalls = 0;
     double gpu[4]{}; // left, right, desktop, ui/tail (ms sums)
     unsigned frames = 0, pairs = 0, monoFrames = 0, gpuSamples = 0, readbacks = 0, waits = 0;
     LARGE_INTEGER lastPresent{}, lastLog{};
@@ -412,7 +418,9 @@ struct GpuProfile {
     bool create(IDirect3DDevice9 *d) {
         if (owner == d) return true;
         release();
-        if (failed || !d) return false;
+        // Timestamp queries cost DXVK work: lab/diagnostic runs only.
+        static const bool enabled = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_PERF_GPU", value, 2) == 1 && value[0] == L'1'; }();
+        if (!enabled || failed || !d) return false;
         for (unsigned i = 0; i < Sets; ++i) {
             if (FAILED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMPDISJOINT, &disjoint[i])) ||
                 FAILED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ, &frequency[i]))) { failed = true; release(); return false; }
@@ -552,7 +560,7 @@ struct NativeUiFrame {
     uint64_t generation = 0;
     uint32_t remoteOwner = 0;
     int slot = -1;
-    bool restore = false, ui = false, fault = false, world = false, zeroCopy = false;
+    bool restore = false, ui = false, fault = false, world = false, zeroCopy = false, published = false;
     bool overlay = false, overlaySeen = false, complete = false, fade = false;
     uintptr_t faultOrigin = 0;
     const char *faultReason = "none";
@@ -910,12 +918,10 @@ static DrawIndexed originalDrawIndexed = nullptr;
 static_assert(D3DPT_TRIANGLELIST==4 && D3DPT_TRIANGLESTRIP==5 && D3DPT_TRIANGLEFAN==6);
 static_assert(D3DFILL_POINT==1 && D3DFILL_WIREFRAME==2 && D3DFILL_SOLID==3);
 static_assert(D3DDECLTYPE_FLOAT3==2 && D3DDECLMETHOD_DEFAULT==0 && D3DDECLUSAGE_TEXCOORD==5);
-// While the native desktop view is rebuilt after a VR pair, its draws to the
-// backbuffer are dropped (the window mirrors the left eye instead); offscreen
-// passes and every state effect still run.
-static bool desktopWorld = false, desktopCull = false, desktopRtBound = false;
+// VR frames render the native desktop view only with [Render] DesktopWorld=1;
+// otherwise the window mirrors the left eye.
+static bool desktopWorld = false;
 void setDesktopWorld(bool render) noexcept { desktopWorld = render; }
-static bool culledDesktopDraw() { return desktopCull && desktopRtBound; }
 template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVETYPE topology,Call call) noexcept {
     const auto generation = graphicsResourceGeneration();
     if (!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
@@ -984,6 +990,11 @@ struct LabWorldDraws {
     uint64_t fullRangeCalls[16]{},worldRangeCalls[16]{},otherRangeCalls[16]{};
 };
 static thread_local LabWorldDraws labWorldDraws{};
+static void countDraw() {
+    if (uiBypass) ++perf.hudDuplicates;
+    else if (activeEye >= 0) ++perf.eyeDraws;
+    else ++perf.desktopDraws;
+}
 static void traceWorldDraw(IDirect3DDevice9 *d,UINT count) {
     auto &sample=labWorldDraws;
     if(sample.device!=d) return;
@@ -1006,7 +1017,7 @@ static HRESULT WINAPI draw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT start,
     return uiDrawCall(d,type,[&]{
         if(!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
         traceWorldDraw(d,count);
-        if (culledDesktopDraw() && !uiBypass) return D3D_OK;
+        countDraw();
         return originalDraw(d,type,start,count);
     });
 }
@@ -1015,7 +1026,7 @@ static HRESULT forwardIndexed(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
     return uiDrawCall(d,type,[&]{
         if(!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
         traceWorldDraw(d,count);
-        if (culledDesktopDraw() && !uiBypass) return D3D_OK;
+        countDraw();
         return originalDrawIndexed(d,type,base,minimum,vertices,start,count);
     });
 }
@@ -1082,12 +1093,12 @@ static HRESULT WINAPI clear(IDirect3DDevice9 *d,DWORD count,const D3DRECT *rects
 }
 static HRESULT WINAPI drawUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT count,const void *vertices,UINT stride) {
     scopeGpuOutput(d);
-    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);if (culledDesktopDraw()) return D3D_OK;return originalDrawUp(d,type,count,vertices,stride); },nullptr,true);
+    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);return originalDrawUp(d,type,count,vertices,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawIndexedUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT minimum,UINT vertices,UINT count,
                                     const void *indices,D3DFORMAT format,const void *data,UINT stride) {
     scopeGpuOutput(d);
-    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);if (culledDesktopDraw()) return D3D_OK;return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); },nullptr,true);
+    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawRect(IDirect3DDevice9 *d,UINT handle,const float *segments,const D3DRECTPATCH_INFO *info) {
     scopeGpuOutput(d);
@@ -1150,7 +1161,6 @@ static HRESULT WINAPI setRT(IDirect3DDevice9 *d, DWORD index, IDirect3DSurface9 
     if ((activeEye >= 0 || scopeScratch) && index == 0 && sameSurface(target, desktopTarget))
         target = uiFrame.slot >= 0 ? uiFrame.target[scopeScratch ? 0 : activeEye] : eye[scopeScratch ? 0 : activeEye];
     HRESULT result = originalSetRT(d, index, target);
-    if (desktopCull && index == 0) desktopRtBound = SUCCEEDED(result) && sameSurface(target, uiFrame.color);
     if ((activeEye >= 0 || scopeScratch) && FAILED(result))
         eyeInvalid = true;
     if (index == 0 && target && activeEye < 0 && !scopeScratch && SUCCEEDED(result)) {
@@ -1780,7 +1790,20 @@ void presentDevice(IDirect3DDevice9 *d, uintptr_t caller, const RECT *src, const
         if (aborted) { uiHalted = true; nestedNativePresentation(); }
     });
 }
+static LARGE_INTEGER lastPresentEnd{}, lastStereoEnd{};
+void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept {
+    perf.presentCall += PerfClock::seconds(start, end);
+    if (lastStereoEnd.QuadPart) perf.postStereo += PerfClock::seconds(lastStereoEnd, start);
+    lastStereoEnd = {};
+    lastPresentEnd = end;
+}
+static void presentBody(IDirect3DDevice9 *d);
 void present(IDirect3DDevice9 *d) {
+    const LARGE_INTEGER hookStart = PerfClock::now();
+    presentBody(d);
+    perf.presentHook += PerfClock::seconds(hookStart, PerfClock::now());
+}
+static void presentBody(IDirect3DDevice9 *d) {
     {
         const LARGE_INTEGER t = PerfClock::now();
         if (perf.lastPresent.QuadPart) { perf.frame += PerfClock::seconds(perf.lastPresent, t); ++perf.frames; }
@@ -1789,6 +1812,16 @@ void present(IDirect3DDevice9 *d) {
         if (PerfClock::seconds(perf.lastLog, t) >= 5 && perf.frames) {
             const double pairs = perf.pairs ? perf.pairs : 1, reads = perf.readbacks ? perf.readbacks : 1,
                 gpus = perf.gpuSamples ? perf.gpuSamples : 1;
+            if (perf.lostNoWorld + perf.lostFault + perf.lostNoOverlay + perf.lostIncomplete + perf.lostOther)
+                log("Perf unpublished pairs: noWorld=%u fault=%u noOverlay=%u incomplete=%u other=%u lastFault=%s",
+                    perf.lostNoWorld, perf.lostFault, perf.lostNoOverlay, perf.lostIncomplete, perf.lostOther, perf.lostReason);
+            log("Perf draws per pair: eyes=%.0f hud duplicates=%.0f; other per frame=%.0f",
+                perf.pairs ? double(perf.eyeDraws) / perf.pairs : 0., perf.pairs ? double(perf.hudDuplicates) / perf.pairs : 0.,
+                double(perf.desktopDraws) / perf.frames);
+            log("Perf per frame: present call=%.2fms hook=%.2fms | before stereo=%.2fms after stereo=%.2fms (n=%u)",
+                1000 * perf.presentCall / perf.frames, 1000 * perf.presentHook / perf.frames,
+                perf.stereoCalls ? 1000 * perf.preStereo / perf.stereoCalls : 0.,
+                perf.stereoCalls ? 1000 * perf.postStereo / perf.stereoCalls : 0., perf.stereoCalls);
             log("Perf frames=%u pairs=%u mono=%u size=%ux%u frame=%.1fms | per pair cpu: stereo=%.1f eyes=%.1f,%.1f "
                 "desktop=%.1f wait=%.1f | per eye read: getRT=%.2f lock=%.2f copy=%.2f | per pair dim=%.2f publish=%.2f | "
                 "mono=%.1fms | gpu(n=%u): eyes=%.2f,%.2f desktop=%.2f tail=%.2f",
@@ -2043,10 +2076,18 @@ static void releaseUiFrame() noexcept {
     if (uiFrame.device) uiFrame.device->Release();
     uiFrame.device=nullptr;
     uiFrame.color=uiFrame.ds=nullptr;
+    if (uiFrame.slot>=0 && !uiFrame.published) {
+        if (!uiFrame.world) ++perf.lostNoWorld;
+        else if (uiFrame.fault) ++perf.lostFault;
+        else if (uiFrame.ui && !uiFrame.overlaySeen) ++perf.lostNoOverlay;
+        else if (uiFrame.ui && !uiFrame.complete) ++perf.lostIncomplete;
+        else ++perf.lostOther;
+        if (uiFrame.fault) perf.lostReason = uiFrame.faultReason;
+    }
     uiFrame.player=nullptr;
     uiFrame.slot=-1;
     admittedUiFrame=nullptr;
-    uiFrame.ui=uiFrame.fault=uiFrame.world=uiFrame.restore=uiFrame.zeroCopy=false;
+    uiFrame.ui=uiFrame.fault=uiFrame.world=uiFrame.restore=uiFrame.zeroCopy=uiFrame.published=false;
     uiFrame.overlay=uiFrame.overlaySeen=uiFrame.complete=uiFrame.fade=false;
     uiFrame.faultOrigin=0;
     uiFrame.faultReason="none";
@@ -2209,7 +2250,7 @@ static bool publishUiFrame(uint32_t presentation) {
     const LARGE_INTEGER start=PerfClock::now();
     const bool accepted=publishUiFrameBody(presentation);
     perf.publish+=PerfClock::seconds(start,PerfClock::now());
-    if (accepted) ++perf.pairs;
+    if (accepted) { ++perf.pairs; uiFrame.published=true; }
     return accepted;
 }
 static bool publishUiFrameBody(uint32_t presentation) {
@@ -2313,12 +2354,8 @@ void nativeUiFinishOwner() {
     else { left=readUiEye(0,false,1); right=left && readUiEye(1,false,1); }
     bool ok=left && right;
     if(trace)log("Native UI readback left=%u right=%u",left,right);
-    if (ok && !uiFrame.zeroCopy) {
-        const LARGE_INTEGER dimStart=PerfClock::now();
-        const auto opaque=makeOpaqueDimming(1);
-        for (auto *image:uiFrame.pixels) dimOpaquePixels(image,uiFrame.pixelBytes/4,opaque);
-        perf.dim+=PerfClock::seconds(dimStart,PerfClock::now());
-    }
+    // No alpha pass: the base projection layer is submitted without
+    // source-alpha blending, so the compositor ignores the eye images' alpha.
     const bool valid=ok && uiCurrent();
     const bool published=valid && publishUiFrame(NativeUiComplete);
     if(trace) log("Native UI publish readback=%u current=%u published=%u",ok,valid,published);
@@ -2519,11 +2556,13 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         LARGE_INTEGER start;
         bool pair = false;
         ~StereoTimer() {
-            const double spent = PerfClock::seconds(start, PerfClock::now());
+            lastStereoEnd = PerfClock::now();
+            const double spent = PerfClock::seconds(start, lastStereoEnd);
             if (pair) perf.stereo += spent;
             else { perf.mono += spent; ++perf.monoFrames; }
         }
     } stereoTimer{stereoStart};
+    if (lastPresentEnd.QuadPart) { perf.preStereo += PerfClock::seconds(lastPresentEnd, stereoStart); ++perf.stereoCalls; }
     pollSharedFences();
     const auto generation = graphicsResourceGeneration();
     if (uiFrame.slot>=0) {
@@ -2542,7 +2581,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
     int chosen=-1;
     bool zeroCopy=false;
     {
-        Lock l(channel);
+        Lock l(channel,2); // A lost race would otherwise turn this frame flat.
         if(l) {
             const auto &images=channel.shared->images;
             const uint32_t sinceCapture=static_cast<uint32_t>(GetTickCount())-images.pixelRequestTick;
@@ -2718,16 +2757,17 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         ok=restoreUiFrame() && ok;
         // Native desktop rebuild remains exactly once; never replay brain/overlay.
         if(traceDepth && generation==graphicsResourceGeneration()) traceStereoDepth(d,request,-1,"before-desktop");
-        desktopCull=ok && !desktopWorld && !traceDepth;
-        desktopRtBound=true; // restoreUiFrame rebound the desktop target.
         const LARGE_INTEGER desktopStart=PerfClock::now();
-        ok=observedWorldRender(d,puppet,original,request,-1,traceDepth) && ok;
-        perf.desktopCpu+=PerfClock::seconds(desktopStart,PerfClock::now());
-        if (desktopCull) {
-            desktopCull=desktopRtBound=false;
+        if(desktopWorld || traceDepth) {
+            ok=observedWorldRender(d,puppet,original,request,-1,traceDepth) && ok;
+        } else {
+            // The desktop window mirrors the left eye; the native mono render is
+            // skipped (a third full scene traversal), keeping its bookkeeping.
+            monoPresentationWithoutRender(puppet);
             if (generation == graphicsResourceGeneration() && uiFrame.color)
-                originalStretch(d,uiFrame.target[0],nullptr,uiFrame.color,nullptr,D3DTEXF_NONE); // Desktop mirror.
+                originalStretch(d,uiFrame.target[0],nullptr,uiFrame.color,nullptr,D3DTEXF_NONE);
         }
+        perf.desktopCpu+=PerfClock::seconds(desktopStart,PerfClock::now());
         if (generation != graphicsResourceGeneration()) return;
         if(traceDepth) traceStereoDepth(d,request,-1,"after-desktop");
         uiFrame.world=ok && !uiFrame.fault && uiFrame.generation==resourceGeneration.load();
@@ -2745,7 +2785,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             const LARGE_INTEGER dimStart=PerfClock::now();
             const auto dimming=makeOpaqueDimming(visibility);
             if(uiFrame.zeroCopy) issueSharedFence();
-            else for(auto *image:uiFrame.pixels) if(image) dimOpaquePixels(image,uiFrame.pixelBytes/4,dimming);
+            else if(!dimming.passthrough) for(auto *image:uiFrame.pixels) if(image) dimOpaquePixels(image,uiFrame.pixelBytes/4,dimming);
             perf.dim+=PerfClock::seconds(dimStart,PerfClock::now());
             publishUiFrame(0);
         }

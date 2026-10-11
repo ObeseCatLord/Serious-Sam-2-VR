@@ -1617,6 +1617,42 @@ struct Host {
                 std::clamp(uint32_t(std::lround(height * scale)), 1u, maxHeight)};
     }
     // Reopen the game's pixel sections when it publishes a new generation.
+    // Private lab only: one zero-copy left eye written as a PPM beside the log,
+    // proving what the headset receives (lab captures otherwise use pixel pairs).
+    void probeZeroCopy(ID3D11Texture2D *source) {
+        wchar_t lab[2]{};
+        if (GetEnvironmentVariableW(L"SS2VR_LAB_PRIVATE_DISPLAY", lab, 2) != 1 || lab[0] != L'1' || !source)
+            return;
+        D3D11_TEXTURE2D_DESC description{};
+        source->GetDesc(&description);
+        description.Usage = D3D11_USAGE_STAGING;
+        description.BindFlags = 0;
+        description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        description.MiscFlags = 0;
+        Com<ID3D11Texture2D> staging;
+        if (FAILED(device->CreateTexture2D(&description, nullptr, staging.put())))
+            return;
+        context->CopyResource(staging.p, source);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context->Map(staging.p, 0, D3D11_MAP_READ, 0, &mapped)))
+            return;
+        if (auto *file = _wfopen((executableDirectory() + L"zero-copy-probe-left.ppm").c_str(), L"wb")) {
+            std::fprintf(file, "P6\n%u %u\n255\n", description.Width, description.Height);
+            std::vector<uint8_t> row(size_t(description.Width) * 3);
+            for (uint32_t y = 0; y < description.Height; ++y) {
+                const auto *bgra = static_cast<const uint8_t *>(mapped.pData) + size_t(y) * mapped.RowPitch;
+                for (uint32_t x = 0; x < description.Width; ++x) {
+                    row[x * 3] = bgra[x * 4 + 2];
+                    row[x * 3 + 1] = bgra[x * 4 + 1];
+                    row[x * 3 + 2] = bgra[x * 4];
+                }
+                std::fwrite(row.data(), 1, row.size(), file);
+            }
+            std::fclose(file);
+            log.write("Zero-copy probe written: zero-copy-probe-left.ppm");
+        }
+        context->Unmap(staging.p, 0);
+    }
     // Opens the game's shared eye images once per generation and acknowledges
     // them; until then (or if this fails) pairs arrive as pixel sections.
     void openSharedImages(SharedImages &images) {
@@ -1805,7 +1841,7 @@ struct Host {
     void pollEyes() {
         int candidate = -1;
         {
-            Mutex lock(channel, 0);
+            Mutex lock(channel, 1);
             if (!lock)
                 return;
             reapLocked();
@@ -1930,7 +1966,8 @@ struct Host {
                 throw std::runtime_error("Zero-copy eye copy did not complete");
             eye[0].releaseWaited();
             eye[1].releaseWaited();
-            ++zeroCopyPairs;
+            if (++zeroCopyPairs == 600)
+                probeZeroCopy(sharedEye[candidate][0].p);
         } else {
             eye[0].uploadWaited(context.p, source[0]);
             eye[1].uploadWaited(context.p, source[1]);

@@ -54,7 +54,11 @@ static __attribute__((noinline)) HRESULT WINAPI chainPresent(IDirect3DSwapChain9
         const bool attachedNow = outer && attachAtChainPresentation(chain, caller);
         if (outer && !attachedNow) ss2vr::game::presentChain(chain, caller, src, dst, window, region, flags);
         else if (ss2vr::game::nativePresentationCaller(caller, true)) ss2vr::game::nestedNativePresentation();
+        LARGE_INTEGER start{}, end{};
+        QueryPerformanceCounter(&start);
         hr = chainHooks[Index].original(chain, src, dst, window, region, flags);
+        QueryPerformanceCounter(&end);
+        if (outer) ss2vr::game::notePresentCall(start, end);
     }, [&](bool) noexcept { --presentationDepth; });
     if (FAILED(hr)) ss2vr::game::nativePresentationFailed(nullptr, chain);
     // Completion is scalar-only, including failed Present: no COM introspection
@@ -159,7 +163,11 @@ static __attribute__((noinline)) HRESULT WINAPI present(IDirect3DDevice9 *d, con
         const bool attachedNow = gfx && caller == gfx + 0x1c75u && attachAtPresentation(d);
         if (outer && !attachedNow) ss2vr::game::presentDevice(d, caller, src, dst, window, region);
         else if (ss2vr::game::nativePresentationCaller(caller, false)) ss2vr::game::nestedNativePresentation();
+        LARGE_INTEGER start{}, end{};
+        QueryPerformanceCounter(&start);
         hr = originalPresent(d, src, dst, window, region);
+        QueryPerformanceCounter(&end);
+        if (outer) ss2vr::game::notePresentCall(start, end);
     }, [&](bool) noexcept { --presentationDepth; });
     if (FAILED(hr)) ss2vr::game::nativePresentationFailed(d, nullptr);
     return hr;
