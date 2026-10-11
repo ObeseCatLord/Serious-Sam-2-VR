@@ -151,6 +151,11 @@ must remain stable. Repeat on foot and in supported seats, separately from firin
    only) quick save then quick load act once each. Report any weapon that shows
    a flat icon instead of a model (the log names it), a model that is black,
    off-centre, oversized or flickering, or icons that are upside down or boxed.
+   Grip pickup: squeeze a grip with the hand on or right beside a takeable
+   object (one the game prompts "Press Use to take"). It must pick up into that
+   hand instead of opening the wheel, follow the hand (weapons are put away), and
+   fly off with the hand's motion when the grip is released (a still hand just
+   drops it). Use still picks up the native way, and Use while carrying drops.
 2. Lose squeeze availability/tracking while a wheel is open, then restore it
    while still squeezing. It must cancel and require a real release/rearm.
 3. Navigate the native menu using the pointer and buttons. The visible cursor

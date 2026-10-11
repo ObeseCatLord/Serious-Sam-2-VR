@@ -1472,7 +1472,7 @@ static void update(void *p) {
                 } else {
                     // Bounded evidence: where the nearest takeable object is from this hand.
                     static unsigned traced = 0;
-                    if (traced < 12) {
+                    if (traced < 48) {
                         ++traced;
                         CarryScan scan;
                         const uint32_t nearby = nearestCarryable(p, hand.p, 40.f, &scan);
