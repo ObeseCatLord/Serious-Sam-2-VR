@@ -1220,7 +1220,8 @@ static bool handWorldPose(const Snapshot &s, void *player, unsigned h, Pose &out
     return finite(out);
 }
 // Handle of the nearest takeable hull whose shape reaches within `reach` of `at`.
-static uint32_t nearestCarryable(void *player, Vec3 at, float reach) {
+struct CarryScan { int hulls = 0, owned = 0, takeable = 0; uint32_t flagsSeen = 0; };
+static uint32_t nearestCarryable(void *player, Vec3 at, float reach, CarryScan *scan = nullptr) {
     NativeHulls hulls;
     uint32_t best = 0;
     float bestDistance = 1e30f;
@@ -1228,7 +1229,11 @@ static uint32_t nearestCarryable(void *player, Vec3 at, float reach) {
     for (int32_t i = 0; hulls.data && i < hulls.count; ++i) {
         void *hull = hulls.data[i];
         void *owner = hull ? hullOwner(hull) : nullptr;
-        if (!owner || owner == player || !(virtualCall<int>(owner, 0x108) & 2)) continue; // Takeable.
+        if (scan) ++scan->hulls;
+        if (!owner || owner == player) continue;
+        const int flags = virtualCall<int>(owner, 0x108); // GetObjectManipulationFlags
+        if (scan) { ++scan->owned; scan->flagsSeen |= uint32_t(flags); scan->takeable += (flags & 2) != 0; }
+        if (!(flags & 2)) continue; // Takeable.
         if (primaryField(owner, 0x84) & 4) continue; // A prop someone already carries.
         void *body = hullBody(hull);
         if (!body) continue;
@@ -1469,14 +1474,16 @@ static void update(void *p) {
                     static unsigned traced = 0;
                     if (traced < 12) {
                         ++traced;
-                        const uint32_t nearby = nearestCarryable(p, hand.p, 8.f);
+                        CarryScan scan;
+                        const uint32_t nearby = nearestCarryable(p, hand.p, 40.f, &scan);
                         void *hull = nearby ? resolve(nearby) : nullptr;
                         void *body = hull ? hullBody(hull) : nullptr;
                         Pose placement{};
                         if (body) memcpy(&placement, static_cast<uint8_t *>(body) + 0x2c, sizeof(placement));
                         const Vec3 d = placement.p - hand.p;
-                        log("Grip carry none in reach hand=%d at=%.2f,%.2f,%.2f nearest8m=%u offset=%.2f,%.2f,%.2f",
-                            h, hand.p.x, hand.p.y, hand.p.z, nearby, d.x, d.y, d.z);
+                        log("Grip carry none in reach hand=%d at=%.2f,%.2f,%.2f nearest40m=%u offset=%.2f,%.2f,%.2f "
+                            "hulls=%d owned=%d takeable=%d flags=%x", h, hand.p.x, hand.p.y, hand.p.z, nearby,
+                            d.x, d.y, d.z, scan.hulls, scan.owned, scan.takeable, scan.flagsSeen);
                     }
                 }
             }
