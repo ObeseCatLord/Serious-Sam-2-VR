@@ -128,10 +128,26 @@ int main() {
         const Vec3 point{.01f,.03f,-.6f}, anchor{0,-.02f,.3f};
         const Pose shot{camera.q,camera.p+rotate(camera.q,model.p+rotate(model.q,point))};
         const Pose hand{yaw(-.7f),{4,1,-2}};
-        const Pose muzzle=handAlignedMuzzle(camera,shot,model,{},anchor,hand,1.5f);
+        const Pose muzzle=handAlignedMuzzle(camera,shot,model,{},rotate(model.q,anchor),hand,1.5f);
         const Vec3 expected=hand.p+rotate(hand.q,(anchor+point)*1.5f);
         const Vec3 error=muzzle.p-expected;
         assert(dot(error,error)<1e-8f);
         assert(std::abs(dot(Vec3{muzzle.q.x,muzzle.q.y,muzzle.q.z},Vec3{hand.q.x,hand.q.y,hand.q.z})+muzzle.q.w*hand.q.w)>.99999f);
+        // A model authored a half turn round (auto shotgun) keeps that turn.
+        const Pose turned{normalize(multiply(model.q,yaw(Pi))),model.p};
+        const Pose turnedShot{camera.q,camera.p+rotate(camera.q,turned.p+rotate(turned.q,point))};
+        const Pose flipped=handAlignedMuzzle(camera,turnedShot,turned,{},rotate(turned.q,anchor),hand,1.f);
+        const Vec3 flippedExpected=hand.p+rotate(multiply(hand.q,yaw(Pi)),anchor+point);
+        const Vec3 flippedError=flipped.p-flippedExpected;
+        assert(dot(flippedError,flippedError)<1e-8f);
+    }
+    {
+        // Axis snapping keeps whole quarter turns and drops small tilts.
+        const auto same=[](Quat a,Quat b){ return std::abs(a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w)>.9999f; };
+        assert(same(snapToAxes(normalize(Quat{.05f,-.08f,.03f,1})),Quat{}));
+        assert(same(snapToAxes(multiply(yaw(Pi),normalize(Quat{.06f,0,.04f,1}))),yaw(Pi)));
+        assert(same(snapToAxes(multiply(yaw(Pi/2),normalize(Quat{0,.1f,0,1}))),yaw(Pi/2)));
+        const Quat pitch{std::sin(Pi/4),0,0,std::cos(Pi/4)};
+        assert(same(snapToAxes(multiply(pitch,yaw(.2f))),pitch));
     }
 }

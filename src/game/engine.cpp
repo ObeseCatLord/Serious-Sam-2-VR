@@ -4694,7 +4694,7 @@ static void drawLasers() {
             laserTraceValue(LaserTraceStage::Draw,"sample-invalid",eyeSnapshot,h,eyeRequest.sequence,2);continue;
         }
         // A laser-pointer red beam: a 2 mm bundle of lines, solid at any distance.
-        const uint32_t color = 0xff1a1affu; // Native RGBA convention.
+        const uint32_t color = 0xffff1a1au; // ARGB (V109 capture: 0xff1a1aff drew blue).
         drawLine(a.muzzle.p, a.end, color, UINT32_MAX);
         for (unsigned k = 0; k != 8; ++k) {
             const float angle = k * Pi / 4;
@@ -5727,9 +5727,10 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
         body, s.origin, s.turn, tracking.head,
         calibratedGrip(tracking, mountHand(s, unsigned(h)), *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4), settings));
     // The weapon is held along the controller's aim axis: the flat viewmodel's
-    // tilt toward the screen centre is dropped so barrel, laser and shots agree.
-    const Quat offset{};
-    const Vec3 displacement = charge;
+    // tilt toward the screen centre is dropped so barrel, laser and shots agree,
+    // but a model authored turned (e.g. the auto shotgun, a half turn) keeps it.
+    const Quat offset = snapToAxes(multiply(inverse(suppliedCamera.q), native.q));
+    const Vec3 displacement = rotate(offset, charge);
     Vec3 alignment;
     if(align && !alignmentDisplacement(modelBefore,offset,alignment)) {
         invalidateMatchingCalibration(s,unsigned(h),5,caller);return reject();
@@ -5737,7 +5738,7 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
     const int nativeId = *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4);
     const float scale = weaponModelScale(settings, nativeId);
     traceWeaponModel(w, nativeId, scale);
-    const Pose target{normalize(hand.q), hand.p + rotate(hand.q, (displacement+alignment) * scale)};
+    const Pose target{normalize(multiply(hand.q, offset)), hand.p + rotate(hand.q, (displacement+alignment) * scale)};
     if (!finite(target))
         return reject();
     const Matrix34 staged = scaledModel(matrix(target), scale); // Enlarged about the hand.

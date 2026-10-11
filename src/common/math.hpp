@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <utility>
 namespace ss2vr {
 constexpr float Pi = 3.14159265358979323846f;
 inline Vec3 operator+(Vec3 a, Vec3 b) {
@@ -159,6 +160,42 @@ inline bool applyNativeViewHeight(Pose &base, uint32_t heightBits) {
 inline Vec3 modelAnchorDisplacement(Quat nativeRotation, Vec3 stretch, Vec3 modelReference) {
     return rotate(nativeRotation, {stretch.x * modelReference.x, stretch.y * modelReference.y,
                                   stretch.z * modelReference.z}) * -1;
+}
+// Nearest of the 24 axis-aligned rotations. Keeps an authored quarter or half
+// turn of a model while dropping a small tilt.
+inline Quat snapToAxes(Quat q) {
+    q = normalize(q);
+    const Vec3 x = rotate(q, {1, 0, 0}), y = rotate(q, {0, 1, 0});
+    const auto axis = [](Vec3 v, int skip) {
+        const float c[3]{v.x, v.y, v.z};
+        int best = skip == 0 ? 1 : 0;
+        for (int i = 0; i < 3; ++i)
+            if (i != skip && std::abs(c[i]) > std::abs(c[best])) best = i;
+        Vec3 out{};
+        (best == 0 ? out.x : best == 1 ? out.y : out.z) = c[best] < 0 ? -1.f : 1.f;
+        return std::pair<Vec3, int>{out, best};
+    };
+    const auto [ax, ix] = axis(x, -1);
+    const auto [ay, iy] = axis(y, ix);
+    (void)iy;
+    const Vec3 az = cross(ax, ay);
+    // Rotation matrix columns ax, ay, az -> quaternion.
+    const float m00 = ax.x, m11 = ay.y, m22 = az.z, trace = m00 + m11 + m22;
+    Quat r;
+    if (trace > 0) {
+        const float s = std::sqrt(trace + 1) * 2;
+        r = {(ay.z - az.y) / s, (az.x - ax.z) / s, (ax.y - ay.x) / s, s / 4};
+    } else if (m00 >= m11 && m00 >= m22) {
+        const float s = std::sqrt(1 + m00 - m11 - m22) * 2;
+        r = {s / 4, (ay.x + ax.y) / s, (az.x + ax.z) / s, (ay.z - az.y) / s};
+    } else if (m11 >= m22) {
+        const float s = std::sqrt(1 + m11 - m00 - m22) * 2;
+        r = {(ay.x + ax.y) / s, s / 4, (az.y + ay.z) / s, (az.x - ax.z) / s};
+    } else {
+        const float s = std::sqrt(1 + m22 - m00 - m11) * 2;
+        r = {(az.x + ax.z) / s, (az.y + ay.z) / s, s / 4, (ax.y - ay.x) / s};
+    }
+    return normalize(r);
 }
 // Uniform model scale about the placement origin: rotation columns only.
 inline Matrix34 scaledModel(Matrix34 m, float scale) {
