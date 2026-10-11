@@ -23,7 +23,7 @@ struct WeaponGrip {
     Vec3 reference;
 };
 inline constexpr WeaponGrip WeaponGrips[] = {
-    {0, {0.f, .084f, -.304f}},       // Circular saw
+    {0, {0.f, .11f, .02f}},          // Circular saw: top trigger handle (V111 side view)
     {1, Id1ModelHandleReference},     // Zap gun
     {2, {0.f, -.075f, -.091f}},      // Auto shotgun
     {3, {-.0379f, -.021f, -.2626f}}, // Double shotgun: Hand bone
@@ -40,12 +40,13 @@ inline constexpr WeaponGrip WeaponGrips[] = {
     {15, {0.f, .003f, -.113f}},      // Beam gun: rear grip
     {16, {0.f, 0.f, -.3f}},          // Flamer
 };
-// Per-weapon display scale so Sam's hands (and the guns with them) look as
-// large in VR as on the flat screen, where each weapon has its own FOV and
-// distance: scale ~ 1 / (|grip in camera space| * tan(weaponFov / 2)), normalised
-// to the revolvers at 1.49 (V101 audit: native weapon FOVs and first-person poses).
+// Per-weapon display scale so Sam's hands are the same size whatever he holds.
+// Weapons whose forearm is visible (zap gun, uzi, Klodovik, bomb, revolvers)
+// are sized so the forearm behind the glove is ~13 cm thick (V111 side views
+// at equal distance); the rest keep the flat-screen-matched size
+// 1 / (|grip in camera space| * tan(weaponFov / 2)) from the V101 audit.
 inline constexpr float WeaponDisplayScales[WeaponCount] = {
-    .98f, 2.68f, 1.29f, 1.51f, 2.03f, .95f, .79f, 1.09f, 2.22f, .75f, .87f, .95f, 1.49f, 1.30f, 1.f, 1.14f, 1.2f};
+    .98f, 3.18f, 1.29f, 1.51f, 3.51f, .95f, .79f, 1.09f, 2.22f, .89f, .87f, 1.2f, 1.29f, 1.30f, 1.f, 1.14f, 1.2f};
 constexpr float weaponDisplayScale(uint32_t nativeId) {
     return nativeId < WeaponCount ? WeaponDisplayScales[nativeId] : 1.f;
 }
