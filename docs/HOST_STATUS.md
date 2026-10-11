@@ -33,13 +33,19 @@ COM, Win32, GDI and OpenXR objects have owned teardown. Normal STOPPING invalida
 
 Profile/component paths were checked against pinned Khronos xr.xml. Triggers are independent float actions; sticks/trackpads are vector actions. Touch/Index squeeze values above 0.65 and Vive/Microsoft squeeze clicks open the respective wheel. The runtime may remap or reject profile suggestions; rejected suggestions are logged.
 
-| Profile | Axes | Use | Jump | Menu | Sprint |
-|---|---|---|---|---|---|
-| Oculus Touch | Thumbsticks | X / A | Y / B | Left menu | Either stick click |
-| Valve Index | Thumbsticks | Either A | Right B | Left B | Either stick click |
-| HTC Vive | Trackpads | Right menu | Right trackpad click | Left menu | Left trackpad click |
-| Microsoft Motion | Thumbsticks | Left trackpad click | Right trackpad click | Either menu | Either stick click |
-| Valve Frame (extension advertised) | Thumbsticks | Left D-pad down / right A | Left D-pad up / right B | Left view / right menu | Either stick click |
+| Profile | Axes | Use | Jump | Menu | Sprint | Reload | Netricsa |
+|---|---|---|---|---|---|---|---|
+| Oculus Touch | Thumbsticks | A | B | Left menu | Either stick click | X | Y |
+| Valve Index | Thumbsticks | Right A | Right B | Left B | Either stick click | Left A | Left trackpad press |
+| HTC Vive | Trackpads | Right menu | Right trackpad click | Left menu | Left trackpad click | — | — |
+| Microsoft Motion | Thumbsticks | Left trackpad click | Right trackpad click | Either menu | Either stick click | — | — |
+| Valve Frame (extension advertised) | Thumbsticks | Right A | Right B | Left view / right menu | Either stick click | Left D-pad down | Left D-pad up |
+
+Menus: point and pull a trigger to select; Use/A confirms, Menu/B goes back, the
+left stick moves the selection, Reload/Netricsa act as the X/Y menu functions.
+While VR is live the menus show the game's own controller prompts (A/B/X/Y) and
+the game does not need window focus: menu keys go through the native menu
+dispatcher, and the engine is kept in its foreground state.
 
 The host enables XR_VALVE_frame_controller_interaction only when enumerated, then
 suggests /interaction_profiles/valve/frame_controller_valve. Left X/Y paths are
