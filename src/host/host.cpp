@@ -801,13 +801,12 @@ struct Actions {
     }
 };
 
-// GDI renders labels into a top-down DIB. Pixels outside the disc remain alpha 0;
-// the disc, sectors and antialiased text use straight-alpha opaque BGRA.
+// GDI renders labels into a top-down DIB as straight-alpha BGRA cards.
 struct WheelBitmap {
     HDC dc = nullptr;
     HBITMAP dib = nullptr;
     HGDIOBJ oldBitmap = nullptr;
-    HFONT label = nullptr, ammo = nullptr;
+    HFONT label = nullptr, ammo = nullptr, title = nullptr, detail = nullptr;
     uint8_t *bits = nullptr;
     uint32_t size = 0, height = 0;
     ~WheelBitmap() {
@@ -819,6 +818,10 @@ struct WheelBitmap {
             DeleteObject(label);
         if (ammo)
             DeleteObject(ammo);
+        if (title)
+            DeleteObject(title);
+        if (detail)
+            DeleteObject(detail);
         if (dc)
             DeleteDC(dc);
     }
@@ -849,14 +852,20 @@ struct WheelBitmap {
         ammo = CreateFontW(-int(size * .030f), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                            DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        if (!label || !ammo)
+        title = CreateFontW(-int(height * .34f), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                            DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        detail = CreateFontW(-int(height * .22f), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        if (!label || !ammo || !title || !detail)
             throw std::runtime_error("GDI wheel fonts unavailable");
         SetBkMode(dc, TRANSPARENT);
     }
-    void text(const wchar_t *value, float x, float y, HFONT font, COLORREF color, float width) {
+    void text(const wchar_t *value, float x, float y, HFONT font, COLORREF color, float width, float line = 0) {
         const HGDIOBJ old = SelectObject(dc, font);
         SetTextColor(dc, color);
-        RECT rectangle{LONG(x - width / 2), LONG(y), LONG(x + width / 2), LONG(y + size * .052f)};
+        RECT rectangle{LONG(x - width / 2), LONG(y), LONG(x + width / 2), LONG(y + (line > 0 ? line : size * .052f))};
         const int result =
             DrawTextW(dc, value, -1, &rectangle, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
         SelectObject(dc, old);
@@ -887,89 +896,51 @@ struct WheelBitmap {
         for (size_t i = 0; i < size_t(size) * height; i++)
             bits[i * 4 + 3] = 220;
     }
+    // Compact card at the centre of the in-world ring (drawn by the game): the
+    // hovered item's name and ammunition, or how to choose and cancel.
     void draw(const WheelUi &ui, unsigned hand) {
         if (!GdiFlush())
             throw std::runtime_error("GDI flush failed");
         const uint32_t count = std::min(ui.count, WeaponCount);
-        const float center = size * .5f, outer = size * .47f, inner = size * .205f;
-        const float step = count ? 2 * Pi / count : 2 * Pi;
-        for (uint32_t y = 0; y < size; ++y)
+        const WheelBubble bubble = wheelHoveredBubble(ui.hover);
+        const bool weapon = ui.hover >= 0 && uint32_t(ui.hover) < count;
+        const bool hovered = weapon || bubble != WheelBubble::None;
+        // Accent edge in the laser colour of the opening hand while an item is hovered.
+        const uint8_t accent[3] = {uint8_t(hand ? 255 : 64), uint8_t(hand ? 223 : 255), uint8_t(hand ? 64 : 96)};
+        for (uint32_t y = 0; y < height; ++y)
             for (uint32_t x = 0; x < size; ++x) {
-                const float dx = x + .5f - center, dy = center - (y + .5f);
-                const float radius = std::sqrt(dx * dx + dy * dy);
-                auto *pixel = bits + (size_t(y) * size + x) * 4;
-                pixel[0] = pixel[1] = pixel[2] = pixel[3] = 0;
-                if (radius > outer)
-                    continue;
-                bool highlight = false;
-                if (radius >= inner && count) {
-                    float angle = std::atan2(dx, dy);
-                    if (angle < 0)
-                        angle += 2 * Pi;
-                    const int sector = int(std::floor((angle + step * .5f) / step)) % int(count);
-                    highlight = ui.hover == sector;
-                }
-                pixel[0] = highlight ? 32 : 31;
-                pixel[1] = highlight ? 116 : 27;
-                pixel[2] = highlight ? 204 : 23;
-                pixel[3] = 255;
+                auto *p = bits + (size_t(y) * size + x) * 4;
+                const bool edge = hovered && x < size / 64;
+                p[0] = edge ? accent[0] : 24;
+                p[1] = edge ? accent[1] : 18;
+                p[2] = edge ? accent[2] : 15;
+                p[3] = 215;
             }
-        HPEN pen = CreatePen(PS_SOLID, std::max(1, int(size / 400)), RGB(120, 128, 138));
-        if (!pen)
-            throw std::runtime_error("GDI wheel pen unavailable");
-        const auto oldPen = SelectObject(dc, pen);
-        const auto oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Ellipse(dc, int(center - inner), int(center - inner), int(center + inner), int(center + inner));
-        for (uint32_t i = 0; i < count; ++i) {
-            const float boundary = step * (i + .5f);
-            MoveToEx(dc, int(center + std::sin(boundary) * inner), int(center - std::cos(boundary) * inner),
-                     nullptr);
-            LineTo(dc, int(center + std::sin(boundary) * outer), int(center - std::cos(boundary) * outer));
-        }
-        SelectObject(dc, oldBrush);
-        SelectObject(dc, oldPen);
-        DeleteObject(pen);
-        for (uint32_t i = 0; i < count; ++i) {
-            const float angle = step * i;
-            const float x = center + std::sin(angle) * outer * .78f;
-            const float y = center - std::cos(angle) * outer * .78f;
-            wchar_t name[48], ammunition[48];
+        wchar_t heading[64], line[64];
+        if (weapon) {
             // Stock names are verified against the native parameter-path switch.
-            std::swprintf(name, 48, L"%ls", weaponName(ui.weapon[i]));
-            if (ui.ammo[i] >= 0)
-                std::swprintf(ammunition, 48, L"%d", ui.ammo[i]);
+            std::swprintf(heading, 64, L"%ls", weaponName(ui.weapon[ui.hover]));
+            if (ui.ammo[ui.hover] > 0)
+                std::swprintf(line, 64, L"Ammo %d", ui.ammo[ui.hover]);
             else
-                std::swprintf(ammunition, 48, L"--");
-            text(name, x, y - size * .033f, label, RGB(255, 255, 255), size * .11f);
-            text(ammunition, x, y + size * .010f, ammo, RGB(220, 225, 230), size * .11f);
-        }
-        text(hand ? L"RIGHT" : L"LEFT", center, center - size * .130f, ammo, RGB(210, 220, 230), size * .34f);
-        if (ui.hover >= 0 && uint32_t(ui.hover) < count) {
-            text(weaponName(ui.weapon[ui.hover]), center, center - size * .045f, label, RGB(255, 255, 255),
-                 size * .36f);
-            wchar_t amount[48];
-            if (ui.ammo[ui.hover] >= 0)
-                std::swprintf(amount, 48, L"Ammo %d", ui.ammo[ui.hover]);
-            else
-                std::swprintf(amount, 48, L"Ammo --");
-            text(amount, center, center + size * .010f, ammo, RGB(235, 240, 250), size * .34f);
-            text(L"Release to select", center, center + size * .090f, ammo, RGB(235, 240, 250), size * .38f);
+                std::swprintf(line, 64, ui.ammo[ui.hover] == 0 ? L"Out of ammo" : L"Release to equip");
+        } else if (bubble != WheelBubble::None) {
+            std::swprintf(heading, 64, L"%ls", wheelBubbleName(bubble));
+            std::swprintf(line, 64, bubble == WheelBubble::QuickSave   ? L"Release to save"
+                                    : bubble == WheelBubble::QuickLoad ? L"Release to load"
+                                                                       : L"Release to open");
         } else {
-            text(L"Choose weapon", center, center - size * .040f, label, RGB(255, 255, 255), size * .36f);
-            text(L"Center to cancel", center, center + size * .050f, ammo, RGB(230, 235, 240), size * .38f);
+            std::swprintf(heading, 64, hand ? L"Right hand" : L"Left hand");
+            std::swprintf(line, 64, L"Reach to an item, release to choose");
         }
+        text(heading, size * .5f, height * .08f, title, RGB(255, 255, 255), size * .92f, height * .44f);
+        text(line, size * .5f, height * .58f, detail, hovered ? RGB(235, 240, 250) : RGB(190, 200, 210),
+             size * .92f, height * .32f);
         if (!GdiFlush())
             throw std::runtime_error("GDI wheel draw flush failed");
-        // GDI overwrites alpha. Restore alpha from the disc mask after drawing.
-        for (uint32_t y = 0; y < size; ++y)
-            for (uint32_t x = 0; x < size; ++x) {
-                const float dx = x + .5f - center, dy = y + .5f - center;
-                auto *pixel = bits + (size_t(y) * size + x) * 4;
-                if (dx * dx + dy * dy <= outer * outer)
-                    pixel[3] = 255;
-                else
-                    pixel[0] = pixel[1] = pixel[2] = pixel[3] = 0;
-            }
+        // GDI clears text alpha; keep the whole card's straight alpha predictable.
+        for (size_t i = 0; i < size_t(size) * height; i++)
+            bits[i * 4 + 3] = 215;
     }
 };
 
@@ -977,14 +948,18 @@ bool sameWheel(const WheelUi &a, const WheelUi &b) {
     return a.open == b.open && a.count == b.count && a.hover == b.hover &&
            !std::memcmp(a.weapon, b.weapon, sizeof(a.weapon)) && !std::memcmp(a.ammo, b.ammo, sizeof(a.ammo));
 }
+// The game draws the ring in the world; the host only labels it. The card sits
+// at the ring centre, slightly toward the user, captured from this host's own
+// sample of the hand when the game first reports that wheel open.
+constexpr float WheelCardWidth = .17f, WheelCardLift = .04f;
 struct WheelLayer {
     Swapchain chain;
     WheelBitmap bitmap;
-    bool previousOpen = false, anchored = false, uploaded = false;
+    bool anchored = false, uploaded = false;
     Pose anchor{};
     WheelUi drawn{};
     void reset() {
-        previousOpen = anchored = uploaded = false;
+        anchored = uploaded = false;
     }
 };
 
@@ -1008,10 +983,10 @@ struct Host {
     WorldSubmissionStream worldSubmission;
     Swapchain eye[2];
     WheelLayer wheels[2];
-    WheelLayout wheelLayout;
     ComfortAnchor menuAnchor, hudAnchor;
     VrSettings settings;
     uint32_t lastFire[2]{}, lastDamage = 0;
+    int32_t lastHover[2]{-1, -1};
     bool feedbackSeeded = false, hapticsAvailable = true;
     Fov currentFov[2];
     bool recenterWasHeld = false, recenterUi = false;
@@ -1268,8 +1243,8 @@ struct Host {
         if (wheelSize < 512)
             throw std::runtime_error("Runtime wheel texture limit too small for legible labels");
         for (auto &wheel : wheels) {
-            wheel.chain.create(api, session, wheelSize, wheelSize);
-            wheel.bitmap.create(wheelSize);
+            wheel.chain.create(api, session, wheelSize, wheelSize / 4);
+            wheel.bitmap.create(wheelSize, wheelSize / 4);
         }
         hudChain.create(api, session, wheelSize, wheelSize / 4);
         hudBitmap.create(wheelSize, wheelSize / 4);
@@ -1350,7 +1325,6 @@ struct Host {
         feedbackSeeded = false;
         menuAnchor.reset();
         hudAnchor.reset();
-        wheelLayout.reset();
         invalidateCachedPair();
         cancelRequests();
         for (auto &wheel : wheels)
@@ -1832,11 +1806,6 @@ struct Host {
                      std::vector<const XrCompositionLayerBaseHeader *> &output) {
         const ULONGLONG now = GetTickCount64();
         const bool fresh = ui.tickMs && now >= ui.tickMs && now - ui.tickMs <= UiFreshMs;
-        const bool anyOpen = fresh && ui.gameplay && (ui.wheel[0].open || ui.wheel[1].open);
-        if (!anyOpen)
-            wheelLayout.reset();
-        if (anyOpen && !wheelLayout.reserved && input.focused && input.headValid)
-            wheelLayout.reserve(input.head, currentFov);
         for (unsigned h = 0; h != 2; ++h) {
             auto &wheel = wheels[h];
             const bool open = fresh && ui.gameplay && ui.wheel[h].open;
@@ -1844,14 +1813,15 @@ struct Host {
                 wheel.reset();
                 continue;
             }
-            if (!wheel.anchored && wheelLayout.reserved) {
-                wheel.anchor = wheelLayout.anchor[h];
+            const WheelPointer pointer = wheelPointer(input, h);
+            if (!wheel.anchored && pointer.valid) {
+                wheel.anchor = compose(wheelRingFrame(pointer.hand, pointer.head), Pose{{}, {0, 0, WheelCardLift}});
                 wheel.anchored = true;
                 wheel.uploaded = false;
             }
-            wheel.previousOpen = true;
+            // Within arm's reach by design; only a card behind or at the face is hidden.
             if (!wheel.anchored || !input.focused || !input.headValid || !input.handValid[h] ||
-                !comfortablePanel(wheel.anchor, input.head, 1.f))
+                !comfortablePanel(wheel.anchor, input.head, .15f))
                 continue;
             if (!wheel.uploaded || !sameWheel(wheel.drawn, ui.wheel[h])) {
                 wheel.bitmap.draw(ui.wheel[h], h);
@@ -1872,7 +1842,7 @@ struct Host {
             layers[h].eyeVisibility = XR_EYE_VISIBILITY_BOTH;
             layers[h].subImage = wheel.chain.subimage();
             layers[h].pose = xrPose(wheel.anchor);
-            layers[h].size = {wheelLayout.diameter, wheelLayout.diameter};
+            layers[h].size = {WheelCardWidth, WheelCardWidth / 4};
             output.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&layers[h]));
         }
         hresult(device->GetDeviceRemovedReason(), "D3D11 device removed during wheel upload", log);
@@ -2023,16 +1993,23 @@ struct Host {
             for (unsigned h = 0; h != 2; ++h) {
                 bool hurt = ui.damageSequence != lastDamage;
                 bool fired = ui.fireSequence[h] != lastFire[h];
+                // A light tick as an open wheel's hover moves onto another item.
+                const bool hovered = ui.wheel[h].open && ui.wheel[h].hover != -1 && ui.wheel[h].hover != lastHover[h];
                 float amplitude =
                     std::max(hurt ? settings.damageHaptic : 0.f, fired ? settings.fireHaptic : 0.f);
+                const bool tick = amplitude <= 0 && hovered;
+                if (tick)
+                    amplitude = .25f;
                 if (hapticsAvailable && amplitude > 0 && input.handValid[h])
                     hapticsAvailable =
                         actions.pulse(api, session, h, amplitude,
-                                      hurt && settings.damageHaptic > 0 ? 80'000'000 : 40'000'000);
+                                      hurt && settings.damageHaptic > 0 ? 80'000'000 : tick ? 15'000'000 : 40'000'000);
             }
         }
-        for (unsigned h = 0; h != 2; ++h)
+        for (unsigned h = 0; h != 2; ++h) {
             lastFire[h] = ui.fireSequence[h];
+            lastHover[h] = ui.wheel[h].open ? ui.wheel[h].hover : -1;
+        }
         lastDamage = ui.damageSequence;
         feedbackSeeded = true;
     }
@@ -2088,17 +2065,12 @@ struct Host {
             const bool validViews = viewsAt(frameState.predictedDisplayTime, views);
             viewsTracked = validViews;
             Input input = sample(frameState.predictedDisplayTime, views, validViews);
-            if (wheelLayout.reserved)
-                for (unsigned h = 0; h != 2; ++h)
-                    if (wheels[h].previousOpen && !comfortablePanel(wheelLayout.anchor[h], input.head, 1.1f))
-                        input.blockedWheels |= 1u << h;
             const bool recenterHeldNow = recenterHeld(input);
             recenterUi = recenterHeldNow && !recenterWasHeld;
             recenterWasHeld = recenterHeldNow;
             if (!validViews || !input.focused || !input.headValid) {
                 menuAnchor.reset();
                 hudAnchor.reset();
-                wheelLayout.reset();
                 for (auto &wheel : wheels)
                     wheel.reset();
             }
@@ -2157,7 +2129,6 @@ struct Host {
                 if (!api.lossPending) {
                     if (snapshot.menuVisible) {
                         hudAnchor.reset();
-                        wheelLayout.reset();
                         for (auto &wheel : wheels)
                             wheel.reset();
                         invalidateCachedPair();

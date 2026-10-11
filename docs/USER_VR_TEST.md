@@ -140,9 +140,15 @@ looking vertically, then return to the horizon; the previous horizontal referenc
 must remain stable. Repeat on foot and in supported seats, separately from firing.
 
 
-1. Open each hand's wheel, select an owned weapon and release to equip. Center
-   the stick before release to cancel. Open both wheels; labels, ammo and hover
-   feedback must be readable and independently actionable.
+1. Hold each hand's grip: weapon icons and four bubbles must appear on a ring
+   around that hand, upright and facing you. Reach onto a weapon (it grows and
+   glows; the centre card names it and its ammo; empty weapons are dimmed) and
+   release to equip it. Return to the ring centre before release to cancel; a
+   deflected stick must still pick by direction. Open both wheels; icons, cards
+   and hover feedback must be readable and independently actionable. Release on
+   each bubble: Netricsa opens, the game menu opens as with Menu, and (single
+   player only) quick save then quick load act once each. The icons must not be
+   upside down or show a solid box around them.
 2. Lose squeeze availability/tracking while a wheel is open, then restore it
    while still squeezing. It must cancel and require a real release/rearm.
 3. Navigate the native menu using the pointer and buttons. The visible cursor

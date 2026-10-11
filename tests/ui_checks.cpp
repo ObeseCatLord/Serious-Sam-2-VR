@@ -66,22 +66,6 @@ int main() {
     check(!comfortablePanel(close, walkingHead), "Approaching a panel violates its explicit distance guard");
     walkingHead.p = close.p + rotate(close.q, {0, 0, -1.5f});
     check(!comfortablePanel(close, walkingHead), "A panel behind the viewer cannot remain eligible");
-    WheelLayout layout;
-    Fov eyes[2] = {{-.8f, .8f, .7f, -.7f}, {-.8f, .8f, .7f, -.7f}};
-    head = {{}, {0, 1.7f, 0}};
-    check(layout.reserve(head, eyes), "A shared wheel layout reserves both panels at first open");
-    auto firstRight = layout.anchor[1];
-    head.q = yaw(1.f); // Second hand opens later; its reservation does not change.
-    check(layout.reserve(head, eyes), "Opening the second wheel retains the active reservation");
-    check(near(firstRight.p.x, layout.anchor[1].p.x) && layout.anchor[0].p.x < layout.anchor[1].p.x,
-          "Staggered wheel opening retains the original non-overlapping reservation");
-    for (unsigned h = 0; h != 2; ++h)
-        for (float corner : {-1.f, 1.f}) {
-            Vec3 point =
-                layout.anchor[h].p + rotate(layout.anchor[h].q, {corner * layout.diameter / 2, 0, 0});
-            float angle = std::atan2(point.x, -point.z);
-            check(std::abs(angle) < .8f, "Wheel edges stay inside the binocular horizontal FOV");
-        }
     MenuNavigation menu;
     Input input{};
     input.primaryActiveMask = 3;
@@ -344,5 +328,5 @@ int main() {
     check(rightColors[0] == 100 && rightColors[3] == 255,
           "Invalid visibility cannot blacken an unqueried world");
     std::cout
-        << "UI comfort, lifecycle, wheel layout, menu recovery, grip, laser and head fade checks passed\n";
+        << "UI comfort, lifecycle, menu recovery, grip, laser and head fade checks passed\n";
 }

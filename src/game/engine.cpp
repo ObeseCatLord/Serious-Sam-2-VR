@@ -348,6 +348,15 @@ static SetWeapon setWeapon = nullptr;
 static Toggle toggleDual = nullptr;
 static HandInt canChange = nullptr;
 static InventoryInt inInventory = nullptr, ammo = nullptr;
+// Hand weapon wheel presentation (optional pinned exports): Sam2Game weapon
+// icons and native weapon-menu order, plus the gfx blend state it restores.
+using WeaponIcon = void *(__cdecl *)(int);
+using WeaponMenuSlot = int32_t(__cdecl *)(int);
+using BlendFunction = void(__cdecl *)(int, int);
+static WeaponIcon nativeWeaponIcon = nullptr;
+static WeaponMenuSlot nativeWeaponMenuDirection = nullptr, nativeWeaponMenuOrder = nullptr;
+static int *blendSource = nullptr, *blendDestination = nullptr;
+static BlendFunction *setBlendFunction = nullptr;
 static MatrixPose matrixPose = nullptr;
 static SRWLOCK snapshotLock = SRWLOCK_INIT;
 struct Calibration {
@@ -508,6 +517,68 @@ static void clearCalibration(int h) {
     ReleaseSRWLockExclusive(&snapshotLock);
 }
 static WeaponWheel wheels[2];
+// Game-local presentation of each open wheel; WheelUi is its fixed IPC subset.
+// Kept beside the copied Snapshot rather than growing every snapshot copy.
+struct WheelPresentation {
+    WheelRing ring;
+    int32_t hoverSlot = -1;
+    bool open = false;
+};
+static SRWLOCK wheelPresentationLock = SRWLOCK_INIT;
+static WheelPresentation wheelPresentation[2];
+static void publishWheelPresentation(unsigned hand, const WeaponWheel &wheel) {
+    AcquireSRWLockExclusive(&wheelPresentationLock);
+    auto &out = wheelPresentation[hand];
+    out.open = wheel.open && wheel.ring.anchored;
+    if (out.open) {
+        out.ring = wheel.ring;
+        out.hoverSlot = wheel.hoverSlot;
+    }
+    ReleaseSRWLockExclusive(&wheelPresentationLock);
+}
+// One-shot actions chosen on a wheel bubble, by WheelBubble value. Simulation
+// stores the release tick; the player input poll (or the presentation, for the
+// game menu) consumes it once. Stale requests expire instead of firing late.
+static std::atomic<uint64_t> wheelRequests[WheelBubbleCount]{};
+static void requestWheelAction(WheelBubble action) {
+    static const char *const names[WheelBubbleCount] = {"Netricsa", "game menu", "quick save", "quick load"};
+    if (action == WheelBubble::None) return;
+    wheelRequests[uint32_t(action)].store(GetTickCount64(), std::memory_order_relaxed);
+    log("Weapon wheel requested %s", names[uint32_t(action)]);
+}
+static bool takeWheelRequest(WheelBubble action, uint64_t now) {
+    if (action == WheelBubble::None) return false;
+    const uint64_t tick = wheelRequests[uint32_t(action)].exchange(0, std::memory_order_relaxed);
+    return tick && now >= tick && now - tick < 500;
+}
+bool wheelMenuRequested(uint64_t now) noexcept {
+    return takeWheelRequest(WheelBubble::Menu, now);
+}
+// Netricsa and the game menu are always offered; native quick save/load only in
+// single player, where the game owns the save.
+static uint32_t wheelBubbles() {
+    uint32_t mask = wheelBubbleBit(WheelBubble::Netricsa) | wheelBubbleBit(WheelBubble::Menu);
+    if (singlePlayer && singlePlayer())
+        mask |= wheelBubbleBit(WheelBubble::QuickSave) | wheelBubbleBit(WheelBubble::QuickLoad);
+    return mask;
+}
+// Native weapon-menu direction/order (samGetWeaponsMenuDir/Order) groups related
+// weapons around the ring; id order remains when those optional exports are absent.
+static void orderWheelWeapons(WheelUi &ui) {
+    if (!nativeWeaponMenuDirection || !nativeWeaponMenuOrder) return;
+    const uint32_t count = std::min(ui.count, WeaponCount);
+    int32_t key[WeaponCount];
+    for (uint32_t i = 0; i != count; ++i) {
+        const int32_t direction = nativeWeaponMenuDirection(ui.weapon[i]), order = nativeWeaponMenuOrder(ui.weapon[i]);
+        key[i] = direction < 0 || order < 0 ? INT32_MAX : direction * 64 + order * 32 + ui.weapon[i];
+    }
+    for (uint32_t i = 1; i < count; ++i)
+        for (uint32_t j = i; j && key[j] < key[j - 1]; --j) {
+            std::swap(key[j], key[j - 1]);
+            std::swap(ui.weapon[j], ui.weapon[j - 1]);
+            std::swap(ui.ammo[j], ui.ammo[j - 1]);
+        }
+}
 static TriggerGate gates[2];
 static HeldZoomInput zoomInputs[2];
 static uint32_t lastButtons[2]{};
@@ -1199,11 +1270,17 @@ static void update(void *p) {
                 ui.ammo[ui.count] = ammo(static_cast<uint8_t *>(p) + 0x8f8, id);
                 ui.count++;
             }
+        orderWheelWeapons(ui);
         bool valid = enabled && !resettingControls && input.handValid[h] && finite(input.hand[h]);
         bool wheelAllowed = valid && rider.handheld() && !(input.blockedWheels & (1u << h));
-        int selected = wheels[h].sample(input, unsigned(h), ui.weapon, ui.count, wheelAllowed);
+        // A squeeze that starts a carry pickup on this hand never opens its wheel.
+        const bool grabPriority = false;
+        int selected = wheels[h].sample(input, unsigned(h), ui.weapon, ui.count, wheelAllowed,
+                                        wheelBubbles(), grabPriority);
         ui.open = wheels[h].open;
         ui.hover = wheels[h].hover;
+        publishWheelPresentation(unsigned(h), wheels[h]);
+        requestWheelAction(wheels[h].action);
         const bool fireAllowed = rider.seated() || (rider.handheld() && wheelAllowed &&
             !wheels[h].open && pendingSelection[h] < 0 && weapon != nullptr);
         s.fire[h] = gates[h].update(input.trigger[h], valid && primaryActionEligible(input, unsigned(h)) &&
@@ -3168,6 +3245,7 @@ float frozenWorldVisibility() {
 static void freezeLasers(const Request &request);
 static void drawLasers();
 static void drawSteeringWheel();
+static void drawWeaponWheels();
 static void __fastcall viewExecute(void *command, void *) {
     const auto generation = graphicsResourceGeneration();
     auto *previousExecution = executingView;
@@ -3187,6 +3265,7 @@ static void __fastcall viewExecute(void *command, void *) {
             if (!executedWeaponWorld.valid) weaponPairFault = true;
             drawLasers();
             drawSteeringWheel();
+            drawWeaponWheels();
         }
     }, [&](bool aborted) noexcept {
         executingView = !aborted && generation == graphicsResourceGeneration() ? previousExecution : nullptr;
@@ -5780,12 +5859,17 @@ static CommandInt originalDown = nullptr, originalPressed = nullptr, originalRel
 static VoidThis originalPoll = nullptr;
 static DataGet getData = nullptr;
 static uint32_t *(__cdecl *toId)(uint32_t *, const char *) = nullptr;
-constexpr int CommandCount = 16;
+constexpr int CommandCount = 18;
+// Quick save/load are queried with IsCommandPressed on these same player
+// bindings (Sam2Game player-controls vtable 2C3424 slot 7, RVA F2880, called
+// from slot 3 before plcmdFire). Only wheel pulses drive them; otherwise the
+// native keyboard binding passes through.
+constexpr int FirstPassThroughCommand = 16;
 static uint32_t ids[CommandCount]{};
 static const char *commands[] = {"plcmdX+",   "plcmdX-",        "plcmdZ+",  "plcmdZ-",     "plcmdY+",
                                  "plcmdFire", "plcmdAltFire",   "plcmdUse", "plcmdSprint", "plcmdH+",
                                  "plcmdH-",   "plcmdMouseLook", "plcmdP+",  "plcmdP-",     "plcmdReloadWeapon",
-                                 "plcmdDisplayNetricsa"};
+                                 "plcmdDisplayNetricsa", "plccmdQuickSave", "plccmdQuickLoad"};
 static_assert(sizeof(commands) / sizeof(commands[0]) == CommandCount);
 static void *playerBindings = nullptr;
 static float values[CommandCount]{}, priorValues[CommandCount]{};
@@ -6357,28 +6441,33 @@ static bool steeringWheelTextureReady(void *texture) {
     uintptr_t table=0;std::memcpy(&table,texture,4);
     return table==staticTextureVtable && !(static_cast<const uint8_t*>(texture)[4]&1u);
 }
-static void loadSteeringWheelTexture() {
-    auto &w=steeringWheel;
-    if(w.textureTried || !resourceObtain || !textureDataType || !*textureDataType || !smartAddRef || !smartRemRef)return;
-    w.textureTried=true;
+// Main thread only. The texture Ptr is owned at &texture for the process.
+static bool obtainStaticTexture(void *&texture,const char *path) {
+    if(!resourceObtain || !textureDataType || !*textureDataType || !smartAddRef || !smartRemRef)return false;
     // Mirror the game's own immediate texture wrapper (sniper mask): method 0,
     // null name, then replace a pending proxy by its loaded object. The Ptr owner
-    // address is &w.texture throughout, as for the native AddRef/RemRef pairs.
+    // address is &texture throughout, as for the native AddRef/RemRef pairs.
     const bool completed=withNativeFinally([&] {
-        resourceObtain(&w.texture,*textureDataType,0,1,1,
-            "Content/SeriousSam2/Models/Vehicles/HoverFighter/Textures/Fighter.tex",nullptr);
-        void *proxy=w.texture;
+        resourceObtain(&texture,*textureDataType,0,1,1,path,nullptr);
+        void *proxy=texture;
         if(proxy && readableMemory(proxy,8) && (static_cast<const uint8_t*>(proxy)[4]&1u)) {
             using Replacement=void *(__thiscall *)(void *);
             auto **table=*static_cast<Replacement **>(proxy);
             void *loaded=table[3](proxy);
-            if(loaded)smartAddRef(loaded,&w.texture);
-            w.texture=loaded;
-            smartRemRef(proxy,&w.texture);
+            if(loaded)smartAddRef(loaded,&texture);
+            texture=loaded;
+            smartRemRef(proxy,&texture);
         }
     },[](bool) noexcept {});
-    if(!completed)w.texture=nullptr;
-    const bool ready=completed && steeringWheelTextureReady(w.texture);
+    if(!completed)texture=nullptr;
+    return completed && steeringWheelTextureReady(texture);
+}
+static void loadSteeringWheelTexture() {
+    auto &w=steeringWheel;
+    if(w.textureTried || !resourceObtain || !textureDataType || !*textureDataType || !smartAddRef || !smartRemRef)return;
+    w.textureTried=true;
+    const bool ready=obtainStaticTexture(w.texture,
+        "Content/SeriousSam2/Models/Vehicles/HoverFighter/Textures/Fighter.tex");
     log("Steering wheel texture %s",ready ? "loaded" : "unavailable; using plain wheel");
 }
 static void updateSteeringWheel(const Snapshot &s) {
@@ -6492,6 +6581,228 @@ static void drawSteeringWheel() {
     if(wasBlend)(*enableBlend)();
     if(wasAlpha)(*enableAlpha)();
     (*setDepthComparison)(priorComparison);
+}
+// Hand weapon wheels, drawn in each eye after the root world like the lasers.
+// Translucent bubbles carry the game's own weapon icons (samGetWeaponIcon) and
+// face the head. Colours are native constant RGBA; icon tint is only grey and
+// alpha. Depth testing is off so an open wheel stays readable over the held
+// weapon and nearby geometry. Main thread only; gfx state is restored after.
+struct WeaponWheelTextures {
+    void *netricsa=nullptr;
+    bool tried=false;
+};
+static WeaponWheelTextures weaponWheelTextures;
+static void loadWeaponWheelTextures(const Snapshot &s) {
+    auto &t=weaponWheelTextures;
+    if(t.tried || !nativeMainThread || !nativeMainThread() || (!s.ui.wheel[0].open && !s.ui.wheel[1].open))return;
+    t.tried=true;
+    const bool ready=obtainStaticTexture(t.netricsa,"Content/SeriousSam2/Textures/Interface/Hud/netricsa.tex");
+    log("Weapon wheel Netricsa icon %s",ready ? "loaded" : "unavailable; using a drawn symbol");
+}
+struct WheelBillboard {
+    Vec3 centre,right,up;
+    Vec3 at(float u,float v) const {return centre+right*u+up*v;}
+};
+// Whole triangles in both windings, so native face culling cannot hide them;
+// one bounded client array per constant colour.
+struct WheelBatch {
+    static constexpr size_t Capacity=960;
+    Vec3 position[Capacity];
+    size_t count=0;
+    uint32_t color=0;
+    void flush() {
+        if(!count)return;
+        constantColor(color);
+        (*bindVertexArray)(0,position,0x87,int(count*12),12);
+        (*drawVertices)(0x99,int(count/3),0);
+        count=0;
+    }
+    void triangle(uint32_t rgba,Vec3 a,Vec3 b,Vec3 c) {
+        if(rgba!=color || count+6>Capacity) {flush();color=rgba;}
+        const Vec3 corners[6]{a,b,c,a,c,b};
+        std::copy_n(corners,6,position+count);
+        count+=6;
+    }
+    void quad(uint32_t rgba,const WheelBillboard &b,float u0,float v0,float u1,float v1) {
+        const Vec3 p00=b.at(u0,v0),p10=b.at(u1,v0),p11=b.at(u1,v1),p01=b.at(u0,v1);
+        triangle(rgba,p00,p10,p11);triangle(rgba,p00,p11,p01);
+    }
+    // A disc when inner is zero, otherwise an annulus.
+    void ring(uint32_t rgba,const WheelBillboard &b,float inner,float outer,unsigned segments=28) {
+        for(unsigned i=0;i!=segments;++i) {
+            const float a0=2*Pi*float(i)/float(segments),a1=2*Pi*float(i+1)/float(segments);
+            const float c0=std::cos(a0),s0=std::sin(a0),c1=std::cos(a1),s1=std::sin(a1);
+            const Vec3 o0=b.at(c0*outer,s0*outer),o1=b.at(c1*outer,s1*outer);
+            if(inner<=0) {triangle(rgba,b.centre,o0,o1);continue;}
+            const Vec3 i0=b.at(c0*inner,s0*inner),i1=b.at(c1*inner,s1*inner);
+            triangle(rgba,i0,o0,o1);triangle(rgba,i0,o1,i1);
+        }
+    }
+};
+static WheelBatch wheelBatch;
+static uint32_t wheelTint(uint8_t grey,uint8_t alpha) {
+    return grey|uint32_t(grey)<<8|uint32_t(grey)<<16|uint32_t(alpha)<<24;
+}
+// Fit a loaded CStaticTexture into a box. CStaticTexture GetWidth/GetHeight
+// (Engine vtable slots 14/15, RVA 81130/81140) return the fields at +30/+34.
+static bool wheelIconExtent(void *texture,float width,float height,float &halfWidth,float &halfHeight) {
+    if(!steeringWheelTextureReady(texture) || !readableMemory(texture,0x38))return false;
+    int32_t size[2]{};
+    std::memcpy(size,static_cast<const uint8_t*>(texture)+0x30,sizeof(size));
+    if(size[0]<1 || size[1]<1 || size[0]>8192 || size[1]>8192)return false;
+    const float scale=std::min(width/float(size[0]),height/float(size[1]));
+    halfWidth=.5f*scale*float(size[0]);halfHeight=.5f*scale*float(size[1]);
+    return std::isfinite(halfWidth) && std::isfinite(halfHeight);
+}
+static void drawWheelIcon(void *texture,const WheelBillboard &b,float halfWidth,float halfHeight,uint32_t tint) {
+    wheelBatch.flush();
+    static Vec3 position[12];
+    static float uv[12][2];
+    static uint32_t color[12];
+    const Vec3 corner[4]{b.at(-halfWidth,halfHeight),b.at(halfWidth,halfHeight),
+                         b.at(halfWidth,-halfHeight),b.at(-halfWidth,-halfHeight)};
+    constexpr float cornerUv[4][2]{{0,0},{1,0},{1,1},{0,1}}; // Engine/D3D top-left origin.
+    constexpr unsigned order[12]{0,1,2,0,2,3,0,2,1,0,3,2};
+    for(unsigned i=0;i!=12;++i) {
+        position[i]=corner[order[i]];
+        uv[i][0]=cornerUv[order[i]][0];uv[i][1]=cornerUv[order[i]][1];
+        color[i]=tint;
+    }
+    useSimpleShader(3); // GFU_SHD_POS_TEX_COL
+    currentTexture(0,texture,0);
+    (*bindVertexArray)(0,position,0x87,12*12,12);
+    (*bindVertexArray)(2,uv,0x86,12*8,8);
+    (*bindVertexArray)(3,color,0x82,12*4,4);
+    (*drawVertices)(0x99,4,0);
+    (*unbindVertexBuffers)();
+    useSimpleShader(0); // GFU_SHD_POS with gfuConstantColor
+}
+// Bubble symbols in units of the symbol half-extent: menu bars, save/load
+// arrows into/out of a tray and an information mark for Netricsa.
+static void drawWheelSymbol(WheelBubble bubble,const WheelBillboard &b,float s) {
+    constexpr uint32_t ink=0xf5f7faffu;
+    const auto box=[&](float u0,float v0,float u1,float v1) {wheelBatch.quad(ink,b,u0*s,v0*s,u1*s,v1*s);};
+    const auto tray=[&] {box(-.6f,-.62f,.6f,-.48f);box(-.6f,-.62f,-.46f,-.2f);box(.46f,-.62f,.6f,-.2f);};
+    switch(bubble) {
+    case WheelBubble::Menu:
+        box(-.55f,.28f,.55f,.46f);box(-.55f,-.09f,.55f,.09f);box(-.55f,-.46f,.55f,-.28f);
+        break;
+    case WheelBubble::QuickSave:
+        tray();box(-.11f,-.05f,.11f,.62f);
+        wheelBatch.triangle(ink,b.at(-.38f*s,-.05f*s),b.at(.38f*s,-.05f*s),b.at(0,-.42f*s));
+        break;
+    case WheelBubble::QuickLoad:
+        tray();box(-.11f,-.36f,.11f,.2f);
+        wheelBatch.triangle(ink,b.at(-.38f*s,.2f*s),b.at(.38f*s,.2f*s),b.at(0,.62f*s));
+        break;
+    case WheelBubble::Netricsa:
+        box(-.12f,.36f,.12f,.6f);box(-.12f,-.6f,.12f,.2f);
+        break;
+    default:
+        break;
+    }
+}
+// Both eyes of one request draw the same copy of the published wheels.
+static struct {
+    uint64_t sequence=0;
+    uint32_t session=0;
+    WheelPresentation wheel[2];
+} eyeWheels;
+static void drawWeaponWheel(unsigned hand,const Pose &head) {
+    const auto &view=eyeWheels.wheel[hand];
+    const auto &ui=eyeSnapshot.ui.wheel[hand];
+    const auto &ring=view.ring;
+    if(!ui.open || !view.open || !ring.anchored || !ring.count || ring.count>WheelSlotCount ||
+       !std::isfinite(ring.radius) || !std::isfinite(ring.itemSize))return;
+    // The ring lives in tracking space like a hand: it follows the rig, not the world.
+    const Pose frame=worldHandTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head,ring.frame);
+    if(!finite(frame))return;
+    const Vec3 ringRight=rotate(frame.q,Vec3{1,0,0}),ringUp=rotate(frame.q,Vec3{0,1,0});
+    const auto billboard=[&](Vec3 centre) {
+        // Face the head centre (shared by both eyes) and keep the ring's up.
+        Vec3 forward=head.p-centre;
+        const float distance=std::sqrt(dot(forward,forward));
+        Vec3 right=distance>.01f ? cross(ringUp,forward*(1/distance)) : Vec3{};
+        const float width=std::sqrt(dot(right,right));
+        if(!(width>.05f))return WheelBillboard{centre,ringRight,ringUp};
+        right=right*(1/width);
+        return WheelBillboard{centre,right,cross(forward*(1/distance),right)};
+    };
+    // Faint outline of the centre: releasing inside it cancels.
+    const float cancel=WheelDeadZone*ring.radius;
+    wheelBatch.ring(0xffffff38u,WheelBillboard{frame.p,ringRight,ringUp},cancel-.0015f,cancel+.0015f,40);
+    constexpr uint32_t gold=0xffc23affu;
+    const uint32_t handColour=hand ? 0x40dfffffu : 0x60ff40ffu; // Laser colours.
+    constexpr uint32_t bubbleFill[WheelBubbleCount]{0x1d7891d8u,0x6a44a8d8u,0x2f8a46d8u,0xb37a1cd8u};
+    const auto drawItem=[&](uint32_t i) {
+        const auto &slot=ring.slot[i];
+        const bool hovered=int(i)==view.hoverSlot;
+        const float radius=ring.itemSize*(hovered ? .65f : .5f);
+        const auto b=billboard(frame.p+rotate(frame.q,ring.slotPosition(i)));
+        if(hovered)
+            for(unsigned g=0;g!=3;++g)
+                wheelBatch.ring((gold&~0xffu)|(0x70u>>g),b,radius*(1+.15f*float(g)),radius*(1.15f+.15f*float(g)));
+        if(slot.bubble!=WheelBubble::None) {
+            const uint32_t kind=uint32_t(slot.bubble);
+            wheelBatch.ring(bubbleFill[kind<WheelBubbleCount ? kind : 0],b,0,radius);
+            wheelBatch.ring(hovered ? gold : 0xe8eef4c0u,b,radius*.9f,radius);
+            float halfWidth=0,halfHeight=0;
+            if(slot.bubble==WheelBubble::Netricsa &&
+               wheelIconExtent(weaponWheelTextures.netricsa,radius*1.3f,radius*1.3f,halfWidth,halfHeight))
+                drawWheelIcon(weaponWheelTextures.netricsa,b,halfWidth,halfHeight,wheelTint(0xff,0xff));
+            else
+                drawWheelSymbol(slot.bubble,b,radius*.62f);
+            return;
+        }
+        int32_t rounds=-1; // Native: -1 for weapons without ammunition, 0 when empty.
+        if(slot.index>=0 && uint32_t(slot.index)<ui.count && uint32_t(slot.index)<WeaponCount &&
+           ui.weapon[slot.index]==slot.weapon)
+            rounds=ui.ammo[slot.index];
+        const bool empty=rounds==0,held=eyeSnapshot.ui.currentWeapon[hand]==slot.weapon;
+        wheelBatch.ring(hovered ? 0x3a2c14e8u : 0x161d27d0u,b,0,radius);
+        wheelBatch.ring(hovered ? gold : held ? handColour : empty ? 0xb83c3cffu : 0x8c99a8e0u,b,radius*.9f,radius);
+        void *icon=nativeWeaponIcon ? nativeWeaponIcon(slot.weapon) : nullptr;
+        float halfWidth=0,halfHeight=0;
+        if(wheelIconExtent(icon,radius*1.8f,radius*1.2f,halfWidth,halfHeight))
+            drawWheelIcon(icon,b,halfWidth,halfHeight,empty ? wheelTint(0x80,0xa0) : wheelTint(0xff,0xff));
+    };
+    for(uint32_t i=0;i!=ring.count;++i)
+        if(int(i)!=view.hoverSlot)drawItem(i);
+    if(view.hoverSlot>=0 && uint32_t(view.hoverSlot)<ring.count)drawItem(uint32_t(view.hoverSlot));
+}
+static void drawWeaponWheels() {
+    if(!eyeAnchorReady || !nativeMainThread || !nativeMainThread() || !eyeSnapshot.ui.gameplay ||
+       !eyeSnapshot.rider.handheld() || !rootView || !currentCanvas || !*currentCanvas || !unbindVertexBuffers ||
+       !*unbindVertexBuffers || !bindVertexArray || !*bindVertexArray || !drawVertices || !*drawVertices ||
+       !useSimpleShader || !constantColor || !currentTexture || !nativeBlendType || !blendSource ||
+       !blendDestination || !setBlendFunction || !*setBlendFunction)return;
+    if(!eyeSnapshot.ui.wheel[0].open && !eyeSnapshot.ui.wheel[1].open)return;
+    if(eyeWheels.sequence!=eyeRequest.sequence || eyeWheels.session!=eyeRequest.session) {
+        AcquireSRWLockShared(&wheelPresentationLock);
+        std::copy_n(wheelPresentation,2,eyeWheels.wheel);
+        ReleaseSRWLockShared(&wheelPresentationLock);
+        eyeWheels.sequence=eyeRequest.sequence;eyeWheels.session=eyeRequest.session;
+    }
+    if(!eyeWheels.wheel[0].open && !eyeWheels.wheel[1].open)return;
+    const Pose head=worldHeadTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head);
+    if(!finite(head))return;
+    ortho();
+    activateView(rootView);
+    const bool wasDepth=*depthEnabled!=0,wasWrite=*depthWriting!=0;
+    const bool wasBlend=*blending!=0,wasAlpha=*alphaTesting!=0;
+    const int priorSource=*blendSource,priorDestination=*blendDestination;
+    (*disableDepth)();(*disableDepthWrite)();(*disableAlpha)();
+    nativeBlendType(501); // GFU_BT_TRANSLUCENT: source alpha over the frame.
+    (*unbindVertexBuffers)();
+    useSimpleShader(0);
+    for(unsigned h=0;h!=2;++h)drawWeaponWheel(h,head);
+    wheelBatch.flush();
+    (*unbindVertexBuffers)(); // Leave no client arrays bound to later native draws.
+    (*setBlendFunction)(priorSource,priorDestination);
+    if(!wasBlend)(*disableBlend)();
+    if(wasDepth)(*enableDepth)();
+    if(wasWrite)(*enableDepthWrite)();
+    if(wasAlpha)(*enableAlpha)();
 }
 // Core's activity test selects the inactive frame cap and input routing. A live
 // VR session owns the game regardless of which desktop window has focus.
@@ -6623,6 +6934,7 @@ static void __fastcall poll(void *b, void *) {
             fire[h] = fire[h] && multiplayer::localPrimaryAllowed(s.player, h, s.intentEpoch[h],
                 s.input.primaryInputGeneration[h], s.input.sequence);
     updateSteeringWheel(s); // Before controlsLock: may load a native texture.
+    loadWeaponWheelTextures(s);
     const bool respawn = respawnRoute(s), netricsa = netricsaOpen(s);
     AcquireSRWLockExclusive(&controlsLock);
     playerBindings = b;
@@ -6674,7 +6986,11 @@ static void __fastcall poll(void *b, void *) {
         values[8] = s.sprint ? 1 : 0;
         const uint32_t buttons = s.input.buttons[0] | s.input.buttons[1];
         values[14] = (buttons & Reload) ? 1 : 0;
-        values[15] = (buttons & Netricsa) ? 1 : 0;
+        // Wheel bubbles press their native command for exactly one poll.
+        const uint64_t now = GetTickCount64();
+        values[15] = ((buttons & Netricsa) || takeWheelRequest(WheelBubble::Netricsa, now)) ? 1 : 0;
+        values[16] = takeWheelRequest(WheelBubble::QuickSave, now) ? 1 : 0;
+        values[17] = takeWheelRequest(WheelBubble::QuickLoad, now) ? 1 : 0;
     }
     const unsigned traceState = unsigned(enabled) | unsigned(values[5] > 0) << 1 | unsigned(values[6] > 0) << 2 |
         unsigned(values[7] > 0) << 3 | unsigned(values[4] > 0) << 4 | unsigned(respawn) << 5 | unsigned(netricsa) << 6;
@@ -6731,7 +7047,7 @@ static float __fastcall commandValue(void *b, void *, uint32_t id) {
     ReleaseSRWLockShared(&controlsLock);
     if (!currentControls(i, snapshot, captured, v > 0))
         v = 0;
-    return i < 0 ? originalValue(b, id) : v;
+    return i < 0 || (i >= FirstPassThroughCommand && v <= 0) ? originalValue(b, id) : v;
 }
 static int query(void *b, uint32_t id, int mode, CommandInt original) {
     auto snapshot = copySnapshot();
@@ -6752,7 +7068,7 @@ static int query(void *b, uint32_t id, int mode, CommandInt original) {
     float v = i < 0 || !enabled ? 0 : values[i], prev = i < 0 ? 0 : priorValues[i];
     const auto captured = sampledControls;
     ReleaseSRWLockShared(&controlsLock);
-    if (i < 0)
+    if (i < 0 || (i >= FirstPassThroughCommand && v <= 0 && prev <= 0))
         return original(b, id);
     return nativeCommandQuery(v, prev, mode, currentControls(i, snapshot, captured, v > 0));
 }
@@ -7689,6 +8005,22 @@ bool attach(bool headless) {
             settings.steeringWheel.enabled = false;
             log("Steering wheel disabled: native drawing/resource entries unavailable");
         }
+        // Weapon-wheel presentation is optional as well: without these entries the
+        // wheel still selects, labelled only by the host. Menu order is cosmetic.
+        bool weaponWheelSymbols = wheelSymbols;
+#define WEAPON_WHEEL(module, name, out) weaponWheelSymbols = symbol(module, name, out) && weaponWheelSymbols
+        WEAPON_WHEEL(g, "?samGetWeaponIcon@SeriousEngine@@YAPAVCTexture@1@W4WeaponIndex@1@@Z", nativeWeaponIcon);
+        WEAPON_WHEEL(e, "?_gfx_eBlendSrc@SeriousEngine@@3W4GfxBlend@1@A", blendSource);
+        WEAPON_WHEEL(e, "?_gfx_eBlendDst@SeriousEngine@@3W4GfxBlend@1@A", blendDestination);
+        WEAPON_WHEEL(e, "?_gfxBlendFunc@SeriousEngine@@3P6AXW4GfxBlend@1@0@ZA", setBlendFunction);
+#undef WEAPON_WHEEL
+        if (!weaponWheelSymbols) {
+            setBlendFunction = nullptr;
+            log("Weapon wheel drawing disabled: native icon/blend entries unavailable");
+        }
+        if (!symbol(g, "?samGetWeaponsMenuDir@SeriousEngine@@YAJW4WeaponIndex@1@@Z", nativeWeaponMenuDirection) ||
+            !symbol(g, "?samGetWeaponsMenuOrder@SeriousEngine@@YAJW4WeaponIndex@1@@Z", nativeWeaponMenuOrder))
+            nativeWeaponMenuDirection = nativeWeaponMenuOrder = nullptr;
         S(e, "?_gfxEnableDepthBuffer@SeriousEngine@@3P6AXXZA", enableDepth);
         S(e, "?_gfxDisableDepthBuffer@SeriousEngine@@3P6AXXZA", disableDepth);
         S(e, "?_gfxEnableDepthWrite@SeriousEngine@@3P6AXXZA", enableDepthWrite);

@@ -1,5 +1,6 @@
 #pragma once
 #include "math.hpp"
+#include "weapon_wheel.hpp"
 namespace ss2vr {
 // Input provenance only: native gameplay still owns firing and zoom. A lost
 // action or changed logical stream cannot reuse an earlier neutral witness.
@@ -274,17 +275,28 @@ struct MenuNavigation {
         return direction;
     }
 };
+// Per-hand wheel on the squeeze action. A fresh press opens a ring anchored at
+// the hand; the hand (or a deflected thumbstick) hovers an item and release
+// commits it. Releasing over nothing cancels. Native code validates the choice.
 struct WeaponWheel {
     bool open = false, previousHold = false;
-    int hover = -1;
-    int selected = -1;
+    int hover = -1;    // WheelUi encoding: weapon list index or wheelBubbleHover().
+    int selected = -1; // Weapon id committed by this update, else -1.
+    WheelBubble action = WheelBubble::None; // Bubble committed by this update.
+    int hoverSlot = -1;
+    WheelRing ring;
     void cancel() {
         open = false;
-        hover = -1;
+        hover = hoverSlot = -1;
         selected = -1;
+        action = WheelBubble::None;
+        ring.anchored = false;
     }
     uint32_t inputEpoch = 0;
-    int sample(const Input &input, unsigned hand, const int *ids, uint32_t count, bool allowed) {
+    // grabPriority: this hand's squeeze belongs to a carry pickup. Only a fresh
+    // press opens the wheel, so a press that started a grab never opens it later.
+    int sample(const Input &input, unsigned hand, const int *ids, uint32_t count, bool allowed,
+               uint32_t bubbles = 0, bool grabPriority = false) {
         if (hand >= 2) { cancel(); return -1; }
         if (inputEpoch != input.wheelInputEpoch[hand]) {
             inputEpoch = input.wheelInputEpoch[hand];
@@ -297,35 +309,55 @@ struct WeaponWheel {
             return -1;
         }
         return update((input.buttons[hand] & Wheel) != 0, input.axis[hand][0], input.axis[hand][1],
-                      ids, count, allowed);
+                      ids, count, allowed, wheelPointer(input, hand), bubbles, grabPriority);
     }
-    int update(bool held, float x, float y, const int *ids, uint32_t count, bool allowed) {
+    int update(bool held, float x, float y, const int *ids, uint32_t count, bool allowed,
+               const WheelPointer &pointer = {}, uint32_t bubbles = 0, bool grabPriority = false) {
         selected = -1;
+        action = WheelBubble::None;
         if (!allowed || !std::isfinite(x) || !std::isfinite(y) || count > WeaponCount) {
             cancel();
             previousHold = held;
             return -1;
         }
-        if (held && !previousHold) {
+        if (held && !previousHold && !grabPriority) {
             open = true;
-            hover = -1;
+            hoverSlot = -1;
+            // Anchored where the hand is now; without a pose only the stick hovers.
+            ring.anchored = pointer.valid;
+            ring.frame = pointer.valid ? wheelRingFrame(pointer.hand, pointer.head) : Pose{};
+            ring.count = 0;
         }
         if (open) {
-            float r = std::sqrt(x * x + y * y);
-            if (r < .3f || !count)
-                hover = -1;
-            else {
-                float a = std::atan2(x, y);
-                if (a < 0)
-                    a += 2 * Pi;
-                hover = int(std::floor((a + Pi / count) / (2 * Pi / count))) % int(count);
+            WheelSlot previous[WheelSlotCount];
+            const uint32_t previousCount = ring.count;
+            std::copy_n(ring.slot, previousCount, previous);
+            ring.layout(ids, count, bubbles & WheelAllBubbles);
+            bool moved = ring.count != previousCount;
+            for (uint32_t i = 0; !moved && i != ring.count; ++i)
+                moved = ring.slot[i].weapon != previous[i].weapon || ring.slot[i].bubble != previous[i].bubble;
+            if (moved)
+                hoverSlot = -1; // Inventory changed under the ring; never keep a moved slot.
+            const bool stick = std::sqrt(x * x + y * y) >= WheelStickDeadZone;
+            hoverSlot = stick ? ring.pickStick(x, y, hoverSlot)
+                      : pointer.valid ? ring.pickHand(pointer.hand, hoverSlot) : -1;
+            hover = -1;
+            if (hoverSlot >= 0) {
+                const auto &slot = ring.slot[hoverSlot];
+                hover = slot.bubble != WheelBubble::None ? wheelBubbleHover(slot.bubble) : slot.index;
             }
         }
         if (!held && previousHold && open) {
-            if (hover >= 0 && uint32_t(hover) < count)
-                selected = ids[hover];
+            if (hoverSlot >= 0 && uint32_t(hoverSlot) < ring.count) {
+                const auto &slot = ring.slot[hoverSlot];
+                if (slot.bubble != WheelBubble::None)
+                    action = slot.bubble;
+                else if (slot.index >= 0 && uint32_t(slot.index) < count && ids[slot.index] == slot.weapon)
+                    selected = slot.weapon;
+            }
             open = false;
-            hover = -1;
+            hover = hoverSlot = -1;
+            ring.anchored = false;
         }
         previousHold = held;
         return selected;
