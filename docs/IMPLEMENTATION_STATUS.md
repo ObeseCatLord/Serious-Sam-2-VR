@@ -1,5 +1,33 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-10 (late) — inputs, render size and weapon scale from user reports
+
+User reports after the first headset session: menu buttons and triggers did
+nothing, render resolution was low and weapons looked small. Simulated Monado
+runs V90–V93 (interactive hold, Index input driver `tools/monado_input_driver.cpp`)
+reproduced and verified each fix:
+
+- Fire: the trigger reached native controls (`route=ordinary fire=1`) but the
+  per-hand primary projection refused coupled dual weapons (two guns without
+  combo weapons) and forced the lane neutral, so nothing fired. Unrepresentable
+  topologies are now left unclaimed; native Fire carries the VR trigger and both
+  triggers send Fire for coupled guns. V91/V93: `DoTheFiring result=1` for both
+  hands from either trigger.
+- Menus: the native dispatcher takes system commands (syscmdOk 0x0B, Back 0x0C,
+  arrows 0x0D–0x10, F1/F2 0x15/0x16), not keyboard ids; keys for other screens
+  are posted to the game window (Core reads window messages), so no focus is
+  needed. The pointer accepted only an exact menu frame and dropped every other
+  poll; it now accepts a bounded lag on the same menu. V92/V93: Menu opens the
+  pause menu, a pointer trigger click opens the selected submenu, Back closes it.
+- Render size: eyes render at the runtime's recommendedImageRect (V92/V93:
+  1344×1512 from the remote driver instead of the 1280×705 window). Core's client
+  rectangle reports that size for the main window, GfxD3D's windowed depth covers
+  it, and pixels travel in per-canvas shared sections (ABI 12). VR needs windowed
+  mode; a fullscreen display mode has no window canvas to resize.
+- Weapons scale about the hand with shots/lasers following the barrel; automatic
+  default from the native weapon/world FOV ratio (V93: world 58.4°, weapon
+  20–32°), tempered to the geometric mean of true and flat apparent size.
+
 ## 2026-10-10 — full-feature black world and startup stall resolved
 
 The user resumed development after the pause recorded in

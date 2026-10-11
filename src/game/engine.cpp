@@ -3522,8 +3522,9 @@ static Matrix44 *__fastcall project(void *p, void *, Matrix44 *out) {
     return out;
 }
 // The flat game draws first-person weapons with their own (narrower) FOV, which
-// magnifies them against the world. Automatic VR scale restores that apparent
-// size: tan(worldFov/2) / tan(weaponFov/2), from the native frustum arguments.
+// magnifies them against the world by tan(worldFov/2) / tan(weaponFov/2) (from
+// the native frustum arguments). At full magnification hand-held guns overlap;
+// automatic VR scale uses the geometric mean of true and flat apparent size.
 static std::atomic<float> nativeWorldFov{0}, nativeWeaponFov[64]{};
 static void noteWorldFov(float fov) {
     constexpr float degree = Pi / 180;
@@ -3541,7 +3542,8 @@ static float weaponModelScale(const VrSettings &s, int id) {
     float base = s.weaponScale;
     if (base <= 0) { // Automatic.
         const float world = nativeWorldFov.load(), weapon = id >= 0 && id < 64 ? nativeWeaponFov[id].load() : 0;
-        base = world > 0 && weapon > 0 ? std::clamp(std::tan(world / 2) / std::tan(weapon / 2), 1.f, 2.5f) : 1.f;
+        base = world > 0 && weapon > 0 ?
+            std::clamp(std::sqrt(std::tan(world / 2) / std::tan(weapon / 2)), 1.f, 1.6f) : 1.f;
     }
     return id >= 0 && id < int(WeaponCount) ? base * s.weaponScaleById[id] : base;
 }

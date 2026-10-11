@@ -15,8 +15,11 @@ Codex must not continue those probes under the current instruction.
   `0a266ded…8b69`, `Bin/SS2VR/ss2vr_host.exe` `20308ef0…c403`,
   `Bin/SS2VR/openxr_loader.dll` `bb011caa…bd1d`. Compare against the package
   `manifest.json`; the installer refuses mismatches.
-- Game settings for VR: D3D renderer, `gfx_bHDRRendering = 0`, no MSAA, resolution
-  at most 2048 per side (Options → Video, or `Content/SeriousSam2/Sam2.ini`).
+- Game settings for VR: D3D renderer, windowed (`gfx_bFullScreen = 0`),
+  `gfx_bHDRRendering = 0`, no MSAA (Options → Video, or
+  `Content/SeriousSam2/Sam2.ini`). Eye resolution follows the headset's OpenXR
+  recommendation automatically; `[Render] Scale` adjusts it and `[Weapons] Scale`
+  sizes hand-held weapons (0 = automatic).
 - Pre-handoff evidence (simulated Monado, fixed neutral pose, no input): with
   `[Roomscale]`, `[HeadComfort]` and `[Melee]` `Enabled=1`, fourteen consecutive
   fresh startups loaded Jungle, presented both native eyes with the visible world,
