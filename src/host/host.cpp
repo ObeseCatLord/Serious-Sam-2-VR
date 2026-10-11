@@ -231,7 +231,15 @@ Pose pose(const XrPosef &value) {
             {value.position.x, value.position.y, value.position.z}};
 }
 XrPosef xrPose(Pose value) {
-    return {{value.q.x, value.q.y, value.q.z, value.q.w}, {value.p.x, value.p.y, value.p.z}};
+    // Runtimes validate layer orientations strictly (Monado rejects frames with
+    // XR_ERROR_POSE_INVALID); composed float quaternions drift, so renormalize.
+    const double x = value.q.x, y = value.q.y, z = value.q.z, w = value.q.w;
+    const double norm = std::sqrt(x * x + y * y + z * z + w * w);
+    if (!std::isfinite(norm) || norm < 1e-6 || !std::isfinite(value.p.x) || !std::isfinite(value.p.y) ||
+        !std::isfinite(value.p.z))
+        return {{0, 0, 0, 1}, {0, 0, 0}};
+    return {{float(x / norm), float(y / norm), float(z / norm), float(w / norm)},
+            {value.p.x, value.p.y, value.p.z}};
 }
 bool validPose(Pose p) {
     const float norm = p.q.x * p.q.x + p.q.y * p.q.y + p.q.z * p.q.z + p.q.w * p.q.w;
@@ -385,6 +393,29 @@ struct Frame {
     XrTime time;
     bool active = true;
     Frame(Api &a, XrSession s, XrTime t) : api(a), session(s), time(t) {}
+    void rejected(XrResult result, const std::vector<const XrCompositionLayerBaseHeader *> &layers) {
+        static unsigned reports = 0;
+        if (reports >= 8) return;
+        ++reports;
+        char line[256];
+        std::snprintf(line, sizeof line, "xrEndFrame rejected %d with %u layers; frame dropped", int(result),
+                      unsigned(layers.size()));
+        api.log.write(line);
+        for (const auto *layer : layers) {
+            if (!layer) continue;
+            XrPosef pose{};
+            if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD)
+                pose = reinterpret_cast<const XrCompositionLayerQuad *>(layer)->pose;
+            else if (layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                const auto *projection = reinterpret_cast<const XrCompositionLayerProjection *>(layer);
+                if (projection->viewCount && projection->views) pose = projection->views[0].pose;
+            }
+            const auto &q = pose.orientation;
+            std::snprintf(line, sizeof line, "  layer type=%d q=%.6g,%.6g,%.6g,%.6g p=%.6g,%.6g,%.6g", int(layer->type),
+                          q.x, q.y, q.z, q.w, pose.position.x, pose.position.y, pose.position.z);
+            api.log.write(line);
+        }
+    }
     ~Frame() {
         if (active) {
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
@@ -403,6 +434,12 @@ struct Frame {
         // xrEndFrame with different parameters. Close our frame guard on attempt.
         active = false;
         const XrResult result = api.EndFrame(session, &end);
+        // A rejected layer set loses one frame, not the VR session.
+        if (result == XR_ERROR_POSE_INVALID || result == XR_ERROR_LAYER_INVALID ||
+            result == XR_ERROR_SWAPCHAIN_RECT_INVALID) {
+            rejected(result, layers);
+            return result;
+        }
         api.check(result, "xrEndFrame");
         return result;
     }
