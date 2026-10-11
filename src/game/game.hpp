@@ -28,6 +28,8 @@ bool vrInputLive() noexcept;
 void installEyeCanvas() noexcept;
 void setDesktopWorld(bool render) noexcept;
 void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept;
+// Diagnostics: time spent in mod sections (0 player update, 1 lasers, 2 wheels).
+void notePerfSection(unsigned section, LARGE_INTEGER start) noexcept;
 void monoPresentationWithoutRender(void *player);
 void applyEyeCanvas() noexcept;
 // Consumes a fresh weapon-wheel request to open the pause menu (one Back tap).

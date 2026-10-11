@@ -380,6 +380,7 @@ struct PerfClock {
     double frame = 0, stereo = 0, mono = 0, eyeCpu[2]{}, desktopCpu = 0;
     double readTarget = 0, lock = 0, copy = 0, dim = 0, publish = 0, wait = 0, presentCall = 0, presentHook = 0;
     double preStereo = 0, postStereo = 0; // Present end -> stereo start, stereo end -> present start.
+    double section[3]{};
     uint64_t eyeDraws = 0, desktopDraws = 0, hudDuplicates = 0;
     // Pairs rendered but not published, by the state they ended in.
     unsigned lostNoWorld = 0, lostFault = 0, lostNoOverlay = 0, lostIncomplete = 0, lostOther = 0;
@@ -1799,6 +1800,9 @@ void presentDevice(IDirect3DDevice9 *d, uintptr_t caller, const RECT *src, const
     });
 }
 static LARGE_INTEGER lastPresentEnd{}, lastStereoEnd{};
+void notePerfSection(unsigned section, LARGE_INTEGER start) noexcept {
+    if (section < 3) perf.section[section] += PerfClock::seconds(start, PerfClock::now());
+}
 void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept {
     perf.presentCall += PerfClock::seconds(start, end);
     if (lastStereoEnd.QuadPart) perf.postStereo += PerfClock::seconds(lastStereoEnd, start);
@@ -1839,6 +1843,8 @@ static void presentBody(IDirect3DDevice9 *d) {
             log("Perf draws per pair: eyes=%.0f hud duplicates=%.0f; other per frame=%.0f",
                 perf.pairs ? double(perf.eyeDraws) / perf.pairs : 0., perf.pairs ? double(perf.hudDuplicates) / perf.pairs : 0.,
                 double(perf.desktopDraws) / perf.frames);
+            log("Perf mod sections per frame: update=%.2fms lasers=%.2fms wheels=%.2fms", 1000 * perf.section[0] / perf.frames,
+                1000 * perf.section[1] / perf.frames, 1000 * perf.section[2] / perf.frames);
             log("Perf per frame: present call=%.2fms hook=%.2fms | before stereo=%.2fms after stereo=%.2fms (n=%u)",
                 1000 * perf.presentCall / perf.frames, 1000 * perf.presentHook / perf.frames,
                 perf.stereoCalls ? 1000 * perf.preStereo / perf.stereoCalls : 0.,

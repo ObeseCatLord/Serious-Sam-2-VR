@@ -2934,7 +2934,7 @@ static void __fastcall entityStep(void *manager, void *) {
                             continue;
                         }
                         if (localPlayer) {
-                            update(player);
+                            { LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart); update(player); notePerfSection(0, sectionStart); }
                             // Read the published existing snapshot, not Input:
                             // first successful tracking can establish ownership.
                             entry->recognized |= primaryLocalRecognized(copySnapshot(), player, handle);
@@ -3311,7 +3311,7 @@ static void __fastcall step(void *p, void *) {
                     break;
                 }
         if (!prepared) {
-            update(p);
+            { LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart); update(p); notePerfSection(0, sectionStart); }
             if (auto *entry = preparedPrimary(p)) {
                 entry->recognized |= primaryLocalRecognized(copySnapshot(), p, handle);
                 if (entry->recognized) entry->primary = NativePrimaryValue::neutral();
@@ -3560,9 +3560,13 @@ static void __fastcall viewExecute(void *command, void *) {
         if (root) {
             rootCaptureArmed = false;
             if (!executedWeaponWorld.valid) weaponPairFault = true;
+            LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart);
             drawLasers();
+            notePerfSection(1, sectionStart);
             drawSteeringWheel();
+            QueryPerformanceCounter(&sectionStart);
             drawWeaponWheels();
+            notePerfSection(2, sectionStart);
         }
     }, [&](bool aborted) noexcept {
         executingView = !aborted && generation == graphicsResourceGeneration() ? previousExecution : nullptr;
