@@ -28,16 +28,16 @@ inline constexpr WeaponGrip WeaponGrips[] = {
     {2, {0.f, -.075f, -.091f}},      // Auto shotgun
     {3, {-.0379f, -.021f, -.2626f}}, // Double shotgun: Hand bone
     {4, {0.f, .0999f, -.0632f}},     // Uzi: Hand bone
-    {5, {0.f, -.037f, -.15f}},       // Minigun
-    {6, {0.f, -.082f, -.32f}},       // Rocket launcher
-    {7, {0.f, .09f, -.288f}},        // Grenade launcher
-    {8, {0.f, .041f, -.053f}},       // Plasma rifle
+    {5, {0.f, -.059f, .264f}},       // Minigun: rear handle
+    {6, {0.f, -.118f, -.058f}},      // Rocket launcher: rear grip
+    {7, {0.f, .058f, .008f}},        // Grenade launcher: rear grip
+    {8, {0.f, .041f, 0.f}},          // Plasma rifle
     {9, {0.f, -.08f, .226f}},        // Klodovik
-    {10, {0.f, -.04f, -.139f}},      // Cannon
+    {10, {0.f, -.065f, .117f}},      // Cannon: rear handle
     {11, {0.f, -.118f, -.531f}},     // Serious bomb
     {12, {.0114f, -.0016f, -.3308f}},// Colt revolvers: Hand bone
     {13, Id13ModelHandleReference},   // Sniper
-    {15, {0.f, .003f, -.347f}},      // Beam gun
+    {15, {0.f, .003f, -.113f}},      // Beam gun: rear grip
     {16, {0.f, 0.f, -.3f}},          // Flamer
 };
 constexpr bool weaponAlignmentSupported(uint32_t nativeId) {
