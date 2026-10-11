@@ -567,9 +567,9 @@ int main() {
     check(near(projectX(std::tan(f.left)), -1) && near(projectX(std::tan(f.right)), 1),
           "Asymmetric XR FOV maps image edges");
     check(near((p.m[10] * -.1f + p.m[11]) / .1f, -1), "Native projection near plane convention");
-    check(offsetof(Shared, latest) == 48 && sizeof(Pose) == 28 && sizeof(Request) == 440 &&
-              sizeof(Shared) == 1856 && offsetof(Shared, slot) == 672 &&
-              offsetof(Shared, pixels) == 1832 && sizeof(Slot) == 504,
+    check(offsetof(Shared, latest) == 48 && sizeof(Pose) == 28 && sizeof(Request) == 480 &&
+              sizeof(Shared) == 2000 && offsetof(Shared, slot) == 672 &&
+              offsetof(Shared, pixels) == 1976 && sizeof(Slot) == 576,
           "Cross-architecture ABI layout");
     InputSampleBoundary interruptedInput{7,3,100,2000,42};
     Input interruptedSample{};

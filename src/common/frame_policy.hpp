@@ -73,7 +73,10 @@ inline bool sameRequest(const Request &a, const Request &b) {
            sameInput(a.input, b.input) && a.uiRequested == b.uiRequested &&
            !std::memcmp(&a.uiPanel,&b.uiPanel,sizeof(a.uiPanel)) &&
            std::bit_cast<uint32_t>(a.uiWidth) == std::bit_cast<uint32_t>(b.uiWidth) &&
-           std::bit_cast<uint32_t>(a.uiHeight) == std::bit_cast<uint32_t>(b.uiHeight);
+           std::bit_cast<uint32_t>(a.uiHeight) == std::bit_cast<uint32_t>(b.uiHeight) &&
+           a.foveated == b.foveated && a.lowWidth == b.lowWidth && a.lowHeight == b.lowHeight &&
+           a.insetWidth == b.insetWidth && a.insetHeight == b.insetHeight &&
+           a.foveationReserved == b.foveationReserved && !std::memcmp(a.insetCentre, b.insetCentre, sizeof(a.insetCentre));
 }
 struct FrameContext {
     uint64_t now = 0, uiTick = 0;

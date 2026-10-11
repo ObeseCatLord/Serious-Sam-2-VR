@@ -508,19 +508,29 @@ int wmain(int argc,wchar_t **argv) {
         if(!found)Sleep(1);
     }
     if(!found)return 5;
-    for(unsigned h=0;h<2;++h) {
-        auto name=std::wstring(argv[3])+(h?L"-right.ppm":L"-left.ppm");
+    // A foveated pair packs the downsampled full view, then the full-resolution
+    // inset; both are written (the base keeps the -left/-right names).
+    const auto writeImage=[&](const std::wstring &name,const uint8_t *bgra,uint32_t width,uint32_t height) {
         auto *f=_wfopen(name.c_str(),L"wbx");if(!f)return 6;
-        std::fprintf(f,"P6\n%u %u\n255\n",request.width,request.height);
-        std::vector<uint8_t> row(size_t(request.width)*3);
-        for(unsigned y=0;y<request.height;++y) {
-            for(unsigned x=0;x<request.width;++x) {
-                const auto offset=(size_t(y)*request.width+x)*4;
-                row[x*3]=pixels[h][offset+2];row[x*3+1]=pixels[h][offset+1];row[x*3+2]=pixels[h][offset];
+        std::fprintf(f,"P6\n%u %u\n255\n",width,height);
+        std::vector<uint8_t> row(size_t(width)*3);
+        for(unsigned y=0;y<height;++y) {
+            for(unsigned x=0;x<width;++x) {
+                const auto offset=(size_t(y)*width+x)*4;
+                row[x*3]=bgra[offset+2];row[x*3+1]=bgra[offset+1];row[x*3+2]=bgra[offset];
             }
             if(std::fwrite(row.data(),1,row.size(),f)!=row.size()){std::fclose(f);return 7;}
         }
-        if(std::fclose(f)!=0)return 7;
+        return std::fclose(f)!=0?7:0;
+    };
+    for(unsigned h=0;h<2;++h) {
+        const auto base=std::wstring(argv[3])+(h?L"-right":L"-left");
+        const bool foveated=request.foveated&&request.lowWidth&&request.insetWidth;
+        if(const int error=writeImage(base+L".ppm",pixels[h].data(),foveated?request.lowWidth:request.width,
+                                      foveated?request.lowHeight:request.height))return error;
+        if(foveated)
+            if(const int error=writeImage(base+L"-inset.ppm",pixels[h].data()+size_t(request.lowWidth)*request.lowHeight*4,
+                                          request.insetWidth,request.insetHeight))return error;
     }
     auto name=std::wstring(argv[3])+L"-metadata.json";
     auto *f=_wfopen(name.c_str(),L"wbx");if(!f)return 6;

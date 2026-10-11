@@ -1,5 +1,6 @@
 #include "common/color.hpp"
 #include "common/controls.hpp"
+#include "common/foveation.hpp"
 #include "common/winpath.hpp"
 #include "common/frame_policy.hpp"
 #include "common/native_ui.hpp"
@@ -346,6 +347,9 @@ void validateLabOnlineIsolation(bool gameplay) {
 static IDirect3DDevice9 *device = nullptr, *creationDevice = nullptr;
 static DWORD creationThread = 0;
 static IDirect3DSurface9 *eye[2]{}, *depth[2]{}, *readback[2]{};
+// Foveated readback per eye: [0] downsampled full view, [1] full-resolution inset.
+static IDirect3DSurface9 *foveaTarget[2][2]{}, *foveaRead[2][2]{};
+static uint32_t foveaWidth[2][2]{}, foveaHeight[2][2]{};
 static uint32_t width = 0, height = 0;
 // Eye/menu pixel sections for the current canvas extent (see PixelStore).
 static PixelStore pixelStore;
@@ -433,6 +437,7 @@ struct NativeUiFrame {
     Matrix44 projection[2];
     Pose panel[2];
     uint8_t *pixels[2]{}; // The admitted slot's eye buffers in the current pixel sections.
+    PixelRect insetRect[2]; // Foveated pairs: the crop actually read back per eye.
     size_t pixelBytes = 0;
     uint32_t pixelGeneration = 0;
     void *player = nullptr;
@@ -1053,6 +1058,12 @@ static void releaseTargets() {
             if (p)
                 p->Release();
         eye[i] = depth[i] = readback[i] = nullptr;
+        for (unsigned k = 0; k < 2; ++k) {
+            if (foveaTarget[i][k]) foveaTarget[i][k]->Release();
+            if (foveaRead[i][k]) foveaRead[i][k]->Release();
+            foveaTarget[i][k] = foveaRead[i][k] = nullptr;
+            foveaWidth[i][k] = foveaHeight[i][k] = 0;
+        }
     }
     width = height = 0;
     if (channel.shared) {
@@ -1778,6 +1789,7 @@ static void releaseUiFrame() noexcept {
         if (uiFrame.read[i]) uiFrame.read[i]->Release();
         uiFrame.target[i]=uiFrame.z[i]=uiFrame.read[i]=nullptr;
         uiFrame.pixels[i] = nullptr;
+        uiFrame.insetRect[i] = {};
     }
     uiFrame.pixelBytes = 0;
     uiFrame.pixelGeneration = 0;
@@ -1853,7 +1865,65 @@ void nativeUiEndFade(bool completed) noexcept {
     if (!completed) nativeUiFault();
     uiFrame.fade=false;
 }
+// Copy one locked readback surface into the eye's pixel buffer at `offset`.
+static bool copyLockedRows(IDirect3DSurface9 *read, uint8_t *target, uint32_t width, uint32_t height) {
+    D3DLOCKED_RECT locked{};
+    if (FAILED(read->LockRect(&locked,nullptr,D3DLOCK_READONLY))) return false;
+    uiFrame.locked=read;
+    read->AddRef();
+    const size_t rowBytes=size_t(width)*4;
+    bool ok=locked.pBits && locked.Pitch>=int(rowBytes);
+    if (ok)
+        for (uint32_t row=0;row<height;++row)
+            memcpy(target+size_t(row)*rowBytes,static_cast<uint8_t *>(locked.pBits)+size_t(row)*locked.Pitch,rowBytes);
+    return retireNativeUiLock(uiFrame.locked,
+        [](IDirect3DSurface9 *surface) {
+            if (FAILED(surface->UnlockRect())) return false;
+            surface->Release();
+            return true;
+        },[] { uiFrame.fault=true; uiHalted=true; }) && ok;
+}
+// Foveated readback: a filtered downsample of the whole eye and an unscaled
+// crop around the requested gaze, packed into the eye's pixel buffer.
+static bool readFoveatedEye(unsigned i) {
+    auto *d=uiFrame.device;
+    const auto &q=uiFrame.request;
+    const uint32_t width[2]{q.lowWidth,q.insetWidth}, height[2]{q.lowHeight,q.insetHeight};
+    if (!foveationFits(q.width,q.height,q.lowWidth,q.lowHeight,q.insetWidth,q.insetHeight) || !uiFrame.pixels[i] ||
+        pixelStore.generation!=uiFrame.pixelGeneration) return false;
+    for (unsigned k=0;k<2;++k) {
+        if (foveaTarget[i][k] && foveaWidth[i][k]==width[k] && foveaHeight[i][k]==height[k]) continue;
+        if (foveaTarget[i][k]) foveaTarget[i][k]->Release();
+        if (foveaRead[i][k]) foveaRead[i][k]->Release();
+        foveaTarget[i][k]=foveaRead[i][k]=nullptr;
+        foveaWidth[i][k]=foveaHeight[i][k]=0;
+        if (FAILED(d->CreateRenderTarget(width[k],height[k],colorFormat,D3DMULTISAMPLE_NONE,0,FALSE,&foveaTarget[i][k],nullptr)) ||
+            FAILED(d->CreateOffscreenPlainSurface(width[k],height[k],colorFormat,D3DPOOL_SYSTEMMEM,&foveaRead[i][k],nullptr)))
+            return false;
+        foveaWidth[i][k]=width[k]; foveaHeight[i][k]=height[k];
+    }
+    const PixelRect rect=insetCrop(q.fov[i],q.width,q.height,q.insetWidth,q.insetHeight,q.insetCentre[i][0],q.insetCentre[i][1]);
+    const RECT crop{rect.x,rect.y,rect.x+rect.w,rect.y+rect.h};
+    if (FAILED(originalStretch(d,uiFrame.target[i],nullptr,foveaTarget[i][0],nullptr,D3DTEXF_LINEAR)) ||
+        FAILED(originalStretch(d,uiFrame.target[i],&crop,foveaTarget[i][1],nullptr,D3DTEXF_NONE)))
+        return false;
+    uint8_t *target=uiFrame.pixels[i];
+    for (unsigned k=0;k<2;++k) {
+        if (FAILED(d->GetRenderTargetData(foveaTarget[i][k],foveaRead[i][k])) ||
+            !copyLockedRows(foveaRead[i][k],target,width[k],height[k])) return false;
+        target+=size_t(width[k])*height[k]*4;
+    }
+    uiFrame.insetRect[i]=rect;
+    static unsigned traced=0;
+    if (traced<2) {
+        ++traced;
+        log("Foveated readback eye=%u full=%ux%u low=%ux%u inset=%ux%u at %d,%d",i,q.width,q.height,
+            q.lowWidth,q.lowHeight,q.insetWidth,q.insetHeight,rect.x,rect.y);
+    }
+    return true;
+}
 static bool readUiEye(unsigned i,bool dim,float visibility) {
+    if (!dim && uiFrame.request.foveated) return readFoveatedEye(i);
     auto *d=uiFrame.device;
     auto *read=uiFrame.read[i];
     if (FAILED(d->GetRenderTargetData(uiFrame.target[i],read))) return false;
@@ -1895,6 +1965,10 @@ static bool publishUiFrame(uint32_t presentation) {
             uiFrame.pixels[0] && uiFrame.pixels[1] && uiFrame.pixelGeneration==channel.shared->pixels.generation) {
             // Eyes were read back straight into this slot's own pixel sections.
             slot.pixelGeneration=uiFrame.pixelGeneration;
+            for (unsigned i=0;i<2;++i) {
+                const auto &r=uiFrame.insetRect[i];
+                slot.insetRect[i][0]=r.x; slot.insetRect[i][1]=r.y; slot.insetRect[i][2]=r.w; slot.insetRect[i][3]=r.h;
+            }
             slot.pixelReserved=0;
             slot.presentation=presentation;
             slot.presentationReserved=0;

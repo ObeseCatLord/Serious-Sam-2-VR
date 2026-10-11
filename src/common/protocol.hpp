@@ -5,7 +5,7 @@
 namespace ss2vr {
 // MaxDimension only bounds sanity checks: images travel in pixel sections sized
 // to the current canvas, which follows the runtime's recommended eye size.
-constexpr uint32_t Magic = 0x32565253, Abi = 12, MaxDimension = 16384, WeaponCount = 17;
+constexpr uint32_t Magic = 0x32565253, Abi = 13, MaxDimension = 16384, WeaponCount = 17;
 // Pixel sections: slot0 left/right, slot1 left/right, then the mono menu frame.
 constexpr unsigned PixelBufferCount = 5, MenuPixelBuffer = 4;
 constexpr unsigned slotPixelBuffer(unsigned slot, unsigned eye) { return slot * 2 + eye; }
@@ -57,6 +57,11 @@ struct Request {
     Pose uiPanel;
     float uiWidth = 0, uiHeight = 0;
     uint32_t uiRequested = 0;
+    // ABI13 foveated readback: each eye returns a downsampled full view
+    // (lowWidth x lowHeight) followed by a full-resolution insetWidth x
+    // insetHeight crop centred at insetCentre (tangent space x right, y up).
+    uint32_t foveated = 0, lowWidth = 0, lowHeight = 0, insetWidth = 0, insetHeight = 0, foveationReserved = 0;
+    float insetCentre[2][2]{};
 };
 struct WheelUi {
     uint32_t open = 0, count = 0;
@@ -91,6 +96,8 @@ struct Slot {
     HeadClearance headClearance;
     // Pixel section generation holding this pair (see Shared::pixels).
     uint32_t pixelGeneration = 0, pixelReserved = 0;
+    // Foveated pairs: the crop actually read back per eye (x, y, w, h pixels).
+    int32_t insetRect[2][4]{};
 };
 // Explicitly mono menu/loading frame; never eligible for a projection layer.
 struct MenuFrame {
@@ -139,8 +146,8 @@ struct Shared {
 static_assert(sizeof(Vec3) == 12 && sizeof(Quat) == 16 && sizeof(Pose) == 28);
 static_assert(std::is_trivially_copyable_v<Request> && std::is_standard_layout_v<Shared>);
 static_assert(offsetof(Shared, latest) == 48);
-static_assert(sizeof(Input) == 272 && sizeof(Request) == 440);
+static_assert(sizeof(Input) == 272 && sizeof(Request) == 480);
 static_assert(sizeof(MenuPointer) == 64);
 static_assert(sizeof(WorldSubmission)==40 && sizeof(PixelSections)==16);
-static_assert(sizeof(Shared) == 1856 && offsetof(Shared, pixels) == 1832); // Same on x86 and x64.
+static_assert(sizeof(Shared) == 2000 && offsetof(Shared, pixels) == 1976); // Same on x86 and x64.
 } // namespace ss2vr

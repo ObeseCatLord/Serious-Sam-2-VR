@@ -34,6 +34,9 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.laserDistance = number(L"Laser", L"MaxDistanceMeters", 100, 5, 200);
     settings.scopeEyeRelief = number(L"Scope", L"EyeReliefMeters", .1f, .02f, .3f);
     settings.renderScale = number(L"Render", L"Scale", 1, .25f, 2);
+    settings.foveation.mode = int(number(L"Render", L"Foveation", 1, 0, 2) + .5f);
+    settings.foveation.inset = number(L"Render", L"FoveationInset", .4f, .25f, .7f);
+    settings.foveation.periphery = number(L"Render", L"FoveationPeriphery", .5f, .25f, .8f);
     settings.weaponScale = number(L"Weapons", L"Scale", 0, 0, 4);
     settings.roomscale = number(L"Roomscale", L"Enabled", 0, 0, 1) >= .5f;
     settings.physicalMelee = number(L"Melee", L"Enabled", 0, 0, 1) >= .5f;

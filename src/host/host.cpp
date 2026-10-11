@@ -451,6 +451,10 @@ struct Actions {
     XrAction aim{}, grip{}, haptic{}, trigger{}, stick{}, wheel{}, wheelValue{}, use{}, jump{}, menu{}, reload{}, netricsa{},
         recenter{}, sprint{};
     XrSpace aimSpace[2]{}, gripSpace[2]{};
+    // XR_EXT_eye_gaze_interaction: one gaze pose without subaction paths.
+    XrAction gaze{};
+    XrSpace gazeSpace{};
+    bool gazeEnabled = false;
     XrPath viveProfile = XR_NULL_PATH, currentProfile[2]{};
     ActionStream primaryStream[2], zoomStream[2], gripPoseStream[2];
     SqueezeAdmission squeeze[2];
@@ -478,7 +482,39 @@ struct Actions {
         api.check(api.CreateAction(set, &create, &result), "xrCreateAction");
         return result;
     }
-    void create(Api &api, XrInstance instance, XrSession session, bool frameController) {
+    void createGaze(Api &api, XrInstance instance) {
+        XrActionCreateInfo create{XR_TYPE_ACTION_CREATE_INFO};
+        std::snprintf(create.actionName, sizeof(create.actionName), "eye_gaze");
+        std::snprintf(create.localizedActionName, sizeof(create.localizedActionName), "Eye gaze (foveation)");
+        create.actionType = XR_ACTION_TYPE_POSE_INPUT;
+        api.check(api.CreateAction(set, &create, &gaze), "xrCreateAction eye gaze");
+        XrActionSuggestedBinding binding{gaze, path(api, instance, "/user/eyes_ext/input/gaze_ext/pose")};
+        XrInteractionProfileSuggestedBinding suggestion{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        suggestion.interactionProfile = path(api, instance, "/interaction_profiles/ext/eye_gaze_interaction");
+        suggestion.countSuggestedBindings = 1;
+        suggestion.suggestedBindings = &binding;
+        const XrResult result = api.SuggestInteractionProfileBindings(instance, &suggestion);
+        gazeEnabled = XR_SUCCEEDED(result);
+        if (!gazeEnabled) api.log.result("Eye gaze binding", result);
+    }
+    // Gaze direction in `space` at `time`; false while eye tracking is unavailable.
+    bool gazeDirection(Api &api, XrSession session, XrSpace space, XrTime time, Vec3 &direction) {
+        if (!gazeEnabled || !gazeSpace) return false;
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action = gaze;
+        XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE};
+        if (XR_FAILED(api.GetActionStatePose(session, &info, &state)) || !state.isActive) return false;
+        XrEyeGazeSampleTimeEXT sampleTime{XR_TYPE_EYE_GAZE_SAMPLE_TIME_EXT};
+        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+        location.next = &sampleTime;
+        if (XR_FAILED(api.LocateSpace(gazeSpace, space, time, &location))) return false;
+        constexpr XrSpaceLocationFlags needed = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+        if ((location.locationFlags & needed) != needed) return false;
+        const auto &q = location.pose.orientation;
+        direction = rotate(normalize(Quat{q.x, q.y, q.z, q.w}), {0, 0, -1});
+        return std::isfinite(direction.x) && std::isfinite(direction.y) && std::isfinite(direction.z);
+    }
+    void create(Api &api, XrInstance instance, XrSession session, bool frameController, bool eyeGaze = false) {
         hand[0] = path(api, instance, "/user/hand/left");
         hand[1] = path(api, instance, "/user/hand/right");
         viveProfile = path(api, instance, "/interaction_profiles/htc/vive_controller");
@@ -501,6 +537,7 @@ struct Actions {
         reload = action(api, "reload", "Reload weapon", XR_ACTION_TYPE_BOOLEAN_INPUT);
         netricsa = action(api, "netricsa", "Netricsa / objectives", XR_ACTION_TYPE_BOOLEAN_INPUT);
         suggest(api, instance, frameController);
+        if (eyeGaze) createGaze(api, instance);
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
         attach.countActionSets = 1;
         attach.actionSets = &set;
@@ -513,6 +550,12 @@ struct Actions {
             api.check(api.CreateActionSpace(session, &space, &aimSpace[h]), "xrCreateActionSpace aim");
             space.action = grip;
             api.check(api.CreateActionSpace(session, &space, &gripSpace[h]), "xrCreateActionSpace grip");
+        }
+        if (gazeEnabled) {
+            XrActionSpaceCreateInfo space{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+            space.action = gaze;
+            space.poseInActionSpace.orientation.w = 1;
+            gazeEnabled = XR_SUCCEEDED(api.CreateActionSpace(session, &space, &gazeSpace));
         }
     }
     void suggest(Api &api, XrInstance instance, bool frameController) {
@@ -991,6 +1034,13 @@ struct Host {
     Fov currentFov[2];
     bool recenterWasHeld = false, recenterUi = false;
     Swapchain menuChain, hudChain, cursorChain;
+    // Foveated readback: eye[] carries the downsampled full view, inset[] the
+    // full-resolution crop submitted as a second projection layer.
+    Swapchain inset[2];
+    bool eyeGazeExtension = false, eyeGazeSupported = false, foveationActive = false, cachedFoveated = false;
+    Fov cachedInset[2];
+    Vec3 lastGaze{};
+    ULONGLONG lastGazeTick = 0;
     bool cursorUploaded = false;
     WheelBitmap hudBitmap;
     std::vector<uint8_t> menuSourcePixels;
@@ -1029,6 +1079,8 @@ struct Host {
             menuChain.abandon();
             hudChain.abandon();
             cursorChain.abandon();
+            for (auto &chain : inset)
+                chain.abandon();
             drainQuery.abandon();
             context.abandon();
             device.abandon();
@@ -1042,6 +1094,8 @@ struct Host {
         menuChain.destroy();
         hudChain.destroy();
         cursorChain.destroy();
+        for (auto &chain : inset)
+            chain.destroy();
         actions.destroy(api);
         if (viewSpace)
             api.cleanup(api.DestroySpace(viewSpace), "xrDestroySpace VIEW");
@@ -1151,15 +1205,20 @@ struct Host {
         const bool frameController=std::any_of(extensions.begin(),extensions.end(),[](const auto &e) {
             return !std::strcmp(e.extensionName,"XR_VALVE_frame_controller_interaction");
         });
-        const char *enabled[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME,frameExtension};
+        // Eye gaze drives foveated readback when the runtime reports a tracker.
+        eyeGazeExtension = settings.foveation.mode != 0 && std::any_of(extensions.begin(), extensions.end(),
+            [](const auto &e) { return !std::strcmp(e.extensionName, "XR_EXT_eye_gaze_interaction"); });
+        std::vector<const char *> enabled{XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+        if (frameController) enabled.push_back(frameExtension);
+        if (eyeGazeExtension) enabled.push_back("XR_EXT_eye_gaze_interaction");
         XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
         std::strcpy(create.applicationInfo.applicationName, "Serious Sam 2 VR");
         std::strcpy(create.applicationInfo.engineName, "SS2VR host");
         create.applicationInfo.applicationVersion = create.applicationInfo.engineVersion = 1;
         // All used core calls are 1.0; this admits 1.0 runtimes with the required extension.
         create.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-        create.enabledExtensionCount = frameController?2:1;
-        create.enabledExtensionNames = enabled;
+        create.enabledExtensionCount = uint32_t(enabled.size());
+        create.enabledExtensionNames = enabled.data();
         api.check(api.CreateInstance(&create, &instance), "xrCreateInstance");
         log.write(frameController ? "Frame controller extension enabled; native profile bindings available" :
                                    "Frame controller extension unavailable; existing runtime profile fallbacks retained");
@@ -1177,7 +1236,11 @@ struct Host {
         XrSystemGetInfo get{XR_TYPE_SYSTEM_GET_INFO};
         get.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
         api.check(api.GetSystem(instance, &get, &system), "xrGetSystem HMD");
+        XrSystemEyeGazeInteractionPropertiesEXT gazeProperties{XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT};
+        if (eyeGazeExtension) systemProperties.next = &gazeProperties;
         api.check(api.GetSystemProperties(instance, system, &systemProperties), "xrGetSystemProperties");
+        systemProperties.next = nullptr;
+        eyeGazeSupported = eyeGazeExtension && gazeProperties.supportsEyeGazeInteraction;
         if (systemProperties.graphicsProperties.maxLayerCount < 4)
             throw std::runtime_error("Runtime cannot present stereo, HUD and two wheel layers");
         api.check(api.EnumerateViewConfigurations(instance, system, 0, &count, nullptr),
@@ -1227,7 +1290,18 @@ struct Host {
         api.check(api.CreateReferenceSpace(session, &space, &local), "xrCreateReferenceSpace LOCAL");
         space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
         api.check(api.CreateReferenceSpace(session, &space, &viewSpace), "xrCreateReferenceSpace VIEW");
-        actions.create(api, instance, session, frameController);
+        actions.create(api, instance, session, frameController, eyeGazeSupported);
+        const auto &f = settings.foveation;
+        foveationActive = systemProperties.graphicsProperties.maxLayerCount >= 5 &&
+            (f.mode == 2 || (f.mode == 1 && actions.gazeEnabled));
+        {
+            char line[192];
+            std::snprintf(line, sizeof line, "Foveated readback %s (mode=%d eyeGaze=%s inset=%.2f periphery=%.2f)",
+                          foveationActive ? "enabled" : "disabled", f.mode,
+                          actions.gazeEnabled ? "tracked" : eyeGazeExtension ? "unsupported" : "unavailable",
+                          f.inset, f.periphery);
+            log.write(line);
+        }
         api.check(api.EnumerateSwapchainFormats(session, 0, &count, nullptr),
                   "xrEnumerateSwapchainFormats count");
         std::vector<int64_t> formats(count);
@@ -1616,12 +1690,30 @@ struct Host {
         return input;
     }
     void discardEyeAcquisitions() {
-        for (auto &chain : eye)
-            if (chain.ownership.acquired && chain.waitImage()) {
-                // Release changes the runtime's most-recent image even without a write.
-                invalidateCachedPair();
-                chain.releaseWaited();
+        for (auto *chains : {eye, inset})
+            for (unsigned h = 0; h != 2; ++h) {
+                auto &chain = chains[h];
+                if (chain.ownership.acquired && chain.waitImage()) {
+                    // Release changes the runtime's most-recent image even without a write.
+                    invalidateCachedPair();
+                    chain.releaseWaited();
+                }
             }
+    }
+    void insetChains(uint32_t width, uint32_t height) {
+        if (inset[0].width == width && inset[0].height == height && inset[1].handle)
+            return;
+        invalidateCachedPair();
+        cancelRequests();
+        if (!drainGpu())
+            throw std::runtime_error("GPU did not drain before inset swapchain resize");
+        for (auto &chain : inset)
+            chain.destroy();
+        for (auto &chain : inset)
+            chain.create(api, session, width, height);
+        char message[128];
+        std::snprintf(message, sizeof(message), "Foveated inset swapchains: %u x %u", width, height);
+        log.write(message);
     }
     void finishSessionAcquisitions() {
         invalidate();
@@ -1637,6 +1729,8 @@ struct Host {
             retiredAll = menuChain.releaseAcquired() && retiredAll;
             retiredAll = hudChain.releaseAcquired() && retiredAll;
             retiredAll = cursorChain.releaseAcquired() && retiredAll;
+            for (auto &chain : inset)
+                retiredAll = chain.releaseAcquired() && retiredAll;
             if (retiredAll)
                 return;
             if (api.lossPending || GetTickCount64() >= deadline)
@@ -1662,18 +1756,21 @@ struct Host {
         }
         // No IPC lock across XR waits. Ready remains owned until BOTH images are writable.
         const bool left = eye[0].waitImage(), right = eye[1].waitImage();
-        if (!left || !right) {
+        const bool insetLeft = !foveationActive || inset[0].waitImage(), insetRight = !foveationActive || inset[1].waitImage();
+        if (!left || !right || !insetLeft || !insetRight) {
             ++imageTimeouts;
             return;
         }
-        if (!bothImagesReady(eye[0].ownership, eye[1].ownership))
+        if (!bothImagesReady(eye[0].ownership, eye[1].ownership) ||
+            (foveationActive && !bothImagesReady(inset[0].ownership, inset[1].ownership)))
             throw std::runtime_error("Stereo wait barrier failed");
         Request reply;
         HeadClearance clearance;
         uint64_t deadline = 0;
         uint32_t presentation = 0;
         bool accepted = false;
-        const uint8_t *source[2]{};
+        uint8_t *source[2]{}, *insetSource[2]{};
+        Fov insetFov[2];
         {
             Mutex lock(channel, 0);
             if (lock) {
@@ -1694,9 +1791,23 @@ struct Host {
                     // The pair is uploaded straight from its pixel sections after the
                     // lock: only this thread can request the slot again afterwards.
                     accepted = currentPixels(channel.shared->pixels) &&
-                        pixels.matches(slot.pixelGeneration, reply.width, reply.height);
+                        pixels.matches(slot.pixelGeneration, reply.width, reply.height) &&
+                        (!reply.foveated || foveationActive);
                     for (unsigned h = 0; h < 2; h++)
                         source[h] = accepted ? pixels.buffer(slotPixelBuffer(candidate, h)) : nullptr;
+                    if (accepted && reply.foveated) {
+                        accepted = foveationFits(reply.width, reply.height, reply.lowWidth, reply.lowHeight,
+                                                 reply.insetWidth, reply.insetHeight);
+                        for (unsigned h = 0; accepted && h < 2; h++) {
+                            const PixelRect rect{slot.insetRect[h][0], slot.insetRect[h][1], slot.insetRect[h][2],
+                                                 slot.insetRect[h][3]};
+                            accepted = rect.w == int32_t(reply.insetWidth) && rect.h == int32_t(reply.insetHeight) &&
+                                rect.x >= 0 && rect.y >= 0 && rect.x <= int32_t(reply.width) - rect.w &&
+                                rect.y <= int32_t(reply.height) - rect.h;
+                            insetSource[h] = source[h] + size_t(reply.lowWidth) * reply.lowHeight * 4;
+                            insetFov[h] = rectFov(reply.fov[h], reply.width, reply.height, rect);
+                        }
+                    }
                     slot.state = SlotState::Empty;
                     slot.cancelled = 0;
                     slot.presentation = 0;
@@ -1714,12 +1825,23 @@ struct Host {
         invalidateCachedPair(); // A failure between releases must never expose a mixed pair.
         eye[0].uploadWaited(context.p, source[0]);
         eye[1].uploadWaited(context.p, source[1]);
+        if (reply.foveated)
+            for (unsigned h = 0; h != 2; ++h) {
+                // The inset fades over its border so the seam to the base view is soft.
+                featherAlpha(insetSource[h], reply.insetWidth, reply.insetHeight, std::max(8u, reply.insetWidth / 16));
+                inset[h].uploadWaited(context.p, insetSource[h]);
+                cachedInset[h] = insetFov[h];
+            }
+        else if (foveationActive)
+            for (auto &chain : inset)
+                chain.releaseWaited();
         hresult(device->GetDeviceRemovedReason(), "D3D11 device removed", log);
         if (!api.lossPending) {
             cachedRequest = reply;
             cachedClearance = clearance;
             cachedDeadline = deadline;
             cachedPresentation = presentation;
+            cachedFoveated = reply.foveated != 0;
             cachedValid = true;
         }
     }
@@ -1757,9 +1879,11 @@ struct Host {
         SetEvent(channel.ready);
     }
     bool projection(XrCompositionLayerProjection &layer,
-                    std::array<XrCompositionLayerProjectionView, 2> &views) {
+                    std::array<XrCompositionLayerProjectionView, 2> &views,
+                    XrCompositionLayerProjection &insetLayer, std::array<XrCompositionLayerProjectionView, 2> &insetViews) {
         if (!cachedValid || !eye[0].ownership.previousImageAvailable() ||
-            !eye[1].ownership.previousImageAvailable())
+            !eye[1].ownership.previousImageAvailable() ||
+            (cachedFoveated && (!inset[0].ownership.previousImageAvailable() || !inset[1].ownership.previousImageAvailable())))
             return false;
         {
             Mutex lock(channel, 0);
@@ -1777,6 +1901,22 @@ struct Host {
         }
         layer.viewCount = 2;
         layer.views = views.data();
+        insetLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        if (cachedFoveated) {
+            // Same pose and space as the base view: the inset is that view's own
+            // full-resolution crop, so it stays aligned through reprojection.
+            insetLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                                    XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+            insetLayer.space = local;
+            for (unsigned h = 0; h != 2; ++h) {
+                insetViews[h] = views[h];
+                const auto &f = cachedInset[h];
+                insetViews[h].fov = {f.left, f.right, f.up, f.down};
+                insetViews[h].subImage = inset[h].subimage();
+            }
+            insetLayer.viewCount = 2;
+            insetLayer.views = insetViews.data();
+        }
         return true;
     }
     bool finalProjectionEligible(const Input &input, bool validViews,const std::array<XrView,2>& views) {
@@ -1800,12 +1940,14 @@ struct Host {
     }
     bool admitFinalWorld(std::vector<const XrCompositionLayerBaseHeader *> &layers,
                          const XrCompositionLayerBaseHeader *world, const Input &input, bool validViews,
-                         const std::array<XrView,2>& views) {
+                         const std::array<XrView,2>& views, const XrCompositionLayerBaseHeader *insetWorld = nullptr) {
         if (std::find(layers.begin(), layers.end(), world) == layers.end())
             return false;
         if (finalProjectionEligible(input, validViews,views))
             return true;
         layers.erase(std::remove(layers.begin(), layers.end(), world), layers.end());
+        if (insetWorld)
+            layers.erase(std::remove(layers.begin(), layers.end(), insetWorld), layers.end());
         return false;
     }
     void wheelLayers(const Ui &ui, const Input &input, std::array<XrCompositionLayerQuad, 2> &layers,
@@ -2102,15 +2244,27 @@ struct Host {
             if (published && !api.lossPending)
                 feedback(snapshot.ui, input, snapshot.menuVisible);
             const bool hudPrepared = published && prepareHudAnchor(snapshot, input);
-            std::array<XrCompositionLayerProjectionView, 2> projectionViews;
+            std::array<XrCompositionLayerProjectionView, 2> projectionViews, insetViews;
             XrCompositionLayerProjection projectionLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+            XrCompositionLayerProjection insetLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             std::array<XrCompositionLayerQuad, 2> quadLayers;
             XrCompositionLayerQuad menuQuad{}, hudQuad{}, cursorQuad{};
             presentedPointer = {};
             if (published && !quit && !api.lossPending && frameState.shouldRender) {
                 if (snapshot.renderer && !snapshot.menuVisible && validViews && input.focused &&
                     input.headValid) {
-                    eyeChains(snapshot.width, snapshot.height);
+                    const auto &f = settings.foveation;
+                    const uint32_t lowWidth = foveationExtent(snapshot.width, f.periphery),
+                                   lowHeight = foveationExtent(snapshot.height, f.periphery),
+                                   insetWidth = foveationExtent(snapshot.width, f.inset),
+                                   insetHeight = foveationExtent(snapshot.height, f.inset);
+                    const bool foveated = foveationActive &&
+                        foveationFits(snapshot.width, snapshot.height, lowWidth, lowHeight, insetWidth, insetHeight);
+                    if (foveated) {
+                        eyeChains(lowWidth, lowHeight);
+                        insetChains(insetWidth, insetHeight);
+                    } else
+                        eyeChains(snapshot.width, snapshot.height);
                     Request request{};
                     request.sequence = ++requestSequence;
                     request.predictedTime = frameState.predictedDisplayTime;
@@ -2121,8 +2275,29 @@ struct Host {
                     request.input = input;
                     for (unsigned h = 0; h != 2; ++h) {
                         request.eye[h] = pose(views[h].pose);
-                        const auto &f = views[h].fov;
-                        request.fov[h] = {f.angleLeft, f.angleRight, f.angleUp, f.angleDown};
+                        const auto &v = views[h].fov;
+                        request.fov[h] = {v.angleLeft, v.angleRight, v.angleUp, v.angleDown};
+                    }
+                    if (foveated) {
+                        request.foveated = 1;
+                        request.lowWidth = lowWidth; request.lowHeight = lowHeight;
+                        request.insetWidth = insetWidth; request.insetHeight = insetHeight;
+                        Vec3 gaze;
+                        const ULONGLONG now = GetTickCount64();
+                        if (actions.gazeDirection(api, session, local, frameState.predictedDisplayTime, gaze)) {
+                            lastGaze = gaze;
+                            lastGazeTick = now;
+                        }
+                        // Hold the last gaze through blinks, then return to the view centre.
+                        const bool gazeFresh = lastGazeTick && now - lastGazeTick < 500;
+                        for (unsigned h = 0; h != 2; ++h) {
+                            const Fov &fov = request.fov[h];
+                            float tx = (std::tan(fov.left) + std::tan(fov.right)) * .5f;
+                            float ty = (std::tan(fov.up) + std::tan(fov.down)) * .5f;
+                            if (gazeFresh) gazeTangent(request.eye[h].q, lastGaze, fov, tx, ty);
+                            request.insetCentre[h][0] = tx;
+                            request.insetCentre[h][1] = ty;
+                        }
                     }
                     if (hudPrepared) {
                         const Pose panel = hudAnchor.panel({0, 0, -settings.menuDistance});
@@ -2136,9 +2311,12 @@ struct Host {
                     }
                     pollEyes();
                     requestEyes(request);
-                    if (projection(projectionLayer, projectionViews))
+                    if (projection(projectionLayer, projectionViews, insetLayer, insetViews)) {
                         layers.push_back(
                             reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projectionLayer));
+                        if (insetLayer.viewCount)
+                            layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&insetLayer));
+                    }
                 } else {
                     invalidateCachedPair();
                     cancelRequests();
@@ -2163,7 +2341,8 @@ struct Host {
             if (quit || api.lossPending)
                 layers.clear();
             const auto *world = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projectionLayer);
-            bool worldPresented = admitFinalWorld(layers, world, input, validViews,views);
+            const auto *insetWorld = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&insetLayer);
+            bool worldPresented = admitFinalWorld(layers, world, input, validViews,views, insetWorld);
             const bool canDrawHud = published && !quit && !api.lossPending && frameState.shouldRender &&
                                     !snapshot.menuVisible;
             bool fallbackDrawn = false;
@@ -2173,11 +2352,11 @@ struct Host {
             }
             // A fallback upload may wait for an image. Recheck the world after it
             // completes so an expired pair is never resubmitted.
-            worldPresented = admitFinalWorld(layers, world, input, validViews,views);
+            worldPresented = admitFinalWorld(layers, world, input, validViews,views, insetWorld);
             if (canDrawHud && !worldPresented && !fallbackDrawn) {
                 hudLayer(snapshot.ui, input, hudQuad, layers);
                 fallbackDrawn = true;
-                worldPresented = admitFinalWorld(layers, world, input, validViews,views);
+                worldPresented = admitFinalWorld(layers, world, input, validViews,views, insetWorld);
             }
             worldPresented=finalNativeUiLayers(quit,api.lossPending,layers,worldPresented);
             if (worldPresented) {

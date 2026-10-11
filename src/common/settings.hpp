@@ -1,6 +1,7 @@
 #pragma once
 #include "ui.hpp"
 #include "steering_wheel.hpp"
+#include "foveation.hpp"
 namespace ss2vr {
 struct VrSettings {
     ComfortConfig comfort;
@@ -10,6 +11,7 @@ struct VrSettings {
     bool lasers = true;
     float laserDistance = 100.f;
     float renderScale = 1.f; // Multiplier on the runtime's recommended per-eye size.
+    FoveationSettings foveation;
     float scopeEyeRelief = .1f; // Optical presentation parameter, not native zoom timing.
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;
