@@ -11,8 +11,39 @@ constexpr Vec3 Id1ModelHandleReference{-.00960000045598f, -.00474976426398f, -.5
 // frame. Both inspected variants and own consumed Black draws agree on identity.
 // This convention does not define skin contact or another weapon's reference.
 constexpr Vec3 Id13ModelHandleReference{0.f, .003122344828160041f, .006718217565474383f};
+// Grip anchor per native weapon, in pre-stretch first-person model coordinates:
+// the point placed at the controller's grip. First-person models put their
+// origin near the camera with the gun up to a metre away, so every weapon needs
+// one. Revolvers, uzi and double shotgun use their authored Hand bone (logged by
+// the private weapon audit, V101); zap gun and sniper keep their measured
+// handles; the rest are handle points chosen on each model and checked against
+// the controller position in lab captures.
+struct WeaponGrip {
+    uint32_t nativeId;
+    Vec3 reference;
+};
+inline constexpr WeaponGrip WeaponGrips[] = {
+    {0, {0.f, .084f, -.304f}},       // Circular saw
+    {1, Id1ModelHandleReference},     // Zap gun
+    {2, {0.f, -.075f, -.091f}},      // Auto shotgun
+    {3, {-.0379f, -.021f, -.2626f}}, // Double shotgun: Hand bone
+    {4, {0.f, .0999f, -.0632f}},     // Uzi: Hand bone
+    {5, {0.f, -.037f, -.15f}},       // Minigun
+    {6, {0.f, -.082f, -.32f}},       // Rocket launcher
+    {7, {0.f, .09f, -.288f}},        // Grenade launcher
+    {8, {0.f, .041f, -.053f}},       // Plasma rifle
+    {9, {0.f, -.08f, .226f}},        // Klodovik
+    {10, {0.f, -.04f, -.139f}},      // Cannon
+    {11, {0.f, -.118f, -.531f}},     // Serious bomb
+    {12, {.0114f, -.0016f, -.3308f}},// Colt revolvers: Hand bone
+    {13, Id13ModelHandleReference},   // Sniper
+    {15, {0.f, .003f, -.347f}},      // Beam gun
+    {16, {0.f, 0.f, -.3f}},          // Flamer
+};
 constexpr bool weaponAlignmentSupported(uint32_t nativeId) {
-    return nativeId==1 || nativeId==13;
+    for (const auto &grip : WeaponGrips)
+        if (grip.nativeId == nativeId) return true;
+    return false;
 }
 // Binding freshness is independent of having an authored grip correction.
 // The installed native inventory has seventeen slots; slot fourteen is unused.
@@ -21,10 +52,12 @@ constexpr bool weaponModelBindingSupported(uint32_t nativeId) {
 }
 inline bool weaponModelHandleReference(uint32_t nativeId,Vec3 &out) {
     out={};
-    if(nativeId==1)out=Id1ModelHandleReference;
-    else if(nativeId==13)out=Id13ModelHandleReference;
-    else return false;
-    return true;
+    for (const auto &grip : WeaponGrips)
+        if (grip.nativeId == nativeId) {
+            out = grip.reference;
+            return true;
+        }
+    return false;
 }
 
 inline bool alignmentBorrowPhase(unsigned renderDepth, bool placement) {

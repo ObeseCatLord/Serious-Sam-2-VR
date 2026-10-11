@@ -101,12 +101,12 @@ int main() {
     // not continuously inverted through animated bones.
     const Quat q=normalize(multiply(yaw(.7f),Quat{.12f,0,0,.99f}));
     Vec3 reference;
-    for(uint32_t unsupported : {0u,2u,12u,14u,UINT32_MAX}) {
+    for(uint32_t unsupported : {14u,WeaponCount,UINT32_MAX}) {
         assert(!weaponAlignmentSupported(unsupported));
         assert(!weaponModelHandleReference(unsupported,reference));
         assert(dot(reference,reference)==0);
     }
-    for(uint32_t nativeId : {1u,13u}) for(uint32_t selector : {0u,1u}) {
+    for(uint32_t nativeId : {0u,1u,2u,3u,4u,5u,6u,7u,8u,9u,10u,11u,12u,13u,15u,16u}) for(uint32_t selector : {0u,1u}) {
         assert(weaponAlignmentSupported(nativeId) && weaponModelHandleReference(nativeId,reference));
         assert(id1RenderedStretch(selector,{1.1f,.9f,.8f},s));
         const Vec3 scaled{s.x*reference.x,s.y*reference.y,s.z*reference.z};

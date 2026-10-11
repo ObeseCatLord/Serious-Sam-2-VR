@@ -1543,18 +1543,19 @@ static void update(void *p) {
              GetTickCount64() - selectionTick[h] > 1500))
             pendingSelection[h] = -1;
         if (settings.labWeaponAudit && h == 1 && valid && rider.handheld() && singlePlayer()) {
-            // Private lab: own every weapon once, then hold each in the right hand for 2.5 s.
+            // Private lab: own every weapon once, then hold each in the right hand for 4 s.
             static bool given = false;
             static uint64_t next = 0;
             static int index = -1;
-            if (!given && giveAllWeapons) { giveAllWeapons(p, 1); given = true; next = GetTickCount64() + 2500; }
+            if (!given && giveAllWeapons) { giveAllWeapons(p, 1); given = true; next = GetTickCount64() + 4000; }
             if (given && GetTickCount64() >= next && pendingSelection[h] < 0) {
-                next = GetTickCount64() + 2500;
+                next = GetTickCount64() + 4000;
                 for (int step = 0; step < int(WeaponCount); ++step) {
                     index = (index + 1) % int(WeaponCount);
                     if (index != 14 && inInventory(static_cast<uint8_t *>(p) + 0x8f8, index)) {
                         pendingSelection[h] = index;
                         selectionTick[h] = GetTickCount64();
+                        log("Weapon audit select id=%d", index);
                         break;
                     }
                 }
