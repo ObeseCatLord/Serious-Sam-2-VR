@@ -14,6 +14,7 @@ struct VrSettings {
     FoveationSettings foveation;
     bool snapTurn = false;                 // Smooth stick turning unless enabled.
     float smoothTurnRate = 150 * Pi / 180; // Radians per second at full deflection.
+    bool desktopWorld = false; // Also draw the world into the desktop window on VR frames (costs a third render).
     float uiAspect = 16.f / 9; // Aspect the game lays out its 2D view (menus, HUD, movies) at in VR.
     bool labWeaponAudit = false; // Private lab: cycle every weapon and log its hand references.
     int labWeaponAuditHand = 1;  // Hand whose selection the audit simulates.

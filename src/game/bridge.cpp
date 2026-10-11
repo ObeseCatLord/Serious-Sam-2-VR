@@ -802,6 +802,12 @@ static DrawIndexed originalDrawIndexed = nullptr;
 static_assert(D3DPT_TRIANGLELIST==4 && D3DPT_TRIANGLESTRIP==5 && D3DPT_TRIANGLEFAN==6);
 static_assert(D3DFILL_POINT==1 && D3DFILL_WIREFRAME==2 && D3DFILL_SOLID==3);
 static_assert(D3DDECLTYPE_FLOAT3==2 && D3DDECLMETHOD_DEFAULT==0 && D3DDECLUSAGE_TEXCOORD==5);
+// While the native desktop view is rebuilt after a VR pair, its draws to the
+// backbuffer are dropped (the window mirrors the left eye instead); offscreen
+// passes and every state effect still run.
+static bool desktopWorld = false, desktopCull = false, desktopRtBound = false;
+void setDesktopWorld(bool render) noexcept { desktopWorld = render; }
+static bool culledDesktopDraw() { return desktopCull && desktopRtBound; }
 template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVETYPE topology,Call call) noexcept {
     const auto generation = graphicsResourceGeneration();
     if (!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
@@ -892,6 +898,7 @@ static HRESULT WINAPI draw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT start,
     return uiDrawCall(d,type,[&]{
         if(!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
         traceWorldDraw(d,count);
+        if (culledDesktopDraw() && !uiBypass) return D3D_OK;
         return originalDraw(d,type,start,count);
     });
 }
@@ -900,6 +907,7 @@ static HRESULT forwardIndexed(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
     return uiDrawCall(d,type,[&]{
         if(!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
         traceWorldDraw(d,count);
+        if (culledDesktopDraw() && !uiBypass) return D3D_OK;
         return originalDrawIndexed(d,type,base,minimum,vertices,start,count);
     });
 }
@@ -966,12 +974,12 @@ static HRESULT WINAPI clear(IDirect3DDevice9 *d,DWORD count,const D3DRECT *rects
 }
 static HRESULT WINAPI drawUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT count,const void *vertices,UINT stride) {
     scopeGpuOutput(d);
-    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);return originalDrawUp(d,type,count,vertices,stride); },nullptr,true);
+    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);if (culledDesktopDraw()) return D3D_OK;return originalDrawUp(d,type,count,vertices,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawIndexedUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT minimum,UINT vertices,UINT count,
                                     const void *indices,D3DFORMAT format,const void *data,UINT stride) {
     scopeGpuOutput(d);
-    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); },nullptr,true);
+    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);if (culledDesktopDraw()) return D3D_OK;return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawRect(IDirect3DDevice9 *d,UINT handle,const float *segments,const D3DRECTPATCH_INFO *info) {
     scopeGpuOutput(d);
@@ -1034,6 +1042,7 @@ static HRESULT WINAPI setRT(IDirect3DDevice9 *d, DWORD index, IDirect3DSurface9 
     if ((activeEye >= 0 || scopeScratch) && index == 0 && sameSurface(target, desktopTarget))
         target = uiFrame.slot >= 0 ? uiFrame.target[scopeScratch ? 0 : activeEye] : eye[scopeScratch ? 0 : activeEye];
     HRESULT result = originalSetRT(d, index, target);
+    if (desktopCull && index == 0) desktopRtBound = SUCCEEDED(result) && sameSurface(target, uiFrame.color);
     if ((activeEye >= 0 || scopeScratch) && FAILED(result))
         eyeInvalid = true;
     if (index == 0 && target && activeEye < 0 && !scopeScratch && SUCCEEDED(result)) {
@@ -2468,7 +2477,14 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         ok=restoreUiFrame() && ok;
         // Native desktop rebuild remains exactly once; never replay brain/overlay.
         if(traceDepth && generation==graphicsResourceGeneration()) traceStereoDepth(d,request,-1,"before-desktop");
+        desktopCull=ok && !desktopWorld && !traceDepth;
+        desktopRtBound=true; // restoreUiFrame rebound the desktop target.
         ok=observedWorldRender(d,puppet,original,request,-1,traceDepth) && ok;
+        if (desktopCull) {
+            desktopCull=desktopRtBound=false;
+            if (generation == graphicsResourceGeneration() && uiFrame.color)
+                originalStretch(d,uiFrame.target[0],nullptr,uiFrame.color,nullptr,D3DTEXF_NONE); // Desktop mirror.
+        }
         if (generation != graphicsResourceGeneration()) return;
         if(traceDepth) traceStereoDepth(d,request,-1,"after-desktop");
         uiFrame.world=ok && !uiFrame.fault && uiFrame.generation==resourceGeneration.load();

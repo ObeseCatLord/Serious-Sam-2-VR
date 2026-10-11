@@ -8271,6 +8271,7 @@ bool attach(bool headless) {
     std::wstring settingsDirectory;
     if (moduleDirectory(nullptr,settingsDirectory))
         settings=loadSettings(settingsDirectory+L"SS2VR\\SS2VR.ini");
+    setDesktopWorld(settings.desktopWorld);
     auto g = GetModuleHandleW(L"Sam2Game.dll"), e = GetModuleHandleW(L"Engine.dll"),
          c = GetModuleHandleW(L"Core.dll");
     if (g && !headless) {
