@@ -1,5 +1,23 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-11 (night) — frame pacing; first real-headset numbers
+
+- Frame pacing: while pairs stream, the next game frame starts once the host has
+  a request waiting (after Present, bounded), so every frame becomes a pair and no
+  full-resolution flat frames are wasted; the host queues a second request only
+  when the game is behind.
+- Flat screen (menus/loading/cutscenes): the 16:9 band is scaled on the GPU to at
+  most 1920x1080 before readback (was the full 3561^2 canvas): 18 → 2 ms per frame.
+- Real Bigscreen Beyond 2e (Monado 25.1 via Envision, RTX 4090, 3561x3561 per eye,
+  75 Hz; measured with `[Lab] FixedPose=1 AutoContinue=1` because the headset was
+  untracked): Jungle start 375 frames / 375 pairs per 5 s, 13.3 ms frames of which
+  6.7 ms idle; City Metropolis start 9.3 ms idle. Present does not block (GPU not
+  limiting at 75 Hz). WayVR running alongside cost dropped pairs (266 vs 4 discarded).
+- Next candidates (Fable RE, scratch notes): execute the engine's collected view
+  twice ("collect once, execute twice") to drop the second traversal; VR settings
+  for dynamic shadows (per-eye shadow render targets); HUD duplication batching.
+
+
 ## 2026-10-11 (evening) — lost pairs and latency
 
 - Pairs lost after rendering were all IPC lock timeouts at publication (2 ms):
