@@ -1608,8 +1608,10 @@ void present(IDirect3DDevice9 *d) {
     }
     bool valid = input.focused && input.headValid && now >= input.tickMs && now - input.tickMs < 200;
     if (valid) vrInputTick.store(now, std::memory_order_relaxed);
-    const MenuAction action =
-        menuNavigation.sample(input, menuVisible, valid, menus::pointerAvailable());
+    MenuAction action = menuNavigation.sample(input, menuVisible, valid, menus::pointerAvailable());
+    // The weapon wheel's menu bubble opens the pause menu exactly as Menu does.
+    if (wheelMenuRequested(now) && action == MenuAction::None && valid && !menuVisible)
+        action = MenuAction::Back;
     WORD key = 0;
     int command = 0; // Sam2Game menu system commands (syscmdOk, syscmdBack, ...).
     switch (action) {

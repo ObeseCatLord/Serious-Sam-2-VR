@@ -101,31 +101,4 @@ inline PanelHit pointAtPanel(Pose aim, Pose panel, float width, float height) {
         return {};
     return {true, u, v};
 }
-struct WheelLayout {
-    Pose anchor[2];
-    float diameter = 0;
-    bool reserved = false;
-    void reset() {
-        *this = {};
-    }
-    bool reserve(Pose head, const Fov (&eyes)[2]) {
-        if (reserved)
-            return true;
-        if (!finite(head))
-            return false;
-        const float halfFov = std::min({-eyes[0].left, -eyes[1].left, eyes[0].right, eyes[1].right});
-        if (!std::isfinite(halfFov) || halfFov <= 15 * Pi / 180)
-            return false;
-        const float width = std::min(28 * Pi / 180, halfFov - 7 * Pi / 180);
-        const float centerAngle = width * .5f + 2 * Pi / 180, distance = 1.45f;
-        const Pose base{yaw(horizontalHeading(head.q)), head.p};
-        diameter = sizeAtAngle(width, distance);
-        for (unsigned hand = 0; hand != 2; ++hand) {
-            const Quat direction = yaw(hand ? -centerAngle : centerAngle);
-            anchor[hand] = compose(base, Pose{direction, rotate(direction, {0, 0, -distance})});
-        }
-        reserved = true;
-        return true;
-    }
-};
 } // namespace ss2vr

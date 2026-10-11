@@ -27,6 +27,8 @@ bool vrInputLive() noexcept;
 // engine creates its window canvas; applied on the main thread's input poll).
 void installEyeCanvas() noexcept;
 void applyEyeCanvas() noexcept;
+// Consumes a fresh weapon-wheel request to open the pause menu (one Back tap).
+bool wheelMenuRequested(uint64_t now) noexcept;
 void deviceReady(IDirect3DDevice9 *device);
 void deviceCreated(IDirect3DDevice9 *device);
 void deviceResetSucceeded(IDirect3DDevice9 *device);
