@@ -12,8 +12,8 @@ struct ScopeSourceView {
     unsigned hand = 2;
 };
 bool scopePreviewNeeded(void *player, const Request &request);
-void beginScopePreview(void *player, const Request &request);
 bool copyScopeSourceView(unsigned hand, ScopeSourceView &out);
+unsigned scopeSourceBeginFailure() noexcept; // Diagnostic: last beginScopeSource rejection.
 bool beginScopeSource(void *player, const Request &request, const ScopeSourceView &view,
                       ScopeCaptureCallback callback, ScopeCaptureCurrent current, void *context);
 // Callback-free current-execution predicate, for the native capture callback.

@@ -197,9 +197,10 @@ inline bool scopeCapClip(const Matrix44 &projection,const Matrix34 &view,const M
 // Preconditions: exact admitted position/UV/zero-index/one-weight stock bytes
 // and matching stream declarations; immutable program and actual constants.
 // CPU float evaluation is an offline/admission bound, not GPU precision proof.
-// The program runs in float through several native matrix products, so the
-// comparison is scaled by the vertex's clip magnitude (at least |w|): 1e-4 of it
-// is far above float rounding yet far below any wrong pose or constant.
+// The program runs in float through several native matrix products whose
+// world-space translations are large, so the comparison is scaled by the
+// vertex's clip magnitude (at least |w|). Lab errors reach 1.6e-4 by position in
+// the level; 1e-3 (a few millimetres) still rejects any wrong pose or matrix.
 inline bool scopeCapPosition(std::span<const uint32_t> program,std::span<const std::array<float,4>> constants,
                              const ScopeCapGeometry &cap,bool weightsBound,const Matrix44 &expected,
                              double *worst=nullptr) noexcept {
@@ -223,6 +224,6 @@ inline bool scopeCapPosition(std::span<const uint32_t> program,std::span<const s
         for (unsigned row=0;row<4;++row) largest=std::max(largest,std::abs(actual[row]-reference[row])/scale);
     }
     if (worst) *worst = largest;
-    return largest<=1e-4;
+    return largest<=1e-3;
 }
 } // namespace ss2vr

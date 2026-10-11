@@ -153,8 +153,8 @@ int main(int argc,char **argv) {
      constants[21][3]=saved;}
     constants[21][3]+=.01f;
     assert(!scopeCapPosition(program,constants,cap,true,expected)); constants[21][3]-=.01f;
-    constants[21][3]+=.001f; // One millimetre of cap displacement is a different pose.
-    assert(!scopeCapPosition(program,constants,cap,true,expected)); constants[21][3]-=.001f;
+    constants[21][3]+=.005f; // Five millimetres of cap displacement is a different pose.
+    assert(!scopeCapPosition(program,constants,cap,true,expected)); constants[21][3]-=.005f;
     auto bad=program; bad.insert(bad.end()-1,{1,0xc0010000,0x90000003});
     assert(!scopeCapPosition(bad,constants,cap,true,expected)); // UV replacing clip X.
     bad=program; bad.insert(bad.end()-1,{1,0xc00f0000,0x80e4000b});

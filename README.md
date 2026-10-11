@@ -24,7 +24,7 @@ pre-bloom scene capture and an ordered RGB-only lens pass. This supports a stric
 stock-geometry, opaque PS2, direct non-MSAA UNORM-target subset; unsupported
 render paths keep the native draw. Surrounding headset FOV and native zoom timing
 stay unchanged. The lens is verified in the simulated-headset lab (4x image on the
-zero-copy path, forgiving eye box, about +7 ms CPU per frame while zoomed); it has
+zero-copy path, mipmapped, forgiving eye box, about +1.7 ms CPU per frame while zoomed); it has
 not yet been tried on a real headset. See [scope source integration](docs/SCOPE_SOURCE_INTEGRATION.md).
 This does not update the historical development archive described below.
 

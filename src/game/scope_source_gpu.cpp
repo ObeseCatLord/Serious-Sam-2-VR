@@ -53,7 +53,7 @@ bool captureScopeSource(IDirect3DDevice9 *device, IDirect3DSurface9 *expectedSou
         // D3D9 may silently return S_OK while discarding work on a lost device.
         // Successful getters/copy alone therefore do not admit source pixels.
         if (!nativeUiDeviceCurrent(device) || device->TestCooperativeLevel() != D3D_OK ||
-            destination->GetType() != D3DRTYPE_TEXTURE || destination->GetLevelCount() != 1 ||
+            destination->GetType() != D3DRTYPE_TEXTURE || destination->GetLevelCount() < 1 ||
             FAILED(destination->GetSurfaceLevel(0, &owner.target)) || !owner.target ||
             FAILED(device->GetRenderTarget(0, &owner.source)) || !owner.source ||
             !identity(expectedSource, owner.expectedId) || !identity(owner.source, owner.sourceId) ||

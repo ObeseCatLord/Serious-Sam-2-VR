@@ -391,6 +391,8 @@ struct PerfClock {
     unsigned stage[10]{};
     unsigned scopeNeeded = 0, scopeCandidates = 0, scopeBegun = 0, scopeReady = 0, scopeHalted = 0;
     unsigned scopeCallbacks = 0, scopeCopied = 0, scopeFinished = 0;
+    double scopeSourceCpu = 0, scopeTailCpu = 0;
+    unsigned scopeBeginFailures[4]{};
     float scopeLuma = -1;
     unsigned publishLock = 0, publishCancelled = 0, publishState = 0, publishRequest = 0, publishImages = 0,
         publishCommit = 0, finishNotCurrent = 0;
@@ -1906,10 +1908,14 @@ static void presentBody(IDirect3DDevice9 *d) {
                     perf.publishCommit, perf.finishNotCurrent);
             if (perf.scopeNeeded || scopeSourcesHalted)
                 log("Perf scope: needed=%u candidates=%u begun=%u ready=%u halted=%u callbacks=%u copied=%u finished=%u "
-                "drawn=%u luma=%.1f eyeInOptic=%.3f,%.3f,%.3f", perf.scopeNeeded, perf.scopeCandidates,
+                "drawn=%u luma=%.1f eyeInOptic=%.3f,%.3f,%.3f sourceCpu=%.2fms tail=%.2fms beginFail=%u/%u/%u",
+                perf.scopeNeeded, perf.scopeCandidates,
                 perf.scopeBegun, perf.scopeReady, unsigned(scopeSourcesHalted), perf.scopeCallbacks, perf.scopeCopied,
                 perf.scopeFinished, scopeImageDraws(), double(perf.scopeLuma), double(scopeEyeInOptic()[0]),
-                double(scopeEyeInOptic()[1]), double(scopeEyeInOptic()[2]));
+                double(scopeEyeInOptic()[1]), double(scopeEyeInOptic()[2]),
+                perf.scopeBegun ? perf.scopeSourceCpu*1000/perf.scopeBegun : 0.,
+                perf.scopeCallbacks ? perf.scopeTailCpu*1000/perf.scopeCallbacks : 0., perf.scopeBeginFailures[1],
+                perf.scopeBeginFailures[2], perf.scopeBeginFailures[3]);
             log("Perf draws per pair: eyes=%.0f hud duplicates=%.0f; other per frame=%.0f",
                 perf.pairs ? double(perf.eyeDraws) / perf.pairs : 0., perf.pairs ? double(perf.hudDuplicates) / perf.pairs : 0.,
                 double(perf.desktopDraws) / perf.frames);
@@ -2538,8 +2544,10 @@ static HRESULT copyScopePixels(IDirect3DDevice9 *d,IDirect3DSurface9 *from,IDire
 static bool scopeCaptureTransferCurrent(void *opaque) noexcept {
     return scopeCaptureCurrent(opaque) && scopeSourceExecuting() && scopeGpuTransactionCurrent(uiFrame.device);
 }
+static LARGE_INTEGER scopeCaptureTime{};
 static __attribute__((force_align_arg_pointer)) void __cdecl captureNativeScope(void *opaque) noexcept {
     ++perf.scopeCallbacks;
+    scopeCaptureTime = PerfClock::now();
     if (!scopeCaptureCurrent(opaque) || !scopeSourceExecuting()) return;
     if (!scopeCaptureFrame.once.enter()) { scopeCaptureFrame.copied = false; return; }
     if (!scopeGpuTransactionBegin(uiFrame.device)) return;
@@ -2598,9 +2606,23 @@ static void probeScopeImage(IDirect3DDevice9 *d,IDirect3DTexture9 *image,const R
     if (read) read->Release();
     if (level) level->Release();
 }
+// Scope views observed in the previous frame's left-eye render. Replaces a
+// dedicated preview render of the world (a whole extra pass while zoomed).
+static ScopeSourceView observedScopeView[2];
+static bool observedScopeValid[2]{};
+static uint64_t observedScopeGeneration = 0;
+static void noteScopeViews(void *puppet,const Request &request) noexcept {
+    const bool needed = !scopeSourcesHalted && scopePreviewNeeded(puppet,request);
+    for (unsigned hand=0;hand<2;++hand)
+        observedScopeValid[hand] = needed && copyScopeSourceView(hand,observedScopeView[hand]);
+    observedScopeGeneration = graphicsResourceGeneration();
+}
 static bool renderScopeSources(void *puppet,void(__thiscall *original)(void *),const Request &request) {
     const auto generation = graphicsResourceGeneration();
-    if (scopeSourcesHalted || !scopePreviewNeeded(puppet,request)) return true;
+    if (scopeSourcesHalted || !scopePreviewNeeded(puppet,request)) {
+        observedScopeValid[0] = observedScopeValid[1] = false;
+        return true;
+    }
     ++perf.scopeNeeded;
     auto *d = uiFrame.device;
     D3DCAPS9 caps{};
@@ -2618,17 +2640,12 @@ static bool renderScopeSources(void *puppet,void(__thiscall *original)(void *),c
         (FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(ScopeImageOpaqueProgram),&scopeShaderCache)) ||
          !scopeShaderCache)) return true;
     if (!uiFrame.scopeShader) { uiFrame.scopeShader = scopeShaderCache; scopeShaderCache->AddRef(); }
-    activeEye = 0; eyeInvalid = false; renderRequest = request;
-    beginScopePreview(puppet,request);
-    bool ok = prepareScopeScratch();
-    if (ok) original(puppet);
-    if (generation != graphicsResourceGeneration()) return false;
-    ok = ok && !eyeInvalid && eyeTargetCurrent(0);
-    bool candidate[2]{};
-    if (ok) for (unsigned hand=0;hand<2;++hand) candidate[hand] = copyScopeSourceView(hand,uiFrame.scopeView[hand]);
-    endEye(); activeEye = -1;
+    activeEye = -1; eyeInvalid = false; renderRequest = request;
+    bool ok = true;
     for (unsigned hand=0;hand<2 && ok;++hand) {
-        if (!candidate[hand]) continue;
+        if (!observedScopeValid[hand] || observedScopeGeneration != generation) continue;
+        observedScopeValid[hand] = false; // One source render per observation.
+        uiFrame.scopeView[hand] = observedScopeView[hand];
         ++perf.scopeCandidates;
         // The source copy needs the eye target's exact format (zero-copy shared
         // targets are A8R8G8B8; the pixel fallback uses the backbuffer format).
@@ -2639,23 +2656,49 @@ static bool renderScopeSources(void *puppet,void(__thiscall *original)(void *),c
                       cached.Height != request.height || cached.Format != eyeDesc.Format)) {
             image->Release(); image = nullptr;
         }
-        if (!image && (FAILED(d->CreateTexture(request.width,request.height,1,D3DUSAGE_RENDERTARGET,eyeDesc.Format,
-                                              D3DPOOL_DEFAULT,&image,nullptr)) || !image)) { image = nullptr; continue; }
+        // Automatic mipmaps when the device can: the lens shows a small, heavily
+        // minified view of this full-size image and would otherwise sparkle.
+        static const bool autoMips = [d,format = eyeDesc.Format] {
+            D3DCAPS9 c{}; IDirect3D9 *api = nullptr; D3DDEVICE_CREATION_PARAMETERS creation{}; D3DDISPLAYMODE mode{};
+            bool ok = SUCCEEDED(d->GetDeviceCaps(&c)) && (c.Caps2 & D3DCAPS2_CANAUTOGENMIPMAP) &&
+                SUCCEEDED(d->GetDirect3D(&api)) && api && SUCCEEDED(d->GetCreationParameters(&creation)) &&
+                SUCCEEDED(d->GetDisplayMode(0,&mode)) &&
+                api->CheckDeviceFormat(creation.AdapterOrdinal,creation.DeviceType,mode.Format,
+                    D3DUSAGE_RENDERTARGET|D3DUSAGE_AUTOGENMIPMAP,D3DRTYPE_TEXTURE,format) == D3D_OK;
+            if (api) api->Release();
+            log("Scope lens mipmaps=%u", unsigned(ok));
+            return ok;
+        }();
+        if (!image && (FAILED(d->CreateTexture(request.width,request.height,autoMips ? 0 : 1,
+                                              D3DUSAGE_RENDERTARGET|(autoMips ? D3DUSAGE_AUTOGENMIPMAP : 0),
+                                              eyeDesc.Format,D3DPOOL_DEFAULT,&image,nullptr)) || !image)) {
+            image = nullptr; continue;
+        }
         if (!uiFrame.scopeImage[hand]) { uiFrame.scopeImage[hand] = image; image->AddRef(); }
         scopeCaptureFrame = {hand,uiFrame.generation,true,false,{}};
         scopeScratch = true; eyeInvalid = false;
         const bool begun = beginScopeSource(puppet,request,uiFrame.scopeView[hand],captureNativeScope,
                                             scopeCaptureCurrent,&scopeCaptureFrame);
+        if (!begun) perf.scopeBeginFailures[std::min(scopeSourceBeginFailure(),3u)]++;
         if (begun) {
             ++perf.scopeBegun;
+            const LARGE_INTEGER sourceStart = PerfClock::now();
+            scopeCaptureTime = {};
             ok = prepareScopeScratch();
             if (ok) original(puppet);
+            const LARGE_INTEGER sourceEnd = PerfClock::now();
+            perf.scopeSourceCpu += PerfClock::seconds(sourceStart,sourceEnd);
+            if (scopeCaptureTime.QuadPart) perf.scopeTailCpu += PerfClock::seconds(scopeCaptureTime,sourceEnd);
             if (generation != graphicsResourceGeneration()) return false;
             const bool finished = endScopeSource(ok && !eyeInvalid);
             perf.scopeFinished += finished; perf.scopeCopied += scopeCaptureFrame.copied;
             uiFrame.scopeReady[hand] = scopeCaptureFrame.once.complete(finished,scopeCaptureFrame.copied) &&
                 scopeCaptureCurrent(&scopeCaptureFrame) && nativeUiFrameCurrent(puppet,request);
-            if (uiFrame.scopeReady[hand]) { ++perf.scopeReady; probeScopeImage(d,uiFrame.scopeImage[hand],request); }
+            if (uiFrame.scopeReady[hand]) {
+                ++perf.scopeReady;
+                if (uiFrame.scopeImage[hand]->GetLevelCount() > 1) uiFrame.scopeImage[hand]->GenerateMipSubLevels();
+                probeScopeImage(d,uiFrame.scopeImage[hand],request);
+            }
         }
         scopeCaptureFrame.active = false;
         scopeScratch = false;
@@ -2892,6 +2935,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                 const LARGE_INTEGER eyeStart=PerfClock::now();
                 ok=observedWorldRender(d,puppet,original,request,i,traceDepth);
                 perf.eyeCpu[pass]+=PerfClock::seconds(eyeStart,PerfClock::now());
+                if(i==0 && generation==graphicsResourceGeneration()) noteScopeViews(puppet,request);
                 noteStage(3);
                 if(traceDepth && generation==graphicsResourceGeneration()) traceStereoDepth(d,request,i,"after-world");
             }

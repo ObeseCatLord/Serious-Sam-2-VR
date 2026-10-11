@@ -5605,13 +5605,9 @@ bool scopePreviewNeeded(void *player, const Request &request) {
             nativeSniper(resolve(eyeSnapshot.handle[hand]))) return true;
     return false;
 }
-void beginScopePreview(void *player, const Request &request) {
-    beginEye(player,request,0);
-    scopePreview = true;
-}
 static bool copyScopeSourceViewChecked(unsigned hand, ScopeSourceView &out, unsigned &reason) {
     out = {};
-    reason = 1; if (!scopePreview || eyeIndex != 0) return false;
+    reason = 1; if (eyeIndex != 0) return false; // Observed in the ordinary left-eye render.
     reason = 2; if (!observedScopePose(hand,out.pose)) return false;
     reason = 3; if (!out.pose.opaqueColorCandidate) return false;
     reason = 4; if (!out.pose.imageCoordinates.valid) return false;
@@ -5648,18 +5644,28 @@ bool copyScopeSourceView(unsigned hand, ScopeSourceView &out) {
     }
     return ok;
 }
+static unsigned scopeBeginFailure = 0; // Diagnostic: 1 view/player, 2 sequence, 3 identity/frame.
+unsigned scopeSourceBeginFailure() noexcept { return scopeBeginFailure; }
 bool beginScopeSource(void *player, const Request &request, const ScopeSourceView &view,
                       ScopeCaptureCallback callback, ScopeCaptureCurrent currentSource, void *context) {
+    scopeBeginFailure = 1;
     if (!callback || !currentSource || !context || view.hand >= 2 || !view.pose.valid ||
         !finite(view.camera) || !scopeOpticalProjectionValid(view.opticalProjection) ||
-        player != eyeSnapshot.player || !eyeSnapshot.rider.handheld() ||
-        view.pose.requestSequence != request.sequence || view.pose.inputSequence != request.input.sequence ||
-        view.pose.generation != eyeSnapshot.generation || view.pose.ownerHandle != eyeSnapshot.playerHandle ||
+        player != eyeSnapshot.player || !eyeSnapshot.rider.handheld()) return false;
+    // The view was observed in the previous frame's left-eye render (no
+    // preview pass); the lens reprojects it into the current optic frame.
+    // Late-latched requests advance the sequence by several per frame.
+    scopeBeginFailure = 2;
+    if (!view.pose.requestSequence || view.pose.requestSequence >= request.sequence ||
+        request.sequence - view.pose.requestSequence > ScopeSourceMaxRequestAge) return false;
+    scopeBeginFailure = 3;
+    if (view.pose.generation != eyeSnapshot.generation || view.pose.ownerHandle != eyeSnapshot.playerHandle ||
         view.pose.weaponHandle != eyeSnapshot.handle[view.hand] || !nativeUiFrameCurrent(player,request)) return false;
     beginEye(player,request,-1); // Explicit source purpose, never a synthetic eye index.
     scopeSource.view = view;
     scopeSource.callback = callback; scopeSource.current = currentSource; scopeSource.context = context;
     scopeSource.active = true;
+    scopeBeginFailure = 0;
     return true;
 }
 bool scopeSourceExecuting() noexcept {

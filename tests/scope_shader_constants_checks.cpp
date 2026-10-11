@@ -51,6 +51,44 @@ int main() {
            close(constants.rows[3][2],relative.z));
     assert(scopeReticleTarget(frame,projection,placement.p+rotate(placement.q,{1,0,-40}),.001f,.012f,constants));
     assert(close(constants.rows[6][0],.75f) && close(constants.rows[6][1],.5f));
+    // Reprojection into an earlier source camera: the unchanged shader arithmetic
+    // must equal projecting the current frame's world ray into the source camera.
+    {
+        auto rigid = [](Pose pose) {
+            ScopeOpticalFrame f;
+            f.camera = matrix(pose); f.inverseCamera = matrix(inverse(pose));
+            f.radiusX = f.radiusY = .02f; f.valid = true;
+            return f;
+        };
+        const Pose currentPose{normalize(Quat{.05f,.2f,-.03f,1}),{.3f,1.2f,-.4f}};
+        const Pose sourcePose{normalize(Quat{.02f,.17f,.01f,1}),{.31f,1.19f,-.38f}};
+        const auto current = rigid(currentPose), source = rigid(sourcePose);
+        const Vec3 eye{.004f,-.003f,.12f};
+        ScopeShaderConstants c;
+        const Vec3 worldEye = currentPose.p + rotate(currentPose.q, eye); // The builder takes world space.
+        assert(scopeShaderConstants(current, projection, coordinates, worldEye, 1, 0, 0, c));
+        assert(scopeReprojectConstants(current, source, c));
+        for (float u : {0.f,.3f,.5f,1.f}) for (float v : {0.f,.6f,1.f}) {
+            const Vec3 aperture{.04f*u-.02f, -.04f*v+.02f, 0};
+            const Vec3 worldRay = rotate(currentPose.q, aperture-eye);
+            const Vec3 sourceRay = rotate(inverse(sourcePose.q), worldRay);
+            const float expectedU = sourceRay.x/-sourceRay.z*c.rows[4][0]+c.rows[4][2];
+            const float expectedV = sourceRay.y/-sourceRay.z*c.rows[4][1]+c.rows[4][3];
+            float ray[3];
+            for (unsigned row = 0; row < 3; ++row)
+                ray[row] = c.rows[row][0]*u + c.rows[row][1]*v + c.rows[row][2] - c.rows[3][row];
+            assert(close(ray[0]/-ray[2]*c.rows[4][0]+c.rows[4][2], expectedU));
+            assert(close(ray[1]/-ray[2]*c.rows[4][1]+c.rows[4][3], expectedV));
+        }
+        ScopeShaderConstants same;
+        assert(scopeShaderConstants(current, projection, coordinates, worldEye, 1, 0, 0, same));
+        const auto before = same.rows;
+        assert(scopeReprojectConstants(current, current, same));
+        for (unsigned row = 0; row < 4; ++row) for (unsigned k = 0; k < 3; ++k)
+            assert(std::abs(same.rows[row][k]-before[row][k]) < 1e-6f); // Same frame is identity.
+        ScopeShaderConstants invalid;
+        assert(!scopeReprojectConstants(current, source, invalid));
+    }
     frame.camera = frame.inverseCamera = matrix({});
     for (Vec3 badEye : {Vec3{0,0,0},Vec3{0,0,-1},Vec3{0,0,std::numeric_limits<float>::infinity()}}) {
         assert(!scopeShaderConstants(frame,projection,coordinates,badEye,1,0,0,constants));

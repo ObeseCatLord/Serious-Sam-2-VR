@@ -1,5 +1,23 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-11 (latest) — cheaper, cleaner scope lens
+
+- No preview pass: the scope view observed in the previous frame's ordinary
+  left-eye render drives this frame's scope-camera render. The lens draw
+  re-expresses its shader constants (aperture rows and eye) in that source
+  camera's frame, so the unchanged shader projects exactly into the one-frame-
+  old image (rotation and translation; only scene motion is a frame old).
+  Zoomed CPU cost: about +7 ms -> +1.7 ms per frame (lab V172); the scope-camera
+  pass itself is ~1.5 ms (narrow FOV) and nothing runs after its capture point.
+- The lens image has an automatic mip chain sampled trilinearly: the full-size
+  source minified onto a small lens sparkled; it is now smooth.
+- Request sequences advance several times per frame (late latching), so the
+  source age guard is 8 requests; freshness is one frame (each observation is
+  used once). The cap-position tolerance is 1e-3 of clip magnitude: float error
+  reaches 1.6e-4 depending on level position; 5 mm displacement still rejects.
+- GPU (lab, 1882x2117): the scope-camera pass adds ~0.3-0.9 ms.
+
+
 ## 2026-10-11 (late) — sniper scope lens, zoom on the physical hand, sizes
 
 - Sniper zoom follows the hand that physically holds the rifle (the stick click
@@ -16,7 +34,8 @@
   parallax, so the magnified view stays visible without the head exactly behind
   the scope (the rifle's scope rides ~0.3 m above the controller).
 - Cost while zoomed: two extra world passes (pose preview + scope source),
-  about +7 ms CPU per frame in the lab; nothing when not zoomed.
+  about +7 ms CPU per frame in the lab; nothing when not zoomed (the preview
+  pass was removed later, see above).
 - Klodovik and the Serious Bomb are 1.5x larger (87% / 130% of the revolver).
 - HeadComfort stays disabled by default; when enabled it now darkens only when a
   fresh probe actually finds the head inside geometry.

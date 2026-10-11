@@ -19,9 +19,13 @@ inline bool scopeSourceSurface(const ScopeSourceSurface &s, uint32_t width, uint
     return width && height && s.type == 1 && s.pool == 0 && s.width == width && s.height == height &&
         s.usage == 1 && s.samples == 0 && s.quality == 0 && (s.format == 21 || s.format == 22);
 }
+// The destination (b) may also carry automatic mipmaps (D3DUSAGE_AUTOGENMIPMAP,
+// 0x400): the lens samples a filtered chain instead of the minified full image.
 inline bool scopeSourcePair(const ScopeSourceSurface &a, const ScopeSourceSurface &b,
                             uint32_t width, uint32_t height) noexcept {
-    return scopeSourceSurface(a,width,height) && scopeSourceSurface(b,width,height) && a.format == b.format;
+    ScopeSourceSurface destination = b;
+    if (destination.usage == 0x401) destination.usage = 1;
+    return scopeSourceSurface(a,width,height) && scopeSourceSurface(destination,width,height) && a.format == b.format;
 }
 inline bool scopeSourceViewport(const ScopeSourceViewport &v, uint32_t width, uint32_t height) noexcept {
     return width && height && !v.x && !v.y && v.width == width && v.height == height &&

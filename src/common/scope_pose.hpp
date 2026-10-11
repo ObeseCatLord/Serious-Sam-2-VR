@@ -111,6 +111,20 @@ inline bool scopeImagePoseMatches(const ScopePoseObservation &a,const ScopePoseO
         scopeNativeZoom(1,1,a.zoom.startMultiplier,a.zoom.endMultiplier,a.zoom.progress).valid && a.zoom.startMultiplier == b.zoom.startMultiplier &&
         a.zoom.endMultiplier == b.zoom.endMultiplier && a.zoom.progress == b.zoom.progress;
 }
+// A source image rendered from an earlier frame's pose of the same weapon (the
+// frame before; late-latched requests can advance the sequence several times
+// per frame, so the bound is a staleness guard). The lens draw reprojects it
+// into the current optic frame; zoom need not match (magnification is the
+// source's own and travels with its projection).
+inline constexpr uint64_t ScopeSourceMaxRequestAge = 8;
+inline bool scopeImageSourceRecent(const ScopePoseObservation &source,const ScopePoseObservation &current) noexcept {
+    return source.valid && current.valid && source.requestSequence && current.requestSequence > source.requestSequence &&
+        current.requestSequence - source.requestSequence <= ScopeSourceMaxRequestAge && source.ownerHandle &&
+        source.ownerHandle == current.ownerHandle && source.weaponHandle && source.weaponHandle == current.weaponHandle &&
+        source.modelHandle && source.modelHandle == current.modelHandle && source.generation &&
+        source.generation == current.generation && source.layout == current.layout &&
+        finiteMatrix(source.affine) && finiteMatrix(current.affine) && source.zoom.valid && current.zoom.valid;
+}
 inline bool scopeObservationThread(uint32_t owner, uint32_t current, bool mainThread) {
     return owner && owner != UINT32_MAX && owner == current && mainThread;
 }

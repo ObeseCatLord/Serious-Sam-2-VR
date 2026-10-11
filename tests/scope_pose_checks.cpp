@@ -71,6 +71,20 @@ int main() {
     accepted.nativeBaseFovRadians=Pi/2;
     accepted.zoom=scopeNativeZoom(1,1,1,.25f,.75f);
     assert(scopeImagePoseMatches(accepted,accepted));
+    {   // An earlier frame's source of the same weapon, one or two requests back.
+        auto next = accepted; next.requestSequence += 1; next.inputSequence += 1; next.affine.m[3] += .01f;
+        assert(scopeImageSourceRecent(accepted,next));
+        next.requestSequence = accepted.requestSequence + ScopeSourceMaxRequestAge;
+        assert(scopeImageSourceRecent(accepted,next));
+        next.requestSequence += 1; assert(!scopeImageSourceRecent(accepted,next)); // Too old.
+        next.requestSequence = accepted.requestSequence; assert(!scopeImageSourceRecent(accepted,next)); // Not earlier.
+        next.requestSequence = accepted.requestSequence + 1;
+        auto other = next; other.weaponHandle++; assert(!scopeImageSourceRecent(accepted,other));
+        other = next; other.modelHandle++; assert(!scopeImageSourceRecent(accepted,other));
+        other = next; other.generation++; assert(!scopeImageSourceRecent(accepted,other));
+        other = next; other.ownerHandle++; assert(!scopeImageSourceRecent(accepted,other));
+        other = next; other.zoom = {}; assert(!scopeImageSourceRecent(accepted,other));
+    }
     auto changed = accepted;
     changed.requestSequence++; assert(!scopeImagePoseMatches(accepted,changed)); changed=accepted;
     changed.inputSequence++; assert(!scopeImagePoseMatches(accepted,changed)); changed=accepted;

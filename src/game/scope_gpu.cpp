@@ -804,7 +804,7 @@ static constexpr D3DSAMPLERSTATETYPE imageSamplerStates[]{D3DSAMP_ADDRESSU,D3DSA
     D3DSAMP_MAGFILTER,D3DSAMP_MINFILTER,D3DSAMP_MIPFILTER,D3DSAMP_SRGBTEXTURE,D3DSAMP_MAXMIPLEVEL,
     D3DSAMP_MIPMAPLODBIAS,D3DSAMP_MAXANISOTROPY};
 static constexpr DWORD imageSamplerValues[]{D3DTADDRESS_CLAMP,D3DTADDRESS_CLAMP,D3DTADDRESS_CLAMP,
-    D3DTEXF_LINEAR,D3DTEXF_LINEAR,D3DTEXF_NONE,0,0,0,1};
+    D3DTEXF_LINEAR,D3DTEXF_LINEAR,D3DTEXF_LINEAR,0,0,0,1}; // Trilinear over the lens image's mip chain.
 static constexpr D3DRENDERSTATETYPE imageStates[]{D3DRS_ZWRITEENABLE,D3DRS_ZFUNC,D3DRS_COLORWRITEENABLE};
 static bool restoreImageState(IDirect3DDevice9 *d) noexcept {
     if (!probe.imageChanged) return !probe.imageRestoreFailed;
@@ -854,14 +854,14 @@ static bool prepareImage(IDirect3DDevice9 *d) {
     if (!color.valid || color.states[15] != FALSE ||
         !scopeGpuImage(d,probe.raster.hand,probe.sourceView,probe.image,probe.imageShader) ||
         probe.sourceView.hand != probe.raster.hand ||
-        !scopeImagePoseMatches(probe.sourceView.pose,probe.raster.pose)) return false;
+        !scopeImageSourceRecent(probe.sourceView.pose,probe.raster.pose) ||
+        !scopeOpticalFrameValid(probe.sourceView.pose.opticalFrame)) return false;
     ScopeOpticalFrame optic;
     ScopeImageCoordinates coordinates;
     Vec3 eye;
     if (!scopeOpticalFrame(probe.cap,probe.raster.pose.affine,optic) ||
         !scopeImageCoordinates(probe.cap,probe.raster.pose.affine,ScopeUvTransform{probe.uvRows},coordinates) ||
-        !probe.sourceView.pose.imageCoordinates.valid ||
-        coordinates.rows != probe.sourceView.pose.imageCoordinates.rows || !scopeImageEye(eye) ||
+        !scopeImageEye(eye) ||
         !scopeShaderConstants(optic,probe.sourceView.opticalProjection,coordinates,eye,1,0,0,probe.imageConstants))
         return false;
     // Forgiving eye box: the sniper's scope rides well above the controller, so
@@ -871,9 +871,13 @@ static bool prepareImage(IDirect3DDevice9 *d) {
     constexpr float EyeBoxParallax = .25f;
     probe.imageConstants.rows[3][0] *= EyeBoxParallax;
     probe.imageConstants.rows[3][1] *= EyeBoxParallax;
+    // The source image was rendered from the previous frame's scope pose:
+    // look it up in that camera's frame (rotation and translation exact).
+    const auto &source = probe.sourceView.pose.opticalFrame;
+    if (!scopeReprojectConstants(optic,source,probe.imageConstants)) return false;
     Vec3 target;
     if (scopeImageTarget(probe.raster.hand,target))
-        scopeReticleTarget(optic,probe.sourceView.opticalProjection,target,.001f,.012f,probe.imageConstants);
+        scopeReticleTarget(source,probe.sourceView.opticalProjection,target,.001f,.012f,probe.imageConstants);
     if (FAILED(d->GetTexture(0,&probe.originalTexture)) ||
         FAILED(d->GetPixelShaderConstantF(0,probe.pixelConstants[0].data(),7))) return false;
     for (unsigned i=0;i<std::size(imageSamplerStates);++i)

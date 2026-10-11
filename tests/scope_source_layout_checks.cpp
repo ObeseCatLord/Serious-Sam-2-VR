@@ -14,7 +14,7 @@ int main() {
             case 1: bad.pool=1; break;
             case 2: --bad.width; break;
             case 3: --bad.height; break;
-            case 4: bad.usage=0x401; break;
+            case 4: bad.usage=0x403; break;
             case 5: bad.samples=2; break;
             case 6: bad.quality=1; break;
             case 7: bad.format=113; break;
@@ -22,6 +22,9 @@ int main() {
             assert(!scopeSourcePair(valid,bad,1920,1080));
             assert(!scopeSourcePair(bad,valid,1920,1080));
         }
+        auto mipmapped=valid; mipmapped.usage=0x401;
+        assert(scopeSourcePair(valid,mipmapped,1920,1080));  // Destination may autogenerate mips.
+        assert(!scopeSourcePair(mipmapped,valid,1920,1080)); // The native source never does.
         auto different=valid; different.format=format==21 ? 22:21;
         assert(!scopeSourcePair(valid,different,1920,1080));
         assert(!scopeSourcePair(valid,valid,0,1080));

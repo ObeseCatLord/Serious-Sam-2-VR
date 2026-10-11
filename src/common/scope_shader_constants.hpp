@@ -53,6 +53,40 @@ inline bool scopeShaderConstants(const ScopeOpticalFrame &frame,
     out = next;
     return true;
 }
+// Re-express the aperture rows (c0..c2) and eye (c3) of constants built in the
+// current optic frame in an earlier source camera's frame. The shader's ray
+// arithmetic is unchanged, so its lookup becomes the exact projection into the
+// source image: a one-frame-old image stays registered to the moving scope
+// (only scene parallax and animation are a frame old).
+inline bool scopeReprojectConstants(const ScopeOpticalFrame &current,const ScopeOpticalFrame &source,
+                                    ScopeShaderConstants &c) noexcept {
+    if (!c.valid || !scopeOpticalFrameValid(current) || !scopeOpticalFrameValid(source)) return false;
+    double rotation[3][3]{}, translation[3]{};
+    const double delta[3]{double(current.camera.m[3]) - source.camera.m[3],
+                          double(current.camera.m[7]) - source.camera.m[7],
+                          double(current.camera.m[11]) - source.camera.m[11]};
+    for (unsigned row = 0; row < 3; ++row) {
+        for (unsigned col = 0; col < 3; ++col)
+            for (unsigned k = 0; k < 3; ++k)
+                rotation[row][col] += double(source.inverseCamera.m[4*row+k]) * current.camera.m[4*k+col];
+        for (unsigned k = 0; k < 3; ++k) translation[row] += double(source.inverseCamera.m[4*row+k]) * delta[k];
+    }
+    ScopeShaderConstants next = c;
+    for (unsigned row = 0; row < 3; ++row) {
+        for (unsigned uv = 0; uv < 3; ++uv) {
+            double value = uv == 2 ? translation[row] : 0;
+            for (unsigned k = 0; k < 3; ++k) value += rotation[row][k] * c.rows[k][uv];
+            next.rows[row][uv] = float(value);
+        }
+        double eye = translation[row];
+        for (unsigned k = 0; k < 3; ++k) eye += rotation[row][k] * c.rows[3][k];
+        next.rows[3][row] = float(eye);
+    }
+    for (unsigned row = 0; row < 4; ++row)
+        for (float value : next.rows[row]) if (!std::isfinite(value)) return false;
+    c = next;
+    return true;
+}
 // Place a reticle at an already-frozen native aim/collision point in the
 // source camera. This is source projection, not the magnification-compressed
 // eye ray used to sample through the aperture. No guessed optical-axis zero.
