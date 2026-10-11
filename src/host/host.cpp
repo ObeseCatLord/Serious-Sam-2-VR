@@ -1054,6 +1054,16 @@ struct Host {
     uint64_t completed = 0, timeouts = 0, fullSlots = 0, discarded = 0, imageTimeouts = 0, invalidViews = 0;
     uint64_t retired = 0, submissions = 0, reused = 0, lastSubmittedSequence = 0;
     ULONGLONG lastDiagnostics = 0, lastMutexDiagnostic = 0;
+    // Host cost accounting for the 5 s diagnostics line (milliseconds sums).
+    double perfWait = 0, perfUpload = 0, perfLoop = 0, perfSubmit = 0;
+    uint64_t perfLoops = 0, perfUploads = 0;
+    LARGE_INTEGER perfLoopStart{};
+    static double perfMs(LARGE_INTEGER a, LARGE_INTEGER b) {
+        static LARGE_INTEGER frequency{};
+        if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+        return 1000. * double(b.QuadPart - a.QuadPart) / double(frequency.QuadPart);
+    }
+    static LARGE_INTEGER perfNow() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
 
     explicit Host(Log &l) : log(l), api(l) {}
     ~Host() {
@@ -1812,6 +1822,11 @@ struct Host {
             return;
         }
         invalidateCachedPair(); // A failure between releases must never expose a mixed pair.
+        const LARGE_INTEGER uploadStart = perfNow();
+        struct UploadTimer {
+            Host &host; LARGE_INTEGER start;
+            ~UploadTimer() { host.perfUpload += perfMs(start, perfNow()); ++host.perfUploads; }
+        } uploadTimer{*this, uploadStart};
         eye[0].uploadWaited(context.p, source[0]);
         eye[1].uploadWaited(context.p, source[1]);
         if (reply.foveated)
@@ -2147,6 +2162,16 @@ struct Host {
                       static_cast<unsigned long long>(xrMenuSuccess), static_cast<unsigned long long>(xrWorldSuccess),
                       static_cast<unsigned long long>(uiPairs), static_cast<unsigned long long>(clearedPairs));
         log.write(line);
+        if (perfLoops) {
+            std::snprintf(line, sizeof(line),
+                          "Host perf loops=%llu loop=%.2fms wait=%.2fms submit=%.2fms uploads=%llu upload=%.2fms",
+                          static_cast<unsigned long long>(perfLoops), perfLoop / perfLoops, perfWait / perfLoops,
+                          perfSubmit / perfLoops, static_cast<unsigned long long>(perfUploads),
+                          perfUploads ? perfUpload / perfUploads : 0.);
+            log.write(line);
+        }
+        perfWait = perfUpload = perfLoop = perfSubmit = 0;
+        perfLoops = perfUploads = 0;
     }
     void run() {
         while (!quit && !api.lossPending) {
@@ -2165,7 +2190,11 @@ struct Host {
             }
             XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
             XrFrameState frameState{XR_TYPE_FRAME_STATE};
+            const LARGE_INTEGER waitStart = perfNow();
+            if (perfLoopStart.QuadPart) { perfLoop += perfMs(perfLoopStart, waitStart); ++perfLoops; }
+            perfLoopStart = waitStart;
             api.check(api.WaitFrame(session, &wait, &frameState), "xrWaitFrame");
+            perfWait += perfMs(waitStart, perfNow());
             XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
             api.check(api.BeginFrame(session, &begin), "xrBeginFrame");
             Frame frame(api, session, frameState.predictedDisplayTime);
@@ -2308,7 +2337,9 @@ struct Host {
                     ++reused;
                 lastSubmittedSequence = cachedRequest.sequence;
             }
+            const LARGE_INTEGER submitStart = perfNow();
             const auto endResult = frame.submit(layers);
+            perfSubmit += perfMs(submitStart, perfNow());
             worldSubmission.sample(GetCurrentProcessId(),cachedRequest,endResult==XR_SUCCESS &&
                 worldPresented && std::find(layers.begin(),layers.end(),world)!=layers.end());
             publishWorldSubmission();

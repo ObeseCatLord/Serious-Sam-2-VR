@@ -33,7 +33,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.lasers = number(L"Laser", L"Enabled", 1, 0, 1) >= .5f;
     settings.laserDistance = number(L"Laser", L"MaxDistanceMeters", 100, 5, 200);
     settings.scopeEyeRelief = number(L"Scope", L"EyeReliefMeters", .1f, .02f, .3f);
-    settings.renderScale = number(L"Render", L"Scale", 1, .25f, 2);
+    settings.renderScale = number(L"Render", L"Scale", 1, .25f, 4);
     settings.foveation.mode = int(number(L"Render", L"Foveation", 1, 0, 2) + .5f);
     settings.desktopWorld = number(L"Render", L"DesktopWorld", 0, 0, 1) >= .5f;
     settings.uiAspect = number(L"Render", L"UiAspect", 16.f / 9, 1.f, 2.5f);

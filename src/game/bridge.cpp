@@ -362,6 +362,100 @@ static bool resetQuarantined = false;
 static D3DFORMAT depthFormat = D3DFMT_UNKNOWN, colorFormat = D3DFMT_UNKNOWN;
 static bool hasStencil = false;
 static std::atomic<bool> stopping = false;
+// Frame cost accounting, logged every five seconds. CPU times come from QPC;
+// GPU times from D3D9 timestamp queries read back a few frames later without
+// stalling. Marks: 0 pair start, 1 left eye, 2 right eye, 3 desktop pass,
+// 4 end of the frame's native UI (just before readback).
+struct PerfClock {
+    double frame = 0, stereo = 0, mono = 0, eyeCpu[2]{}, desktopCpu = 0;
+    double readTarget = 0, lock = 0, copy = 0, dim = 0, publish = 0, wait = 0;
+    double gpu[4]{}; // left, right, desktop, ui/tail (ms sums)
+    unsigned frames = 0, pairs = 0, monoFrames = 0, gpuSamples = 0, readbacks = 0, waits = 0;
+    LARGE_INTEGER lastPresent{}, lastLog{};
+    static double seconds(LARGE_INTEGER a, LARGE_INTEGER b) {
+        static LARGE_INTEGER frequency{};
+        if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+        return double(b.QuadPart - a.QuadPart) / double(frequency.QuadPart);
+    }
+    static LARGE_INTEGER now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
+};
+static PerfClock perf;
+struct GpuProfile {
+    static constexpr unsigned Sets = 6, Marks = 5;
+    IDirect3DDevice9 *owner = nullptr;
+    IDirect3DQuery9 *disjoint[Sets]{}, *frequency[Sets]{}, *stamp[Sets][Marks]{};
+    unsigned marked[Sets]{}; // Bit per issued mark.
+    bool open[Sets]{}, pending[Sets]{}, failed = false;
+    int current = -1;
+    unsigned next = 0;
+    void release() {
+        for (unsigned i = 0; i < Sets; ++i) {
+            for (auto *&q : stamp[i]) { if (q) q->Release(); q = nullptr; }
+            if (disjoint[i]) disjoint[i]->Release();
+            if (frequency[i]) frequency[i]->Release();
+            disjoint[i] = frequency[i] = nullptr;
+            marked[i] = 0; open[i] = pending[i] = false;
+        }
+        owner = nullptr; current = -1;
+    }
+    bool create(IDirect3DDevice9 *d) {
+        if (owner == d) return true;
+        release();
+        if (failed || !d) return false;
+        for (unsigned i = 0; i < Sets; ++i) {
+            if (FAILED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMPDISJOINT, &disjoint[i])) ||
+                FAILED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ, &frequency[i]))) { failed = true; release(); return false; }
+            for (auto *&q : stamp[i])
+                if (FAILED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &q))) { failed = true; release(); return false; }
+        }
+        owner = d;
+        return true;
+    }
+    void collect() {
+        for (unsigned i = 0; i < Sets; ++i) {
+            if (!pending[i]) continue;
+            BOOL disjointed = TRUE;
+            UINT64 hz = 0, t[Marks]{};
+            if (disjoint[i]->GetData(&disjointed, sizeof(disjointed), 0) != S_OK ||
+                frequency[i]->GetData(&hz, sizeof(hz), 0) != S_OK) continue;
+            bool ready = true;
+            for (unsigned k = 0; k < Marks && ready; ++k)
+                if (marked[i] & (1u << k)) ready = stamp[i][k]->GetData(&t[k], sizeof(t[k]), 0) == S_OK;
+            if (!ready) continue;
+            pending[i] = false;
+            if (disjointed || !hz || marked[i] != (1u << Marks) - 1) continue;
+            for (unsigned k = 0; k + 1 < Marks; ++k) perf.gpu[k] += 1000. * double(t[k + 1] - t[k]) / double(hz);
+            ++perf.gpuSamples;
+        }
+    }
+    void begin(IDirect3DDevice9 *d) {
+        current = -1;
+        if (!create(d)) return;
+        collect();
+        const unsigned i = next;
+        if (pending[i] || open[i]) return; // Ring full: skip this pair.
+        next = (next + 1) % Sets;
+        marked[i] = 0;
+        if (FAILED(disjoint[i]->Issue(D3DISSUE_BEGIN))) return;
+        open[i] = true;
+        current = int(i);
+        mark(0);
+    }
+    void mark(unsigned k) {
+        if (current < 0 || k >= Marks) return;
+        if (SUCCEEDED(stamp[current][k]->Issue(D3DISSUE_END))) marked[current] |= 1u << k;
+    }
+    void end() {
+        if (current < 0) return;
+        const unsigned i = unsigned(current);
+        disjoint[i]->Issue(D3DISSUE_END);
+        frequency[i]->Issue(D3DISSUE_END);
+        open[i] = false;
+        pending[i] = true;
+        current = -1;
+    }
+};
+static GpuProfile gpuProfile;
 static int deferredSlot = -1;
 static uint64_t deferredSequence = 0;
 static void retireDeferred() {
@@ -1058,6 +1152,7 @@ static HRESULT WINAPI setRT(IDirect3DDevice9 *d, DWORD index, IDirect3DSurface9 
 }
 static void releaseTargets() {
     ++resourceGeneration;
+    gpuProfile.release();
     nativeUiFault();
     if (uiQuarantinedReadback) uiQuarantinedReadback->Release();
     uiQuarantinedReadback=nullptr;
@@ -1303,6 +1398,18 @@ static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 
         channel.shared->rendererReady = 1;
     }
     log("CPU stereo targets %ux%u; performance unverified", width, height);
+    static bool sharedProbed = false;
+    if (!sharedProbed) {
+        // Evidence for a zero-copy path: can this device create a cross-process shared render target?
+        sharedProbed = true;
+        IDirect3DTexture9 *shared = nullptr;
+        HANDLE handle = nullptr;
+        const HRESULT hr = device->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, colorFormat, D3DPOOL_DEFAULT,
+                                                 &shared, &handle);
+        log("Shared render target probe hr=%08lx handle=%p format=%u", static_cast<unsigned long>(hr), handle,
+            static_cast<unsigned>(colorFormat));
+        if (shared) shared->Release();
+    }
     return true;
 }
 static bool allocate(bool stereo = true) noexcept {
@@ -1595,20 +1702,6 @@ void presentDevice(IDirect3DDevice9 *d, uintptr_t caller, const RECT *src, const
         if (aborted) { uiHalted = true; nestedNativePresentation(); }
     });
 }
-// Frame cost accounting, logged every five seconds: whole frame (present to
-// present), the stereo world/UI render and the eye readback within it.
-struct PerfClock {
-    double frame = 0, stereo = 0, readback = 0;
-    unsigned frames = 0, pairs = 0;
-    LARGE_INTEGER lastPresent{}, lastLog{};
-    static double seconds(LARGE_INTEGER a, LARGE_INTEGER b) {
-        static LARGE_INTEGER frequency{};
-        if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
-        return double(b.QuadPart - a.QuadPart) / double(frequency.QuadPart);
-    }
-    static LARGE_INTEGER now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
-};
-static PerfClock perf;
 void present(IDirect3DDevice9 *d) {
     {
         const LARGE_INTEGER t = PerfClock::now();
@@ -1616,9 +1709,17 @@ void present(IDirect3DDevice9 *d) {
         perf.lastPresent = t;
         if (!perf.lastLog.QuadPart) perf.lastLog = t;
         if (PerfClock::seconds(perf.lastLog, t) >= 5 && perf.frames) {
-            log("Perf frames=%u frame=%.1fms stereo=%.1fms readback=%.1fms pairs=%u size=%ux%u", perf.frames,
-                1000 * perf.frame / perf.frames, 1000 * perf.stereo / perf.frames,
-                perf.pairs ? 1000 * perf.readback / perf.pairs : 0., perf.pairs, width, height);
+            const double pairs = perf.pairs ? perf.pairs : 1, reads = perf.readbacks ? perf.readbacks : 1,
+                gpus = perf.gpuSamples ? perf.gpuSamples : 1;
+            log("Perf frames=%u pairs=%u mono=%u size=%ux%u frame=%.1fms | per pair cpu: stereo=%.1f eyes=%.1f,%.1f "
+                "desktop=%.1f wait=%.1f | per eye read: getRT=%.2f lock=%.2f copy=%.2f | per pair dim=%.2f publish=%.2f | "
+                "mono=%.1fms | gpu(n=%u): eyes=%.2f,%.2f desktop=%.2f tail=%.2f",
+                perf.frames, perf.pairs, perf.monoFrames, width, height, 1000 * perf.frame / perf.frames,
+                1000 * perf.stereo / pairs, 1000 * perf.eyeCpu[0] / pairs, 1000 * perf.eyeCpu[1] / pairs,
+                1000 * perf.desktopCpu / pairs, 1000 * perf.wait / pairs, 1000 * perf.readTarget / reads,
+                1000 * perf.lock / reads, 1000 * perf.copy / reads, 1000 * perf.dim / pairs, 1000 * perf.publish / pairs,
+                perf.monoFrames ? 1000 * perf.mono / perf.monoFrames : 0., perf.gpuSamples, perf.gpu[0] / gpus,
+                perf.gpu[1] / gpus, perf.gpu[2] / gpus, perf.gpu[3] / gpus);
             perf = PerfClock{};
             perf.lastPresent = perf.lastLog = t;
         }
@@ -1986,9 +2087,13 @@ static bool readUiEye(unsigned i,bool dim,float visibility) {
     if (!dim && uiFrame.request.foveated) return readFoveatedEye(i);
     auto *d=uiFrame.device;
     auto *read=uiFrame.read[i];
+    const LARGE_INTEGER t0=PerfClock::now();
     if (FAILED(d->GetRenderTargetData(uiFrame.target[i],read))) return false;
+    const LARGE_INTEGER t1=PerfClock::now();
     D3DLOCKED_RECT locked{};
     if (FAILED(read->LockRect(&locked,nullptr,dim ? 0 : D3DLOCK_READONLY))) return false;
+    const LARGE_INTEGER t2=PerfClock::now();
+    perf.readTarget+=PerfClock::seconds(t0,t1); perf.lock+=PerfClock::seconds(t1,t2); ++perf.readbacks;
     uiFrame.locked=read;
     read->AddRef();
     bool ok=locked.pBits && locked.Pitch>=int(uiFrame.request.width*4);
@@ -2002,6 +2107,7 @@ static bool readUiEye(unsigned i,bool dim,float visibility) {
             if (dim) dimRgbPixels(source,uiFrame.request.width,dimming);
             else if (ok) memcpy(uiFrame.pixels[i]+size_t(row)*rowBytes,source,rowBytes);
         }
+        perf.copy+=PerfClock::seconds(t2,PerfClock::now());
     }
     ok = retireNativeUiLock(uiFrame.locked,
         [](IDirect3DSurface9 *surface) {
@@ -2012,7 +2118,15 @@ static bool readUiEye(unsigned i,bool dim,float visibility) {
     if (dim && ok) ok=SUCCEEDED(originalUpdate(d,read,nullptr,uiFrame.target[i],nullptr));
     return ok;
 }
+static bool publishUiFrameBody(uint32_t presentation);
 static bool publishUiFrame(uint32_t presentation) {
+    const LARGE_INTEGER start=PerfClock::now();
+    const bool accepted=publishUiFrameBody(presentation);
+    perf.publish+=PerfClock::seconds(start,PerfClock::now());
+    if (accepted) ++perf.pairs;
+    return accepted;
+}
+static bool publishUiFrameBody(uint32_t presentation) {
     if (!channel.shared || !uiFrame.world || uiFrame.fault ||
         uiFrame.generation!=resourceGeneration.load()) return false;
     // No native rendering while IPC is held. commitStereo retains the existing
@@ -2092,15 +2206,16 @@ void nativeUiFinishOwner() {
     }
     if (!current) { nativeUiFault(); return; }
     // UI and original full-field fades have now finished in BOTH owned eye RTs.
-    const LARGE_INTEGER readStart = PerfClock::now();
+    gpuProfile.mark(4);
+    gpuProfile.end();
     const bool left=readUiEye(0,false,1),right=left && readUiEye(1,false,1);
-    perf.readback += PerfClock::seconds(readStart, PerfClock::now());
-    ++perf.pairs;
     bool ok=left && right;
     if(trace)log("Native UI readback left=%u right=%u",left,right);
     if (ok) {
+        const LARGE_INTEGER dimStart=PerfClock::now();
         const auto opaque=makeOpaqueDimming(1);
         for (auto *image:uiFrame.pixels) dimOpaquePixels(image,uiFrame.pixelBytes/4,opaque);
+        perf.dim+=PerfClock::seconds(dimStart,PerfClock::now());
     }
     const bool valid=ok && uiCurrent();
     const bool published=valid && publishUiFrame(NativeUiComplete);
@@ -2300,7 +2415,12 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
     const LARGE_INTEGER stereoStart = PerfClock::now();
     struct StereoTimer {
         LARGE_INTEGER start;
-        ~StereoTimer() { perf.stereo += PerfClock::seconds(start, PerfClock::now()); }
+        bool pair = false;
+        ~StereoTimer() {
+            const double spent = PerfClock::seconds(start, PerfClock::now());
+            if (pair) perf.stereo += spent;
+            else { perf.mono += spent; ++perf.monoFrames; }
+        }
     } stereoTimer{stereoStart};
     const auto generation = graphicsResourceGeneration();
     if (uiFrame.slot>=0) {
@@ -2344,6 +2464,8 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
     static unsigned depthTraceRequests=0;
     const bool traceDepth=labDepthTrace && depthTraceRequests<8;
     if(traceDepth) ++depthTraceRequests;
+    stereoTimer.pair=true;
+    gpuProfile.begin(device);
     uiFrame.slot=chosen;
     uiFrame.pixelGeneration=pixelStore.generation;
     uiFrame.pixelBytes=size_t(pixelStore.bytes());
@@ -2437,7 +2559,9 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                 (hasStencil ? D3DCLEAR_STENCIL : 0),0xff000000,1,0));
             if(ok) {
                 if(traceDepth) traceStereoDepth(d,request,i,"before-world");
+                const LARGE_INTEGER eyeStart=PerfClock::now();
                 ok=observedWorldRender(d,puppet,original,request,i,traceDepth);
+                perf.eyeCpu[pass]+=PerfClock::seconds(eyeStart,PerfClock::now());
                 if(traceDepth && generation==graphicsResourceGeneration()) traceStereoDepth(d,request,i,"after-world");
             }
             if (generation != graphicsResourceGeneration()) { ok = false; break; }
@@ -2471,6 +2595,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                     return complete;
                 });
             endEye(); activeEye=-1;
+            gpuProfile.mark(pass+1);
             if(ok && generation == graphicsResourceGeneration() && (!uiFrame.ui || visibility!=1)) ok=readUiEye(i,uiFrame.ui,visibility);
         }
         activeEye=-1; endEye(); desktopTarget=desktopDepth=nullptr;
@@ -2479,7 +2604,9 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         if(traceDepth && generation==graphicsResourceGeneration()) traceStereoDepth(d,request,-1,"before-desktop");
         desktopCull=ok && !desktopWorld && !traceDepth;
         desktopRtBound=true; // restoreUiFrame rebound the desktop target.
+        const LARGE_INTEGER desktopStart=PerfClock::now();
         ok=observedWorldRender(d,puppet,original,request,-1,traceDepth) && ok;
+        perf.desktopCpu+=PerfClock::seconds(desktopStart,PerfClock::now());
         if (desktopCull) {
             desktopCull=desktopRtBound=false;
             if (generation == graphicsResourceGeneration() && uiFrame.color)
@@ -2493,12 +2620,16 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             ++completionDiagnostics;
             log("Native world render completion ok=%u fault=%u world=%u ui=%u",ok,uiFrame.fault,uiFrame.world,uiFrame.ui);
         }
+        gpuProfile.mark(3);
+        if(!uiFrame.ui) { gpuProfile.mark(4); gpuProfile.end(); }
         if(uiFrame.ui) {
             if(!uiCurrent()) nativeUiFault();
             retained=true; // Even a partial UI pair remains owned until enclosing cleanup.
         } else if(uiFrame.world) {
+            const LARGE_INTEGER dimStart=PerfClock::now();
             const auto dimming=makeOpaqueDimming(visibility);
             for(auto *image:uiFrame.pixels) if(image) dimOpaquePixels(image,uiFrame.pixelBytes/4,dimming);
+            perf.dim+=PerfClock::seconds(dimStart,PerfClock::now());
             publishUiFrame(0);
         }
     },[&](bool aborted) noexcept {
