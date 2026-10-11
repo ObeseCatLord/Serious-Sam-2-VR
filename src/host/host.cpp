@@ -990,9 +990,10 @@ struct Host {
     bool feedbackSeeded = false, hapticsAvailable = true;
     Fov currentFov[2];
     bool recenterWasHeld = false, recenterUi = false;
-    Swapchain menuChain, hudChain;
+    Swapchain menuChain, hudChain, cursorChain;
+    bool cursorUploaded = false;
     WheelBitmap hudBitmap;
-    std::vector<uint8_t> menuPixels, menuSourcePixels;
+    std::vector<uint8_t> menuSourcePixels;
     uint64_t menuSequence = 0;
     MenuPointer presentedPointer;
     int cursorX = -1, cursorY = -1;
@@ -1027,6 +1028,7 @@ struct Host {
                 wheel.chain.abandon();
             menuChain.abandon();
             hudChain.abandon();
+            cursorChain.abandon();
             drainQuery.abandon();
             context.abandon();
             device.abandon();
@@ -1039,6 +1041,7 @@ struct Host {
             wheel.chain.destroy();
         menuChain.destroy();
         hudChain.destroy();
+        cursorChain.destroy();
         actions.destroy(api);
         if (viewSpace)
             api.cleanup(api.DestroySpace(viewSpace), "xrDestroySpace VIEW");
@@ -1248,6 +1251,8 @@ struct Host {
         }
         hudChain.create(api, session, wheelSize, wheelSize / 4);
         hudBitmap.create(wheelSize, wheelSize / 4);
+        cursorChain.create(api, session, CursorSize, CursorSize);
+        cursorUploaded = false;
         log.write("OpenXR D3D11 HMD session initialized; awaiting runtime READY and game dimensions");
     }
     void graphics() {
@@ -1631,6 +1636,7 @@ struct Host {
                 retiredAll = wheel.chain.releaseAcquired() && retiredAll;
             retiredAll = menuChain.releaseAcquired() && retiredAll;
             retiredAll = hudChain.releaseAcquired() && retiredAll;
+            retiredAll = cursorChain.releaseAcquired() && retiredAll;
             if (retiredAll)
                 return;
             if (api.lossPending || GetTickCount64() >= deadline)
@@ -1847,7 +1853,25 @@ struct Host {
         }
         hresult(device->GetDeviceRemovedReason(), "D3D11 device removed during wheel upload", log);
     }
-    void menuLayer(const Input &input, XrCompositionLayerQuad &layer,
+    // The pointer ring is its own small quad over the menu: moving it never
+    // recopies or reuploads the (runtime-resolution sized) menu image.
+    static constexpr uint32_t CursorSize = 64;
+    bool cursorImage() {
+        if (cursorUploaded) return cursorChain.ownership.previousImageAvailable();
+        std::vector<uint8_t> ring(size_t(CursorSize) * CursorSize * 4, 0);
+        const float centre = (CursorSize - 1) * .5f, outer = CursorSize * .5f - 1, inner = outer * .86f;
+        for (uint32_t y = 0; y < CursorSize; ++y)
+            for (uint32_t x = 0; x < CursorSize; ++x) {
+                const float r = std::hypot(x - centre, y - centre);
+                const float alpha = std::clamp(std::min(outer - r, r - inner) + .5f, 0.f, 1.f);
+                uint8_t *p = &ring[(size_t(y) * CursorSize + x) * 4];
+                p[0] = 255; p[1] = 235; p[2] = 40; p[3] = uint8_t(alpha * 255); // Same tint as the former ring.
+            }
+        if (!cursorChain.upload(context.p, ring.data())) return false;
+        cursorUploaded = true;
+        return cursorChain.ownership.previousImageAvailable();
+    }
+    void menuLayer(const Input &input, XrCompositionLayerQuad &layer, XrCompositionLayerQuad &cursor,
                    std::vector<const XrCompositionLayerBaseHeader *> &output) {
         if (!input.focused || !input.headValid)
             return;
@@ -1905,32 +1929,13 @@ struct Host {
                 }
         const int x = hit.valid ? std::min(int(width) - 1, int(hit.u * width)) : -1;
         const int y = hit.valid ? std::min(int(height) - 1, int(hit.v * height)) : -1;
-        if (sequence != menuSequence || x != cursorX || y != cursorY) {
-            menuPixels = menuSourcePixels;
-            if (hit.valid) {
-                const int radius = std::max(4, int(width * sizeAtAngle(.7f * Pi / 180,
-                                                                    settings.menuDistance) /
-                                                  settings.menuWidth * .5f));
-                for (int dy = -radius; dy <= radius; ++dy)
-                    for (int dx = -radius; dx <= radius; ++dx) {
-                        int px = x + dx, py = y + dy;
-                        const int r2 = dx * dx + dy * dy;
-                        if (px < 0 || py < 0 || px >= int(width) || py >= int(height) ||
-                            r2 > radius * radius || r2 < (radius - 2) * (radius - 2))
-                            continue;
-                        size_t index = (size_t(py) * width + px) * 4;
-                        menuPixels[index] = 255;
-                        menuPixels[index + 1] = 235;
-                        menuPixels[index + 2] = 40;
-                        menuPixels[index + 3] = 255;
-                    }
-            }
-            if (!menuChain.upload(context.p, menuPixels.data()))
+        if (sequence != menuSequence) {
+            if (!menuChain.upload(context.p, menuSourcePixels.data()))
                 return;
             menuSequence = sequence;
-            cursorX = x;
-            cursorY = y;
         }
+        cursorX = x;
+        cursorY = y;
         if (!menuChain.ownership.previousImageAvailable())
             return;
         layer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
@@ -1940,6 +1945,19 @@ struct Host {
         layer.pose = xrPose(panel);
         layer.size = {settings.menuWidth, panelHeight};
         output.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&layer));
+        if (hit.valid && cursorImage()) {
+            const float diameter = sizeAtAngle(.7f * Pi / 180, settings.menuDistance);
+            cursor = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            cursor.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                                XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+            cursor.space = local;
+            cursor.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            cursor.subImage = cursorChain.subimage();
+            cursor.pose = xrPose(compose(panel, Pose{{0, 0, 0, 1},
+                {(hit.u - .5f) * settings.menuWidth, (.5f - hit.v) * panelHeight, .004f}}));
+            cursor.size = {diameter, diameter};
+            output.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cursor));
+        }
         if (hit.valid)
             presentedPointer = {input.sequence, GetTickCount64(), sequence, input.session, input.reference,
                                 menuGeneration, 1, hand, hit.u, hit.v, input.trigger[hand],
@@ -2087,7 +2105,7 @@ struct Host {
             std::array<XrCompositionLayerProjectionView, 2> projectionViews;
             XrCompositionLayerProjection projectionLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             std::array<XrCompositionLayerQuad, 2> quadLayers;
-            XrCompositionLayerQuad menuQuad{}, hudQuad{};
+            XrCompositionLayerQuad menuQuad{}, hudQuad{}, cursorQuad{};
             presentedPointer = {};
             if (published && !quit && !api.lossPending && frameState.shouldRender) {
                 if (snapshot.renderer && !snapshot.menuVisible && validViews && input.focused &&
@@ -2133,7 +2151,7 @@ struct Host {
                             wheel.reset();
                         invalidateCachedPair();
                         cancelRequests();
-                        menuLayer(input, menuQuad, layers);
+                        menuLayer(input, menuQuad, cursorQuad, layers);
                     } else {
                         menuAnchor.reset();
                         wheelLayers(snapshot.ui, input, quadLayers, layers);

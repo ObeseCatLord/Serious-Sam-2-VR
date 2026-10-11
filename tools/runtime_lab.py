@@ -1029,6 +1029,17 @@ def interactive_hold(cfg,env,token,deadline,run_dir,owned_game):
                     raise
                 except (TimeoutError,subprocess.TimeoutExpired):break
                 out.write(json.dumps(state)+'\n');out.flush();samples+=1
+                # Operator capture requests: run_dir/capture-request-<name> -> <name>-left/right.ppm
+                # of the next eye pair at the commanded baseline head pose.
+                for request in sorted(run_dir.glob('capture-request-*')):
+                    name=request.name[len('capture-request-'):]
+                    request.unlink()
+                    if not name.replace('-','').isalnum():continue
+                    baseline=cfg['expected_baseline_head']
+                    try:observer(cfg,env,'capture',token,(run_dir/name,state['input_sequence'],*baseline['p'],*baseline['q']),
+                                 timeout=remaining(end,20),deadline=end)
+                    except (ObserverError,TimeoutError,subprocess.TimeoutExpired) as error:
+                        (run_dir/(name+'-error.txt')).write_text(str(error))
                 time.sleep(.25)
     finally:
         subprocess.run([cfg['pose_driver'],str(cfg['remote_port']),*map(str,cfg['baseline_head'])],check=True,timeout=5)
