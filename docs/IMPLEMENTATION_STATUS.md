@@ -1,5 +1,25 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-11 (evening) — lost pairs and latency
+
+- Pairs lost after rendering were all IPC lock timeouts at publication (2 ms):
+  the lab observer held the mutex across file I/O per status poll, and Wine's
+  mutex wake-up alone can exceed 2 ms. The observer copies the shared block and
+  writes afterwards; publication waits up to 25 ms. V128: one lost pair in 75 s
+  (was ~1/s); the stalls also cost frame time (52 pairs/s in the lab).
+- A HUD panel partly behind an eye (a head turn the panel has not followed yet)
+  failed its projection and dropped every pair until the panel caught up; it is
+  now an empty projection and the HUD skips that eye.
+- Late-latching: a request the game has not taken yet is refreshed with each host
+  loop's newer poses (request-to-swapchain pose age 37 → ~16 ms in the lab).
+- Tried and reverted: a host intake thread copying pairs during xrWaitFrame (its
+  copies and IPC traffic landed mid game frame: slower frames, no better age).
+- Remaining game-thread cost is the engine's own eye rendering; the mod's own
+  per-frame work is under 0.2 ms (wheels ~1.3 ms while open).
+- Lab: compositor sockets live in /run/user/<uid>/ss2vr-lab; completed fixtures and
+  runs move to an archive on the data drive (Wine prefixes need a native FS).
+
+
 ## 2026-10-11 (later) — performance, weapon feel, controls
 
 Measured in the simulated lab with five-second `Perf` lines (game) and `Host perf`
