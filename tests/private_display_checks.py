@@ -412,7 +412,7 @@ class Checks(unittest.TestCase):
             directory=root/'runs/diagnostic';directory.mkdir(parents=True)
             (directory/'result.json').write_text(json.dumps({'result':'display_prerequisite_only','cleanup_errors':[], 'game_launch_requested':False,'monado_launch_requested':False}))
             prepared={'display_prerequisite_only':True} if prerequisite else {'neutral_runtime_probe':True}
-            with patch.object(display,'prepared_configuration',return_value=prepared),patch.object(display,'run',return_value=directory) as native,patch.object(display.signal,'signal') as signals,patch.object(display,'neutral_runtime_summary',return_value={'evidence_scope':'native-neutral-runtime'}) as summary,patch.dict(display.os.environ,env,clear=True),patch.object(display.os,'getppid',return_value=456),patch.object(display,'identity',side_effect=identify),patch.object(Path,'iterdir',list_paths),patch.object(display.subprocess,'run',side_effect=query),patch.object(display.importlib.util,'spec_from_file_location') as load:
+            with patch.object(display,'runtime_base',return_value=root),patch.object(display,'prepared_configuration',return_value=prepared),patch.object(display,'run',return_value=directory) as native,patch.object(display.signal,'signal') as signals,patch.object(display,'neutral_runtime_summary',return_value={'evidence_scope':'native-neutral-runtime'}) as summary,patch.dict(display.os.environ,env,clear=True),patch.object(display.os,'getppid',return_value=456),patch.object(display,'identity',side_effect=identify),patch.object(Path,'iterdir',list_paths),patch.object(display.subprocess,'run',side_effect=query),patch.object(display.importlib.util,'spec_from_file_location') as load:
                 display.inside(cfg,out,not (prerequisite or neutral),prerequisite);load.assert_not_called()
                 if prerequisite or neutral:
                     native.assert_called_once();self.assertEqual(signals.call_args.args[0],display.signal.SIGTERM)
@@ -467,7 +467,8 @@ class Checks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)/('long-fixture-name-'*4);root.mkdir()
             cfg={'private_root':str(root),'display_timing_probe':True,'expected_product_source':'a'*64}
-            with patch.object(display.subprocess,'Popen') as process:
+            # The socket directory comes from runtime_base(); an overlong one must refuse.
+            with patch.object(display,'runtime_base',return_value=root),patch.object(display.subprocess,'Popen') as process:
                 with self.assertRaisesRegex(RuntimeError,'socket path'):display.launch(root/'config.json',cfg)
                 process.assert_not_called()
             self.assertFalse((root/'agent-capture-attempt.json').exists())
@@ -506,7 +507,7 @@ class Checks(unittest.TestCase):
                     cancel[0]=False;handlers[display.signal.SIGTERM](display.signal.SIGTERM,None)
                 if faults[0]:faults[0]=False;raise RuntimeError('injected child cleanup fault')
                 live.discard(item['pid'])
-            with patch.object(display.subprocess,'Popen',side_effect=popen),patch.object(display,'identity',side_effect=identify),patch.object(display,'gather',side_effect=gather),patch.object(display,'still_owned',side_effect=lambda item:item['pid'] in live),patch.object(display,'stop_exact',side_effect=stop),patch.object(display.signal,'signal',side_effect=signals),patch.object(display.time,'sleep'):
+            with patch.object(display,'runtime_base',return_value=root),patch.object(display.subprocess,'Popen',side_effect=popen),patch.object(display,'identity',side_effect=identify),patch.object(display,'gather',side_effect=gather),patch.object(display,'still_owned',side_effect=lambda item:item['pid'] in live),patch.object(display,'stop_exact',side_effect=stop),patch.object(display.signal,'signal',side_effect=signals),patch.object(display.time,'sleep'):
                 if expect_success:display.launch(root/'config.json',cfg)
                 else:
                     with self.assertRaises((FileNotFoundError,RuntimeError)):
