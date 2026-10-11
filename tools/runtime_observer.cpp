@@ -415,11 +415,14 @@ int wmain(int argc,wchar_t **argv) {
     if(!wcsncmp(argv[1],L"stock-",6))return stockCommand(argc,argv);
     Channel channel;if(!channel.open(argv[2],false))return 3;
     if(wcscmp(argv[1],L"status")==0) {
-        Lock lock(channel,20);if(!lock)return 4;
         if(argc!=3&&argc!=5)return 2;
+        // Copy under the lock and write afterwards: holding the game's IPC mutex
+        // across file I/O delayed (and in the game dropped) stereo pair publication.
+        static Shared snapshot;
+        {Lock lock(channel,20);if(!lock)return 4;std::memcpy(&snapshot,channel.shared,sizeof(Shared));}
         FILE *output=argc==5 ? _wfopen(argv[3],L"wbx") : stdout;
         if(!output)return 6;
-        const auto &s=*channel.shared;const auto &i=s.latest;
+        const auto &s=snapshot;const auto &i=s.latest;
         const auto now=GetTickCount64(), age=now>=i.tickMs ? now-i.tickMs : ~uint64_t{};
         std::fprintf(output,"{\"abi\":%u,\"game_pid\":%u,\"host_pid\":%u,\"renderer\":%u,\"gameplay\":%u,\"menu\":%u,\"input_sequence\":%llu,\"input_tick_ms\":%llu,\"input_age_ms\":%llu,\"focused\":%u,\"head_valid\":%u,\"head\":",
             s.abi,s.gamePid,s.hostPid,s.rendererReady,s.ui.gameplay,s.menu.visible,

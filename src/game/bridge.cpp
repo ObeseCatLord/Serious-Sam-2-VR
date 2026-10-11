@@ -384,6 +384,10 @@ struct PerfClock {
     // Pairs rendered but not published, by the state they ended in.
     unsigned lostNoWorld = 0, lostFault = 0, lostNoOverlay = 0, lostIncomplete = 0, lostOther = 0;
     const char *lostReason = "none";
+    uintptr_t lostOrigin = 0;
+    unsigned publishLock = 0, publishCancelled = 0, publishState = 0, publishRequest = 0, publishImages = 0,
+        publishCommit = 0, finishNotCurrent = 0;
+    bool lostWorldOk = false, lostUi = false, lostOverlaySeen = false, lostComplete = false;
     unsigned stereoCalls = 0;
     double gpu[4]{}; // left, right, desktop, ui/tail (ms sums)
     unsigned frames = 0, pairs = 0, monoFrames = 0, gpuSamples = 0, readbacks = 0, waits = 0;
@@ -396,6 +400,7 @@ struct PerfClock {
     static LARGE_INTEGER now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
 };
 static PerfClock perf;
+extern "C" IMAGE_DOS_HEADER __ImageBase;
 struct GpuProfile {
     static constexpr unsigned Sets = 6, Marks = 5;
     IDirect3DDevice9 *owner = nullptr;
@@ -1419,7 +1424,7 @@ static void pollSharedFences() {
         BOOL done = FALSE;
         const HRESULT result = sharedFence[slot] ? sharedFence[slot]->GetData(&done, sizeof(done), 0) : E_FAIL;
         if (result == S_FALSE) continue;
-        Lock l(channel, 1);
+        Lock l(channel, 5);
         if (!l) continue;
         sharedPending[slot] = false;
         auto &target = channel.shared->slot[slot];
@@ -1813,8 +1818,14 @@ static void presentBody(IDirect3DDevice9 *d) {
             const double pairs = perf.pairs ? perf.pairs : 1, reads = perf.readbacks ? perf.readbacks : 1,
                 gpus = perf.gpuSamples ? perf.gpuSamples : 1;
             if (perf.lostNoWorld + perf.lostFault + perf.lostNoOverlay + perf.lostIncomplete + perf.lostOther)
-                log("Perf unpublished pairs: noWorld=%u fault=%u noOverlay=%u incomplete=%u other=%u lastFault=%s",
-                    perf.lostNoWorld, perf.lostFault, perf.lostNoOverlay, perf.lostIncomplete, perf.lostOther, perf.lostReason);
+                log("Perf unpublished pairs: noWorld=%u fault=%u noOverlay=%u incomplete=%u other=%u lastFault=%s origin=+%lx world=%u ui=%u overlay=%u complete=%u",
+                    perf.lostNoWorld, perf.lostFault, perf.lostNoOverlay, perf.lostIncomplete, perf.lostOther, perf.lostReason,
+                    static_cast<unsigned long>(perf.lostOrigin), perf.lostWorldOk, perf.lostUi, perf.lostOverlaySeen, perf.lostComplete);
+            if (perf.publishLock + perf.publishCancelled + perf.publishState + perf.publishRequest + perf.publishImages +
+                perf.publishCommit + perf.finishNotCurrent)
+                log("Perf publish rejected: lock=%u cancelled=%u state=%u request=%u images=%u commit=%u notCurrent=%u",
+                    perf.publishLock, perf.publishCancelled, perf.publishState, perf.publishRequest, perf.publishImages,
+                    perf.publishCommit, perf.finishNotCurrent);
             log("Perf draws per pair: eyes=%.0f hud duplicates=%.0f; other per frame=%.0f",
                 perf.pairs ? double(perf.eyeDraws) / perf.pairs : 0., perf.pairs ? double(perf.hudDuplicates) / perf.pairs : 0.,
                 double(perf.desktopDraws) / perf.frames);
@@ -2082,7 +2093,12 @@ static void releaseUiFrame() noexcept {
         else if (uiFrame.ui && !uiFrame.overlaySeen) ++perf.lostNoOverlay;
         else if (uiFrame.ui && !uiFrame.complete) ++perf.lostIncomplete;
         else ++perf.lostOther;
-        if (uiFrame.fault) perf.lostReason = uiFrame.faultReason;
+        if (uiFrame.fault) {
+            perf.lostReason = uiFrame.faultReason;
+            perf.lostOrigin = uiFrame.faultOrigin ? uiFrame.faultOrigin - reinterpret_cast<uintptr_t>(&__ImageBase) : 0;
+            perf.lostWorldOk = uiFrame.world; perf.lostUi = uiFrame.ui;
+            perf.lostOverlaySeen = uiFrame.overlaySeen; perf.lostComplete = uiFrame.complete;
+        }
     }
     uiFrame.player=nullptr;
     uiFrame.slot=-1;
@@ -2258,12 +2274,18 @@ static bool publishUiFrameBody(uint32_t presentation) {
         uiFrame.generation!=resourceGeneration.load()) return false;
     // No native rendering while IPC is held. commitStereo retains the existing
     // native snapshot/remote binding admission through the Ready transition.
-    if (!channel.lock(2)) return false;
+    // A finished pair is worth a short wait: Wine's mutex wake-up can exceed a
+    // couple of milliseconds even when the host holds the lock only briefly.
+    if (!channel.lock(25)) { ++perf.publishLock; return false; }
     bool accepted=false;
     withNativeFinally([&] {
         auto &slot=channel.shared->slot[uiFrame.slot];
         const bool imagesCurrent=uiFrame.zeroCopy ? sharedGeneration && channel.shared->images.opened==sharedGeneration :
             uiFrame.pixels[0] && uiFrame.pixels[1] && uiFrame.pixelGeneration==channel.shared->pixels.generation;
+        if (slot.cancelled) ++perf.publishCancelled;
+        else if (slot.state!=SlotState::Rendering) ++perf.publishState;
+        else if (!sameRequest(slot.request,uiFrame.request)) ++perf.publishRequest;
+        else if (!imagesCurrent) ++perf.publishImages;
         if (!slot.cancelled && slot.state==SlotState::Rendering && sameRequest(slot.request,uiFrame.request) && imagesCurrent) {
             // Eyes were rendered into this slot's shared images, or read back
             // straight into its own pixel sections.
@@ -2278,6 +2300,7 @@ static bool publishUiFrameBody(uint32_t presentation) {
             slot.presentation=presentation;
             slot.presentationReserved=0;
             accepted=commitStereo(uiFrame.player,uiFrame.request,slot,uiFrame.remoteOwner);
+            if (!accepted) ++perf.publishCommit;
             if (accepted) SetEvent(channel.ready);
             else slot.state=SlotState::Empty;
         }
@@ -2345,7 +2368,7 @@ void nativeUiFinishOwner() {
                 i,e.Stream,e.Offset,e.Type,e.Method,e.Usage,e.UsageIndex);
         }
     }
-    if (!current) { nativeUiFault(); return; }
+    if (!current) { ++perf.finishNotCurrent; nativeUiFault(); return; }
     // UI and original full-field fades have now finished in BOTH owned eye RTs.
     gpuProfile.mark(4);
     gpuProfile.end();
@@ -2581,7 +2604,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
     int chosen=-1;
     bool zeroCopy=false;
     {
-        Lock l(channel,2); // A lost race would otherwise turn this frame flat.
+        Lock l(channel,5); // A lost race would otherwise turn this frame flat.
         if(l) {
             const auto &images=channel.shared->images;
             const uint32_t sinceCapture=static_cast<uint32_t>(GetTickCount())-images.pixelRequestTick;

@@ -117,11 +117,22 @@ struct Log {
 
 // Channel::lock does not handle WAIT_ABANDONED. Use this narrow guard without
 // changing the frozen IPC header; an abandoned writer invalidates the channel.
+// Long IPC mutex holds stall the game's pair publication (diagnostics).
+struct MutexStats {
+    uint64_t longHolds = 0;
+    double maxHoldMs = 0;
+    uintptr_t site = 0;
+};
+inline MutexStats mutexStats;
 struct Mutex {
     Channel &channel;
     bool held = false;
-    Mutex(Channel &c, DWORD wait) : channel(c) {
+    LARGE_INTEGER acquired{};
+    uintptr_t site = 0;
+    __attribute__((noinline)) Mutex(Channel &c, DWORD wait) : channel(c) {
+        site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         const DWORD result = WaitForSingleObject(c.mutex, wait);
+        QueryPerformanceCounter(&acquired);
         if (result == WAIT_ABANDONED) {
             ReleaseMutex(c.mutex);
             throw std::runtime_error("IPC mutex abandoned; refusing possibly partial payload");
@@ -131,8 +142,17 @@ struct Mutex {
         held = result == WAIT_OBJECT_0;
     }
     ~Mutex() {
-        if (held)
-            ReleaseMutex(channel.mutex);
+        if (!held)
+            return;
+        LARGE_INTEGER now{}, frequency{};
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&frequency);
+        const double ms = 1000. * double(now.QuadPart - acquired.QuadPart) / double(frequency.QuadPart);
+        if (ms > 1) {
+            ++mutexStats.longHolds;
+            if (ms > mutexStats.maxHoldMs) { mutexStats.maxHoldMs = ms; mutexStats.site = site; }
+        }
+        ReleaseMutex(channel.mutex);
     }
     explicit operator bool() const {
         return held;
@@ -2318,6 +2338,13 @@ struct Host {
                           perfSubmit / perfLoops, static_cast<unsigned long long>(perfUploads),
                           perfUploads ? perfUpload / perfUploads : 0., static_cast<unsigned long long>(zeroCopyPairs));
             log.write(line);
+        }
+        if (mutexStats.longHolds) {
+            std::snprintf(line, sizeof(line), "Host IPC holds over 1 ms=%llu max=%.2fms site=+%llx",
+                          static_cast<unsigned long long>(mutexStats.longHolds), mutexStats.maxHoldMs,
+                          static_cast<unsigned long long>(mutexStats.site - reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))));
+            log.write(line);
+            mutexStats = {};
         }
         perfWait = perfUpload = perfLoop = perfSubmit = 0;
         perfLoops = perfUploads = 0;
