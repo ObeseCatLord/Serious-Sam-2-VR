@@ -3874,7 +3874,8 @@ static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snap
                 Pose target;
                 if (calibrationAdmitted)
                     target = retargetCalibratedMuzzle(nativeCamera, *out, c.nativeModelLocal.p,
-                                                      hand, c.nativeDisplacement, c.nativeAlignment);
+                                                      hand, c.nativeDisplacement, c.nativeAlignment,
+                                                      weaponModelScale(settings, primaryField(w, 0xb4)));
                 else
                     target = {normalize(multiply(hand.q, multiply(inverse(nativeCamera.q), out->q))), hand.p};
                 diagnosticRejection=17;
@@ -5212,6 +5213,19 @@ bool observedScopePose(unsigned hand, ScopePoseObservation &out) {
                               ownerHandle, weaponHandle, modelHandle, eyeSnapshot.generation,
                               weaponPairFault, out);
 }
+// One-time evidence per weapon: native model extent and the applied scale.
+struct Box3 { Vec3 min, max; }; // Native Box3f.
+static Box3 *(__cdecl *modelBounds)(Box3 *, const void *) = nullptr;
+static void traceWeaponModel(void *w, int nativeId, float scale) {
+    static bool traced[64]{};
+    if (nativeId < 0 || nativeId >= 64 || traced[nativeId] || !modelBounds) return;
+    traced[nativeId] = true;
+    void *instance = resolve(primaryField(w, 0x24));
+    Box3 box{};
+    if (!instance || !modelBounds(&box, instance)) return;
+    log("Weapon model id=%d extent=%.3f,%.3f,%.3f scale=%.2f", nativeId, box.max.x - box.min.x,
+        box.max.y - box.min.y, box.max.z - box.min.z, scale);
+}
 static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 &out) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -5284,10 +5298,13 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
     if(align && !alignmentDisplacement(modelBefore,offset,alignment)) {
         invalidateMatchingCalibration(s,unsigned(h),5,caller);return reject();
     }
-    const Pose target{normalize(multiply(hand.q, offset)), hand.p + rotate(hand.q, displacement+alignment)};
+    const int nativeId = *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4);
+    const float scale = weaponModelScale(settings, nativeId);
+    traceWeaponModel(w, nativeId, scale);
+    const Pose target{normalize(multiply(hand.q, offset)), hand.p + rotate(hand.q, (displacement+alignment) * scale)};
     if (!finite(target))
         return reject();
-    const Matrix34 staged = matrix(target);
+    const Matrix34 staged = scaledModel(matrix(target), scale); // Enlarged about the hand.
     Matrix34 flatModel;
     const auto flatCamera = matrix(nativeCamera);
     Pose flatPose;
@@ -7588,6 +7605,7 @@ bool attach(bool headless) {
     if (!headless) {
         S(e, "?GetModelInstance@CModelRenderable@SeriousEngine@@QAEPAVCModelInstance@2@XZ", laserModelInstance);
         S(e, "?mdlGetAttachmentAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z", laserAttachment);
+        symbol(e, "?mdlModelInstanceGetBoundingBox@SeriousEngine@@YA?AVBox3f@1@PBVCModelInstance@1@@Z", modelBounds);
         S(g, "?RenderNavigationalBeacons@CPuppetEntity@SeriousEngine@@QAEXABVMatrix34f@2@ABVMatrix44f@2@ABVVector2l@2@M@Z", nativeNavigation);
         S(g, "?RenderMissionObjectives@CPuppetEntity@SeriousEngine@@QAEXABVMatrix34f@2@ABVMatrix44f@2@ABVVector2l@2@M@Z", nativeObjectives);
         S(g, "?samGetWorldInfo@SeriousEngine@@YAPAVCWorldInfoEntity@1@XZ", nativeWorldInfo);

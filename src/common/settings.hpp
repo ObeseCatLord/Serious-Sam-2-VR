@@ -20,7 +20,13 @@ struct VrSettings {
     bool remoteHeadTracking = true;
     float headRadius = .12f, headClearanceMargin = .05f;
     Pose gripOffset[WeaponCount];
+    // Hand-held weapon model scale: the global [Weapons] Scale times [WeaponN] Scale.
+    float weaponScale = 1.f, weaponScaleById[WeaponCount]{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 };
+inline float weaponModelScale(const VrSettings &settings, int weapon) {
+    const float base = settings.weaponScale;
+    return weapon >= 0 && weapon < int(WeaponCount) ? base * settings.weaponScaleById[weapon] : base;
+}
 inline Pose calibratedGrip(const Input &input, unsigned hand, int weapon, const VrSettings &settings) {
     Pose tracked = weaponTracking(input, hand);
     return weapon >= 0 && weapon < int(WeaponCount) ? compose(tracked, settings.gripOffset[weapon]) : tracked;

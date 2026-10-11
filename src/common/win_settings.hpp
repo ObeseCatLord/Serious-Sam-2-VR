@@ -34,6 +34,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.laserDistance = number(L"Laser", L"MaxDistanceMeters", 100, 5, 200);
     settings.scopeEyeRelief = number(L"Scope", L"EyeReliefMeters", .1f, .02f, .3f);
     settings.renderScale = number(L"Render", L"Scale", 1, .25f, 2);
+    settings.weaponScale = number(L"Weapons", L"Scale", 1, .25f, 4);
     settings.roomscale = number(L"Roomscale", L"Enabled", 0, 0, 1) >= .5f;
     settings.physicalMelee = number(L"Melee", L"Enabled", 0, 0, 1) >= .5f;
     settings.immersiveSwimming = number(L"Swimming", L"Immersive", 0, 0, 1) >= .5f;
@@ -64,6 +65,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
         float pitch = number(section, L"PitchDegrees", 0, -90, 90) * Pi / 180;
         float heading = number(section, L"YawDegrees", 0, -90, 90) * Pi / 180;
         float roll = number(section, L"RollDegrees", 0, -90, 90) * Pi / 180;
+        settings.weaponScaleById[weapon] = number(section, L"Scale", 1, .25f, 4);
         settings.gripOffset[weapon] = {
             multiply(multiply(yaw(heading), {std::sin(pitch / 2), 0, 0, std::cos(pitch / 2)}),
                      {0, 0, std::sin(roll / 2), std::cos(roll / 2)}),

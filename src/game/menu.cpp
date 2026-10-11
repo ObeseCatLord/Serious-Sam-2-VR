@@ -56,14 +56,17 @@ static void logCommand(int command, bool ready) {
             current() != 0, current() ? interactive() : 0, instance ? read32(instance + 0x24) : 0u);
     }
 }
-static void logPointer(bool same, bool source, bool ready, bool held) {
+static void logPointer(bool same, bool source, bool ready, bool held, uintptr_t menu, uint32_t pointerGeneration,
+                       uint32_t publishedGeneration, uint64_t pointerSequence, uint64_t menuSequence) {
     static unsigned count = 0, previous = ~0u;
     const unsigned state = unsigned(same) | unsigned(source) << 1 | unsigned(ready) << 2 | unsigned(held) << 3;
     if (state == previous || count >= 64) return;
     previous = state;
     ++count;
-    log("Menu pointer sameMenu=%d source=%d nativeReady=%d cursor=%u held=%d", same, source, ready,
-        read32(base + 0x3fe214), held);
+    log("Menu pointer sameMenu=%d source=%d nativeReady=%d cursor=%u held=%d menu=%08x captured=%08x "
+        "generation=%u pointerGeneration=%u published=%u pointerFrame=%llu menuFrame=%llu", same, source, ready,
+        read32(base + 0x3fe214), held, unsigned(menu), unsigned(capturedMenu), generation, pointerGeneration,
+        publishedGeneration, static_cast<unsigned long long>(pointerSequence), static_cast<unsigned long long>(menuSequence));
 }
 static void __cdecl poll() {
     originalPoll(); // Preserve the normal keyboard, mouse and menu event ordering.
@@ -96,6 +99,8 @@ static void __cdecl poll() {
     MenuPointer pointer;
     Input input;
     bool sourceEligible = false;
+    uint32_t publishedGeneration = 0;
+    uint64_t menuSequence = 0;
     {
         Lock lock(channel);
         if (!lock) {
@@ -108,8 +113,9 @@ static void __cdecl poll() {
         }
         pointer = channel.shared->pointer;
         input = channel.shared->latest;
-        sourceEligible = menuPointerEligible(pointer, input, channel.shared->menu.sequence,
-                                             channel.shared->menu.interactionGeneration, GetTickCount64());
+        publishedGeneration = channel.shared->menu.interactionGeneration;
+        menuSequence = channel.shared->menu.sequence;
+        sourceEligible = menuPointerEligible(pointer, input, menuSequence, publishedGeneration, GetTickCount64());
     }
     uintptr_t menu = current();
     AcquireSRWLockShared(&stateLock);
@@ -131,7 +137,8 @@ static void __cdecl poll() {
     allowed =
         allowed && std::isfinite(sensitivity) && sensitivity > .0001f && std::isfinite(x) && std::isfinite(y);
     bool held = trigger.update(pointer.trigger, allowed);
-    if (menu) logPointer(sameMenu, sourceEligible, nativeReady, held);
+    if (menu) logPointer(sameMenu, sourceEligible, nativeReady, held, menu, pointer.interactionGeneration,
+                         publishedGeneration, pointer.menuSequence, menuSequence);
     if (down && !held) {
         // Native release clears its global mouse-held state and routes through
         // the current menu. Never retain a down state after focus/target loss.

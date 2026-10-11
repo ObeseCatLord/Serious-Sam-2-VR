@@ -1181,8 +1181,12 @@ void applyEyeCanvas() noexcept {
     void *canvas = nullptr;
     memcpy(&canvas, reinterpret_cast<void *>(canvasExe + 0x8498), sizeof(canvas));
     if (!nativeResizeCanvas || !canvas) { canvasResizePending = true; return; }
+    int32_t before[2]{}, after[2]{};
+    memcpy(before, static_cast<uint8_t *>(canvas) + 0xc, sizeof(before));
     const int result = nativeResizeCanvas(canvas); // The same call Sam2.exe makes for a window resize.
-    log("Eye canvas native resize result=%d", result);
+    memcpy(after, static_cast<uint8_t *>(canvas) + 0xc, sizeof(after));
+    // A fullscreen display mode has no window canvas to resize: run the game windowed in VR.
+    log("Eye canvas native resize result=%d canvas %dx%d -> %dx%d", result, before[0], before[1], after[0], after[1]);
 }
 // Pixel sections follow the canvas extent. A new generation is published before
 // the old one closes; readers keep their own mapping of an in-flight frame.

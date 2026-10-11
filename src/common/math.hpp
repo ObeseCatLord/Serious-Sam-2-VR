@@ -160,9 +160,18 @@ inline Vec3 modelAnchorDisplacement(Quat nativeRotation, Vec3 stretch, Vec3 mode
     return rotate(nativeRotation, {stretch.x * modelReference.x, stretch.y * modelReference.y,
                                   stretch.z * modelReference.z}) * -1;
 }
+// Uniform model scale about the placement origin: rotation columns only.
+inline Matrix34 scaledModel(Matrix34 m, float scale) {
+    for (unsigned row = 0; row < 3; ++row)
+        for (unsigned column = 0; column < 3; ++column)
+            m.m[row * 4 + column] *= scale;
+    return m;
+}
+// scale enlarges the hand-held model about the hand; the shot origin follows
+// the rendered barrel so bullets and lasers still leave the visible muzzle.
 inline Pose retargetShot(Pose anchor, Pose nativeShot, Vec3 nativeModelLocal, Pose hand,
                          float muzzleBound = .5f, Vec3 nativeDisplacement = {},
-                         Vec3 nativeAlignment = {}, bool preserveNativeReach = false) {
+                         Vec3 nativeAlignment = {}, bool preserveNativeReach = false, float scale = 1) {
     Pose shotLocal = compose(inverse(anchor), nativeShot);
     // Native model placement includes charge displacement, while the native
     // attachment getter does not. Remove it from the reference root, then add
@@ -176,6 +185,6 @@ inline Pose retargetShot(Pose anchor, Pose nativeShot, Vec3 nativeModelLocal, Po
         if (n > muzzleBound)
             muzzle = muzzle * (muzzleBound / n);
     }
-    return {normalize(multiply(hand.q, shotLocal.q)), hand.p + rotate(hand.q, muzzle + nativeDisplacement)};
+    return {normalize(multiply(hand.q, shotLocal.q)), hand.p + rotate(hand.q, (muzzle + nativeDisplacement) * scale)};
 }
 } // namespace ss2vr

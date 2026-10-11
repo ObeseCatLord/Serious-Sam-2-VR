@@ -8,9 +8,9 @@ namespace ss2vr {
 // This does not establish an anatomical grip or a particular animated child point.
 inline Pose retargetCalibratedMuzzle(Pose camera, Pose nativeShot, Vec3 nativeModelLocal,
                                     Pose hand, Vec3 nativeDisplacement = {},
-                                    Vec3 nativeAlignment = {}) {
+                                    Vec3 nativeAlignment = {}, float scale = 1) {
     return retargetShot(camera, nativeShot, nativeModelLocal, hand, .5f,
-                        nativeDisplacement, nativeAlignment, true);
+                        nativeDisplacement, nativeAlignment, true, scale);
 }
 // Transient evidence from native ownership and the frozen authoritative sample.
 // This stores no policy across ticks and never resolves game pointers itself.
