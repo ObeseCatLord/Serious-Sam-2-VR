@@ -52,7 +52,16 @@ def install(game, package, dry):
         if Path(name).name != name: raise ValueError('Unsafe fingerprint filename')
         if digest(game/'Bin'/name) != metadata['sha256']:
             raise ValueError('Game build does not match verified fingerprints: ' + name)
-    if (game/'Bin/SS2VR').exists() or (game/'Bin/SS2VR').is_symlink():
+    folder = game/'Bin/SS2VR'
+    # Uninstall keeps the host's own log; a folder holding only that log is ours.
+    leftovers = [] if folder.is_symlink() or not folder.is_dir() else list(folder.iterdir())
+    if folder.is_dir() and not folder.is_symlink() and leftovers and \
+       all(f.is_file() and not f.is_symlink() and f.name.startswith('ss2vr_host') and f.suffix == '.log'
+           for f in leftovers):
+        if not dry:
+            for f in leftovers: f.rename(game/'Bin'/(f.name + '.previous'))
+            folder.rmdir()
+    elif folder.exists() or folder.is_symlink():
         raise FileExistsError('SS2VR destination already exists; refusing overwrite')
     for relative, expected in entries.items():
         source = package/relative
