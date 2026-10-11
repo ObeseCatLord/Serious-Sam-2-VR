@@ -385,6 +385,7 @@ struct GpuProfile {
     IDirect3DDevice9 *owner = nullptr;
     IDirect3DQuery9 *disjoint[Sets]{}, *frequency[Sets]{}, *stamp[Sets][Marks]{};
     unsigned marked[Sets]{}; // Bit per issued mark.
+    unsigned age[Sets]{};    // Pairs begun since the set was ended.
     bool open[Sets]{}, pending[Sets]{}, failed = false;
     int current = -1;
     unsigned next = 0;
@@ -414,6 +415,7 @@ struct GpuProfile {
     void collect() {
         for (unsigned i = 0; i < Sets; ++i) {
             if (!pending[i]) continue;
+            if (++age[i] > 2 * Sets) { pending[i] = false; continue; } // Never resolved: drop it.
             BOOL disjointed = TRUE;
             UINT64 hz = 0, t[Marks]{};
             if (disjoint[i]->GetData(&disjointed, sizeof(disjointed), 0) != S_OK ||
@@ -433,7 +435,8 @@ struct GpuProfile {
         if (!create(d)) return;
         collect();
         const unsigned i = next;
-        if (pending[i] || open[i]) return; // Ring full: skip this pair.
+        if (pending[i]) return; // Ring full: skip this pair.
+        open[i] = false;        // A pair that never reached end() is abandoned.
         next = (next + 1) % Sets;
         marked[i] = 0;
         if (FAILED(disjoint[i]->Issue(D3DISSUE_BEGIN))) return;
@@ -452,6 +455,7 @@ struct GpuProfile {
         frequency[i]->Issue(D3DISSUE_END);
         open[i] = false;
         pending[i] = true;
+        age[i] = 0;
         current = -1;
     }
 };
