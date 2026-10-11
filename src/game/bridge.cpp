@@ -347,6 +347,16 @@ void validateLabOnlineIsolation(bool gameplay) {
 static IDirect3DDevice9 *device = nullptr, *creationDevice = nullptr;
 static DWORD creationThread = 0;
 static IDirect3DSurface9 *eye[2]{}, *depth[2]{}, *readback[2]{};
+// Zero-copy eye images (ABI14): one shared render target per IPC slot and eye.
+// The host opens them by handle and copies straight into its swapchains, so a
+// pair needs no readback. A slot's pair is published Ready at once and marked
+// gpuReady when its event query shows the GPU finished (polled, never waited).
+static IDirect3DTexture9 *sharedTexture[2][2]{};
+static IDirect3DSurface9 *sharedSurface[2][2]{};
+static IDirect3DQuery9 *sharedFence[2]{};
+static uint32_t sharedGeneration = 0, sharedGenerations = 0;
+static bool sharedPending[2]{}, sharedFailed = false;
+static uint64_t sharedPendingSequence[2]{};
 // Foveated readback per eye: [0] downsampled full view, [1] full-resolution inset.
 static IDirect3DSurface9 *foveaTarget[2][2]{}, *foveaRead[2][2]{};
 static uint32_t foveaWidth[2][2]{}, foveaHeight[2][2]{};
@@ -542,7 +552,7 @@ struct NativeUiFrame {
     uint64_t generation = 0;
     uint32_t remoteOwner = 0;
     int slot = -1;
-    bool restore = false, ui = false, fault = false, world = false;
+    bool restore = false, ui = false, fault = false, world = false, zeroCopy = false;
     bool overlay = false, overlaySeen = false, complete = false, fade = false;
     uintptr_t faultOrigin = 0;
     const char *faultReason = "none";
@@ -1154,9 +1164,29 @@ static HRESULT WINAPI setRT(IDirect3DDevice9 *d, DWORD index, IDirect3DSurface9 
     }
     return result;
 }
+static void releaseSharedImages() {
+    for (unsigned slot = 0; slot != 2; ++slot) {
+        for (unsigned i = 0; i != 2; ++i) {
+            if (sharedSurface[slot][i]) sharedSurface[slot][i]->Release();
+            if (sharedTexture[slot][i]) sharedTexture[slot][i]->Release();
+            sharedSurface[slot][i] = nullptr;
+            sharedTexture[slot][i] = nullptr;
+        }
+        if (sharedFence[slot]) sharedFence[slot]->Release();
+        sharedFence[slot] = nullptr;
+        sharedPending[slot] = false;
+    }
+    if (sharedGeneration && channel.shared) {
+        Lock l(channel, 50);
+        if (l) channel.shared->images = {};
+    }
+    sharedGeneration = 0;
+}
 static void releaseTargets() {
     ++resourceGeneration;
     gpuProfile.release();
+    releaseSharedImages();
+    sharedFailed = false;
     nativeUiFault();
     if (uiQuarantinedReadback) uiQuarantinedReadback->Release();
     uiQuarantinedReadback=nullptr;
@@ -1336,6 +1366,60 @@ static bool ensurePixelStore() {
         static_cast<unsigned long long>(pixelStore.bytes() >> 20));
     return true;
 }
+// Shared eye images are always A8R8G8B8 so the host sees B8G8R8A8_UNORM; the
+// alpha channel is ignored by the opaque projection layer.
+static void createSharedImages() {
+    if (sharedGeneration || sharedFailed || !device || !channel.shared || !width || !height) return;
+    uint32_t handles[2][2]{};
+    bool ok = true;
+    for (unsigned slot = 0; slot != 2 && ok; ++slot) {
+        for (unsigned i = 0; i != 2 && ok; ++i) {
+            HANDLE handle = nullptr;
+            ok = SUCCEEDED(device->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8,
+                                                 D3DPOOL_DEFAULT, &sharedTexture[slot][i], &handle)) &&
+                handle && handle != INVALID_HANDLE_VALUE &&
+                SUCCEEDED(sharedTexture[slot][i]->GetSurfaceLevel(0, &sharedSurface[slot][i]));
+            handles[slot][i] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(handle));
+        }
+        ok = ok && SUCCEEDED(device->CreateQuery(D3DQUERYTYPE_EVENT, &sharedFence[slot]));
+    }
+    if (!ok) {
+        log("Shared eye images unavailable %ux%u; pairs use pixel sections", width, height);
+        releaseSharedImages();
+        sharedFailed = true;
+        return;
+    }
+    Lock l(channel, 50);
+    if (!l) { releaseSharedImages(); return; } // Retried on the next allocation.
+    sharedGeneration = ++sharedGenerations;
+    auto &images = channel.shared->images;
+    images = {};
+    images.generation = sharedGeneration;
+    images.width = width;
+    images.height = height;
+    for (unsigned slot = 0; slot != 2; ++slot)
+        for (unsigned i = 0; i != 2; ++i) images.handle[slot][i] = handles[slot][i];
+    log("Shared eye images generation=%u %ux%u handles=%08x,%08x,%08x,%08x", sharedGeneration, width, height,
+        handles[0][0], handles[0][1], handles[1][0], handles[1][1]);
+}
+// Marks pairs whose GPU work has finished; the host copies only those.
+static void pollSharedFences() {
+    for (unsigned slot = 0; slot != 2; ++slot) {
+        if (!sharedPending[slot]) continue;
+        BOOL done = FALSE;
+        const HRESULT result = sharedFence[slot] ? sharedFence[slot]->GetData(&done, sizeof(done), 0) : E_FAIL;
+        if (result == S_FALSE) continue;
+        Lock l(channel, 1);
+        if (!l) continue;
+        sharedPending[slot] = false;
+        auto &target = channel.shared->slot[slot];
+        if (result == S_OK && target.state == SlotState::Ready && target.sharedImage == sharedGeneration &&
+            target.request.sequence == sharedPendingSequence[slot] && !target.gpuReady) {
+            target.gpuReady = 1;
+            SetEvent(channel.ready);
+        }
+    }
+}
 static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 *&nativeDepth) {
     if (!device || !presentationChain || resetQuarantined)
         return false;
@@ -1370,6 +1454,7 @@ static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 
         return false;
     if (eye[0] && desc.Width == width && desc.Height == height && depthDesc.Format == depthFormat &&
         desc.Format == colorFormat) {
+        createSharedImages();
         Lock l(channel);
         if (l)
             channel.shared->rendererReady = 1;
@@ -1395,6 +1480,7 @@ static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 
             return false;
         }
     }
+    createSharedImages();
     Lock l(channel);
     if (l) {
         channel.shared->width = width;
@@ -1402,18 +1488,6 @@ static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 
         channel.shared->rendererReady = 1;
     }
     log("CPU stereo targets %ux%u; performance unverified", width, height);
-    static bool sharedProbed = false;
-    if (!sharedProbed) {
-        // Evidence for a zero-copy path: can this device create a cross-process shared render target?
-        sharedProbed = true;
-        IDirect3DTexture9 *shared = nullptr;
-        HANDLE handle = nullptr;
-        const HRESULT hr = device->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, colorFormat, D3DPOOL_DEFAULT,
-                                                 &shared, &handle);
-        log("Shared render target probe hr=%08lx handle=%p format=%u", static_cast<unsigned long>(hr), handle,
-            static_cast<unsigned>(colorFormat));
-        if (shared) shared->Release();
-    }
     return true;
 }
 static bool allocate(bool stereo = true) noexcept {
@@ -1730,6 +1804,7 @@ void present(IDirect3DDevice9 *d) {
     }
     if (!presentationChain || resetQuarantined || !nativeUiDeviceCurrent(d) ||
         !nativePresentationThreadCurrent() || uiHalted || stopping) return;
+    pollSharedFences();
     static std::atomic<bool> first{false};
     if (!first.load(std::memory_order_relaxed) && !first.exchange(true, std::memory_order_relaxed))
         logStartup("first device Present", d, hooksReady.load(std::memory_order_acquire));
@@ -1971,7 +2046,7 @@ static void releaseUiFrame() noexcept {
     uiFrame.player=nullptr;
     uiFrame.slot=-1;
     admittedUiFrame=nullptr;
-    uiFrame.ui=uiFrame.fault=uiFrame.world=uiFrame.restore=false;
+    uiFrame.ui=uiFrame.fault=uiFrame.world=uiFrame.restore=uiFrame.zeroCopy=false;
     uiFrame.overlay=uiFrame.overlaySeen=uiFrame.complete=uiFrame.fade=false;
     uiFrame.faultOrigin=0;
     uiFrame.faultReason="none";
@@ -2122,6 +2197,13 @@ static bool readUiEye(unsigned i,bool dim,float visibility) {
     if (dim && ok) ok=SUCCEEDED(originalUpdate(d,read,nullptr,uiFrame.target[i],nullptr));
     return ok;
 }
+// End-of-pair marker for a zero-copy slot; flushed so it completes promptly.
+static void issueSharedFence() {
+    auto *fence = uiFrame.slot >= 0 ? sharedFence[uiFrame.slot] : nullptr;
+    if (!fence || FAILED(fence->Issue(D3DISSUE_END))) { nativeUiFault(); return; }
+    BOOL done = FALSE;
+    fence->GetData(&done, sizeof(done), D3DGETDATA_FLUSH);
+}
 static bool publishUiFrameBody(uint32_t presentation);
 static bool publishUiFrame(uint32_t presentation) {
     const LARGE_INTEGER start=PerfClock::now();
@@ -2139,9 +2221,13 @@ static bool publishUiFrameBody(uint32_t presentation) {
     bool accepted=false;
     withNativeFinally([&] {
         auto &slot=channel.shared->slot[uiFrame.slot];
-        if (!slot.cancelled && slot.state==SlotState::Rendering && sameRequest(slot.request,uiFrame.request) &&
-            uiFrame.pixels[0] && uiFrame.pixels[1] && uiFrame.pixelGeneration==channel.shared->pixels.generation) {
-            // Eyes were read back straight into this slot's own pixel sections.
+        const bool imagesCurrent=uiFrame.zeroCopy ? sharedGeneration && channel.shared->images.opened==sharedGeneration :
+            uiFrame.pixels[0] && uiFrame.pixels[1] && uiFrame.pixelGeneration==channel.shared->pixels.generation;
+        if (!slot.cancelled && slot.state==SlotState::Rendering && sameRequest(slot.request,uiFrame.request) && imagesCurrent) {
+            // Eyes were rendered into this slot's shared images, or read back
+            // straight into its own pixel sections.
+            slot.sharedImage=uiFrame.zeroCopy ? sharedGeneration : 0;
+            slot.gpuReady=uiFrame.zeroCopy ? 0 : 1;
             slot.pixelGeneration=uiFrame.pixelGeneration;
             for (unsigned i=0;i<2;++i) {
                 const auto &r=uiFrame.insetRect[i];
@@ -2158,7 +2244,17 @@ static bool publishUiFrameBody(uint32_t presentation) {
         if (aborted) { uiFrame.fault=true; uiHalted=true; }
         channel.unlock();
     });
-    if (accepted) {
+    if (accepted && uiFrame.zeroCopy) {
+        sharedPending[uiFrame.slot]=true;
+        sharedPendingSequence[uiFrame.slot]=uiFrame.request.sequence;
+        static unsigned zeroCopyDiagnostics = 0;
+        if (zeroCopyDiagnostics < 2) {
+            ++zeroCopyDiagnostics;
+            log("Zero-copy pair published sequence=%llu slot=%d images=%u",
+                static_cast<unsigned long long>(uiFrame.request.sequence),uiFrame.slot,sharedGeneration);
+        }
+    }
+    if (accepted && !uiFrame.zeroCopy) {
         static unsigned pairDiagnostics = 0;
         if (pairDiagnostics < 4) {
             ++pairDiagnostics;
@@ -2212,10 +2308,12 @@ void nativeUiFinishOwner() {
     // UI and original full-field fades have now finished in BOTH owned eye RTs.
     gpuProfile.mark(4);
     gpuProfile.end();
-    const bool left=readUiEye(0,false,1),right=left && readUiEye(1,false,1);
+    bool left=true,right=true;
+    if(uiFrame.zeroCopy) issueSharedFence();
+    else { left=readUiEye(0,false,1); right=left && readUiEye(1,false,1); }
     bool ok=left && right;
     if(trace)log("Native UI readback left=%u right=%u",left,right);
-    if (ok) {
+    if (ok && !uiFrame.zeroCopy) {
         const LARGE_INTEGER dimStart=PerfClock::now();
         const auto opaque=makeOpaqueDimming(1);
         for (auto *image:uiFrame.pixels) dimOpaquePixels(image,uiFrame.pixelBytes/4,opaque);
@@ -2426,6 +2524,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             else { perf.mono += spent; ++perf.monoFrames; }
         }
     } stereoTimer{stereoStart};
+    pollSharedFences();
     const auto generation = graphicsResourceGeneration();
     if (uiFrame.slot>=0) {
         nativeUiFault();
@@ -2441,8 +2540,15 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
     }
     Request request{};
     int chosen=-1;
+    bool zeroCopy=false;
     {
         Lock l(channel);
+        if(l) {
+            const auto &images=channel.shared->images;
+            const uint32_t sinceCapture=static_cast<uint32_t>(GetTickCount())-images.pixelRequestTick;
+            zeroCopy=sharedGeneration && images.generation==sharedGeneration && images.opened==sharedGeneration &&
+                images.width==width && images.height==height && (!images.pixelRequestTick || sinceCapture>3000);
+        }
         if(l) for(int i=0;i<2;++i) {
             auto &slot=channel.shared->slot[i];
             const auto now=GetTickCount64();
@@ -2482,8 +2588,9 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
     uiFrame.generation=resourceGeneration.load();
     uiFrame.device=device;
     device->AddRef();
+    uiFrame.zeroCopy=zeroCopy && !request.foveated && sharedSurface[chosen][0] && sharedSurface[chosen][1];
     for(unsigned i=0;i<2;++i) {
-        uiFrame.target[i]=eye[i]; eye[i]->AddRef();
+        uiFrame.target[i]=uiFrame.zeroCopy ? sharedSurface[chosen][i] : eye[i]; uiFrame.target[i]->AddRef();
         uiFrame.z[i]=depth[i]; depth[i]->AddRef();
         uiFrame.read[i]=readback[i]; readback[i]->AddRef();
     }
@@ -2534,6 +2641,11 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         }
         if (generation != graphicsResourceGeneration()) { original(puppet); return; }
         const float visibility=ok ? frozenWorldVisibility() : 1;
+        if(uiFrame.zeroCopy && visibility!=1) {
+            // Fades dim the eye images on the CPU: use the pixel path for this pair.
+            for(unsigned i=0;i<2;++i) { uiFrame.target[i]->Release(); uiFrame.target[i]=eye[i]; eye[i]->AddRef(); }
+            uiFrame.zeroCopy=false;
+        }
         if(traceDepth) traceStereoDepth(d,request,-1,"entry");
         if (ok) ok = renderScopeSources(puppet,original,request);
         if (generation != graphicsResourceGeneration()) { original(puppet); return; }
@@ -2600,7 +2712,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                 });
             endEye(); activeEye=-1;
             gpuProfile.mark(pass+1);
-            if(ok && generation == graphicsResourceGeneration() && (!uiFrame.ui || visibility!=1)) ok=readUiEye(i,uiFrame.ui,visibility);
+            if(ok && generation == graphicsResourceGeneration() && !uiFrame.zeroCopy && (!uiFrame.ui || visibility!=1)) ok=readUiEye(i,uiFrame.ui,visibility);
         }
         activeEye=-1; endEye(); desktopTarget=desktopDepth=nullptr;
         ok=restoreUiFrame() && ok;
@@ -2632,7 +2744,8 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         } else if(uiFrame.world) {
             const LARGE_INTEGER dimStart=PerfClock::now();
             const auto dimming=makeOpaqueDimming(visibility);
-            for(auto *image:uiFrame.pixels) if(image) dimOpaquePixels(image,uiFrame.pixelBytes/4,dimming);
+            if(uiFrame.zeroCopy) issueSharedFence();
+            else for(auto *image:uiFrame.pixels) if(image) dimOpaquePixels(image,uiFrame.pixelBytes/4,dimming);
             perf.dim+=PerfClock::seconds(dimStart,PerfClock::now());
             publishUiFrame(0);
         }

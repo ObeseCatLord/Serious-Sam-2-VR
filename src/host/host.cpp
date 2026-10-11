@@ -361,6 +361,12 @@ struct Swapchain {
         context->Flush();
         releaseWaited();
     }
+    // Zero-copy: the game's shared eye image goes straight into the waited image.
+    void copyWaited(ID3D11DeviceContext *context, ID3D11Texture2D *source) {
+        if (!ownership.acquired || !ownership.waited)
+            throw std::runtime_error("Writing an unowned OpenXR image");
+        context->CopySubresourceRegion(images[ownership.index].texture, 0, 0, 0, 0, source, 0, nullptr);
+    }
     void releaseWaited() {
         if (!ownership.acquired || !ownership.waited)
             throw std::runtime_error("Releasing an unwaited OpenXR image");
@@ -1015,6 +1021,10 @@ struct Host {
     Com<ID3D11Device> device;
     Com<ID3D11DeviceContext> context;
     Com<ID3D11Query> drainQuery;
+    // Zero-copy eye images opened from the game's shared handles (slot x eye).
+    Com<ID3D11Texture2D> sharedEye[2][2];
+    uint32_t sharedOpened = 0, sharedTried = 0, sharedWidth = 0, sharedHeight = 0;
+    uint64_t zeroCopyPairs = 0;
     Actions actions;
     WorldSubmissionStream worldSubmission;
     Swapchain eye[2];
@@ -1082,6 +1092,9 @@ struct Host {
             for (auto &chain : inset)
                 chain.abandon();
             drainQuery.abandon();
+            for (auto &row : sharedEye)
+                for (auto &image : row)
+                    image.abandon();
             context.abandon();
             device.abandon();
             api.loader.h = nullptr;
@@ -1102,6 +1115,9 @@ struct Host {
             api.cleanup(api.DestroySpace(local), "xrDestroySpace LOCAL");
         if (session)
             api.cleanup(api.DestroySession(session), "xrDestroySession");
+        for (auto &row : sharedEye)
+            for (auto &image : row)
+                image.reset();
         context.reset();
         drainQuery.reset();
         device.reset();
@@ -1567,6 +1583,7 @@ struct Host {
         const auto eyeSize = recommendedEye();
         shared.recommendedWidth = eyeSize.first;
         shared.recommendedHeight = eyeSize.second;
+        openSharedImages(shared.images);
         reapLocked();
         snapshot = {shared.width, shared.height, shared.rendererReady != 0, shared.ui,
                     shared.menu.visible && GetTickCount64() - shared.menu.tickMs < 250};
@@ -1600,6 +1617,58 @@ struct Host {
                 std::clamp(uint32_t(std::lround(height * scale)), 1u, maxHeight)};
     }
     // Reopen the game's pixel sections when it publishes a new generation.
+    // Opens the game's shared eye images once per generation and acknowledges
+    // them; until then (or if this fails) pairs arrive as pixel sections.
+    void openSharedImages(SharedImages &images) {
+        if (!device.p || images.generation == sharedTried) {
+            images.opened = images.generation && images.generation == sharedOpened ? sharedOpened : 0;
+            return;
+        }
+        sharedTried = images.generation;
+        for (auto &row : sharedEye)
+            for (auto &image : row)
+                image.reset();
+        sharedOpened = sharedWidth = sharedHeight = 0;
+        images.opened = 0;
+        if (!images.generation)
+            return;
+        // Copies need the swapchain's byte layout (BGRA); RGBA swapchains keep pixels.
+        bool ok = api.colorFormat == DXGI_FORMAT_B8G8R8A8_UNORM && images.width && images.height &&
+            images.width <= MaxDimension && images.height <= MaxDimension;
+        HRESULT failure = S_OK;
+        for (unsigned slot = 0; slot != 2 && ok; ++slot)
+            for (unsigned h = 0; h != 2 && ok; ++h) {
+                const HANDLE handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(images.handle[slot][h]));
+                failure = device->OpenSharedResource(handle, __uuidof(ID3D11Texture2D),
+                                                     reinterpret_cast<void **>(sharedEye[slot][h].put()));
+                ok = SUCCEEDED(failure) && sharedEye[slot][h].p;
+                if (ok) {
+                    D3D11_TEXTURE2D_DESC description{};
+                    sharedEye[slot][h]->GetDesc(&description);
+                    ok = description.Width == images.width && description.Height == images.height &&
+                        description.MipLevels == 1 && description.ArraySize == 1 && description.SampleDesc.Count == 1 &&
+                        (description.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                         description.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS);
+                }
+            }
+        char message[160];
+        if (!ok) {
+            for (auto &row : sharedEye)
+                for (auto &image : row)
+                    image.reset();
+            std::snprintf(message, sizeof(message), "Shared eye images generation=%u unavailable hr=%08lx; pixel pairs",
+                          images.generation, static_cast<unsigned long>(failure));
+            log.write(message);
+            return;
+        }
+        sharedOpened = images.generation;
+        sharedWidth = images.width;
+        sharedHeight = images.height;
+        images.opened = sharedOpened;
+        std::snprintf(message, sizeof(message), "Shared eye images generation=%u %ux%u opened: zero-copy pairs",
+                      images.generation, images.width, images.height);
+        log.write(message);
+    }
     bool currentPixels(const PixelSections &published) {
         if (!published.generation) return false;
         if (pixels.matches(published.generation, published.width, published.height)) return true;
@@ -1744,13 +1813,13 @@ struct Host {
             // retire the older one so time never runs backwards.
             for (int i = 0; i < 2; i++)
                 if (outstanding[i].active && !outstanding[i].expired &&
-                    channel.shared->slot[i].state == SlotState::Ready &&
+                    channel.shared->slot[i].state == SlotState::Ready && channel.shared->slot[i].gpuReady &&
                     (candidate < 0 || channel.shared->slot[i].request.sequence >
                                           channel.shared->slot[candidate].request.sequence))
                     candidate = i;
             if (candidate >= 0) {
                 auto &older = channel.shared->slot[1 - candidate];
-                if (outstanding[1 - candidate].active && older.state == SlotState::Ready &&
+                if (outstanding[1 - candidate].active && older.state == SlotState::Ready && older.gpuReady &&
                     older.request.sequence < channel.shared->slot[candidate].request.sequence) {
                     older.state = SlotState::Empty;
                     older.cancelled = 0;
@@ -1782,6 +1851,7 @@ struct Host {
         uint32_t presentation = 0;
         bool accepted = false;
         uint8_t *source[2]{}, *insetSource[2]{};
+        bool zeroCopy = false;
         Fov insetFov[2];
         {
             Mutex lock(channel, 0);
@@ -1802,11 +1872,17 @@ struct Host {
                     presentation = slot.presentation;
                     // The pair is uploaded straight from its pixel sections after the
                     // lock: only this thread can request the slot again afterwards.
-                    accepted = currentPixels(channel.shared->pixels) &&
+                    zeroCopy = slot.sharedImage != 0;
+                    accepted = zeroCopy ?
+                        slot.gpuReady && slot.sharedImage == sharedOpened && !reply.foveated &&
+                            reply.width == sharedWidth && reply.height == sharedHeight &&
+                            reply.width == eye[0].width && reply.height == eye[0].height &&
+                            sharedEye[candidate][0].p && sharedEye[candidate][1].p :
+                        currentPixels(channel.shared->pixels) &&
                         pixels.matches(slot.pixelGeneration, reply.width, reply.height) &&
                         (!reply.foveated || foveationActive);
                     for (unsigned h = 0; h < 2; h++)
-                        source[h] = accepted ? pixels.buffer(slotPixelBuffer(candidate, h)) : nullptr;
+                        source[h] = accepted && !zeroCopy ? pixels.buffer(slotPixelBuffer(candidate, h)) : nullptr;
                     if (accepted && reply.foveated) {
                         accepted = foveationFits(reply.width, reply.height, reply.lowWidth, reply.lowHeight,
                                                  reply.insetWidth, reply.insetHeight);
@@ -1825,6 +1901,7 @@ struct Host {
                     slot.presentation = 0;
                     slot.presentationReserved = 0;
                     slot.headClearance = {};
+                    slot.sharedImage = slot.gpuReady = 0;
                     tracked = {};
                     if (accepted) {
                         ++completed;
@@ -1844,8 +1921,20 @@ struct Host {
             Host &host; LARGE_INTEGER start;
             ~UploadTimer() { host.perfUpload += perfMs(start, perfNow()); ++host.perfUploads; }
         } uploadTimer{*this, uploadStart};
-        eye[0].uploadWaited(context.p, source[0]);
-        eye[1].uploadWaited(context.p, source[1]);
+        if (zeroCopy) {
+            // The slot is requested again only after this returns, so the copy
+            // must have executed before the game can render into the image again.
+            eye[0].copyWaited(context.p, sharedEye[candidate][0].p);
+            eye[1].copyWaited(context.p, sharedEye[candidate][1].p);
+            if (!drainGpu())
+                throw std::runtime_error("Zero-copy eye copy did not complete");
+            eye[0].releaseWaited();
+            eye[1].releaseWaited();
+            ++zeroCopyPairs;
+        } else {
+            eye[0].uploadWaited(context.p, source[0]);
+            eye[1].uploadWaited(context.p, source[1]);
+        }
         if (reply.foveated)
             for (unsigned h = 0; h != 2; ++h) {
                 // The inset fades over its border so the seam to the base view is soft.
@@ -1872,14 +1961,14 @@ struct Host {
             return;
         reapLocked();
         auto &shared = *channel.shared;
-        // One request may wait while the game renders the other slot, so the game
-        // finds work as soon as it finishes a pair instead of drawing a frame the
-        // headset never sees. Anything else outstanding (a waiting request, a Ready
-        // pair, a cancelled render) holds further requests.
+        // One request may wait while the game holds the other slot (rendering it,
+        // or Ready and waiting for its GPU work or for this loop), so the game finds
+        // work as soon as it finishes a pair instead of drawing a frame the headset
+        // never sees. A request not yet taken, or an expiring slot, holds further ones.
         unsigned active = 0;
         for (unsigned i = 0; i != 2; ++i)
             if (outstanding[i].active && (++active > 1 || outstanding[i].expired ||
-                                          shared.slot[i].state != SlotState::Rendering || shared.slot[i].cancelled)) {
+                                          shared.slot[i].state == SlotState::Requested || shared.slot[i].cancelled)) {
                 ++fullSlots;
                 return;
             }
@@ -2187,10 +2276,10 @@ struct Host {
         log.write(line);
         if (perfLoops) {
             std::snprintf(line, sizeof(line),
-                          "Host perf loops=%llu loop=%.2fms wait=%.2fms submit=%.2fms uploads=%llu upload=%.2fms",
+                          "Host perf loops=%llu loop=%.2fms wait=%.2fms submit=%.2fms uploads=%llu upload=%.2fms zero_copy=%llu",
                           static_cast<unsigned long long>(perfLoops), perfLoop / perfLoops, perfWait / perfLoops,
                           perfSubmit / perfLoops, static_cast<unsigned long long>(perfUploads),
-                          perfUploads ? perfUpload / perfUploads : 0.);
+                          perfUploads ? perfUpload / perfUploads : 0., static_cast<unsigned long long>(zeroCopyPairs));
             log.write(line);
         }
         perfWait = perfUpload = perfLoop = perfSubmit = 0;
@@ -2266,7 +2355,7 @@ struct Host {
                                    lowHeight = foveationExtent(snapshot.height, f.periphery),
                                    insetWidth = foveationExtent(snapshot.width, f.inset),
                                    insetHeight = foveationExtent(snapshot.height, f.inset);
-                    const bool foveated = foveationActive &&
+                    const bool foveated = foveationActive && !sharedOpened &&
                         foveationFits(snapshot.width, snapshot.height, lowWidth, lowHeight, insetWidth, insetHeight);
                     if (foveated) {
                         eyeChains(lowWidth, lowHeight);

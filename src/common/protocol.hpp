@@ -5,7 +5,7 @@
 namespace ss2vr {
 // MaxDimension only bounds sanity checks: images travel in pixel sections sized
 // to the current canvas, which follows the runtime's recommended eye size.
-constexpr uint32_t Magic = 0x32565253, Abi = 13, MaxDimension = 16384, WeaponCount = 17;
+constexpr uint32_t Magic = 0x32565253, Abi = 14, MaxDimension = 16384, WeaponCount = 17;
 // Pixel sections: slot0 left/right, slot1 left/right, then the mono menu frame.
 constexpr unsigned PixelBufferCount = 5, MenuPixelBuffer = 4;
 constexpr unsigned slotPixelBuffer(unsigned slot, unsigned eye) { return slot * 2 + eye; }
@@ -102,6 +102,10 @@ struct Slot {
     uint32_t pixelGeneration = 0, pixelReserved = 0;
     // Foveated pairs: the crop actually read back per eye (x, y, w, h pixels).
     int32_t insetRect[2][4]{};
+    // ABI14 zero-copy pairs: the SharedImages generation the pair was rendered
+    // into (0 = pixel sections). gpuReady becomes 1 once the game has observed
+    // its GPU work on those images complete; pixel pairs are ready at once.
+    uint32_t sharedImage = 0, gpuReady = 0;
 };
 // Explicitly mono menu/loading frame; never eligible for a projection layer.
 struct MenuFrame {
@@ -113,6 +117,16 @@ struct MenuFrame {
 // publishes it here; readers reopen when the generation changes.
 struct PixelSections {
     uint32_t generation = 0, width = 0, height = 0, reserved = 0;
+};
+// ABI14: eye images the game renders straight into, shared with the host as
+// D3D9 (DXVK) KMT handles, one per slot and eye. The host opens a generation
+// and acknowledges it in opened; until then pairs travel as pixel sections.
+// A capture tool that needs pixels sets pixelRequestTick (GetTickCount); the
+// game then sends pixel pairs for the next few seconds.
+struct SharedImages {
+    uint32_t generation = 0, width = 0, height = 0, opened = 0;
+    uint32_t handle[2][2]{};
+    uint32_t pixelRequestTick = 0, reserved = 0;
 };
 struct MenuPointer {
     uint64_t inputSequence = 0, tickMs = 0, menuSequence = 0;
@@ -145,6 +159,7 @@ struct Shared {
     // per-eye image size (the larger of the two views), published by the host.
     PixelSections pixels;
     uint32_t recommendedWidth = 0, recommendedHeight = 0;
+    SharedImages images;
 };
 #pragma pack(pop)
 static_assert(sizeof(Vec3) == 12 && sizeof(Quat) == 16 && sizeof(Pose) == 28);
@@ -152,6 +167,6 @@ static_assert(std::is_trivially_copyable_v<Request> && std::is_standard_layout_v
 static_assert(offsetof(Shared, latest) == 48);
 static_assert(sizeof(Input) == 272 && sizeof(Request) == 480);
 static_assert(sizeof(MenuPointer) == 64);
-static_assert(sizeof(WorldSubmission)==40 && sizeof(PixelSections)==16);
-static_assert(sizeof(Shared) == 2000 && offsetof(Shared, pixels) == 1976); // Same on x86 and x64.
+static_assert(sizeof(WorldSubmission)==40 && sizeof(PixelSections)==16 && sizeof(SharedImages)==40);
+static_assert(sizeof(Shared) == 2056 && offsetof(Shared, pixels) == 1992 && offsetof(Shared, images) == 2016); // Same on x86 and x64.
 } // namespace ss2vr

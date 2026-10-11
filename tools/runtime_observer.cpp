@@ -475,6 +475,8 @@ int wmain(int argc,wchar_t **argv) {
     while(GetTickCount64()<deadline&&!found) {
         {Lock lock(channel,2);if(lock) {
             const Slot *best=nullptr;
+            // Zero-copy pairs carry no pixels: ask the game for pixel pairs meanwhile.
+            channel.shared->images.pixelRequestTick=static_cast<uint32_t>(GetTickCount());
             const auto &shared=*channel.shared;
             for(const auto &s:shared.slot) {
                 const auto &head=s.request.input.head;
@@ -485,7 +487,7 @@ int wmain(int argc,wchar_t **argv) {
                 const bool poseMatches=std::isfinite(norm)&&std::abs(norm-1)<.001&&std::isfinite(dot)&&std::abs(dot)>.99999&&
                     std::isfinite(head.p.x)&&std::isfinite(head.p.y)&&std::isfinite(head.p.z)&&
                     std::abs(head.p.x-expected[0])<.001&&std::abs(head.p.y-expected[1])<.001&&std::abs(head.p.z-expected[2])<.001;
-                if(s.state==SlotState::Ready&&!s.cancelled&&s.request.input.sequence>=minimumInput&&
+                if(s.state==SlotState::Ready&&!s.cancelled&&!s.sharedImage&&s.request.input.sequence>=minimumInput&&
                     shared.rendererReady&&shared.ui.gameplay&&!shared.menu.visible&&s.request.input.focused&&s.request.input.headValid&&
                     poseMatches&&!s.request.reserved&&!s.presentationReserved&&s.presentation==NativeUiComplete&&s.request.uiRequested==1&&
                     s.request.trackingGeneration==trackingEpoch(shared)&&
