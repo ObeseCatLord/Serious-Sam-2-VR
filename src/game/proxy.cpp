@@ -29,6 +29,18 @@ static AdditionalChain originalAdditional = nullptr;
 // implementations are logged and left untouched, never mapped to a wrong ABI.
 static struct ChainHook { void *address = nullptr; ChainPresent original = nullptr; bool enabled = false; }
     chainHooks[2];
+static bool attachAtPresentation(IDirect3DDevice9 *d);
+// Native frames reach either the device Present (GfxD3D+1C75) or the swap-chain
+// Present (GfxD3D+1C68), depending on display mode. Attach from whichever runs.
+static bool attachAtChainPresentation(IDirect3DSwapChain9 *chain, uintptr_t caller) {
+    const auto gfx = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"GfxD3D.dll"));
+    if (!gfx || caller != gfx + 0x1c68u || !chain) return false;
+    IDirect3DDevice9 *device = nullptr;
+    if (FAILED(chain->GetDevice(&device)) || !device) return false;
+    const bool attached = attachAtPresentation(device);
+    device->Release();
+    return attached;
+}
 template<unsigned Index>
 static __attribute__((noinline)) HRESULT WINAPI chainPresent(IDirect3DSwapChain9 *chain,
     const RECT *src, const RECT *dst, HWND window, const RGNDATA *region, DWORD flags) {
@@ -38,7 +50,9 @@ static __attribute__((noinline)) HRESULT WINAPI chainPresent(IDirect3DSwapChain9
     const bool outer = presentationDepth == 0;
     ++presentationDepth;
     ss2vr::game::withNativeFinally([&] {
-        if (outer) ss2vr::game::presentChain(chain, caller, src, dst, window, region, flags);
+        // The frame that attaches presents natively; VR presentation starts next frame.
+        const bool attachedNow = outer && attachAtChainPresentation(chain, caller);
+        if (outer && !attachedNow) ss2vr::game::presentChain(chain, caller, src, dst, window, region, flags);
         else if (ss2vr::game::nativePresentationCaller(caller, true)) ss2vr::game::nestedNativePresentation();
         hr = chainHooks[Index].original(chain, src, dst, window, region, flags);
     }, [&](bool) noexcept { --presentationDepth; });
