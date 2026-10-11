@@ -1317,6 +1317,13 @@ static void keyTap(WORD key) {
     pendingKey = key;
     releaseKeyAt = GetTickCount64() + 75;
 }
+std::atomic<uint64_t> vrInputTick{0};
+// While the headset is actively driving the game, the engine treats itself as
+// the foreground application (full frame rate, live input) regardless of focus.
+bool vrInputLive() noexcept {
+    const uint64_t tick = vrInputTick.load(std::memory_order_relaxed), now = GetTickCount64();
+    return hooksReady.load(std::memory_order_acquire) && tick && now >= tick && now - tick < 1000;
+}
 bool foregroundGame() {
     if (!device)
         return false;
@@ -1459,33 +1466,48 @@ void present(IDirect3DDevice9 *d) {
             nativeMenu, gameplay, stereoReady, static_cast<unsigned long long>(now >= ui.tickMs ? now-ui.tickMs : 0));
     }
     bool valid = input.focused && input.headValid && now >= input.tickMs && now - input.tickMs < 200;
+    if (valid) vrInputTick.store(now, std::memory_order_relaxed);
     bool foreground = foregroundGame();
     const MenuAction action =
-        menuNavigation.sample(input, menuVisible, valid && foreground, menus::pointerAvailable());
+        menuNavigation.sample(input, menuVisible, valid, menus::pointerAvailable());
     WORD key = 0;
+    int nativeKey = 0; // Engine key ids from Core's key table.
     switch (action) {
     case MenuAction::Back:
-        key = VK_ESCAPE;
+        key = VK_ESCAPE; nativeKey = 0x60;
         break;
     case MenuAction::Confirm:
-        key = VK_RETURN;
+        key = VK_RETURN; nativeKey = 0x65;
         break;
     case MenuAction::Up:
-        key = VK_UP;
+        key = VK_UP; nativeKey = 0x80;
         break;
     case MenuAction::Down:
-        key = VK_DOWN;
+        key = VK_DOWN; nativeKey = 0x81;
         break;
     case MenuAction::Left:
-        key = VK_LEFT;
+        key = VK_LEFT; nativeKey = 0x82;
         break;
     case MenuAction::Right:
-        key = VK_RIGHT;
+        key = VK_RIGHT; nativeKey = 0x83;
         break;
     default:
         break;
     }
-    if (key)
+    // Controller-prompt X/Y menu functions are F1/F2 in the PC menus (engine
+    // keys 0x51/0x52): Touch X/Y, Index left A / left trackpad.
+    {
+        static uint32_t previousExtras = 0;
+        const uint32_t extras = valid ? ((input.buttons[0] | input.buttons[1]) & (Reload | Netricsa)) : 0;
+        const uint32_t pressed = extras & ~previousExtras;
+        previousExtras = extras;
+        if (nativeMenu && !key && pressed)
+            menus::queueKey((pressed & Reload) ? 0x51 : 0x52);
+    }
+    // Native menus take keys through their own dispatcher (focus independent).
+    // Other flat screens fall back to OS keys only while the game owns focus,
+    // so input never leaks into another application.
+    if (key && !(nativeMenu && menus::queueKey(nativeKey)) && foreground)
         keyTap(key);
     if ((!valid || !foreground) && pendingKey) {
         keyEvent(pendingKey, true);

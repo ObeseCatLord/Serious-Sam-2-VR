@@ -23,6 +23,8 @@ static bool down = false;
 static unsigned selectedHand = 2;
 static uint32_t session = 0, reference = 0, pointerGeneration = 0;
 static uint32_t actionGeneration = 0;
+static std::atomic<int> queuedKey{0};
+static int heldKey = 0;
 static uint32_t read32(uintptr_t address) {
     uint32_t result;
     std::memcpy(&result, reinterpret_cast<void *>(address), sizeof(result));
@@ -38,7 +40,8 @@ static uintptr_t current() {
 }
 static bool nativePointerReady() {
     float sensitivity = readFloat(base + 0x3fe200);
-    return foregroundGame() && interactive() && read32(base + 0x3fe214) && std::isfinite(sensitivity) &&
+    // Driven through the native dispatcher, not OS input: window focus is not required.
+    return interactive() && read32(base + 0x3fe214) && std::isfinite(sensitivity) &&
            sensitivity > .0001f && std::isfinite(readFloat(base + 0x3fe20c)) &&
            std::isfinite(readFloat(base + 0x3fe210));
 }
@@ -47,6 +50,26 @@ static void __cdecl poll() {
     if (!hooksReady.load(std::memory_order_acquire) || !channel.shared)
         return;
     pollThread = GetCurrentThreadId();
+    // Sam2Game input mode (RVA 3FDFE8): 1 keyboard, 2 gamepad. It only selects
+    // menu/loading prompts (A/B/X/Y icons and "press A" text), so a live VR
+    // session shows the game's own controller prompts instead of PC keys.
+    // Player input rewrites it every gameplay poll; fire-button flip and aiming
+    // use inpUsingGamepad() directly and are not affected.
+    if (vrInputLive()) {
+        auto *mode = reinterpret_cast<volatile int32_t *>(base + 0x3fdfe8);
+        if (*mode == 1 || *mode == 2) *mode = 2;
+    }
+    // Native menu keys: press on one poll, release on the next.
+    if (heldKey) {
+        release(heldKey);
+        heldKey = 0;
+    }
+    if (const int key = queuedKey.exchange(0)) {
+        if (current() && interactive()) {
+            press(key, 0);
+            heldKey = key;
+        }
+    }
     MenuPointer pointer;
     Input input;
     bool sourceEligible = false;
@@ -147,6 +170,12 @@ bool pointerAvailable() {
     bool same = current() == capturedMenu && pointer.interactionGeneration == generation;
     ReleaseSRWLockShared(&stateLock);
     return same && sourceEligible && nativePointerReady();
+}
+bool queueKey(int key) {
+    if (!key || !active())
+        return false;
+    queuedKey.store(key);
+    return true;
 }
 bool initialize(HMODULE sam, HookInstaller install) {
     base = reinterpret_cast<uintptr_t>(sam);

@@ -22,6 +22,7 @@ void installLabOnlineIsolation();
 void validateLabOnlineIsolation(bool gameplay);
 bool labOnlineIsolationInstalled() noexcept;
 bool foregroundGame();
+bool vrInputLive() noexcept;
 void deviceReady(IDirect3DDevice9 *device);
 void deviceCreated(IDirect3DDevice9 *device);
 void deviceResetSucceeded(IDirect3DDevice9 *device);

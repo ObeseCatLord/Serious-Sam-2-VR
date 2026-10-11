@@ -448,7 +448,7 @@ struct Frame {
 struct Actions {
     XrActionSet set = XR_NULL_HANDLE;
     XrPath hand[2]{};
-    XrAction aim{}, grip{}, haptic{}, trigger{}, stick{}, wheel{}, wheelValue{}, use{}, jump{}, menu{},
+    XrAction aim{}, grip{}, haptic{}, trigger{}, stick{}, wheel{}, wheelValue{}, use{}, jump{}, menu{}, reload{}, netricsa{},
         recenter{}, sprint{};
     XrSpace aimSpace[2]{}, gripSpace[2]{};
     XrPath viveProfile = XR_NULL_PATH, currentProfile[2]{};
@@ -498,6 +498,8 @@ struct Actions {
         menu = action(api, "menu", "Pause and menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
         recenter = action(api, "recenter_chord", "Recenter with both grips", XR_ACTION_TYPE_BOOLEAN_INPUT);
         sprint = action(api, "sprint", "Sprint / sniper zoom", XR_ACTION_TYPE_BOOLEAN_INPUT);
+        reload = action(api, "reload", "Reload weapon", XR_ACTION_TYPE_BOOLEAN_INPUT);
+        netricsa = action(api, "netricsa", "Netricsa / objectives", XR_ACTION_TYPE_BOOLEAN_INPUT);
         suggest(api, instance, frameController);
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
         attach.countActionSets = 1;
@@ -552,18 +554,19 @@ struct Actions {
             switch (profile.kind) {
             case 0:
                 bind(sprint, 1, click);
-                bind(use, 0, "x/click");
+                bind(reload, 0, "x/click");
                 bind(use, 1, "a/click");
-                bind(jump, 0, "y/click");
+                bind(netricsa, 0, "y/click");
                 bind(jump, 1, "b/click");
                 bind(menu, 0, "menu/click"); // Touch has no right menu component.
                 break;
             case 1:
                 bind(sprint, 1, click);
-                bind(use, 0, "a/click");
+                bind(reload, 0, "a/click");
                 bind(use, 1, "a/click");
                 bind(jump, 1, "b/click");
                 bind(menu, 0, "b/click");
+                bind(netricsa, 0, "trackpad/force");
                 break;
             case 2:
                 bind(menu, 0, "menu/click");
@@ -581,9 +584,9 @@ struct Actions {
                 // Valve Frame has a left D-pad/view and right ABXY/menu.
                 // Keep the established action semantics; no invented left XY.
                 bind(sprint, 1, click);
-                bind(use, 0, "dpad_down/click");
+                bind(reload, 0, "dpad_down/click");
                 bind(use, 1, "a/click");
-                bind(jump, 0, "dpad_up/click");
+                bind(netricsa, 0, "dpad_up/click");
                 bind(jump, 1, "b/click");
                 bind(menu, 0, "view/click");
                 bind(menu, 1, "menu/click");
@@ -728,6 +731,10 @@ struct Actions {
                 input.buttons[h] |= Jump;
             if (boolean(api, session, menu, h))
                 input.buttons[h] |= Menu;
+            if (boolean(api, session, reload, h))
+                input.buttons[h] |= Reload;
+            if (boolean(api, session, netricsa, h))
+                input.buttons[h] |= Netricsa;
             if (sprintState.isActive && sprintState.currentState)
                 input.buttons[h] |= Sprint;
             const bool viveRight = h == 1 && currentProfile[h] == viveProfile;

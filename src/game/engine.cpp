@@ -5674,15 +5674,18 @@ static CommandInt originalDown = nullptr, originalPressed = nullptr, originalRel
 static VoidThis originalPoll = nullptr;
 static DataGet getData = nullptr;
 static uint32_t *(__cdecl *toId)(uint32_t *, const char *) = nullptr;
-static uint32_t ids[14]{};
+constexpr int CommandCount = 16;
+static uint32_t ids[CommandCount]{};
 static const char *commands[] = {"plcmdX+",   "plcmdX-",        "plcmdZ+",  "plcmdZ-",     "plcmdY+",
                                  "plcmdFire", "plcmdAltFire",   "plcmdUse", "plcmdSprint", "plcmdH+",
-                                 "plcmdH-",   "plcmdMouseLook", "plcmdP+",  "plcmdP-"};
+                                 "plcmdH-",   "plcmdMouseLook", "plcmdP+",  "plcmdP-",     "plcmdReloadWeapon",
+                                 "plcmdDisplayNetricsa"};
+static_assert(sizeof(commands) / sizeof(commands[0]) == CommandCount);
 static void *playerBindings = nullptr;
-static float values[14]{}, priorValues[14]{};
+static float values[CommandCount]{}, priorValues[CommandCount]{};
 // A dead local player has no tracked gameplay, but native respawn/reload prompts
 // still wait for Fire/Use. Forward only those presses while dead (main thread).
-static float respawnValues[14]{}, respawnPrior[14]{};
+static float respawnValues[CommandCount]{}, respawnPrior[CommandCount]{};
 static uint64_t respawnTick = 0;
 // Provenance of the existing cached command values, not an admission policy.
 struct ControlSample {
@@ -6367,6 +6370,14 @@ static void drawSteeringWheel() {
     if(wasAlpha)(*enableAlpha)();
     (*setDepthComparison)(priorComparison);
 }
+// Core's activity test selects the inactive frame cap and input routing. A live
+// VR session owns the game regardless of which desktop window has focus.
+static int(__cdecl *originalAppForeground)() = nullptr;
+static int __cdecl appForeground() {
+    if (vrInputLive())
+        return 1;
+    return originalAppForeground ? originalAppForeground() : 0;
+}
 static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -6458,10 +6469,11 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
 }
 
 static bool respawnRoute(const Snapshot &s);
+static bool netricsaOpen(const Snapshot &s);
 static void __fastcall poll(void *b, void *) {
     originalPoll(b);
     if (!ids[0])
-        for (int i = 0; i < 14; i++)
+        for (int i = 0; i < CommandCount; i++)
             toId(&ids[i], commands[i]);
     void *data = getData(b);
     if (!data)
@@ -6488,15 +6500,19 @@ static void __fastcall poll(void *b, void *) {
             fire[h] = fire[h] && multiplayer::localPrimaryAllowed(s.player, h, s.intentEpoch[h],
                 s.input.primaryInputGeneration[h], s.input.sequence);
     updateSteeringWheel(s); // Before controlsLock: may load a native texture.
-    const bool respawn = respawnRoute(s);
+    const bool respawn = respawnRoute(s), netricsa = netricsaOpen(s);
     AcquireSRWLockExclusive(&controlsLock);
     playerBindings = b;
     std::copy(std::begin(respawnValues), std::end(respawnValues), std::begin(respawnPrior));
     std::fill(std::begin(respawnValues), std::end(respawnValues), 0);
-    if (respawn) {
-        respawnValues[5] = primaryActionEligible(s.input, 1) && s.input.trigger[1] > .5f ? 1 : 0;
-        respawnValues[6] = primaryActionEligible(s.input, 0) && s.input.trigger[0] > .5f ? 1 : 0;
-        respawnValues[7] = ((s.input.buttons[0] | s.input.buttons[1]) & Use) ? 1 : 0;
+    if (respawn || netricsa) {
+        if (respawn) {
+            respawnValues[5] = primaryActionEligible(s.input, 1) && s.input.trigger[1] > .5f ? 1 : 0;
+            respawnValues[6] = primaryActionEligible(s.input, 0) && s.input.trigger[0] > .5f ? 1 : 0;
+            respawnValues[7] = ((s.input.buttons[0] | s.input.buttons[1]) & Use) ? 1 : 0;
+        }
+        if (netricsa)
+            respawnValues[15] = ((s.input.buttons[0] | s.input.buttons[1]) & Netricsa) ? 1 : 0;
         respawnTick = GetTickCount64();
     } else {
         std::fill(std::begin(respawnPrior), std::end(respawnPrior), 0);
@@ -6532,13 +6548,16 @@ static void __fastcall poll(void *b, void *) {
         values[6] = fire[0] ? 1 : 0;
         values[7] = s.use ? 1 : 0;
         values[8] = s.sprint ? 1 : 0;
+        const uint32_t buttons = s.input.buttons[0] | s.input.buttons[1];
+        values[14] = (buttons & Reload) ? 1 : 0;
+        values[15] = (buttons & Netricsa) ? 1 : 0;
     }
     ReleaseSRWLockExclusive(&controlsLock);
 }
 static int commandIndex(void *b, uint32_t id) {
     if (b != playerBindings)
         return -1;
-    for (int i = 0; i < 14; i++)
+    for (int i = 0; i < CommandCount; i++)
         if (ids[i] == id)
             return i;
     return -1;
@@ -6547,8 +6566,14 @@ static bool respawnRoute(const Snapshot &s) {
     return livePlayer(s) && s.initialized && local(s.player) && isAlive && !isAlive(s.player) &&
            fresh(s.input) && !recenterHeld(s.input) && !menus::active();
 }
+static bool netricsaOpen(const Snapshot &s) {
+    return livePlayer(s) && s.initialized && local(s.player) && isNetricsa && isNetricsa(s.player) &&
+           fresh(s.input) && !recenterHeld(s.input) && !menus::active();
+}
 static bool respawnCommand(int i, const Snapshot &s) {
-    return (i == 5 || i == 6 || i == 7) && respawnTick && GetTickCount64() - respawnTick < 200 && respawnRoute(s);
+    if (!respawnTick || GetTickCount64() - respawnTick >= 200) return false;
+    if (i == 15) return netricsaOpen(s);
+    return (i == 5 || i == 6 || i == 7) && respawnRoute(s);
 }
 static float __fastcall commandValue(void *b, void *, uint32_t id) {
     auto snapshot = copySnapshot();
@@ -7586,6 +7611,8 @@ bool attach(bool headless) {
     }
 #define H(module, name, fn, orig)                                                                            \
     ok = hook(module, name, reinterpret_cast<void *>(fn), reinterpret_cast<void **>(&orig)) && ok
+    if (!headless)
+        H(c, "?sysIsAppForeground@SeriousEngine@@YAHXZ", appForeground, originalAppForeground);
     if(!headless && labSniperConfigured && labPreparation->sniperZoom)
         H(e,"?mdlGetAttachmentAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z",
           observedAttachment,originalObservedAttachment);

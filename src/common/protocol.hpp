@@ -5,7 +5,7 @@
 namespace ss2vr {
 constexpr uint32_t Magic = 0x32565253, Abi = 11, MaxDimension = 2048, WeaponCount = 17;
 constexpr size_t EyeBytes = size_t(MaxDimension) * MaxDimension * 4;
-enum Button : uint32_t { Wheel = 1, Use = 2, Jump = 4, Menu = 8, Recenter = 16, Sprint = 32 };
+enum Button : uint32_t { Wheel = 1, Use = 2, Jump = 4, Menu = 8, Recenter = 16, Sprint = 32, Reload = 64, Netricsa = 128 };
 enum FramePresentation : uint32_t { NativeUiComplete = 1 };
 enum class SlotState : uint32_t { Empty, Requested, Rendering, Ready };
 #pragma pack(push, 8)
