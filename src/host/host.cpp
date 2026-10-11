@@ -1740,10 +1740,27 @@ struct Host {
             if (!lock)
                 return;
             reapLocked();
+            // With two requests in flight both may be Ready: show the newest and
+            // retire the older one so time never runs backwards.
             for (int i = 0; i < 2; i++)
                 if (outstanding[i].active && !outstanding[i].expired &&
-                    channel.shared->slot[i].state == SlotState::Ready)
+                    channel.shared->slot[i].state == SlotState::Ready &&
+                    (candidate < 0 || channel.shared->slot[i].request.sequence >
+                                          channel.shared->slot[candidate].request.sequence))
                     candidate = i;
+            if (candidate >= 0) {
+                auto &older = channel.shared->slot[1 - candidate];
+                if (outstanding[1 - candidate].active && older.state == SlotState::Ready &&
+                    older.request.sequence < channel.shared->slot[candidate].request.sequence) {
+                    older.state = SlotState::Empty;
+                    older.cancelled = 0;
+                    older.presentation = 0;
+                    older.presentationReserved = 0;
+                    older.headClearance = {};
+                    outstanding[1 - candidate] = {};
+                    ++discarded;
+                }
+            }
         }
         if (candidate < 0) {
             discardEyeAcquisitions();
@@ -1854,12 +1871,18 @@ struct Host {
         if (!lock)
             return;
         reapLocked();
-        for (const auto &pending : outstanding)
-            if (pending.active) {
-                ++fullSlots;
-                return; // Includes Ready retries and cancelled native Rendering.
-            }
         auto &shared = *channel.shared;
+        // One request may wait while the game renders the other slot, so the game
+        // finds work as soon as it finishes a pair instead of drawing a frame the
+        // headset never sees. Anything else outstanding (a waiting request, a Ready
+        // pair, a cancelled render) holds further requests.
+        unsigned active = 0;
+        for (unsigned i = 0; i != 2; ++i)
+            if (outstanding[i].active && (++active > 1 || outstanding[i].expired ||
+                                          shared.slot[i].state != SlotState::Rendering || shared.slot[i].cancelled)) {
+                ++fullSlots;
+                return;
+            }
         request.trackingGeneration = trackingEpoch(shared);
         uint64_t deadline = GetTickCount64() + FrameAgeMs;
         if (shared.shutdown || !eligibleFrame(request, deadline, frameContext()))
