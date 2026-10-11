@@ -241,7 +241,11 @@ def launch(cfg_path, cfg, display_only=False, prerequisite_only=False):
         json.dump({'schema':1,'time_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
                    'source_products':cfg['expected_product_source'],'desktop_input':False,
                    'display_only':display_only,'prerequisite_only':prerequisite_only},file,indent=2)
-    cmd=['weston','--backend=headless','--renderer=pixman','--shell='+shell,'--fake-seat',
+    # pixman (CPU) by default; SS2VR_LAB_WESTON_RENDERER=gl composites on the GPU like
+    # a real desktop, so the game window's Present stops costing a CPU copy.
+    renderer=os.environ.get('SS2VR_LAB_WESTON_RENDERER','pixman')
+    if renderer not in ('pixman','gl','vulkan'):raise ValueError('Unknown private compositor renderer')
+    cmd=['weston','--backend=headless','--renderer='+renderer,'--shell='+shell,'--fake-seat',
          '--refresh-rate=60000','--width=1280','--height=720','--xwayland','--no-config',
          '--idle-time=0','--socket=ss2-vr-private','--log='+str(out/'weston.log'),
          '--',sys.executable,str(Path(__file__).resolve()),'--config',str(cfg_path),'--inside',str(out)]

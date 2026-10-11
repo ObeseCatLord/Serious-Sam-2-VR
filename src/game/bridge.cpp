@@ -404,6 +404,7 @@ struct PerfClock {
     static LARGE_INTEGER now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
 };
 static PerfClock perf;
+static ULONGLONG lastPairTick = 0; // Last published stereo pair (VR frame pacing).
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 struct GpuProfile {
     static constexpr unsigned Sets = 6, Marks = 5;
@@ -1803,12 +1804,37 @@ static LARGE_INTEGER lastPresentEnd{}, lastStereoEnd{};
 void notePerfSection(unsigned section, LARGE_INTEGER start) noexcept {
     if (section < 3) perf.section[section] += PerfClock::seconds(start, PerfClock::now());
 }
+// VR frame pacing, at the frame boundary: while the headset streams pairs, the
+// next frame starts only once the host has a request waiting, so its simulation
+// uses the same input sample as the request and its render becomes a pair
+// instead of a flat frame nobody sees (a full-resolution render competing with
+// the real pairs). Bounded, and inactive outside stereo streaming.
+static bool requestWaiting() {
+    Lock l(channel, 2);
+    if (!l) return true; // Never stall on contention.
+    for (const auto &slot : channel.shared->slot)
+        if (slot.state == SlotState::Requested && !slot.cancelled) return true;
+    return false;
+}
+static void paceToHeadset() {
+    if (!lastPairTick || GetTickCount64() - lastPairTick > 250 || !channel.shared || stopping) return;
+    if (requestWaiting()) return;
+    const LARGE_INTEGER start = PerfClock::now();
+    const ULONGLONG deadline = GetTickCount64() + 25;
+    do {
+        Sleep(1);
+        pollSharedFences(); // Finished pairs must keep freeing slots while we wait.
+    } while (!requestWaiting() && GetTickCount64() < deadline && !stopping);
+    perf.wait += PerfClock::seconds(start, PerfClock::now());
+    ++perf.waits;
+}
 void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept {
     perf.presentCall += PerfClock::seconds(start, end);
     if (lastStereoEnd.QuadPart) perf.postStereo += PerfClock::seconds(lastStereoEnd, start);
     lastStereoEnd = {};
-    lastPresentEnd = end;
     pollSharedFences(); // Present flushed the frame: its pair is often complete already.
+    paceToHeadset();
+    lastPresentEnd = PerfClock::now();
 }
 static void presentBody(IDirect3DDevice9 *d);
 void present(IDirect3DDevice9 *d) {
@@ -1845,6 +1871,7 @@ static void presentBody(IDirect3DDevice9 *d) {
                 double(perf.desktopDraws) / perf.frames);
             log("Perf mod sections per frame: update=%.2fms lasers=%.2fms wheels=%.2fms", 1000 * perf.section[0] / perf.frames,
                 1000 * perf.section[1] / perf.frames, 1000 * perf.section[2] / perf.frames);
+            log("Perf pacing: waits=%u wait=%.2fms per frame", perf.waits, 1000 * perf.wait / perf.frames);
             log("Perf per frame: present call=%.2fms hook=%.2fms | before stereo=%.2fms after stereo=%.2fms (n=%u)",
                 1000 * perf.presentCall / perf.frames, 1000 * perf.presentHook / perf.frames,
                 perf.stereoCalls ? 1000 * perf.preStereo / perf.stereoCalls : 0.,
@@ -2282,7 +2309,7 @@ static bool publishUiFrame(uint32_t presentation) {
     const LARGE_INTEGER start=PerfClock::now();
     const bool accepted=publishUiFrameBody(presentation);
     perf.publish+=PerfClock::seconds(start,PerfClock::now());
-    if (accepted) { ++perf.pairs; uiFrame.published=true; }
+    if (accepted) { ++perf.pairs; uiFrame.published=true; lastPairTick=GetTickCount64(); }
     return accepted;
 }
 static bool publishUiFrameBody(uint32_t presentation) {
@@ -2619,7 +2646,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
     Request request{};
     int chosen=-1;
     bool zeroCopy=false;
-    {
+    const auto acquireRequest=[&] {
         Lock l(channel,5); // A lost race would otherwise turn this frame flat.
         if(l) {
             const auto &images=channel.shared->images;
@@ -2637,7 +2664,8 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                 chosen=i; request=slot.request; slot.state=SlotState::Rendering; break;
             }
         }
-    }
+    };
+    acquireRequest();
     static unsigned requestDiagnostics = 0;
     if (chosen >= 0 && requestDiagnostics < 4) {
         ++requestDiagnostics;

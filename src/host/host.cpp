@@ -2013,7 +2013,7 @@ struct Host {
             cachedValid = true;
         }
     }
-    void requestEyes(Request request) {
+    void requestEyes(Request request, bool allowSecond = true) {
         Mutex lock(channel, 2);
         if (!lock)
             return;
@@ -2050,7 +2050,9 @@ struct Host {
             SetEvent(channel.ready);
             return;
         }
-        if (active > 1) {
+        // A second request in flight only helps when the game is behind the
+        // display; when it keeps up, it would render a pair that is discarded.
+        if (active > 1 || (active == 1 && !allowSecond)) {
             ++fullSlots;
             return;
         }
@@ -2492,8 +2494,9 @@ struct Host {
                         } else
                             hudAnchor.reset();
                     }
+                    const uint64_t completedBefore = completed;
                     pollEyes();
-                    requestEyes(request);
+                    requestEyes(request, completed == completedBefore);
                     if (projection(projectionLayer, projectionViews, insetLayer, insetViews)) {
                         layers.push_back(
                             reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projectionLayer));
