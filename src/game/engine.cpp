@@ -1107,6 +1107,14 @@ static bool aliased(const Snapshot &s) {
         return false;
     return s.handle[0] == s.handle[1] || resolve(s.handle[0]) == resolve(s.handle[1]);
 }
+// A lone weapon (two-handed, the other native hand empty) is mounted on the
+// hand whose wheel chose it, whichever native slot the game put it in.
+static std::atomic<unsigned> soloMountHand{1};
+static unsigned mountHand(const Snapshot &s, unsigned nativeHand) {
+    if (nativeHand < 2 && s.handle[nativeHand] && !s.handle[1 - nativeHand])
+        return soloMountHand.load(std::memory_order_relaxed) & 1;
+    return nativeHand;
+}
 static int handOf(void *weapon, const Snapshot &s) {
     if (!s.rider.handheld() || !nativeRiderCurrent(s.player, s.rider))
         return -1;
@@ -1457,7 +1465,9 @@ static void update(void *p) {
             gates[h] = {};
         }
         refreshHand(s, p, h);
-        void *weapon = s.handle[h] ? resolve(s.handle[h]) : nullptr;
+        // The native weapon this tracked hand holds, including a mounted lone weapon.
+        const unsigned slot = s.handle[h] ? unsigned(h) : (mountHand(s, 1 - h) == unsigned(h) ? 1 - h : h);
+        void *weapon = s.handle[slot] ? resolve(s.handle[slot]) : nullptr;
         auto &ui = s.ui.wheel[h];
         for (int id = 0; id < int(WeaponCount); id++)
             if (id != 14 && inInventory(static_cast<uint8_t *>(p) + 0x8f8, id)) {
@@ -1542,7 +1552,7 @@ static void update(void *p) {
               *reinterpret_cast<int *>(static_cast<uint8_t *>(weapon) + 0xb4) == pendingSelection[h]) ||
              GetTickCount64() - selectionTick[h] > 1500))
             pendingSelection[h] = -1;
-        if (settings.labWeaponAudit && h == 1 && valid && rider.handheld() && singlePlayer()) {
+        if (settings.labWeaponAudit && h == settings.labWeaponAuditHand && valid && rider.handheld() && singlePlayer()) {
             // Private lab: own every weapon once, then hold each in the right hand for 5 s.
             static bool given = false;
             static uint64_t next = 0;
@@ -1555,7 +1565,7 @@ static void update(void *p) {
                     if (index != 14 && inInventory(static_cast<uint8_t *>(p) + 0x8f8, index)) {
                         pendingSelection[h] = index;
                         selectionTick[h] = GetTickCount64();
-                        log("Weapon audit select id=%d", index);
+                        log("Weapon audit select id=%d hand=%d", index, h);
                         break;
                     }
                 }
@@ -1563,6 +1573,7 @@ static void update(void *p) {
         }
         if (pendingSelection[h] >= 0 && !multiplayer::remoteClient() && canChange(p, h) &&
             nativeRiderCurrent(p, rider)) {
+            soloMountHand = unsigned(h);
             setWeapon(p, pendingSelection[h], h, 1);
             if (!nativeRiderCurrent(p, rider))
                 return; // A native lifecycle callback superseded this transaction.
@@ -1575,6 +1586,13 @@ static void update(void *p) {
             advanceGeneration(s);
         }
     }
+    // Fire flags are native-slot indexed: a lone weapon mounted on the other
+    // hand fires from that hand's trigger.
+    for (unsigned n = 0; n < 2; ++n)
+        if (const unsigned m = mountHand(s, n); m != n) {
+            s.fire[n] = s.fire[m];
+            s.fire[m] = false;
+        }
     // Use existing dual-wield policy. Retry while native weapons cannot yet transition.
     if (enabled && rider.handheld() && !multiplayer::remoteClient() && !isDual(p) && !s.fire[0] && !s.fire[1] &&
         canChange(p, 0) && canChange(p, 1) && nativeRiderCurrent(p, rider))
@@ -4189,7 +4207,7 @@ static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snap
                     return;
                 Pose hand = worldHandTracking(
                     body, s.origin, s.turn, s.input.head,
-                    calibratedGrip(s.input, context.hand,
+                    calibratedGrip(s.input, mountHand(s, context.hand),
                                    *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4), settings));
                 AcquireSRWLockShared(&snapshotLock);
                 auto c = calibration[context.hand];
@@ -5673,7 +5691,7 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
         return reject();
     const Pose hand = worldHandTracking(
         body, s.origin, s.turn, tracking.head,
-        calibratedGrip(tracking, h, *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4), settings));
+        calibratedGrip(tracking, mountHand(s, unsigned(h)), *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4), settings));
     const Quat offset = multiply(inverse(suppliedCamera.q), native.q);
     const Vec3 displacement = rotate(offset, charge);
     Vec3 alignment;

@@ -1033,6 +1033,7 @@ struct Host {
     uint32_t sessionGeneration = 0, referenceGeneration = 1;
     uint64_t inputSequence = 0, requestSequence = 0;
     uint64_t xrEndSuccess = 0, xrLayerSuccess = 0, xrMenuSuccess = 0, xrWorldSuccess = 0;
+    uint64_t uiPairs = 0, clearedPairs = 0; // Pairs with the native HUD composited; head-clearance opaque pairs.
     uint64_t completed = 0, timeouts = 0, fullSlots = 0, discarded = 0, imageTimeouts = 0, invalidViews = 0;
     uint64_t retired = 0, submissions = 0, reused = 0, lastSubmittedSequence = 0;
     ULONGLONG lastDiagnostics = 0, lastMutexDiagnostic = 0;
@@ -1781,7 +1782,11 @@ struct Host {
                     slot.presentationReserved = 0;
                     slot.headClearance = {};
                     tracked = {};
-                    if (accepted) ++completed;
+                    if (accepted) {
+                        ++completed;
+                        if (presentation == NativeUiComplete) ++uiPairs;
+                        if (clearance.mode == HeadClearanceMode::Opaque) ++clearedPairs;
+                    }
                 }
             }
         }
@@ -2115,14 +2120,15 @@ struct Host {
         std::snprintf(line, sizeof(line),
                       "Frame totals: ipc_complete=%llu deadline=%llu slots_full=%llu discarded=%llu "
                       "image_wait=%llu invalid_views=%llu retired=%llu submitted=%llu reused=%llu "
-                      "xr_end_success=%llu xr_layers=%llu xr_menu=%llu xr_world=%llu",
+                      "xr_end_success=%llu xr_layers=%llu xr_menu=%llu xr_world=%llu ui_pairs=%llu opaque_pairs=%llu",
                       static_cast<unsigned long long>(completed), static_cast<unsigned long long>(timeouts),
                       static_cast<unsigned long long>(fullSlots), static_cast<unsigned long long>(discarded),
                       static_cast<unsigned long long>(imageTimeouts),
                       static_cast<unsigned long long>(invalidViews), static_cast<unsigned long long>(retired),
                       static_cast<unsigned long long>(submissions), static_cast<unsigned long long>(reused),
                       static_cast<unsigned long long>(xrEndSuccess), static_cast<unsigned long long>(xrLayerSuccess),
-                      static_cast<unsigned long long>(xrMenuSuccess), static_cast<unsigned long long>(xrWorldSuccess));
+                      static_cast<unsigned long long>(xrMenuSuccess), static_cast<unsigned long long>(xrWorldSuccess),
+                      static_cast<unsigned long long>(uiPairs), static_cast<unsigned long long>(clearedPairs));
         log.write(line);
     }
     void run() {
