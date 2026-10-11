@@ -8303,6 +8303,7 @@ bool attach(bool headless) {
     if (moduleDirectory(nullptr,settingsDirectory))
         settings=loadSettings(settingsDirectory+L"SS2VR\\SS2VR.ini");
     setDesktopWorld(settings.desktopWorld);
+    setLabAutoContinue(settings.labAutoContinue);
     auto g = GetModuleHandleW(L"Sam2Game.dll"), e = GetModuleHandleW(L"Engine.dll"),
          c = GetModuleHandleW(L"Core.dll");
     if (g && !headless) {

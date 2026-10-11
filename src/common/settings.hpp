@@ -20,6 +20,7 @@ struct VrSettings {
     int labWeaponAuditHand = 1;  // Hand whose selection the audit simulates.
     int labHoldWeapon = -1;      // With WeaponAudit: select this native weapon once and keep it.
     bool labFixedPose = false;   // Measurement only: untracked headset uses a fixed head pose.
+    bool labAutoContinue = false; // Measurement only: confirm loading prompts/menus until gameplay.
     float scopeEyeRelief = .1f; // Optical presentation parameter, not native zoom timing.
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;

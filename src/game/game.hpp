@@ -27,6 +27,7 @@ bool vrInputLive() noexcept;
 // engine creates its window canvas; applied on the main thread's input poll).
 void installEyeCanvas() noexcept;
 void setDesktopWorld(bool render) noexcept;
+void setLabAutoContinue(bool enabled) noexcept;
 void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept;
 // Diagnostics: time spent in mod sections (0 player update, 1 lasers, 2 wheels).
 void notePerfSection(unsigned section, LARGE_INTEGER start) noexcept;

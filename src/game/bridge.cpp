@@ -1705,6 +1705,17 @@ static void keyEvent(WORD key, bool up) {
         bits |= 3u << 30; // Previous state down, transition up.
     PostMessageW(params.hFocusWindow, up ? WM_KEYUP : WM_KEYDOWN, key, static_cast<LPARAM>(bits));
 }
+static bool labAutoContinue = false;
+void setLabAutoContinue(bool enabled) noexcept { labAutoContinue = enabled; }
+static void keyTap(WORD key);
+// Measurement only ([Lab] AutoContinue): with no controller to press, confirm
+// loading prompts and menus every 2 s until gameplay starts, as the lab does.
+static void autoContinue(bool nativeMenu, bool menuVisible, uint64_t now) {
+    static uint64_t last = 0;
+    if (!labAutoContinue || !menuVisible || now - last < 2000) return;
+    last = now;
+    if (!(nativeMenu && menus::queueCommand(0x0b))) keyTap(VK_RETURN);
+}
 static void keyTap(WORD key) {
     if (pendingKey)
         keyEvent(pendingKey, true);
@@ -1944,6 +1955,7 @@ static void presentBody(IDirect3DDevice9 *d) {
     // death views, and gameplay without stereo resources. Only native menus
     // accept pointer interaction; Confirm/Back keys work for all of them.
     const bool menuVisible = nativeMenu || !gameplay || !stereoReady;
+    autoContinue(nativeMenu, nativeMenu || !gameplay, now);
     static unsigned diagnostics = 0, previousClassification = ~0u;
     const unsigned classification = unsigned(nativeMenu) | (unsigned(gameplay) << 1) | (unsigned(stereoReady) << 2);
     if (diagnostics < 16 && classification != previousClassification) {

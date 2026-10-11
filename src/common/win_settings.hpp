@@ -43,6 +43,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.labWeaponAuditHand = number(L"Lab", L"WeaponAuditHand", 1, 0, 1) >= .5f ? 1 : 0;
     settings.labHoldWeapon = int(number(L"Lab", L"HoldWeapon", -1, -1, 16));
     settings.labFixedPose = number(L"Lab", L"FixedPose", 0, 0, 1) >= .5f;
+    settings.labAutoContinue = number(L"Lab", L"AutoContinue", 0, 0, 1) >= .5f;
     settings.foveation.inset = number(L"Render", L"FoveationInset", .4f, .25f, .7f);
     settings.foveation.periphery = number(L"Render", L"FoveationPeriphery", .5f, .25f, .8f);
     settings.weaponScale = number(L"Weapons", L"Scale", 0, 0, 4);
