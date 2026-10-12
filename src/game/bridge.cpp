@@ -523,6 +523,7 @@ extern float frozenWorldVisibility();
 extern bool commitStereo(void *, const Request &, Slot &, uint32_t);
 extern void beginEye(void *, const Request &, int);
 extern void *shadowReuseProbeTexture() noexcept;
+extern void rootExecuteStats(double &left, double &right) noexcept;
 extern void shadowReuseStats(unsigned &created, unsigned &reused, unsigned &missed, double &createdMs, double &reusedMs) noexcept;
 extern void endEye();
 static bool sameSurface(IDirect3DSurface9 *a, IDirect3DSurface9 *b) {
@@ -1235,7 +1236,59 @@ static void countDraw() {
     else if (activeEye >= 0) ++perf.eyeDraws;
     else ++perf.desktopDraws;
 }
+// Lab only (SS2VR_LAB_SHADER_CENSUS=1): left-eye draws by bound vertex/pixel
+// shader version (0 = fixed function), counted per perf window.
+static struct ShaderCensus {
+    IDirect3DVertexShader9 *seenVertex[256]{}; DWORD vertexVersion[256]{}; unsigned vertexCount = 0;
+    IDirect3DPixelShader9 *seenPixel[256]{}; DWORD pixelVersion[256]{}; unsigned pixelCount = 0;
+    unsigned draws[2][8]{}; // [vs/ps][version bucket: 0 ff, 1 x.1/1.x, 2 2.0, 3 2.x, 4 3.0, 5 other]
+} census;
+static unsigned censusBucket(DWORD version) noexcept {
+    if (!version) return 0;
+    const DWORD major = (version >> 8) & 0xff, minor = version & 0xff;
+    if (major == 1) return 1;
+    if (major == 2) return minor ? 3 : 2;
+    if (major == 3) return 4;
+    return 5;
+}
+static void shaderCensus(IDirect3DDevice9 *d) {
+    static const bool enabled = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SHADER_CENSUS", value, 2) == 1 && value[0] == L'1'; }();
+    if (!enabled || activeEye != 0 || uiBypass) return;
+    IDirect3DVertexShader9 *vs = nullptr; IDirect3DPixelShader9 *ps = nullptr;
+    DWORD vv = 0, pv = 0;
+    if (SUCCEEDED(d->GetVertexShader(&vs)) && vs) {
+        unsigned i = 0;
+        while (i < census.vertexCount && census.seenVertex[i] != vs) ++i;
+        if (i == census.vertexCount && i < 256) {
+            DWORD words[2]{}; UINT bytes = 0;
+            if (SUCCEEDED(vs->GetFunction(nullptr, &bytes)) && bytes >= 4) {
+                std::vector<DWORD> code(bytes / 4); bytes = UINT(code.size() * 4);
+                if (SUCCEEDED(vs->GetFunction(code.data(), &bytes))) words[0] = code[0];
+            }
+            census.seenVertex[i] = vs; census.vertexVersion[i] = words[0] & 0xffff; ++census.vertexCount;
+        }
+        if (i < census.vertexCount) vv = census.vertexVersion[i];
+        vs->Release();
+    }
+    if (SUCCEEDED(d->GetPixelShader(&ps)) && ps) {
+        unsigned i = 0;
+        while (i < census.pixelCount && census.seenPixel[i] != ps) ++i;
+        if (i == census.pixelCount && i < 256) {
+            UINT bytes = 0; DWORD first = 0;
+            if (SUCCEEDED(ps->GetFunction(nullptr, &bytes)) && bytes >= 4) {
+                std::vector<DWORD> code(bytes / 4); bytes = UINT(code.size() * 4);
+                if (SUCCEEDED(ps->GetFunction(code.data(), &bytes))) first = code[0];
+            }
+            census.seenPixel[i] = ps; census.pixelVersion[i] = first & 0xffff; ++census.pixelCount;
+        }
+        if (i < census.pixelCount) pv = census.pixelVersion[i];
+        ps->Release();
+    }
+    ++census.draws[0][censusBucket(vv)];
+    ++census.draws[1][censusBucket(pv)];
+}
 static void traceWorldDraw(IDirect3DDevice9 *d,UINT count) {
+    shaderCensus(d);
     auto &sample=labWorldDraws;
     if(sample.device!=d) return;
     ++sample.calls;sample.primitives+=count;
@@ -2186,6 +2239,21 @@ static void presentBody(IDirect3DDevice9 *d) {
                     log("Perf shadows per frame: created=%.1f reused=%.1f missed=%.1f | per shadow: render+project=%.3fms "
                         "project only=%.3fms", double(created) / perf.frames, double(reused) / perf.frames,
                         double(missed) / perf.frames, created ? createdMs / created : 0., reused ? reusedMs / reused : 0.);
+            }
+            {
+                double left = 0, right = 0;
+                rootExecuteStats(left, right);
+                if (perf.pairs)
+                    log("Perf eye split per pair: execute=%.2f,%.2fms of eyes=%.2f,%.2fms (rest: collect/sort/setup)",
+                        left / perf.pairs, right / perf.pairs, 1000 * perf.eyeCpu[0] / perf.pairs, 1000 * perf.eyeCpu[1] / perf.pairs);
+            }
+            if (census.vertexCount || census.draws[0][0]) {
+                log("Perf shader census left-eye draws: vs ff=%u 1.x=%u 2.0=%u 2.x=%u 3.0=%u other=%u (programs=%u) | "
+                    "ps ff=%u 1.x=%u 2.0=%u 2.x=%u 3.0=%u other=%u (programs=%u)",
+                    census.draws[0][0], census.draws[0][1], census.draws[0][2], census.draws[0][3], census.draws[0][4],
+                    census.draws[0][5], census.vertexCount, census.draws[1][0], census.draws[1][1], census.draws[1][2],
+                    census.draws[1][3], census.draws[1][4], census.draws[1][5], census.pixelCount);
+                for (auto &row : census.draws) for (auto &count : row) count = 0;
             }
             log("Perf mod sections per frame: update=%.2fms lasers=%.2fms wheels=%.2fms", 1000 * perf.section[0] / perf.frames,
                 1000 * perf.section[1] / perf.frames, 1000 * perf.section[2] / perf.frames);

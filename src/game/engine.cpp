@@ -3571,6 +3571,13 @@ static void freezeLasers(const Request &request);
 static void drawLasers();
 static void drawSteeringWheel();
 static void drawWeaponWheels();
+// Diagnostic: time spent executing the root view's collected commands, per eye
+// (the rest of an eye render is scene collection, sorting and setup).
+static double rootExecuteSeconds[2]{};
+void rootExecuteStats(double &left, double &right) noexcept {
+    left = 1000 * std::exchange(rootExecuteSeconds[0], 0.);
+    right = 1000 * std::exchange(rootExecuteSeconds[1], 0.);
+}
 static void __fastcall viewExecute(void *command, void *) {
     const auto generation = graphicsResourceGeneration();
     auto *previousExecution = executingView;
@@ -3581,8 +3588,15 @@ static void __fastcall viewExecute(void *command, void *) {
         rootCaptureArmed = true;
     }
     const bool sourceRoot = command == rootView && scopeSource.active && eyePlayer && eyeIndex == -1;
+    LARGE_INTEGER executeStart{};
+    if (root) QueryPerformanceCounter(&executeStart);
     withNativeFinally([&] {
         originalViewExecute(command);
+        if (root) {
+            LARGE_INTEGER executeEnd{}, frequency{};
+            QueryPerformanceCounter(&executeEnd); QueryPerformanceFrequency(&frequency);
+            rootExecuteSeconds[eyeIndex & 1] += double(executeEnd.QuadPart - executeStart.QuadPart) / double(frequency.QuadPart);
+        }
         if (generation != graphicsResourceGeneration()) return;
         if (sourceRoot) scopeSource.executed = true;
         if (root) {
