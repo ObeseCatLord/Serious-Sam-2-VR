@@ -1,3 +1,4 @@
+#include "eye_replay.hpp"
 #include "common/controls.hpp"
 #include "common/lab_preparation.hpp"
 #include "common/ride_control_observation.hpp"
@@ -8389,6 +8390,90 @@ template <class T> static bool symbol(HMODULE m, const char *name, T &out) {
         log("Required symbol missing: %s", name);
     return out != nullptr;
 }
+// Eye replay support (bridge eye_replay): the left eye's geometry for the
+// right-eye rewrite, and the right eye's root capture derived from it.
+using BindMatrix = void(__cdecl *)(uint32_t, int32_t);
+static BindMatrix originalBindMatrix = nullptr;
+static void __cdecl bindMatrix(uint32_t type, int32_t index) {
+    const bool tag = replay::recording();
+    if (tag) replay::matrixBegin(type);
+    withNativeFinally([&] { originalBindMatrix(type, index); }, [&](bool) noexcept { if (tag) replay::matrixEnd(); });
+}
+static ss2vr::replay::ViewState replayRoot;
+static WeaponWorldView replayRootWorld;
+static Pose replayRightCamera;
+const ss2vr::replay::ViewState &replayRootState() noexcept { return replayRoot; }
+bool replayCaptureEyeGeometry(ss2vr::replay::EyeChange &out) noexcept {
+    out = {};
+    if (!eyePlayer || eyeIndex != 0 || !eyeSnapshot.initialized || !eyeAnchorReady || weaponPairFault || !rootCaptureAttempted ||
+        !executedWeaponWorld.valid || !executedUiProjectionValid) return false;
+    // Frames with the mod's own 3D overlays (weapon wheels, vehicle steering
+    // wheel) render the right eye natively: their replay is not yet exact.
+    if (eyeSnapshot.ui.wheel[0].open || eyeSnapshot.ui.wheel[1].open || !eyeSnapshot.rider.handheld()) return false;
+    const Pose left = worldEyeTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, eyeRequest.input.head, eyeRequest.eye[0]);
+    const Pose right = worldEyeTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, eyeRequest.input.head, eyeRequest.eye[1]);
+    if (!finite(left) || !finite(right)) return false;
+    out = ss2vr::replay::eyeChange(matrix(compose(inverse(right), left)), eyeRequest.fov[0], eyeRequest.fov[1]);
+    std::memcpy(replayRoot.adjusted.data(), executedUiProjection.m, sizeof(replayRoot.adjusted));
+    std::memcpy(replayRoot.projection.data(), executedWeaponWorld.projection.m, sizeof(replayRoot.projection));
+    std::memcpy(replayRoot.view.data(), executedWeaponWorld.view.m, sizeof(replayRoot.view));
+    replayRootWorld = executedWeaponWorld;
+    replayRightCamera = right;
+    return out.valid;
+}
+// Lab check (SS2VR_LAB_REPLAY_VERIFY=1): after a native right eye, compare its
+// root capture with what the replay derivation would have produced.
+void replayVerifyEye(const ss2vr::replay::EyeChange &change) noexcept {
+    if (eyeIndex != 1 || !executedWeaponWorld.valid || !executedUiProjectionValid) return;
+    const auto r = ss2vr::replay::rewrite(replayRoot, change);
+    if (!r.valid) return;
+    double view = 0, projection = 0, adjusted = 0;
+    for (unsigned i = 0; i < 12; ++i) view = std::max(view, std::abs(r.view[i] - executedWeaponWorld.view.m[i]));
+    for (unsigned i = 0; i < 16; ++i) projection = std::max(projection, std::abs(r.projection[i] - executedWeaponWorld.projection.m[i]));
+    for (unsigned i = 0; i < 16; ++i) adjusted = std::max(adjusted, std::abs(r.adjusted[i] - executedUiProjection.m[i]));
+    static unsigned logged = 0;
+    if (logged++ < 6) {
+        const auto &a = executedUiProjection.m;
+        log("Eye replay verify max|diff| view=%.5f projection=%.5f adjusted=%.5f native AP1 row0 %.4f %.4f %.4f %.4f derived %.4f %.4f %.4f %.4f",
+            view, projection, adjusted, a[0], a[1], a[2], a[3], r.adjusted[0], r.adjusted[1], r.adjusted[2], r.adjusted[3]);
+        const auto &p = executedWeaponWorld.projection.m;
+        log("Eye replay verify native P1 row0 %.4f %.4f %.4f %.4f derived %.4f %.4f %.4f %.4f | P0 row0 %.4f %.4f %.4f %.4f",
+            p[0], p[1], p[2], p[3], r.projection[0], r.projection[1], r.projection[2], r.projection[3],
+            replayRoot.projection[0], replayRoot.projection[1], replayRoot.projection[2], replayRoot.projection[3]);
+    }
+}
+// After beginEye(1) and a successful replay: the right eye's root capture, as
+// a native right-eye render would have produced it.
+bool replayAdoptEye(const ss2vr::replay::EyeChange &change) noexcept {
+    if (!eyePlayer || eyeIndex != 1 || weaponPairFault || !replayRootWorld.valid) return false;
+    const auto r = ss2vr::replay::rewrite(replayRoot, change);
+    if (!r.valid) return false;
+    WeaponWorldView world = replayRootWorld;
+    for (unsigned i = 0; i < 12; ++i) world.view.m[i] = float(r.view[i]);
+    for (unsigned i = 0; i < 16; ++i) world.projection.m[i] = float(r.projection[i]);
+    Matrix44 adjusted{};
+    for (unsigned i = 0; i < 16; ++i) adjusted.m[i] = float(r.adjusted[i]);
+    if (!finiteMatrix(world.view) || !finiteProjection(world.projection) || !finiteProjection(adjusted)) return false;
+    preparedWeaponWorld = world;
+    executedWeaponWorld = world;
+    executedUiProjection = adjusted;
+    executedUiProjectionValid = true;
+    executedRootGeneration = graphicsResourceGeneration();
+    rootCaptureAttempted = true;
+    rootCaptureArmed = false;
+    // Lab receipt in the native camera format: the right eye's camera as replayed.
+    static const bool labTrace = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_TRACE",value,2)==1 && value[0]==L'1'; }();
+    static uint64_t loggedRequest = 0;
+    static unsigned receipts = 0;
+    if (labTrace && receipts < 16384 && loggedRequest != eyeRequest.sequence) {
+        ++receipts; loggedRequest = eyeRequest.sequence;
+        const auto &head = eyeRequest.input.head; const auto &c = replayRightCamera;
+        log("Lab native camera eye=1 request=%llu session=%u reference=%u tracking=%u head=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f camera=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+            static_cast<unsigned long long>(eyeRequest.sequence),eyeRequest.session,eyeRequest.reference,eyeRequest.trackingGeneration,
+            head.p.x,head.p.y,head.p.z,head.q.x,head.q.y,head.q.z,head.q.w,c.p.x,c.p.y,c.p.z,c.q.x,c.q.y,c.q.z,c.q.w);
+    }
+    return true;
+}
 // Dynamic shadow reuse (ren_iDynamicShadowQuality 3). The engine renders each
 // shadow caster's light-space image into one shared canvas and projects it onto
 // nearby hulls, once per eye. The image depends only on the light and the model,
@@ -8558,6 +8643,7 @@ bool attach(bool headless) {
     if (moduleDirectory(nullptr,settingsDirectory))
         settings=loadSettings(settingsDirectory+L"SS2VR\\SS2VR.ini");
     setDesktopWorld(settings.desktopWorld);
+    setEyeReplay(settings.eyeReplay);
     setLabAutoContinue(settings.labAutoContinue);
     auto g = GetModuleHandleW(L"Sam2Game.dll"), e = GetModuleHandleW(L"Engine.dll"),
          c = GetModuleHandleW(L"Core.dll");
@@ -8993,6 +9079,14 @@ bool attach(bool headless) {
         ok = internalHook(graphics, 0x56a0, reinterpret_cast<void *>(weaponDepthRange),
                           reinterpret_cast<void **>(&originalDepthRange)) && ok;
         ok = shadow_reuse::install(e) && ok;
+        {
+            const auto exported = [&](const char *name) { return reinterpret_cast<const float *>(GetProcAddress(e, name)); };
+            replay::setEngineMatrices(exported("?_gfx_mAdjustedProjection@SeriousEngine@@3VMatrix44f@1@A"),
+                                      exported("?_gfx_mCurrentProjection@SeriousEngine@@3VMatrix44f@1@A"),
+                                      exported("?_gfx_mCurrentView@SeriousEngine@@3VMatrix34f@1@A"));
+            ok = hook(e, "?gfxBindMatrix@SeriousEngine@@YAXW4GfxMatrixType@1@J@Z", reinterpret_cast<void *>(bindMatrix),
+                      reinterpret_cast<void **>(&originalBindMatrix)) && ok;
+        }
         H(g, "?ProcessPlayerControls@CPlayerBrainEntity@SeriousEngine@@UAEXEVVector3f@2@0@Z",
           waterPlayerControls, originalPlayerControls);
         H(g, "?HandleObjectCarrying@CPuppetEntity@SeriousEngine@@QAEXXZ", carryStep, originalCarrying);
