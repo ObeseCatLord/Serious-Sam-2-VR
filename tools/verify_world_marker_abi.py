@@ -80,8 +80,11 @@ require(len(fade_calls) == 1, fade_calls)
 at = fade_calls[0]
 require(instructions[at-1] == 'mov    (%ecx),%eax', instructions[at-3:at+4])
 require(re.fullmatch(r'mov    \(%[a-z]+\),%ecx', instructions[at-2]), instructions[at-2])
-require(instructions[at+1] == 'fld    %st(0)', instructions[at+1:at+5])
-require(any(ins.startswith('fstps  -0x') for ins in instructions[at+1:at+15]), "Required boundary check failed: any((ins.startswith('fstps  -0x') for ins in instructions[at + 1:at + 15]))")
+# The float result is consumed straight from x87 st0: duplicated (fld st0) or
+# stored to a frame slot (fsts/fstps); the register choice is compiler-owned.
+consume = instructions[at+1]
+require(consume == 'fld    %st(0)' or re.fullmatch(r'fstp?s\s+-0x[0-9a-f]+\(%ebp\)', consume), instructions[at+1:at+5])
+require(any(re.match(r'fstp?s\s+-0x', ins) for ins in instructions[at+1:at+15]), "Required boundary check failed: the fade result is never stored to a frame slot")
 entries['nativeFade'] = {'virtual_byte_slot': '0x60c', 'ecx_receiver': True,
                          'return_consumed_from_x87_st0': True}
 print(json.dumps({'runtime_executed': False, 'artifact': artifact.name,

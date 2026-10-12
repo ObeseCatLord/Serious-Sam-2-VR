@@ -80,7 +80,14 @@ target = symbol('laserModelInstanceE', 'b')
 sites = [i for i, ins in enumerate(read) if ins == f'call   *0x{target:x}']
 require(len(sites) == 1, sites)
 at = sites[0]
-receiver = read[at-1]
+# The receiver load may be scheduled a few instructions before the call; every
+# instruction in between must leave ECX alone and must not be a call.
+load = at-1
+while load > at-4 and not read[load].endswith(',%ecx'):
+    require(not read[load].startswith('call') and '%ecx' not in read[load] and '%cx' not in read[load],
+            read[load-1:at+1])
+    load -= 1
+receiver = read[load]
 if not re.fullmatch(r'mov    0x[0-9a-f]+\(%esp\),%ecx', receiver):
     # GCC 16 keeps the resolved model pointer in callee-saved EBX across the
     # readability check. Prove this specific sequence, not arbitrary ECX data.

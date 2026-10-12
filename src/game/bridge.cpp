@@ -381,7 +381,10 @@ struct PerfClock {
     double readTarget = 0, lock = 0, copy = 0, dim = 0, publish = 0, wait = 0, presentCall = 0, presentHook = 0;
     double preStereo = 0, postStereo = 0; // Present end -> stereo start, stereo end -> present start.
     double section[3]{};
-    uint64_t eyeDraws = 0, desktopDraws = 0, hudDuplicates = 0;
+    uint64_t eyeDraws = 0, desktopDraws = 0, hudDuplicates = 0, hudDraws = 0;
+    double hudCpu = 0; // Whole HUD draw path (desktop draw, capture, both eye duplicates, restore).
+    double hudFlushCpu = 0;
+    unsigned hudLayerDraws = 0, hudFallbackDraws = 0, hudFlushes = 0;
     // Pairs rendered but not published, by the state they ended in.
     unsigned lostNoWorld = 0, lostFault = 0, lostNoOverlay = 0, lostIncomplete = 0, lostOther = 0;
     const char *lostReason = "none";
@@ -577,6 +580,7 @@ struct NativeUiFrame {
     int slot = -1;
     bool restore = false, ui = false, fault = false, world = false, zeroCopy = false, published = false;
     bool overlay = false, overlaySeen = false, complete = false, fade = false;
+    bool hudLayerDirty = false, hudLayerCleared = false; // HUD layer content this frame / cleared this frame.
     uintptr_t faultOrigin = 0;
     const char *faultReason = "none";
     D3DVERTEXELEMENT9 diagnosticElements[8]{};
@@ -771,12 +775,15 @@ struct NativeUiDrawState {
     float planes[6][4]{};
     DWORD state[4]{};
     DWORD fill = 0;
+    DWORD layerState[5]{}; // Saved separate-alpha/colour-write states of a HUD layer draw.
     const char *captureStage = "not-started";
-    bool busy = false, captured = false, changed = false;
+    bool busy = false, captured = false, changed = false, layered = false;
 };
 static thread_local NativeUiDrawState uiDraw;
 static constexpr D3DRENDERSTATETYPE uiStates[]{D3DRS_ZENABLE, D3DRS_ZWRITEENABLE,
     D3DRS_SCISSORTESTENABLE, D3DRS_CLIPPLANEENABLE};
+static constexpr D3DRENDERSTATETYPE hudLayerStates[]{D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SRCBLENDALPHA,
+    D3DRS_DESTBLENDALPHA, D3DRS_BLENDOPALPHA, D3DRS_COLORWRITEENABLE};
 static void cleanupUiDraw(bool aborted) noexcept {
     if (aborted) { nativeUiFault(); uiHalted = true; }
     bool ok = true;
@@ -787,6 +794,9 @@ static void cleanupUiDraw(bool aborted) noexcept {
         ok = SUCCEEDED(d->SetVertexShaderConstantF(1, uiDraw.constants.m, 4)) && ok;
         for (unsigned i=0;i<4;++i) ok = SUCCEEDED(d->SetRenderState(uiStates[i], uiDraw.state[i])) && ok;
         for (unsigned i=0;i<6;++i) ok = SUCCEEDED(d->SetClipPlane(i, uiDraw.planes[i])) && ok;
+        if (uiDraw.layered)
+            for (unsigned i=0;i<std::size(hudLayerStates);++i)
+                ok = SUCCEEDED(d->SetRenderState(hudLayerStates[i], uiDraw.layerState[i])) && ok;
         // SetRenderTarget resets viewport. Both raster rectangles are restored last.
         ok = SUCCEEDED(d->SetViewport(&uiDraw.viewport)) && ok;
         ok = SUCCEEDED(d->SetScissorRect(&uiDraw.scissor)) && ok;
@@ -937,6 +947,193 @@ static_assert(D3DDECLTYPE_FLOAT3==2 && D3DDECLMETHOD_DEFAULT==0 && D3DDECLUSAGE_
 // otherwise the window mirrors the left eye.
 static bool desktopWorld = false;
 void setDesktopWorld(bool render) noexcept { desktopWorld = render; }
+using Clear = HRESULT(WINAPI *)(IDirect3DDevice9 *,DWORD,const D3DRECT *,DWORD,D3DCOLOR,float,DWORD);
+using DrawUp = HRESULT(WINAPI *)(IDirect3DDevice9 *,D3DPRIMITIVETYPE,UINT,const void *,UINT);
+static Clear originalClear = nullptr;
+static DrawUp originalDrawUp = nullptr;
+// HUD layer. Each admitted HUD draw renders once, unprojected, into a canvas-
+// sized premultiplied layer (separate alpha blending keeps its coverage), and
+// the layer is composited at the end of the overlay onto the desktop backbuffer
+// (1:1) and onto each eye's panel (perspective-correct, trilinear). This
+// replaces a desktop draw plus two projected eye draws, three render-target
+// switches and six clip planes per HUD draw. Blend modes that cannot be
+// expressed as a layer, and fades, flush the layer and keep the per-eye path.
+static IDirect3DTexture9 *hudLayer = nullptr;
+static IDirect3DSurface9 *hudLayerSurface = nullptr;
+static IDirect3DDevice9 *hudLayerDevice = nullptr;
+static bool hudLayerDisabled = false; // Composition failed once: keep the per-eye path.
+static void releaseHudLayer() noexcept {
+    if (hudLayerSurface) hudLayerSurface->Release();
+    if (hudLayer) hudLayer->Release();
+    hudLayerSurface = nullptr; hudLayer = nullptr; hudLayerDevice = nullptr;
+}
+static bool hudLayerReady(IDirect3DDevice9 *d) noexcept {
+    if (hudLayerDisabled || uiFrame.fade || !uiFrame.color) return false;
+    const UINT w = uiFrame.request.width, h = uiFrame.request.height;
+    D3DSURFACE_DESC desc{};
+    if (hudLayer && (hudLayerDevice != d || FAILED(hudLayerSurface->GetDesc(&desc)) || desc.Width != w || desc.Height != h))
+        releaseHudLayer();
+    if (!hudLayer) {
+        static const bool autoMips = [d] {
+            D3DCAPS9 c{}; IDirect3D9 *api = nullptr; D3DDEVICE_CREATION_PARAMETERS creation{}; D3DDISPLAYMODE mode{};
+            bool ok = SUCCEEDED(d->GetDeviceCaps(&c)) && (c.Caps2 & D3DCAPS2_CANAUTOGENMIPMAP) &&
+                (c.PrimitiveMiscCaps & D3DPMISCCAPS_SEPARATEALPHABLEND) &&
+                SUCCEEDED(d->GetDirect3D(&api)) && api && SUCCEEDED(d->GetCreationParameters(&creation)) &&
+                SUCCEEDED(d->GetDisplayMode(0,&mode)) &&
+                api->CheckDeviceFormat(creation.AdapterOrdinal,creation.DeviceType,mode.Format,
+                    D3DUSAGE_RENDERTARGET|D3DUSAGE_AUTOGENMIPMAP,D3DRTYPE_TEXTURE,D3DFMT_A8R8G8B8) == D3D_OK;
+            if (api) api->Release();
+            return ok;
+        }();
+        if (!autoMips || FAILED(d->CreateTexture(w,h,0,D3DUSAGE_RENDERTARGET|D3DUSAGE_AUTOGENMIPMAP,D3DFMT_A8R8G8B8,
+                                                D3DPOOL_DEFAULT,&hudLayer,nullptr)) || !hudLayer ||
+            FAILED(hudLayer->GetSurfaceLevel(0,&hudLayerSurface)) || !hudLayerSurface) {
+            releaseHudLayer(); hudLayerDisabled = true;
+            log("HUD layer unavailable (mips=%u); HUD stays per eye", unsigned(autoMips));
+            return false;
+        }
+        hudLayerDevice = d;
+        log("HUD layer %ux%u", w, h);
+    }
+    return true;
+}
+// Alpha blending that turns the engine's colour blend into premultiplied layer
+// coverage: "over" blends accumulate alpha, additive ones leave it unchanged.
+static bool hudLayerAlpha(IDirect3DDevice9 *d,DWORD &source,DWORD &destination) noexcept {
+    DWORD enabled=0, src=0, dst=0, op=0;
+    if (FAILED(d->GetRenderState(D3DRS_ALPHABLENDENABLE,&enabled)) || !enabled ||
+        FAILED(d->GetRenderState(D3DRS_SRCBLEND,&src)) || FAILED(d->GetRenderState(D3DRS_DESTBLEND,&dst)) ||
+        FAILED(d->GetRenderState(D3DRS_BLENDOP,&op)) || op != D3DBLENDOP_ADD) return false;
+    if ((src == D3DBLEND_SRCALPHA || src == D3DBLEND_ONE) && dst == D3DBLEND_INVSRCALPHA) {
+        source = D3DBLEND_ONE; destination = D3DBLEND_INVSRCALPHA; return true;
+    }
+    if ((src == D3DBLEND_SRCALPHA || src == D3DBLEND_ONE) && dst == D3DBLEND_ONE) {
+        source = D3DBLEND_ZERO; destination = D3DBLEND_ONE; return true;
+    }
+    return false;
+}
+struct HudVertex { float x, y, z, rhw, u, v; };
+// Composite the layer onto the desktop backbuffer and both eyes; restores all
+// device state (state block) and the bound render target. Clears the layer flag.
+static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
+    if (!uiFrame.hudLayerDirty) return true;
+    uiFrame.hudLayerDirty = false;
+    if (!hudLayer || hudLayerDevice != d) return false;
+    const LARGE_INTEGER start = PerfClock::now();
+    ++perf.hudFlushes;
+    hudLayer->GenerateMipSubLevels();
+    IDirect3DStateBlock9 *saved = nullptr;
+    IDirect3DSurface9 *bound = nullptr;
+    bool ok = SUCCEEDED(d->CreateStateBlock(D3DSBT_ALL,&saved)) && saved &&
+        SUCCEEDED(d->GetRenderTarget(0,&bound)) && bound;
+    uiBypass = true;
+    if (ok) {
+        const float W = float(uiFrame.request.width), H = float(uiFrame.request.height);
+        ok = SUCCEEDED(d->SetVertexShader(nullptr)) && SUCCEEDED(d->SetPixelShader(nullptr)) &&
+            SUCCEEDED(d->SetFVF(D3DFVF_XYZRHW|D3DFVF_TEX1)) && SUCCEEDED(d->SetTexture(0,hudLayer)) &&
+            SUCCEEDED(d->SetTexture(1,nullptr));
+        const std::pair<D3DTEXTURESTAGESTATETYPE,DWORD> stages[]{
+            {D3DTSS_COLOROP,D3DTOP_SELECTARG1},{D3DTSS_COLORARG1,D3DTA_TEXTURE},
+            {D3DTSS_ALPHAOP,D3DTOP_SELECTARG1},{D3DTSS_ALPHAARG1,D3DTA_TEXTURE},
+            {D3DTSS_TEXCOORDINDEX,0},{D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_DISABLE}};
+        for (const auto &[state,value] : stages) ok = SUCCEEDED(d->SetTextureStageState(0,state,value)) && ok;
+        ok = SUCCEEDED(d->SetTextureStageState(1,D3DTSS_COLOROP,D3DTOP_DISABLE)) && ok;
+        ok = SUCCEEDED(d->SetTextureStageState(1,D3DTSS_ALPHAOP,D3DTOP_DISABLE)) && ok;
+        const std::pair<D3DRENDERSTATETYPE,DWORD> states[]{
+            {D3DRS_ZENABLE,D3DZB_FALSE},{D3DRS_ZWRITEENABLE,FALSE},{D3DRS_ALPHATESTENABLE,FALSE},
+            {D3DRS_ALPHABLENDENABLE,TRUE},{D3DRS_SRCBLEND,D3DBLEND_ONE},{D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA},
+            {D3DRS_BLENDOP,D3DBLENDOP_ADD},{D3DRS_SEPARATEALPHABLENDENABLE,FALSE},{D3DRS_CULLMODE,D3DCULL_NONE},
+            {D3DRS_FOGENABLE,FALSE},{D3DRS_STENCILENABLE,FALSE},{D3DRS_CLIPPLANEENABLE,0},
+            {D3DRS_SCISSORTESTENABLE,FALSE},{D3DRS_LIGHTING,FALSE},{D3DRS_SRGBWRITEENABLE,FALSE},
+            {D3DRS_FILLMODE,D3DFILL_SOLID},{D3DRS_SHADEMODE,D3DSHADE_GOURAUD},{D3DRS_SPECULARENABLE,FALSE},
+            {D3DRS_TEXTUREFACTOR,0xffffffff},
+            {D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_RED|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_BLUE}};
+        for (const auto &[state,value] : states) ok = SUCCEEDED(d->SetRenderState(state,value)) && ok;
+        const auto draw = [&](IDirect3DSurface9 *target,const HudVertex (&v)[4],bool filtered) {
+            const D3DVIEWPORT9 full{0,0,uiFrame.request.width,uiFrame.request.height,0,1};
+            bool drawn = SUCCEEDED(originalSetRT(d,0,target)) && SUCCEEDED(d->SetViewport(&full));
+            const DWORD filter = filtered ? D3DTEXF_LINEAR : D3DTEXF_POINT;
+            const std::pair<D3DSAMPLERSTATETYPE,DWORD> samplers[]{
+                {D3DSAMP_ADDRESSU,D3DTADDRESS_CLAMP},{D3DSAMP_ADDRESSV,D3DTADDRESS_CLAMP},
+                {D3DSAMP_MINFILTER,filter},{D3DSAMP_MAGFILTER,filter},
+                {D3DSAMP_MIPFILTER,filtered ? D3DTEXF_LINEAR : D3DTEXF_NONE},{D3DSAMP_MAXMIPLEVEL,0},
+                {D3DSAMP_MIPMAPLODBIAS,0},{D3DSAMP_SRGBTEXTURE,FALSE}};
+            for (const auto &[state,value] : samplers) drawn = SUCCEEDED(d->SetSamplerState(0,state,value)) && drawn;
+            ++perf.hudDuplicates;
+            return drawn && SUCCEEDED(originalDrawUp(d,D3DPT_TRIANGLEFAN,2,v,sizeof(HudVertex)));
+        };
+        // Desktop: exactly one texel per pixel (D3D9 centres pre-transformed pixels on integers).
+        const HudVertex desktop[4]{{-.5f,-.5f,.5f,1,0,0},{W-.5f,-.5f,.5f,1,1,0},
+                                   {W-.5f,H-.5f,.5f,1,1,1},{-.5f,H-.5f,.5f,1,0,1}};
+        ok = ok && draw(uiFrame.color,desktop,false);
+        for (unsigned i=0;i<2 && ok;++i) {
+            // Panel-local corners (top of the canvas is +Y) through this eye's projection.
+            const Matrix34 panel = matrix(uiFrame.panel[i]);
+            const Matrix44 &eye = uiFrame.projection[i];
+            const float hw = uiFrame.request.uiWidth*.5f, hh = uiFrame.request.uiHeight*.5f;
+            const float corner[4][4]{{-hw,hh,0,0},{hw,hh,1,0},{hw,-hh,1,1},{-hw,-hh,0,1}};
+            HudVertex v[4]{};
+            bool visible = true;
+            for (unsigned k=0;k<4 && visible;++k) {
+                double local[3]{};
+                for (unsigned r=0;r<3;++r)
+                    local[r] = double(panel.m[4*r])*corner[k][0] + double(panel.m[4*r+1])*corner[k][1] + panel.m[4*r+3];
+                double clip[4]{};
+                for (unsigned r=0;r<4;++r)
+                    clip[r] = double(eye.m[4*r])*local[0] + double(eye.m[4*r+1])*local[1] +
+                              double(eye.m[4*r+2])*local[2] + eye.m[4*r+3];
+                // A panel partly behind this eye is not drawn there (as the per-draw path).
+                const double margin = std::max(1.,std::abs(clip[3]))*1e-5;
+                if (!(clip[3] > margin) || !(clip[2] > margin) || !(clip[3]-clip[2] > margin)) { visible = false; break; }
+                v[k] = {float((clip[0]/clip[3]+1)*.5*W), float((1-clip[1]/clip[3])*.5*H), .5f,
+                        float(1/clip[3]), corner[k][2], corner[k][3]};
+            }
+            if (visible) ok = draw(uiFrame.target[i],v,true);
+        }
+    }
+    bool restored = bound && SUCCEEDED(originalSetRT(d,0,bound));
+    restored = saved && SUCCEEDED(saved->Apply()) && restored;
+    uiBypass = false;
+    if (bound) bound->Release();
+    if (saved) saved->Release();
+    perf.hudFlushCpu += PerfClock::seconds(start,PerfClock::now());
+    if (!ok || !restored) {
+        hudLayerDisabled = true;
+        log("HUD layer composite failed (ok=%u restored=%u); HUD stays per eye", unsigned(ok), unsigned(restored));
+        nativeUiFault("hud-layer-composite");
+        return false;
+    }
+    uiFrame.hudLayerCleared = false; // The next layer draw starts from a clear layer.
+    return true;
+}
+// One admitted HUD draw into the layer. Captured state (uiDraw) restores the
+// render target, viewport, scissor and layer states in cleanupUiDraw.
+template<class Call> static bool hudLayerDraw(IDirect3DDevice9 *d,Call call,DWORD alphaSource,DWORD alphaDestination,
+                                              HRESULT &result) noexcept {
+    for (unsigned i=0;i<std::size(hudLayerStates);++i)
+        if (FAILED(d->GetRenderState(hudLayerStates[i],&uiDraw.layerState[i]))) return false;
+    uiBypass = true;
+    uiDraw.changed = true; uiDraw.layered = true;
+    bool ok = SUCCEEDED(originalSetRT(d,0,hudLayerSurface));
+    if (ok && !uiFrame.hudLayerCleared) {
+        ok = SUCCEEDED(originalClear(d,0,nullptr,D3DCLEAR_TARGET,0,1,0));
+        uiFrame.hudLayerCleared = ok;
+    }
+    ok = ok && SUCCEEDED(d->SetViewport(&uiDraw.viewport)) && SUCCEEDED(d->SetScissorRect(&uiDraw.scissor));
+    ok = ok && SUCCEEDED(d->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE,TRUE)) &&
+        SUCCEEDED(d->SetRenderState(D3DRS_SRCBLENDALPHA,alphaSource)) &&
+        SUCCEEDED(d->SetRenderState(D3DRS_DESTBLENDALPHA,alphaDestination)) &&
+        SUCCEEDED(d->SetRenderState(D3DRS_BLENDOPALPHA,D3DBLENDOP_ADD));
+    // Coverage must be written even if the engine masks alpha for the backbuffer.
+    const DWORD colorWrite = uiDraw.layerState[4];
+    ok = ok && SUCCEEDED(d->SetRenderState(D3DRS_COLORWRITEENABLE,
+        colorWrite & 7 ? colorWrite | D3DCOLORWRITEENABLE_ALPHA : colorWrite));
+    uiBypass = false;
+    if (!ok) return false;
+    result = call();
+    if (SUCCEEDED(result)) { uiFrame.hudLayerDirty = true; ++perf.hudLayerDraws; }
+    return true;
+}
 template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVETYPE topology,Call call) noexcept {
     const auto generation = graphicsResourceGeneration();
     if (!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
@@ -944,10 +1141,36 @@ template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVET
     if (uiDraw.busy) { nativeUiFault(); return call(); }
     uiDraw.busy = true;
     HRESULT result = D3DERR_INVALIDCALL;
+    const LARGE_INTEGER hudStart = PerfClock::now();
+    struct HudTimer { LARGE_INTEGER start; ~HudTimer() { perf.hudCpu += PerfClock::seconds(start, PerfClock::now()); ++perf.hudDraws; } } hudTimer{hudStart};
     const bool contained = withNativeFinally([&] {
+        DWORD alphaSource = 0, alphaDestination = 0;
+        if (hudLayerReady(d) && hudLayerAlpha(d,alphaSource,alphaDestination)) {
+            // Capture first: the layer draw replaces the desktop draw (composited later).
+            if (!captureUiDraw(d)) {
+                result = call(); // Offscreen or unadmitted: native, exactly as before.
+                if (generation != graphicsResourceGeneration()) return;
+                if (FAILED(result)) { nativeUiFault("desktop-draw-hresult"); return; }
+                if (!uiDraw.color || sameSurface(uiDraw.color,uiFrame.color)) nativeUiFault(uiDraw.captureStage);
+                return;
+            }
+            if (!nativeUiTriangleTopology(topology,uiDraw.fill)) { result = call(); nativeUiFault("topology-or-fill"); return; }
+            if (!hudLayerDraw(d,call,alphaSource,alphaDestination,result)) { nativeUiFault("hud-layer-draw"); return; }
+            if (generation != graphicsResourceGeneration()) return;
+            if (FAILED(result)) nativeUiFault("desktop-draw-hresult");
+            return;
+        }
+        if (uiFrame.hudLayerDirty) {
+            // A per-eye draw onto the backbuffer goes above the layer's earlier content.
+            IDirect3DSurface9 *bound = nullptr;
+            const bool desktop = SUCCEEDED(d->GetRenderTarget(0,&bound)) && sameSurface(bound,uiFrame.color);
+            if (bound) bound->Release();
+            if (desktop && !flushHudLayer(d)) return;
+        }
         result = call(); // Desktop first, exactly once; preserve its HRESULT/state effects.
         if (generation != graphicsResourceGeneration()) return;
         if (FAILED(result)) { nativeUiFault("desktop-draw-hresult"); return; }
+        if (uiFrame.ui) ++perf.hudFallbackDraws;
         if (!captureUiDraw(d)) {
             // Offscreen drawing stays native; only eventual desktop composition is adapted.
             if (!uiDraw.color || sameSurface(uiDraw.color,uiFrame.color)) nativeUiFault(uiDraw.captureStage);
@@ -1089,14 +1312,10 @@ template<class Call> static HRESULT observeUiOutput(IDirect3DDevice9 *d, Call ca
     });
     return result;
 }
-using Clear = HRESULT(WINAPI *)(IDirect3DDevice9 *,DWORD,const D3DRECT *,DWORD,D3DCOLOR,float,DWORD);
-using DrawUp = HRESULT(WINAPI *)(IDirect3DDevice9 *,D3DPRIMITIVETYPE,UINT,const void *,UINT);
 using DrawIndexedUp = HRESULT(WINAPI *)(IDirect3DDevice9 *,D3DPRIMITIVETYPE,UINT,UINT,UINT,const void *,D3DFORMAT,const void *,UINT);
 using DrawRect = HRESULT(WINAPI *)(IDirect3DDevice9 *,UINT,const float *,const D3DRECTPATCH_INFO *);
 using DrawTri = HRESULT(WINAPI *)(IDirect3DDevice9 *,UINT,const float *,const D3DTRIPATCH_INFO *);
 using Update = HRESULT(WINAPI *)(IDirect3DDevice9 *,IDirect3DSurface9 *,const RECT *,IDirect3DSurface9 *,const POINT *);
-static Clear originalClear = nullptr;
-static DrawUp originalDrawUp = nullptr;
 static DrawIndexedUp originalDrawIndexedUp = nullptr;
 static DrawRect originalDrawRect = nullptr;
 static DrawTri originalDrawTri = nullptr;
@@ -1221,6 +1440,7 @@ static void releaseMenuScaled();
 static void releaseTargets() {
     ++resourceGeneration;
     releaseScopeCache();
+    releaseHudLayer();
     releaseMenuScaled();
     gpuProfile.release();
     releaseSharedImages();
@@ -1916,9 +2136,12 @@ static void presentBody(IDirect3DDevice9 *d) {
                 perf.scopeBegun ? perf.scopeSourceCpu*1000/perf.scopeBegun : 0.,
                 perf.scopeCallbacks ? perf.scopeTailCpu*1000/perf.scopeCallbacks : 0., perf.scopeBeginFailures[1],
                 perf.scopeBeginFailures[2], perf.scopeBeginFailures[3]);
-            log("Perf draws per pair: eyes=%.0f hud duplicates=%.0f; other per frame=%.0f",
+            log("Perf draws per pair: eyes=%.0f hud duplicates=%.0f; other per frame=%.0f; hud draws per frame=%.1f "
+                "hud cpu per frame=%.3fms layer=%u fallback=%u flushes=%u flush=%.3fms",
                 perf.pairs ? double(perf.eyeDraws) / perf.pairs : 0., perf.pairs ? double(perf.hudDuplicates) / perf.pairs : 0.,
-                double(perf.desktopDraws) / perf.frames);
+                double(perf.desktopDraws) / perf.frames, double(perf.hudDraws) / perf.frames,
+                1000 * perf.hudCpu / perf.frames, perf.hudLayerDraws, perf.hudFallbackDraws, perf.hudFlushes,
+                perf.hudFlushes ? 1000 * perf.hudFlushCpu / perf.hudFlushes : 0.);
             log("Perf mod sections per frame: update=%.2fms lasers=%.2fms wheels=%.2fms", 1000 * perf.section[0] / perf.frames,
                 1000 * perf.section[1] / perf.frames, 1000 * perf.section[2] / perf.frames);
             log("Perf pacing: waits=%u wait=%.2fms per frame", perf.waits, 1000 * perf.wait / perf.frames);
@@ -2251,10 +2474,14 @@ bool nativeUiBeginOverlay(void *player,bool admitted) {
     }
     uiFrame.overlaySeen=true;
     uiFrame.overlay=true;
+    uiFrame.hudLayerDirty=uiFrame.hudLayerCleared=false;
     return true;
 }
 void nativeUiEndOverlay(bool completed) noexcept {
     if (uiFrame.slot<0 || !uiFrame.ui) return;
+    if (completed && uiFrame.overlay && !uiFrame.fade && !uiDraw.busy && !uiFrame.fault && uiFrame.device)
+        flushHudLayer(uiFrame.device);
+    uiFrame.hudLayerDirty=false;
     if (!completed || !uiFrame.overlay || uiFrame.fade || uiDraw.busy) nativeUiFault();
     uiFrame.complete=completed && uiFrame.overlay && !uiFrame.fault;
     uiFrame.overlay=false;
@@ -2263,6 +2490,8 @@ void nativeUiEndOverlay(bool completed) noexcept {
 bool nativeUiBeginFade() {
     if (!uiFrame.overlay || !uiFrame.ui) return false;
     if (uiFrame.fade || !uiCurrent()) { nativeUiFault(); return false; }
+    // Fades cover the whole field of view above the HUD drawn so far.
+    if (uiFrame.hudLayerDirty && !flushHudLayer(uiFrame.device)) return false;
     uiFrame.fade=true;
     return true;
 }
