@@ -1,5 +1,36 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-12 (later) — right eye by record and replay; mod overhead cut
+
+- The right eye is no longer a second engine render. The left eye's world
+  render is recorded at the D3D9 call level (`eye_replay.cpp`) and replayed
+  into the right eye's targets with the view-dependent vertex constants
+  rewritten exactly (`common/replay_math.hpp`, unit tested): `gfxBindMatrix`
+  uploads by matrix type, and the shader system's constant blocks by their
+  c1..c4 MVP when it decomposes as an MVP of the recorded view state (or the
+  root/background view for draws after the root returned). The right eye's
+  root capture (HUD projection, markers) is derived identically; a lab verify
+  mode matched a native right eye to 3e-5. Captures: disparity of near and far
+  objects identical to a native right eye (-1 px far, -55/-60 px weapons).
+- Data lifetime: vertex data is append-only within a frame; the engine's
+  dynamic index ring wraps several times per frame, so dynamic index buffers
+  are written through a CPU shadow and recorded draws keep their indices for
+  a private replay index buffer. Any unsafe buffer lock, user-pointer draw or
+  replay failure renders the right eye natively for that frame, as do frames
+  with the mod's own 3D overlays (weapon wheels, vehicle steering wheel),
+  whose replay still showed artifacts.
+- Lab V207 (1344x1512): right eye 1.5-1.9 ms -> 0.3 ms; stereo CPU per pair
+  ~3.2 -> 2.2 ms. Not yet measured on the real headset. `[Render] EyeReplay=1`
+  (default); lab switches `SS2VR_LAB_EYE_REPLAY=0`, `SS2VR_LAB_REPLAY_VERIFY=1`.
+- The mod's own per-draw overhead (scope/idle probe resets on every draw, the
+  roomscale resource gates' register/FP saves) was ~25 % of each eye's CPU;
+  fast paths removed it (render-thread CPU ~9.4 -> 5.3 ms per frame in the lab;
+  `SS2VR_LAB_NO_FASTPATH=1` restores the old paths). An in-process sampler
+  (`SS2VR_LAB_SAMPLER=1`) profiles the render thread by module.
+- Single-pass stereo by instancing was planned (private plan) but set aside
+  for record/replay, which needs no shader patching.
+
+
 ## 2026-10-12 — HUD layer, dynamic shadow reuse, trigger chainsaw, housekeeping
 
 - HUD layer: each admitted HUD draw renders once into a canvas-sized

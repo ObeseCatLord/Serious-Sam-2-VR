@@ -39,6 +39,14 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 5. Roomscale: walk physically to a wall, a corner, stairs and a low roof, and
    also push with the stick. Note clipping, pushing back, or jumps of the origin.
 
+## Right-eye replay
+
+The right eye is drawn by replaying the left eye's draw calls with the view
+changed (`[Render] EyeReplay=1`). Look for anything that appears only in the
+right eye, sits at the wrong depth there, or flickers between eyes, and say
+whether it goes away with `EyeReplay=0`. While a weapon wheel is open the right
+eye is rendered normally.
+
 ## Weapons
 
 1. Grip size and orientation feel right for every weapon; hands are the same
@@ -97,4 +105,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `ae8ea3a`, version `0.2.11-dev.af9e46a144f8` (2026-10-12).
+Installed candidate: commit `5842aaf`, version `0.2.11-dev.b255ddf274e4` (2026-10-12).
