@@ -116,7 +116,7 @@ inline bool scopeImagePoseMatches(const ScopePoseObservation &a,const ScopePoseO
 // per frame, so the bound is a staleness guard). The lens draw reprojects it
 // into the current optic frame; zoom need not match (magnification is the
 // source's own and travels with its projection).
-inline constexpr uint64_t ScopeSourceMaxRequestAge = 8;
+inline constexpr uint64_t ScopeSourceMaxRequestAge = 64; // Staleness guard only (slow frames latch many requests).
 inline bool scopeImageSourceRecent(const ScopePoseObservation &source,const ScopePoseObservation &current) noexcept {
     return source.valid && current.valid && source.requestSequence && current.requestSequence > source.requestSequence &&
         current.requestSequence - source.requestSequence <= ScopeSourceMaxRequestAge && source.ownerHandle &&

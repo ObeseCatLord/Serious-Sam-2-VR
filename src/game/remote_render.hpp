@@ -33,6 +33,7 @@ bool copyIdlePalette(void *instance,IdlePaletteCopy &out,IdlePaletteBoundaryCopy
 uint32_t idlePaletteProjectionSequence(const IdleProjectionProbe &,const IdlePaletteCopy &) noexcept;
 // Existing render bank and actual DIP borrow only. No buffer/program, whole-draw
 // affine or physical-grip admission is supplied by this Main mapping observation.
+bool rideDrawPossible() noexcept;
 bool copyCurrentRideMainDraw(RideMainDrawCopy &out);
 bool rideMainDrawCurrent(const RideMainDrawCopy &copy) noexcept;
 bool claimRideGpuAttempt(const RideMainDrawCopy &copy) noexcept;

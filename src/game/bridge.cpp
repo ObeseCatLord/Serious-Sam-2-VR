@@ -9,6 +9,7 @@
 #include "game.hpp"
 #include "menu.hpp"
 #include "native_finally.hpp"
+#include "native_memory.hpp"
 #include "scope_gpu.hpp"
 #include "scope_source_gpu.hpp"
 #include "common/scope_capture_command.hpp"
@@ -2262,6 +2263,19 @@ static void presentBody(IDirect3DDevice9 *d) {
                 1000 * perf.presentCall / perf.frames, 1000 * perf.presentHook / perf.frames,
                 perf.stereoCalls ? 1000 * perf.preStereo / perf.stereoCalls : 0.,
                 perf.stereoCalls ? 1000 * perf.postStereo / perf.stereoCalls : 0., perf.stereoCalls);
+            {
+                // Render-thread CPU time (excludes preemption by other processes,
+                // unlike the wall-clock figures below).
+                static uint64_t lastThreadCpu = 0;
+                FILETIME created{}, exited{}, kernel{}, user{};
+                if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+                    const uint64_t cpu = ((uint64_t(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
+                                         ((uint64_t(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+                    if (lastThreadCpu && perf.frames)
+                        log("Perf render thread cpu per frame=%.2fms", double(cpu - lastThreadCpu) / 1e4 / perf.frames);
+                    lastThreadCpu = cpu;
+                }
+            }
             log("Perf frames=%u pairs=%u mono=%u size=%ux%u frame=%.1fms | per pair cpu: stereo=%.1f eyes=%.1f,%.1f "
                 "desktop=%.1f wait=%.1f | per eye read: getRT=%.2f lock=%.2f copy=%.2f | per pair dim=%.2f publish=%.2f | "
                 "mono=%.1fms | gpu(n=%u): eyes=%.2f,%.2f desktop=%.2f tail=%.2f",
@@ -3103,7 +3117,150 @@ static bool observedWorldRender(IDirect3DDevice9 *d,void *puppet,void(__thiscall
     if(!contained || aborted) { nativeUiFault();uiHalted=true;return false; }
     return true;
 }
+// Lab only (SS2VR_LAB_SAMPLER=1): statistical profile of the render thread.
+// A sampler thread suspends it ~1000 times a second, reads EIP and buckets it by
+// module (and 256-byte RVA bucket inside Engine/GfxD3D); logged every 10 s.
+namespace sampler {
+static HANDLE target = nullptr;
+static std::atomic<bool> running{false};
+static std::atomic<bool> inEyes{false}; // Sample only while an eye renders.
+struct Module { uintptr_t base = 0, end = 0; char name[48]{}; uint32_t samples = 0; };
+static Module modules[96];
+static unsigned moduleCount = 0;
+static uint32_t unknown = 0, total = 0;
+struct Bucket { uint32_t key = 0, samples = 0; };
+static Bucket buckets[4096]; // key = module index << 24 | rva >> 8
+static SRWLOCK lock = SRWLOCK_INIT;
+static void refreshModules() {
+    moduleCount = 0;
+    HMODULE handle = nullptr;
+    // Walk the address space for mapped images (no psapi dependency).
+    MEMORY_BASIC_INFORMATION info{};
+    for (uintptr_t address = 0x10000; address < 0x7fff0000 && moduleCount < 96;) {
+        if (!VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof(info))) break;
+        if (info.Type == MEM_IMAGE && info.AllocationBase == info.BaseAddress &&
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCWSTR>(info.BaseAddress), &handle)) {
+            auto &m = modules[moduleCount++];
+            m.base = reinterpret_cast<uintptr_t>(info.BaseAddress);
+            const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(m.base);
+            const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(m.base + dos->e_lfanew);
+            m.end = m.base + nt->OptionalHeader.SizeOfImage;
+            wchar_t path[MAX_PATH]{};
+            GetModuleFileNameW(handle, path, MAX_PATH);
+            const wchar_t *file = wcsrchr(path, L'\\');
+            file = file ? file + 1 : path;
+            WideCharToMultiByte(CP_UTF8, 0, file, -1, m.name, sizeof(m.name) - 1, nullptr, nullptr);
+            // Distinguish the mod's proxy d3d9 from DXVK's d3d9 by directory.
+            if (!_stricmp(m.name, "d3d9.dll") && wcsstr(path, L"system32")) strcpy(m.name, "d3d9.dll(dxvk)");
+            address = m.end;
+            continue;
+        }
+        address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+    }
+}
+static Bucket callers[1024]; // CRT samples attributed to the first caller outside the CRT.
+static unsigned moduleOf(uintptr_t address) {
+    unsigned i = 0;
+    while (i < moduleCount && !(address >= modules[i].base && address < modules[i].end)) ++i;
+    return i;
+}
+static bool crt(unsigned i) { return i < moduleCount && (!_stricmp(modules[i].name, "ucrtbase.dll") || !_stricmp(modules[i].name, "ntdll.dll") || !_stricmp(modules[i].name, "msvcrt.dll")); }
+static void recordCaller(uintptr_t esp) {
+    for (unsigned slot = 0; slot < 48; ++slot) {
+        uintptr_t value = 0;
+        if (!readableMemory(reinterpret_cast<void *>(esp + slot * 4), 4)) return;
+        std::memcpy(&value, reinterpret_cast<void *>(esp + slot * 4), 4);
+        const unsigned m = moduleOf(value);
+        if (m == moduleCount || crt(m) || !readableMemory(reinterpret_cast<void *>(value - 6), 6)) continue;
+        const auto *code = reinterpret_cast<const uint8_t *>(value);
+        if (code[-5] != 0xe8 && code[-6] != 0xff && code[-2] != 0xff && code[-3] != 0xff) continue;
+        const uint32_t key = (m << 24) | uint32_t((value - modules[m].base) >> 4);
+        uint32_t index = (key * 2654435761u) & 1023;
+        for (unsigned probe = 0; probe < 1024; ++probe, index = (index + 1) & 1023)
+            if (!callers[index].samples || callers[index].key == key) { callers[index].key = key; ++callers[index].samples; break; }
+        return;
+    }
+}
+static void record(uintptr_t eip) {
+    AcquireSRWLockExclusive(&lock);
+    ++total;
+    unsigned i = 0;
+    while (i < moduleCount && !(eip >= modules[i].base && eip < modules[i].end)) ++i;
+    if (i == moduleCount) { ++unknown; ReleaseSRWLockExclusive(&lock); return; }
+    ++modules[i].samples;
+    const uint32_t key = (i << 24) | uint32_t((eip - modules[i].base) >> 8);
+    uint32_t slot = (key * 2654435761u) & 4095;
+    for (unsigned probe = 0; probe < 4096; ++probe, slot = (slot + 1) & 4095)
+        if (!buckets[slot].samples || buckets[slot].key == key) { buckets[slot].key = key; ++buckets[slot].samples; break; }
+    ReleaseSRWLockExclusive(&lock);
+}
+static DWORD WINAPI run(void *) {
+    refreshModules();
+    uint64_t last = GetTickCount64();
+    while (running.load()) {
+        Sleep(1);
+        if (inEyes.load(std::memory_order_relaxed) && SuspendThread(target) != DWORD(-1)) {
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_CONTROL;
+            const bool ok = GetThreadContext(target, &context) && inEyes.load(std::memory_order_relaxed);
+            ResumeThread(target);
+            if (ok) {
+                record(context.Eip);
+                AcquireSRWLockExclusive(&lock);
+                if (crt(moduleOf(context.Eip))) recordCaller(context.Esp);
+                ReleaseSRWLockExclusive(&lock);
+            }
+        }
+        if (GetTickCount64() - last >= 10000) {
+            last = GetTickCount64();
+            AcquireSRWLockExclusive(&lock);
+            char line[1024]; int used = snprintf(line, sizeof(line), "Lab sampler total=%u unknown=%u |", total, unknown);
+            for (unsigned pick = 0; pick < 12; ++pick) {
+                unsigned best = moduleCount; uint32_t most = 0;
+                for (unsigned i = 0; i < moduleCount; ++i) if (modules[i].samples > most) { most = modules[i].samples; best = i; }
+                if (best == moduleCount) break;
+                used += snprintf(line + used, sizeof(line) - used, " %s=%.1f%%", modules[best].name, 100.0 * most / std::max(1u, total));
+                modules[best].samples = 0;
+                if (used >= int(sizeof(line)) - 64) break;
+            }
+            log("%s", line);
+            for (unsigned pick = 0; pick < 24; ++pick) {
+                unsigned best = 4096; uint32_t most = 0;
+                for (unsigned i = 0; i < 4096; ++i) if (buckets[i].samples > most) { most = buckets[i].samples; best = i; }
+                if (best == 4096) break;
+                const auto &m = modules[buckets[best].key >> 24];
+                log("Lab sampler hot %s+%05x %.1f%%", m.name, (buckets[best].key & 0xffffff) << 8, 100.0 * most / std::max(1u, total));
+                buckets[best].samples = 0;
+            }
+            for (unsigned pick = 0; pick < 12; ++pick) {
+                unsigned best = 1024; uint32_t most = 0;
+                for (unsigned i = 0; i < 1024; ++i) if (callers[i].samples > most) { most = callers[i].samples; best = i; }
+                if (best == 1024) break;
+                const auto &m = modules[callers[best].key >> 24];
+                log("Lab sampler crt caller %s+%05x %.1f%%", m.name, (callers[best].key & 0xffffff) << 4, 100.0 * most / std::max(1u, total));
+                callers[best].samples = 0;
+            }
+            for (auto &b : callers) b = {};
+            for (auto &b : buckets) b = {};
+            for (unsigned i = 0; i < moduleCount; ++i) modules[i].samples = 0;
+            total = unknown = 0;
+            ReleaseSRWLockExclusive(&lock);
+        }
+    }
+    return 0;
+}
+static void start() {
+    static const bool enabled = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SAMPLER", value, 2) == 1 && value[0] == L'1'; }();
+    if (!enabled || running.exchange(true)) return;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &target,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0)) return;
+    if (HANDLE thread = CreateThread(nullptr, 0, run, nullptr, 0, nullptr)) CloseHandle(thread);
+    log("Lab sampler started on render thread %lu", GetCurrentThreadId());
+}
+} // namespace sampler
 void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRender) {
+    sampler::start();
     const LARGE_INTEGER stereoStart = PerfClock::now();
     struct StereoTimer {
         LARGE_INTEGER start;
@@ -3275,7 +3432,9 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             if(ok) {
                 if(traceDepth) traceStereoDepth(d,request,i,"before-world");
                 const LARGE_INTEGER eyeStart=PerfClock::now();
+                sampler::inEyes.store(true, std::memory_order_relaxed);
                 ok=observedWorldRender(d,puppet,original,request,i,traceDepth);
+                sampler::inEyes.store(false, std::memory_order_relaxed);
                 perf.eyeCpu[pass]+=PerfClock::seconds(eyeStart,PerfClock::now());
                 if(i==0 && generation==graphicsResourceGeneration()) noteScopeViews(puppet,request);
                 noteStage(3);

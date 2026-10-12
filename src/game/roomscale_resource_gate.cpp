@@ -12,6 +12,18 @@
 namespace ss2vr::game {
 namespace {
 thread_local bool *unavailable = nullptr;
+}
+// Count of open resource scopes on any thread (read by the gates' fast path).
+extern "C" { volatile long ss2vrResourceScopes = 0; }
+// Lab A/B (SS2VR_LAB_NO_FASTPATH=1): one permanent "open scope" forces every
+// gate through its full path, as before the fast path existed.
+static const bool labForcedSlowGates = [] {
+    wchar_t value[2]{};
+    const bool slow = GetEnvironmentVariableW(L"SS2VR_LAB_NO_FASTPATH", value, 2) == 1 && value[0] == L'1';
+    if (slow) InterlockedIncrement(&ss2vrResourceScopes);
+    return slow;
+}();
+namespace {
 bool gatesQueued = false;
 uintptr_t primitiveHullTable=0,modelHullTable=0,fluidHullTable=0,forceHullTable=0;
 uintptr_t hullEngineBase=0;
@@ -127,10 +139,15 @@ extern "C" int __cdecl ss2vrResourceDecision(const uint8_t *resource, unsigned s
 // The native instruction's FP stack and flags survive both continuations.
 // Branch on the helper result BEFORE restoring the original flags. Two restore
 // suffixes avoid modifying a native return address or relying on a fake RET.
+// Fast path: with no resource scope open on any thread every decision is
+// "original" (scope pointer null), so skip the register/FP save entirely. These
+// gates sit on resource accessors hit throughout rendering (lab profile ~5% of
+// each eye). Flags are saved around the test, as at the full gate.
 #define RESOURCE_GATE(name, receiverSlot, kind) \
     extern "C" { void *name##_original=nullptr; void *name##_cancel=nullptr; void *name##_clear=nullptr; } \
     extern "C" __attribute__((naked,used)) void name() { __asm__( \
-        "pushfl\n\tpushal\n\tcld\n\tmovl %esp,%ebp\n\tandl $-16,%esp\n\tsubl $512,%esp\n\t" \
+        "pushfl\n\tcmpl $0,_ss2vrResourceScopes\n\tjne 4f\n\tpopfl\n\tjmp *_" STRING(name) "_original\n\t" \
+        "4: pushal\n\tcld\n\tmovl %esp,%ebp\n\tandl $-16,%esp\n\tsubl $512,%esp\n\t" \
         "fxsave (%esp)\n\tfninit\n\tfldcw (%esp)\n\tsubl $8,%esp\n\t" \
         "pushl $(" STRING(__LINE__) "*256+" STRING(kind) ")\n\tpushl " STRING(receiverSlot) "(%ebp)\n\t" \
         "call _ss2vrResourceDecision\n\taddl $16,%esp\n\tcmpl $1,%eax\n\tje 1f\n\tcmpl $2,%eax\n\tje 2f\n\t" \
@@ -290,12 +307,14 @@ bool runRoomscaleResourceScope(bool &failed, DWORD thread, RoomscaleResourceBody
     if (!resourceGatesEnabled() || !thread || GetCurrentThreadId()!=thread || !body || failed) {
         failed=true; return false;
     }
+    InterlockedIncrement(&ss2vrResourceScopes);
     const bool completed=withNativeFinally([&] {
         unavailable=&failed;
         body(context);
     },[&](bool aborted) noexcept {
         if (aborted) failed=true;
         unavailable=nullptr;
+        InterlockedDecrement(&ss2vrResourceScopes);
     });
     return completed&&!failed;
 }

@@ -262,13 +262,18 @@ def verify(game):
         bodies=functions(asm)
         for name in sorted(found):
             instructions=code(bodies['_'+name])
-            require(instructions[:9]==['pushf','pusha','cld','mov ebp,esp','and esp,0xfffffff0',
+            # Flag-preserving fast path: no open resource scope -> original instruction.
+            fast=instructions[:5]
+            require(fast[0]=='pushf' and re.fullmatch(r'cmp DWORD PTR ds:0x[0-9a-f]+,0x0',fast[1]) and
+                    fast[2].startswith('jne ') and fast[3]=='popf' and fast[4].startswith('jmp DWORD PTR ds:'),
+                    'Fast path differs: '+name)
+            require(instructions[5:13]==['pusha','cld','mov ebp,esp','and esp,0xfffffff0',
                     'sub esp,0x200','fxsave [esp]','fninit','fldcw WORD PTR [esp]'],'Save frame differs: '+name)
             require(sum(x.startswith('call ') for x in instructions)==1,'Extra gate call: '+name)
             require(instructions.count('fxrstor [esp]')==3 and instructions.count('popa')==3 and
-                    instructions.count('popf')==3,'Every continuation must restore native state')
+                    instructions.count('popf')==4,'Every continuation must restore native state')
             require(not any(x.startswith('ret') for x in instructions),'Gate must not synthesize a native return')
-            require(sum(x.startswith('jmp DWORD PTR') for x in instructions)==3,'Wrong continuation count')
+            require(sum(x.startswith('jmp DWORD PTR') for x in instructions)==4,'Wrong continuation count')
         require('lea esp,[ebp-0xc0]' in code(bodies['_resourceCancelCollisionQuery']),'Wrong collision query stack restoration')
         require('lea esp,[ebp-0x58]' in code(bodies['_resourceCancelModelPreparation']),'Wrong model stack restoration')
         require(code(bodies['_resourceCancelMaterialGetter'])[:5]==

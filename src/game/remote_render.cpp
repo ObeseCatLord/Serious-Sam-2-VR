@@ -1684,6 +1684,11 @@ bool copyIdlePalette(void *instance,IdlePaletteCopy &out,IdlePaletteBoundaryCopy
     if(!observed)out={};
     return observed;
 }
+// Cheap pre-check for the per-draw probe: a ride main draw can only be observed
+// while a frozen ride pair is current on this thread (same first checks as below).
+bool rideDrawPossible() noexcept {
+    return rideObservationOwnerCurrent(currentFrozenOwner) && frozenRide.valid() && !rideObservationDeclined;
+}
 __attribute__((noinline)) bool copyCurrentRideMainDraw(RideMainDrawCopy &out) {
     if(!rideObservationOwnerCurrent(currentFrozenOwner))return false;
     out={};

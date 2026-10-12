@@ -5008,6 +5008,11 @@ static bool currentWeaponDraw(ScopeDrawBinding &out,int wantedId) {
     return true;
 }
 bool currentScopeDraw(ScopeDrawBinding &out) {return currentWeaponDraw(out,13);}
+// Cheap pre-check for the per-draw probe: scope and idle observations need the
+// tracked weapon's own model draw in progress (currentWeaponDraw's first gate).
+bool weaponModelDrawActive() noexcept {
+    return physicalWeapon && !physicalWeapon->pass.failed && physicalWeapon->pass.stage == 4 && eyeIndex >= 0;
+}
 IdleWeaponTrace *idleProjectionOwner() noexcept {
     if(!physicalWeapon || !physicalWeapon->ordinaryCommand || !physicalWeapon->idle ||
        physicalWeapon->hand<0 || physicalWeapon->hand>1 || eyeIndex<0 || eyeIndex>1)

@@ -8,6 +8,7 @@ struct ScopeDrawBinding {
     unsigned hand = 2;
 };
 bool currentScopeDraw(ScopeDrawBinding &out);
+bool weaponModelDrawActive() noexcept;
 struct ScopeRasterObservation {
     ScopePoseObservation pose{};
     unsigned hand = 2;

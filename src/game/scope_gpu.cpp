@@ -907,11 +907,17 @@ static HRESULT probeScopeDraw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
                      UINT start,UINT primitives,uintptr_t caller,ScopeIndexedForward forward) noexcept {
     if(probe.busy)probe.rideReentered=true;
     if (!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
-    const auto gfx=reinterpret_cast<uintptr_t>(GetModuleHandleW(L"GfxD3D.dll"));
+    static const auto gfx=reinterpret_cast<uintptr_t>(GetModuleHandleW(L"GfxD3D.dll")); // Loaded before any draw; never unloaded.
     if(probe.busy && probe.idleTrace)probe.idleTrace->reject(IdleWeaponTrace::Rejection::GpuReentry);
     if(probe.busy && probe.idleTrace && probe.idleTrace->streamProbe.selected)probe.streamReentered=true;
     if(probe.busy && probe.submissionOwner)probe.submissionOwner->submissions.reenter(probe.submissionSlot);
     if (probe.busy || !gfx || caller != gfx+0xa011) return forward(d,type,base,minimum,vertices,start,primitives);
+    // Nearly every world draw is neither the tracked weapon's model nor a ride
+    // main draw: forward it without resetting the observation state (lab
+    // profile: the per-draw resets were ~15% of each eye's CPU time).
+    static const bool labSlowPath = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_NO_FASTPATH", value, 2) == 1 && value[0] == L'1'; }();
+    if (!labSlowPath && !weaponModelDrawActive() && !remote_render::rideDrawPossible())
+        return forward(d,type,base,minimum,vertices,start,primitives);
     // All owning state exists above NativeFinally; no stack-native pointer is
     // kept through any COM call, and no allocation/native callback occurs locked.
     probe.busy=true;
