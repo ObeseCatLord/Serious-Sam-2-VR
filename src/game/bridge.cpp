@@ -1252,9 +1252,42 @@ static unsigned censusBucket(DWORD version) noexcept {
     if (major == 3) return 4;
     return 5;
 }
+// Private lab dumps (proprietary engine programs: never committed), one file per program.
+template<class Shader> static void censusDump(Shader *shader, const char *kind, unsigned index) {
+    UINT bytes = 0;
+    if (FAILED(shader->GetFunction(nullptr, &bytes)) || !bytes) return;
+    std::vector<uint8_t> code(bytes);
+    if (FAILED(shader->GetFunction(code.data(), &bytes))) return;
+    std::wstring directory;
+    if (!moduleDirectory(nullptr, directory)) return;
+    directory += L"SS2VR\\shaders";
+    CreateDirectoryW(directory.c_str(), nullptr);
+    uint32_t hash = 2166136261u; // FNV-1a over the bytecode: stable names across runs.
+    for (uint8_t byte : code) hash = (hash ^ byte) * 16777619u;
+    wchar_t name[64]; swprintf(name, 64, L"\\%hs_%08x.bin", kind, hash);
+    (void)index;
+    if (FILE *file = _wfopen((directory + name).c_str(), L"wb")) { fwrite(code.data(), 1, bytes, file); fclose(file); }
+}
+// Lab census of draw kinds and vertex layouts in the left eye (single-pass planning).
+static struct DrawCensus { unsigned plain = 0, indexed = 0, stream15 = 0, maxStream = 0, instanced = 0; } drawCensus;
+static void declarationCensus(IDirect3DDevice9 *d) {
+    IDirect3DVertexDeclaration9 *declaration = nullptr;
+    if (FAILED(d->GetVertexDeclaration(&declaration)) || !declaration) return;
+    D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1]{};
+    UINT count = MAXD3DDECLLENGTH + 1;
+    if (SUCCEEDED(declaration->GetDeclaration(elements, &count)))
+        for (UINT e = 0; e < count && elements[e].Stream != 0xff; ++e) {
+            drawCensus.maxStream = std::max<unsigned>(drawCensus.maxStream, elements[e].Stream);
+            if (elements[e].Stream == 15 || elements[e].Usage == D3DDECLUSAGE_BLENDINDICES) ++drawCensus.stream15;
+        }
+    declaration->Release();
+    UINT frequency = 1;
+    if (SUCCEEDED(d->GetStreamSourceFreq(0, &frequency)) && frequency != 1) ++drawCensus.instanced;
+}
 static void shaderCensus(IDirect3DDevice9 *d) {
     static const bool enabled = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SHADER_CENSUS", value, 2) == 1 && value[0] == L'1'; }();
     if (!enabled || activeEye != 0 || uiBypass) return;
+    declarationCensus(d);
     IDirect3DVertexShader9 *vs = nullptr; IDirect3DPixelShader9 *ps = nullptr;
     DWORD vv = 0, pv = 0;
     if (SUCCEEDED(d->GetVertexShader(&vs)) && vs) {
@@ -1267,6 +1300,7 @@ static void shaderCensus(IDirect3DDevice9 *d) {
                 if (SUCCEEDED(vs->GetFunction(code.data(), &bytes))) words[0] = code[0];
             }
             census.seenVertex[i] = vs; census.vertexVersion[i] = words[0] & 0xffff; ++census.vertexCount;
+            censusDump(vs, "vs", i);
         }
         if (i < census.vertexCount) vv = census.vertexVersion[i];
         vs->Release();
@@ -1281,6 +1315,7 @@ static void shaderCensus(IDirect3DDevice9 *d) {
                 if (SUCCEEDED(ps->GetFunction(code.data(), &bytes))) first = code[0];
             }
             census.seenPixel[i] = ps; census.pixelVersion[i] = first & 0xffff; ++census.pixelCount;
+            censusDump(ps, "ps", i);
         }
         if (i < census.pixelCount) pv = census.pixelVersion[i];
         ps->Release();
@@ -1310,6 +1345,7 @@ static HRESULT WINAPI draw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT start,
     scopeGpuOutput(d);
     return uiDrawCall(d,type,[&]{
         if(!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
+        if(activeEye==0 && !uiBypass) ++drawCensus.plain;
         traceWorldDraw(d,count);
         countDraw();
         return originalDraw(d,type,start,count);
@@ -1319,6 +1355,7 @@ static HRESULT forwardIndexed(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
                                UINT vertices,UINT start,UINT count) {
     return uiDrawCall(d,type,[&]{
         if(!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
+        if(activeEye==0 && !uiBypass) ++drawCensus.indexed;
         traceWorldDraw(d,count);
         countDraw();
         return originalDrawIndexed(d,type,base,minimum,vertices,start,count);
@@ -2255,6 +2292,9 @@ static void presentBody(IDirect3DDevice9 *d) {
                     census.draws[0][5], census.vertexCount, census.draws[1][0], census.draws[1][1], census.draws[1][2],
                     census.draws[1][3], census.draws[1][4], census.draws[1][5], census.pixelCount);
                 for (auto &row : census.draws) for (auto &count : row) count = 0;
+                log("Perf draw census left eye: plain=%u indexed=%u stream15OrBlendIndices=%u maxStream=%u instanced=%u",
+                    drawCensus.plain, drawCensus.indexed, drawCensus.stream15, drawCensus.maxStream, drawCensus.instanced);
+                drawCensus = {};
             }
             log("Perf mod sections per frame: update=%.2fms lasers=%.2fms wheels=%.2fms", 1000 * perf.section[0] / perf.frames,
                 1000 * perf.section[1] / perf.frames, 1000 * perf.section[2] / perf.frames);
