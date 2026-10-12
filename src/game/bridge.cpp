@@ -522,6 +522,8 @@ extern bool headFramePrepared(void *,const Request &) noexcept;
 extern float frozenWorldVisibility();
 extern bool commitStereo(void *, const Request &, Slot &, uint32_t);
 extern void beginEye(void *, const Request &, int);
+extern void *shadowReuseProbeTexture() noexcept;
+extern void shadowReuseStats(unsigned &created, unsigned &reused, unsigned &missed, double &createdMs, double &reusedMs) noexcept;
 extern void endEye();
 static bool sameSurface(IDirect3DSurface9 *a, IDirect3DSurface9 *b) {
     if (a == b)
@@ -2142,6 +2144,49 @@ static void presentBody(IDirect3DDevice9 *d) {
                 double(perf.desktopDraws) / perf.frames, double(perf.hudDraws) / perf.frames,
                 1000 * perf.hudCpu / perf.frames, perf.hudLayerDraws, perf.hudFallbackDraws, perf.hudFlushes,
                 perf.hudFlushes ? 1000 * perf.hudFlushCpu / perf.hudFlushes : 0.);
+            {
+                unsigned created = 0, reused = 0, missed = 0;
+                double createdMs = 0, reusedMs = 0;
+                shadowReuseStats(created, reused, missed, createdMs, reusedMs);
+                // Lab only (SS2VR_SHADOW_PROBE=1): dump one pooled shadow image once.
+                static const bool shadowProbe = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_SHADOW_PROBE", value, 2) == 1 && value[0] == L'1'; }();
+                static bool shadowProbed = false;
+                if (shadowProbe && !shadowProbed && device) {
+                    if (auto *texture = static_cast<IDirect3DTexture9 *>(shadowReuseProbeTexture())) {
+                        shadowProbed = true;
+                        IDirect3DSurface9 *level = nullptr, *read = nullptr;
+                        D3DSURFACE_DESC desc{};
+                        D3DLOCKED_RECT locked{};
+                        if (SUCCEEDED(texture->GetSurfaceLevel(0, &level)) && SUCCEEDED(level->GetDesc(&desc)) &&
+                            SUCCEEDED(device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &read, nullptr)) &&
+                            SUCCEEDED(device->GetRenderTargetData(level, read)) && SUCCEEDED(read->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+                            std::wstring directory;
+                            FILE *file = moduleDirectory(nullptr, directory) ? _wfopen((directory + L"SS2VR\\shadow-probe.ppm").c_str(), L"wb") : nullptr;
+                            unsigned dark = 0;
+                            if (file) fprintf(file, "P6\n%u %u\n255\n", desc.Width, desc.Height);
+                            for (UINT y = 0; y < desc.Height; ++y) for (UINT x = 0; x < desc.Width; ++x) {
+                                uint8_t rgb[3]{};
+                                const auto *row = static_cast<const uint8_t *>(locked.pBits) + size_t(y) * locked.Pitch;
+                                if (desc.Format == D3DFMT_R5G6B5) {
+                                    const uint16_t v = uint16_t(row[x*2] | row[x*2+1] << 8);
+                                    rgb[0] = uint8_t((v >> 11) << 3); rgb[1] = uint8_t(((v >> 5) & 63) << 2); rgb[2] = uint8_t((v & 31) << 3);
+                                } else { rgb[0] = row[x*4+2]; rgb[1] = row[x*4+1]; rgb[2] = row[x*4]; }
+                                dark += rgb[0] + rgb[1] + rgb[2] < 384;
+                                if (file) fwrite(rgb, 1, 3, file);
+                            }
+                            if (file) fclose(file);
+                            read->UnlockRect();
+                            log("Shadow probe %ux%u format=%u dark=%u of %u", desc.Width, desc.Height, unsigned(desc.Format), dark, desc.Width * desc.Height);
+                        }
+                        if (read) read->Release();
+                        if (level) level->Release();
+                    }
+                }
+                if (created || reused || missed)
+                    log("Perf shadows per frame: created=%.1f reused=%.1f missed=%.1f | per shadow: render+project=%.3fms "
+                        "project only=%.3fms", double(created) / perf.frames, double(reused) / perf.frames,
+                        double(missed) / perf.frames, created ? createdMs / created : 0., reused ? reusedMs / reused : 0.);
+            }
             log("Perf mod sections per frame: update=%.2fms lasers=%.2fms wheels=%.2fms", 1000 * perf.section[0] / perf.frames,
                 1000 * perf.section[1] / perf.frames, 1000 * perf.section[2] / perf.frames);
             log("Perf pacing: waits=%u wait=%.2fms per frame", perf.waits, 1000 * perf.wait / perf.frames);

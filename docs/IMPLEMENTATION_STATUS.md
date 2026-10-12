@@ -1,5 +1,31 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-12 — HUD layer, dynamic shadow reuse, trigger chainsaw, housekeeping
+
+- HUD layer: each admitted HUD draw renders once into a canvas-sized
+  premultiplied layer (separate alpha blending keeps coverage for over and
+  additive blends); the layer is composited 1:1 onto the backbuffer and,
+  perspective-correct with trilinear mips, onto each eye's panel (fixed
+  function, pre-transformed vertices, state restored by a state block). Fades
+  and blend modes a layer cannot express flush the layer and keep the per-eye
+  path. Lab V174: all 18 HUD draws per frame layered, 3 composite draws instead
+  of 36 eye duplicates, HUD CPU about 0.53 -> 0.38 ms per frame.
+- Dynamic shadow reuse (`[Render] ShadowReuse=1`): at shadow quality 3 the
+  first eye renders each caster's light-space image into its own pooled engine
+  canvas (the shared canvas pointer is swapped around the engine call) and the
+  second eye projects it through the engine's own quality<=2 path with the
+  pooled handle, skipping its render-to-texture. Lab V176/V177: every caster
+  reused (0 misses); the pooled image is the correct silhouette. Saving is small
+  on the CPU (~0.02 ms per caster; projection, ~0.11 ms per caster per eye,
+  remains per eye) plus two render-target switches, a clear and a model draw
+  per caster on the GPU side. Engine RVAs in `engine.cpp` (shadow_reuse).
+- The chainsaw is trigger-only in the user package (`[Melee] Enabled=0`);
+  physical swing gestures are not used.
+- Offline ABI verifiers (`verify_world_marker_abi`, `verify_vehicle_laser_abi`)
+  accept the compiler's current scheduling again; USER_VR_TEST.md rewritten for
+  the current build.
+
+
 ## 2026-10-11 (latest) — cheaper, cleaner scope lens
 
 - No preview pass: the scope view observed in the previous frame's ordinary

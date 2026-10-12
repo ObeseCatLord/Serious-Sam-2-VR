@@ -8370,6 +8370,162 @@ template <class T> static bool symbol(HMODULE m, const char *name, T &out) {
         log("Required symbol missing: %s", name);
     return out != nullptr;
 }
+// Dynamic shadow reuse (ren_iDynamicShadowQuality 3). The engine renders each
+// shadow caster's light-space image into one shared canvas and projects it onto
+// nearby hulls, once per eye. The image depends only on the light and the model,
+// so the frame's first eye renders each caster into its own pooled canvas and the
+// second eye projects that image through the engine's own quality<=2 path (which
+// skips image creation and binds gfx_hCircleTexture), with the pooled handle.
+// Fingerprinted Engine RVAs: RenderModelShadow 0xe54c0 (instance, placement,
+// lod), shadow image+projection 0xe39c0 (box, light, light projection, colour),
+// shared canvas pointer 0x2eadf4, shadow resource end callback 0xe3290.
+namespace shadow_reuse {
+using ModelShadow = void(__cdecl *)(void *, const void *, float);
+using Image = void(__cdecl *)(const void *, const void *, const void *, uint32_t);
+using End = void(__cdecl *)();
+using CreateCanvas = void *(__cdecl *)(int32_t, int32_t, int32_t, int32_t, int32_t);
+using DeleteCanvas = void(__cdecl *)(void *);
+using Scissor = void(__cdecl *)(int32_t, int32_t, int32_t, int32_t);
+static ModelShadow originalModelShadow = nullptr;
+static Image originalImage = nullptr;
+static End originalEnd = nullptr;
+static CreateCanvas createCanvas = nullptr;
+static DeleteCanvas deleteCanvas = nullptr;
+static Scissor *scissor = nullptr;
+static int32_t *quality = nullptr, *imageSize = nullptr, *circleTexture = nullptr, *showPolys = nullptr, *showTexture = nullptr;
+static void **sharedCanvas = nullptr;
+static uint8_t *textures = nullptr; // _gfx_atpTextures: data pointer at +4, 0x1c-byte records, texture first.
+static thread_local void *caster = nullptr;
+constexpr unsigned PoolSize = 64;
+struct Entry { void *instance; uint8_t light[48], projection[64]; int32_t handle; bool used; };
+static void *pool[PoolSize]{};
+static int32_t poolImageSize = 0;
+static Entry entries[PoolSize];
+static unsigned entryCount = 0;
+static uint64_t frameSequence = 0;
+static int producerEye = -1;
+static unsigned created = 0, reused = 0, missed = 0;
+static double createdSeconds = 0, reusedSeconds = 0; // Engine time inside the image function, per path.
+static double since(LARGE_INTEGER start) noexcept {
+    LARGE_INTEGER now{}, frequency{};
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
+    return double(now.QuadPart - start.QuadPart) / double(frequency.QuadPart);
+}
+static void releasePool() noexcept {
+    for (auto *&canvas : pool) {
+        if (canvas && sharedCanvas && *sharedCanvas != canvas) deleteCanvas(canvas);
+        canvas = nullptr;
+    }
+    entryCount = 0; frameSequence = 0; producerEye = -1;
+}
+static void __cdecl resourceEnd() {
+    releasePool(); // The renderer's shadow resources are going away: pooled canvases first.
+    originalEnd();
+}
+static void __cdecl modelShadow(void *instance, const void *placement, float lod) {
+    void *previous = caster;
+    caster = instance;
+    withNativeFinally([&] { originalModelShadow(instance, placement, lod); },
+                      [&](bool) noexcept { caster = previous; });
+}
+static int32_t canvasHandle(void *canvas) noexcept {
+    int32_t handle = 0;
+    std::memcpy(&handle, static_cast<uint8_t *>(canvas) + 0x14, 4);
+    return handle;
+}
+static void __cdecl image(const void *box, const void *light, const void *projection, uint32_t color) {
+    const bool eligible = settings.shadowReuse && caster && light && projection && eyePlayer &&
+        (eyeIndex == 0 || eyeIndex == 1) && *quality >= 3 && !*showPolys && !*showTexture && *imageSize > 0;
+    if (!eligible) return originalImage(box, light, projection, color);
+    if (eyeRequest.sequence != frameSequence) {
+        frameSequence = eyeRequest.sequence; producerEye = eyeIndex; entryCount = 0;
+    }
+    if (eyeIndex == producerEye) {
+        if (poolImageSize != *imageSize) { releasePool(); poolImageSize = *imageSize;
+            frameSequence = eyeRequest.sequence; producerEye = eyeIndex; }
+        if (entryCount >= PoolSize) return originalImage(box, light, projection, color);
+        void *&canvas = pool[entryCount];
+        if (!canvas) canvas = createCanvas(*imageSize, *imageSize, 0, 0xde, 0);
+        if (!canvas) return originalImage(box, light, projection, color);
+        void *saved = *sharedCanvas;
+        *sharedCanvas = canvas;
+        bool aborted = false;
+        LARGE_INTEGER start{}; QueryPerformanceCounter(&start);
+        withNativeFinally([&] { originalImage(box, light, projection, color); }, [&](bool unwound) noexcept {
+            void *now = *sharedCanvas;
+            *sharedCanvas = saved;
+            canvas = now; // The engine replaces a canvas whose size no longer matches.
+            aborted = unwound;
+        });
+        createdSeconds += since(start);
+        if (aborted || !canvas) return;
+        auto &entry = entries[entryCount++];
+        entry.instance = caster;
+        std::memcpy(entry.light, light, sizeof(entry.light));
+        std::memcpy(entry.projection, projection, sizeof(entry.projection));
+        entry.handle = canvasHandle(canvas);
+        entry.used = false;
+        ++created;
+        return;
+    }
+    for (unsigned i = 0; i < entryCount; ++i) {
+        auto &entry = entries[i];
+        if (entry.used || entry.instance != caster || !entry.handle ||
+            std::memcmp(entry.light, light, sizeof(entry.light)) ||
+            std::memcmp(entry.projection, projection, sizeof(entry.projection))) continue;
+        entry.used = true;
+        const int32_t savedQuality = *quality, savedCircle = *circleTexture;
+        *quality = 2; *circleTexture = entry.handle;
+        LARGE_INTEGER start{}; QueryPerformanceCounter(&start);
+        (*scissor)(0, 0, -1, -1); // The skipped drawport restore resets the scissor.
+        withNativeFinally([&] { originalImage(box, light, projection, color); }, [&](bool) noexcept {
+            *quality = savedQuality; *circleTexture = savedCircle;
+        });
+        reusedSeconds += since(start);
+        ++reused;
+        return;
+    }
+    ++missed; // Visible only in this eye, or a different light/LOD: native path.
+    originalImage(box, light, projection, color);
+}
+static bool install(HMODULE engine) {
+    const auto exported = [&](const char *name) { return reinterpret_cast<void *>(GetProcAddress(engine, name)); };
+    createCanvas = reinterpret_cast<CreateCanvas>(exported("?gfxCreateTextureCanvas@SeriousEngine@@YAPAVCTextureCanvas@1@JJHW4GfxColorFormat@1@0@Z"));
+    deleteCanvas = reinterpret_cast<DeleteCanvas>(exported("?gfxDeleteCanvas@SeriousEngine@@YAXPAVCCanvas@1@@Z"));
+    scissor = static_cast<Scissor *>(exported("?_gfxScissor@SeriousEngine@@3P6AXJJJJ@ZA"));
+    quality = static_cast<int32_t *>(exported("?ren_iDynamicShadowQuality@SeriousEngine@@3JA"));
+    imageSize = static_cast<int32_t *>(exported("?ren_pixDynamicShadowSize@SeriousEngine@@3JA"));
+    circleTexture = static_cast<int32_t *>(exported("?gfx_hCircleTexture@SeriousEngine@@3JA"));
+    showPolys = static_cast<int32_t *>(exported("?shd_bShowPolys@SeriousEngine@@3HA"));
+    showTexture = static_cast<int32_t *>(exported("?shd_bShowTexture@SeriousEngine@@3HA"));
+    sharedCanvas = reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(engine) + 0x2eadf4);
+    textures = static_cast<uint8_t *>(exported("?_gfx_atpTextures@SeriousEngine@@3V?$CStaticStackArray@VCTextureParams@SeriousEngine@@@1@A"));
+    if (!createCanvas || !deleteCanvas || !scissor || !quality || !imageSize || !circleTexture || !showPolys ||
+        !showTexture) { log("Shadow reuse unavailable: engine symbols missing"); return true; }
+    return internalHook(engine, 0xe54c0, reinterpret_cast<void *>(modelShadow), reinterpret_cast<void **>(&originalModelShadow)) &&
+        internalHook(engine, 0xe39c0, reinterpret_cast<void *>(image), reinterpret_cast<void **>(&originalImage)) &&
+        internalHook(engine, 0xe3290, reinterpret_cast<void *>(resourceEnd), reinterpret_cast<void **>(&originalEnd));
+}
+} // namespace shadow_reuse
+// Lab diagnostic: the device texture behind the first pooled shadow canvas.
+void *shadowReuseProbeTexture() noexcept {
+    using namespace shadow_reuse;
+    if (!textures || !pool[0] || !entryCount) return nullptr;
+    const int32_t handle = canvasHandle(pool[0]);
+    uint8_t *data = nullptr;
+    std::memcpy(&data, textures + 4, 4);
+    if (handle <= 0 || !data) return nullptr;
+    void *texture = nullptr;
+    std::memcpy(&texture, data + size_t(handle - 1) * 0x1c, 4);
+    return texture;
+}
+void shadowReuseStats(unsigned &created, unsigned &reused, unsigned &missed, double &createdMs, double &reusedMs) noexcept {
+    createdMs = 1000 * std::exchange(shadow_reuse::createdSeconds, 0.);
+    reusedMs = 1000 * std::exchange(shadow_reuse::reusedSeconds, 0.);
+    created = std::exchange(shadow_reuse::created, 0u);
+    reused = std::exchange(shadow_reuse::reused, 0u);
+    missed = std::exchange(shadow_reuse::missed, 0u);
+}
 bool attach(bool headless) {
     if (hooksReady)
         return true;
@@ -8817,6 +8973,7 @@ bool attach(bool headless) {
           originalMatrixInverse);
         ok = internalHook(graphics, 0x56a0, reinterpret_cast<void *>(weaponDepthRange),
                           reinterpret_cast<void **>(&originalDepthRange)) && ok;
+        ok = shadow_reuse::install(e) && ok;
         H(g, "?ProcessPlayerControls@CPlayerBrainEntity@SeriousEngine@@UAEXEVVector3f@2@0@Z",
           waterPlayerControls, originalPlayerControls);
         H(g, "?HandleObjectCarrying@CPuppetEntity@SeriousEngine@@QAEXXZ", carryStep, originalCarrying);
