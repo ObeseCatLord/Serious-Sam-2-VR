@@ -147,6 +147,94 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
     return true;
 }
 
+// Pixel programs: the instanced pass draws both eyes into the double-wide target
+// with one draw, so each fragment of the other eye's half is discarded with a
+// texkill on texcoord set `k` (the vertex program writes -/+x of the eye's clip
+// position there). The set must be one the pixel program does not read.
+constexpr uint32_t PsVersion11 = 0xffff0101u, PsVersion12 = 0xffff0102u, PsVersion13 = 0xffff0103u,
+                   PsVersion20 = 0xffff0200u;
+namespace detail {
+inline int pixelOperands(uint32_t opcode) {
+    switch (opcode) {
+    case 0x00: return 0;
+    case 0x01: case 0x06: case 0x07: case 0x13: return 2;            // mov rcp rsq frc
+    case 0x02: case 0x03: case 0x05: case 0x08: case 0x09: return 3;  // add sub mul dp3 dp4
+    case 0x04: case 0x12: case 0x50: case 0x58: return 4;            // mad lrp cnd cmp
+    case 0x40: case 0x41: case 0x42: case 0x57: return 1;            // texcoord texkill tex texdepth
+    case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: case 0x48: case 0x49: case 0x4a:
+    case 0x4d: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: return 2;
+    case 0x4c: case 0x59: return 3;                                  // texm3x3spec bem
+    case 0x51: return 5;                                             // def
+    default: return -1;
+    }
+}
+constexpr unsigned Texture = 3;
+} // namespace detail
+// Texcoord sets a pixel program reads (bit per set); false if not understood.
+inline bool pixelTexcoords(const uint32_t *words, size_t count, uint32_t &sets) {
+    using namespace detail;
+    sets = 0;
+    if (!words || count < 2) return false;
+    const uint32_t version = words[0];
+    const bool sm1 = version == PsVersion11 || version == PsVersion12 || version == PsVersion13;
+    if (!sm1 && version != PsVersion20) return false;
+    for (size_t i = 1; i < count;) {
+        const uint32_t token = words[i];
+        if (token == 0x0000ffffu) return true;
+        const uint32_t opcode = token & 0xffffu;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const int n = sm1 ? pixelOperands(opcode) : int((token >> 24) & 0xfu);
+        if (n < 0 || i + 1 + size_t(n) > count) return false;
+        for (int k = 0; k < n; ++k) {
+            const uint32_t t = words[i + 1 + k];
+            if (opcode == 0x51 && k > 0) continue;  // def immediates
+            if (opcode == 0x1f && k == 0) continue; // dcl usage token
+            if (regType(t) == Texture && regNum(t) < 8) sets |= 1u << regNum(t);
+        }
+        i += 1 + size_t(n);
+    }
+    return false;
+}
+// Inserts `texkill t<k>` (and, for ps_2_0, its declaration) ahead of the
+// program's first non-definition instruction.
+inline bool patchPixelShader(const uint32_t *words, size_t count, unsigned k, std::vector<uint32_t> &out) {
+    using namespace detail;
+    uint32_t sets = 0;
+    if (!pixelTexcoords(words, count, sets) || k >= 8 || (sets & (1u << k))) return false;
+    const uint32_t version = words[0];
+    const bool sm2 = version == PsVersion20;
+    if (!sm2 && k >= 4) return false;
+    std::vector<uint32_t> result;
+    result.reserve(count + 8);
+    result.push_back(version);
+    size_t i = 1;
+    bool inserted = false;
+    const auto insert = [&] {
+        if (sm2) {
+            result.push_back(0x1fu | (2u << 24));                    // dcl t<k>
+            result.push_back(0x80000000u);
+            result.push_back(dst(Texture, k, 0xf));
+            result.push_back(0x41u | (1u << 24));                    // texkill t<k>
+        } else result.push_back(0x41u);
+        result.push_back(dst(Texture, k, 0xf));
+        inserted = true;
+    };
+    while (i < count && words[i] != 0x0000ffffu) {
+        const uint32_t token = words[i], opcode = token & 0xffffu;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const int n = sm2 ? int((token >> 24) & 0xfu) : pixelOperands(opcode);
+        if (n < 0) return false;
+        // Definitions (and ps_2_0 declarations) stay first.
+        if (!inserted && opcode != 0x51 && !(sm2 && opcode == 0x1f)) insert();
+        result.insert(result.end(), words + i, words + i + 1 + n);
+        i += 1 + size_t(n);
+    }
+    if (!inserted) insert();
+    result.push_back(0x0000ffffu);
+    out = std::move(result);
+    return true;
+}
+
 // One eye's instance record (v10..v15): misc (0,1,1,1), R rows 0..3, kill row K.
 struct EyeRecord {
     float misc[4]{0, 1, 1, 1};

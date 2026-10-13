@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <d3d9.h>
 #include "common/replay_math.hpp"
+#include <vector>
 
 // Single-pass stereo: the world is traversed once from a centre camera into a
 // double-wide target. Every draw made while the pass is active is issued once
@@ -15,6 +16,7 @@ struct Originals { Draw draw = nullptr; DrawIndexed drawIndexed = nullptr; Clear
 // Hooks shader/declaration binding, viewport, scissor and render states.
 bool install(IDirect3DDevice9 *device, const Originals &originals) noexcept;
 bool installed() noexcept;
+void setInstancing(bool enabled) noexcept; // [Render] SinglePassInstancing
 // Engine globals: adjusted projection, projection, view (read at draw time).
 void setEngineMatrices(const float *adjusted, const float *projection, const float *view) noexcept;
 // Starts the pass on `target` (2W x H): `change[i]` maps the centre camera's
@@ -27,7 +29,15 @@ HRESULT draw(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT start, UINT count)
 HRESULT drawIndexed(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, INT base, UINT minimum, UINT vertices, UINT start, UINT count) noexcept;
 HRESULT clear(IDirect3DDevice9 *d, DWORD count, const D3DRECT *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) noexcept;
 struct Stats {
-    unsigned passes = 0, draws = 0, unpatched = 0, stateChanges = 0, variants = 0, failedVariants = 0;
+    unsigned passes = 0, draws = 0, instanced = 0, unpatched = 0, stateChanges = 0, variants = 0, failedVariants = 0;
 };
 Stats takeStats() noexcept;
+// Lab: instance only eligible draws with index in [lo, hi) (counted per pass);
+// logs the programs of eligible draw `detail`.
+void labInstanceRange(unsigned lo, unsigned hi, unsigned detail) noexcept;
+unsigned labEligibleCount() noexcept;
+// Lab: pixel programs (bytecode hashes) seen in instanced draws, and an allow list
+// (empty vector = all) restricting which may instance.
+std::vector<uint32_t> labInstancedPixelShaders() noexcept;
+void labAllowPixelShaders(const std::vector<uint32_t> &hashes, bool restrict) noexcept;
 } // namespace ss2vr::game::single_pass

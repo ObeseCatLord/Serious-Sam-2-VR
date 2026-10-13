@@ -8855,6 +8855,7 @@ bool attach(bool headless) {
     setDesktopWorld(settings.desktopWorld);
     setEyeReplay(settings.eyeReplay);
     setSinglePass(settings.singlePass);
+    single_pass::setInstancing(settings.singlePassInstancing);
     setLabAutoContinue(settings.labAutoContinue);
     auto g = GetModuleHandleW(L"Sam2Game.dll"), e = GetModuleHandleW(L"Engine.dll"),
          c = GetModuleHandleW(L"Core.dll");

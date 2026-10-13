@@ -53,5 +53,27 @@ int main() {
         std::printf("dumped vertex programs patched %u/%u\n", ok, total);
         assert(ok == total);
     }
+    // Pixel programs: ps_1_1 tex t0; mov r0, t0 -> texkill on a free set ahead of tex.
+    const std::vector<uint32_t> pixel{PsVersion11, 0x42, dst(3, 0, 0xf), 0x01, dst(0, 0, 0xf), src(3, 0), 0x0000ffffu};
+    uint32_t sets = 0;
+    assert(pixelTexcoords(pixel.data(), pixel.size(), sets) && sets == 1);
+    assert(!patchPixelShader(pixel.data(), pixel.size(), 0, out)); // t0 is read.
+    assert(patchPixelShader(pixel.data(), pixel.size(), 2, out));
+    assert(out.size() == pixel.size() + 2 && out[1] == 0x41 && out[2] == dst(3, 2, 0xf));
+    assert(pixelTexcoords(out.data(), out.size(), sets) && sets == 5);
+    if (const char *dir = std::getenv("SS2VR_SHADER_DUMPS")) {
+        unsigned total = 0, covered = 0;
+        for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+            if (entry.path().filename().string().rfind("ps_", 0) != 0) continue;
+            std::ifstream f(entry.path(), std::ios::binary);
+            std::vector<uint32_t> words(std::filesystem::file_size(entry.path()) / 4);
+            f.read(reinterpret_cast<char *>(words.data()), std::streamsize(words.size() * 4));
+            ++total;
+            bool any = false;
+            for (unsigned k = 0; k < 8 && !any; ++k) any = patchPixelShader(words.data(), words.size(), k, out);
+            if (any) ++covered; else std::printf("no free texcoord %s\n", entry.path().filename().string().c_str());
+        }
+        std::printf("dumped pixel programs with a free texcoord set %u/%u\n", covered, total);
+    }
     std::puts("shader patch ok");
 }

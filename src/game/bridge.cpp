@@ -2346,8 +2346,9 @@ static void presentBody(IDirect3DDevice9 *d) {
             {
                 const auto sp = single_pass::takeStats();
                 if (singlePassEnabled)
-                    log("Perf single pass: passes=%u draws/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f variants=%u failed=%u",
-                        sp.passes, sp.passes ? double(sp.draws) / sp.passes : 0., sp.passes ? double(sp.unpatched) / sp.passes : 0.,
+                    log("Perf single pass: passes=%u draws/pass=%.0f instanced/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f variants=%u failed=%u",
+                        sp.passes, sp.passes ? double(sp.draws) / sp.passes : 0., sp.passes ? double(sp.instanced) / sp.passes : 0.,
+                        sp.passes ? double(sp.unpatched) / sp.passes : 0.,
                         sp.passes ? double(sp.stateChanges) / sp.passes : 0., sp.variants, sp.failedVariants);
             }
             {
@@ -2648,6 +2649,35 @@ static void write(const wchar_t *name, const std::vector<uint8_t> &bgra, UINT w,
         }
         fclose(f);
     }
+}
+double regionLuma(IDirect3DDevice9 *d, IDirect3DSurface9 *target, int x0, int y0, int x1, int y1) noexcept {
+    std::vector<uint8_t> pixels;
+    D3DSURFACE_DESC desc{};
+    if (!target || FAILED(target->GetDesc(&desc)) || !read(d, target, pixels)) return -1;
+    double sum = 0; size_t n = 0;
+    for (int y = std::max(0, y0); y < std::min<int>(y1, desc.Height); ++y)
+        for (int x = std::max(0, x0); x < std::min<int>(x1, desc.Width); ++x) {
+            const uint8_t *p = pixels.data() + (size_t(y) * desc.Width + x) * 4;
+            static const bool red = [] { wchar_t v[4]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_METRIC", v, 4) && v[0] == L'r'; }();
+            if (red) sum += (p[2] > 170 && p[1] < 90 && p[0] < 90) ? 255. : 0.;
+            else sum += .2126 * p[2] + .7152 * p[1] + .0722 * p[0];
+            ++n;
+        }
+    return n ? sum / n : -1;
+}
+size_t differing(IDirect3DDevice9 *d, IDirect3DSurface9 *target) noexcept {
+    std::vector<uint8_t> now, kept;
+    if (!copy || !read(d, target, now) || !read(d, copy, kept) || now.size() != kept.size()) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < now.size(); i += 4)
+        if (std::abs(int(now[i]) - kept[i]) + std::abs(int(now[i+1]) - kept[i+1]) + std::abs(int(now[i+2]) - kept[i+2]) > 60) ++count;
+    if (count > 200 && written < 4) {
+        wchar_t name[64];
+        swprintf(name, 64, L"sp-kept-%u.ppm", written); write(name, kept, copyWidth, copyHeight);
+        swprintf(name, 64, L"sp-now-%u.ppm", written); write(name, now, copyWidth, copyHeight);
+        ++written;
+    }
+    return count;
 }
 void compare(IDirect3DDevice9 *d, IDirect3DSurface9 *target) noexcept {
     std::vector<uint8_t> native, replayed;
@@ -3677,9 +3707,76 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                     noteStage(2);
                     const LARGE_INTEGER eyeStart=PerfClock::now();
                     sampler::inEyes.store(true, std::memory_order_relaxed);
-                    if(ok && single_pass::begin(d,uiFrame.target[0],width,singlePassChange)) {
+                    // Lab (SS2VR_LAB_SP_BISECT=1): on sampled frames render the pass without
+                    // instancing, keep it, render again instancing a range of eligible draws,
+                    // and binary-search the first draw whose instancing changes the image.
+                    static const bool spBisect=[] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_BISECT",v,2)==1 && v[0]==L'1'; }();
+                    static unsigned spFrames=0, spLo=0, spHi=0; static bool spDone=false;
+                    const bool spCompare=spBisect && !spDone && ++spFrames%30==0;
+                    if(ok && spCompare && single_pass::begin(d,uiFrame.target[0],width,singlePassChange)) {
+                        single_pass::labInstanceRange(0,0,~0u);
+                        setSinglePassWorld(true);
+                        ok=observedWorldRender(d,puppet,original,centre,0,false);
+                        setSinglePassWorld(false);
+                        single_pass::end(d);
+                        ok=ok && replay_compare::keep(d,uiFrame.target[0]);
+                        D3DVIEWPORT9 wv2{0,0,width*2,height,0,1};
+                        const RECT wideScissor2{0,0,LONG(width*2),LONG(height)};
+                        ok=ok && SUCCEEDED(d->SetViewport(&wv2)) && SUCCEEDED(d->SetScissorRect(&wideScissor2)) &&
+                           SUCCEEDED(d->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER|(hasStencil ? D3DCLEAR_STENCIL : 0),0xff000000,1,0));
+                        D3DVIEWPORT9 ev2{0,0,width,height,0,1};
+                        ok=ok && SUCCEEDED(d->SetViewport(&ev2)) && SUCCEEDED(d->SetScissorRect(&uiFrame.scissor));
+                        if(!spHi) spHi=1000000;
+                        const unsigned mid=spLo+(spHi-spLo)/2;
+                        if(ok && single_pass::begin(d,uiFrame.target[0],width,singlePassChange)) {
+                            single_pass::labInstanceRange(0,mid,spHi-spLo<=1 ? spLo : ~0u);
+                            setSinglePassWorld(true);
+                            ok=observedWorldRender(d,puppet,original,centre,0,traceDepth);
+                            setSinglePassWorld(false);
+                            const unsigned eligible=single_pass::labEligibleCount();
+                            single_pass::end(d);
+                            const size_t differing=replay_compare::differing(d,uiFrame.target[0]);
+                            if(spHi==1000000) { spHi=eligible; spDone=differing<=200; } // First: everything instanced.
+                            else if(spHi-spLo<=1) spDone=true;
+                            else if(differing>200) spHi=mid; else spLo=mid;
+                            log("Single pass bisect allowed=[0,%u) differing=%zu eligible=%u -> range [%u,%u)",mid,differing,eligible,spLo,spHi);
+                        } else ok=false;
+                    } else if(ok && single_pass::begin(d,uiFrame.target[0],width,singlePassChange)) {
+                        // Lab (SS2VR_LAB_SP_REGION=x0,y0,x1,y1 of the left eye): across frames,
+                        // binary-search the first eligible draw whose instancing changes the
+                        // mean luminance of that region (e.g. where the moon must be).
+                        static struct { bool on=false; int x0=0,y0=0,x1=0,y1=0; unsigned frame=0, step=0, lo=0, hi=0; double good=-1, bad=-1; bool done=false, logged=false; } rb = [] {
+                            decltype(rb) b; wchar_t v[64]{};
+                            if(GetEnvironmentVariableW(L"SS2VR_LAB_SP_REGION",v,64)) b.on=swscanf(v,L"%d,%d,%d,%d",&b.x0,&b.y0,&b.x1,&b.y1)==4;
+                            return b; }();
+                        const bool measure=rb.on && !rb.done && ++rb.frame%20==0;
+                        // Bisection over the instanced pixel programs (stable across frames).
+                        static std::vector<uint32_t> psList;
+                        if(rb.on && !rb.done) {
+                            if(rb.step==0) single_pass::labAllowPixelShaders({},true);       // none instanced
+                            else if(rb.step==1) single_pass::labAllowPixelShaders({},false); // all
+                            else single_pass::labAllowPixelShaders(std::vector<uint32_t>(psList.begin()+rb.lo,psList.begin()+(rb.lo+rb.hi)/2),true);
+                        } else if(rb.on) single_pass::labAllowPixelShaders({},false);
                         setSinglePassWorld(true);
                         ok=observedWorldRender(d,puppet,original,centre,0,traceDepth);
+                        if(measure && ok) {
+                            const double l=replay_compare::regionLuma(d,uiFrame.target[0],rb.x0,rb.y0,rb.x1,rb.y1);
+                            const unsigned eligible=single_pass::labEligibleCount();
+                            if(rb.step==0) rb.good=l;
+                            else if(rb.step==1) { rb.bad=l; psList=single_pass::labInstancedPixelShaders(); rb.lo=0; rb.hi=unsigned(psList.size()); }
+                            else {
+                                const unsigned mid=(rb.lo+rb.hi)/2;
+                                const bool broken=std::abs(l-rb.bad)<std::abs(l-rb.good);
+                                if(broken) rb.hi=mid; else rb.lo=mid;
+                                if(rb.hi-rb.lo<=1) {
+                                    rb.done=true;
+                                    log("Single pass region bisect culprit pixel program %08x",rb.lo<psList.size()?psList[rb.lo]:0u);
+                                }
+                            }
+                            (void)eligible;
+                            log("Single pass region bisect step=%u luma=%.2f good=%.2f bad=%.2f eligible=%u range=[%u,%u)",rb.step,l,rb.good,rb.bad,eligible,rb.lo,rb.hi);
+                            ++rb.step;
+                        }
                         setSinglePassWorld(false);
                         single_pass::end(d);
                     } else ok=false;
