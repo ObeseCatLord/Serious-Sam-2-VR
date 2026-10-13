@@ -9,8 +9,10 @@ namespace ss2vr {
 // a ring around the point where the hand opened the wheel; reaching onto an item
 // and releasing selects it. Geometry only: native inventory, equip validation
 // and player commands remain their owners.
-enum class WheelBubble : int32_t { None = -1, Netricsa, Menu, QuickSave, QuickLoad };
-inline constexpr uint32_t WheelBubbleCount = 4, WheelSlotCount = WeaponCount + WheelBubbleCount;
+// VrOptions opens the host's VR options panel (the host watches the wheel close
+// on it; the game only offers and draws the bubble).
+enum class WheelBubble : int32_t { None = -1, Netricsa, Menu, QuickSave, QuickLoad, VrOptions };
+inline constexpr uint32_t WheelBubbleCount = 5, WheelSlotCount = WeaponCount + WheelBubbleCount;
 inline constexpr uint32_t wheelBubbleBit(WheelBubble bubble) {
     return bubble == WheelBubble::None ? 0u : 1u << uint32_t(bubble);
 }
@@ -29,6 +31,7 @@ inline const wchar_t *wheelBubbleName(WheelBubble bubble) {
     case WheelBubble::Menu: return L"Game menu";
     case WheelBubble::QuickSave: return L"Quick save";
     case WheelBubble::QuickLoad: return L"Quick load";
+    case WheelBubble::VrOptions: return L"VR options";
     default: return L"";
     }
 }

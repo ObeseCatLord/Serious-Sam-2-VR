@@ -1040,6 +1040,106 @@ struct WheelLayer {
     }
 };
 
+// VR options: a panel opened from the weapon wheel's options bubble, drawn by
+// GDI like the wheel cards. A stick moves between rows and changes the value
+// (a trigger or A steps it too); B, the menu button or the Close row close it.
+// Game input is held neutral while it is open. Values apply at once and are
+// written to SS2VR.ini; the game re-reads its settings when the file changes.
+struct OptionsRow {
+    const wchar_t *label;
+    std::wstring value;
+    const wchar_t *note = L"";
+};
+struct OptionsBitmap {
+    HDC dc = nullptr;
+    HBITMAP dib = nullptr;
+    HGDIOBJ oldBitmap = nullptr;
+    HFONT title = nullptr, row = nullptr, small = nullptr;
+    uint8_t *bits = nullptr;
+    uint32_t width = 0, height = 0;
+    ~OptionsBitmap() {
+        if (oldBitmap) SelectObject(dc, oldBitmap);
+        for (HGDIOBJ o : {HGDIOBJ(dib), HGDIOBJ(title), HGDIOBJ(row), HGDIOBJ(small)})
+            if (o) DeleteObject(o);
+        if (dc) DeleteDC(dc);
+    }
+    void create(uint32_t w, uint32_t h) {
+        width = w; height = h;
+        dc = CreateCompatibleDC(nullptr);
+        if (!dc) throw std::runtime_error("GDI options memory DC unavailable");
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = LONG(w);
+        info.bmiHeader.biHeight = -LONG(h);
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void *data = nullptr;
+        dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &data, nullptr, 0);
+        if (!dib || !data) throw std::runtime_error("GDI options DIB unavailable");
+        bits = static_cast<uint8_t *>(data);
+        oldBitmap = SelectObject(dc, dib);
+        const auto font = [&](float size, int weight) {
+            return CreateFontW(-int(size), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                               CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        };
+        title = font(h * .065f, FW_BOLD); row = font(h * .042f, FW_SEMIBOLD); small = font(h * .030f, FW_NORMAL);
+        if (!oldBitmap || oldBitmap == HGDI_ERROR || !title || !row || !small)
+            throw std::runtime_error("GDI options resources unavailable");
+        SetBkMode(dc, TRANSPARENT);
+    }
+    void text(const std::wstring &value, RECT r, HFONT font, COLORREF color, UINT align) {
+        const HGDIOBJ old = SelectObject(dc, font);
+        SetTextColor(dc, color);
+        DrawTextW(dc, value.c_str(), -1, &r, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SelectObject(dc, old);
+    }
+    void fill(RECT r, uint8_t b, uint8_t g, uint8_t red) {
+        for (LONG y = std::max(0L, r.top); y < std::min(LONG(height), r.bottom); ++y)
+            for (LONG x = std::max(0L, r.left); x < std::min(LONG(width), r.right); ++x) {
+                auto *p = bits + (size_t(y) * width + x) * 4;
+                p[0] = b; p[1] = g; p[2] = red;
+            }
+    }
+    void draw(const std::vector<OptionsRow> &rows, unsigned selected) {
+        GdiFlush();
+        fill({0, 0, LONG(width), LONG(height)}, 26, 20, 16);
+        const LONG margin = LONG(width * .05f), top = LONG(height * .12f);
+        const LONG line = LONG((height * .80f) / float(std::max<size_t>(rows.size(), 1)));
+        fill({0, 0, LONG(width), LONG(height * .1f)}, 60, 40, 24);
+        text(L"VR options", {margin, 0, LONG(width) - margin, LONG(height * .1f)}, title, RGB(255, 255, 255), DT_LEFT);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const RECT r{margin / 2, top + LONG(i) * line, LONG(width) - margin / 2, top + LONG(i + 1) * line - 4};
+            const bool on = i == selected;
+            if (on) fill(r, 40, 120, 190);
+            const COLORREF ink = on ? RGB(255, 255, 255) : RGB(210, 218, 228);
+            text(rows[i].label, {r.left + margin / 2, r.top, LONG(width * .55f), r.bottom}, row, ink, DT_LEFT);
+            const std::wstring value = rows[i].value + (on && *rows[i].note ? std::wstring(L"  ") + rows[i].note : L"");
+            text(value, {LONG(width * .5f), r.top, r.right - margin / 2, r.bottom}, on ? row : small,
+                 on ? RGB(255, 236, 160) : RGB(170, 200, 230), DT_RIGHT);
+        }
+        text(L"Stick: choose and change    Trigger / A: change    B / Menu: close",
+             {margin, LONG(height * .93f), LONG(width) - margin, LONG(height)}, small, RGB(170, 180, 190), DT_CENTER);
+        GdiFlush();
+        for (size_t i = 0; i < size_t(width) * height; ++i) bits[i * 4 + 3] = 235;
+    }
+};
+struct OptionsPanel {
+    Swapchain chain;
+    OptionsBitmap bitmap;
+    bool open = false, uploaded = false;
+    Pose anchor{};
+    unsigned selected = 0;
+    int stepY = 0, stepX = 0;
+    ULONGLONG repeatY = 0, repeatX = 0;
+    bool triggerHeld[2]{}, buttonHeld = false, closeHeld = false;
+    std::vector<OptionsRow> drawn;
+    unsigned drawnSelected = ~0u;
+    int32_t wheelHover[2]{-1, -1};
+    bool wheelOpen[2]{};
+};
+constexpr float OptionsWidth = .9f, OptionsAspect = .75f, OptionsDistance = .95f;
+
 struct Host {
     Log &log;
     Api api;
@@ -1064,6 +1164,8 @@ struct Host {
     WorldSubmissionStream worldSubmission;
     Swapchain eye[2];
     WheelLayer wheels[2];
+    OptionsPanel options;
+    std::wstring settingsFile;
     ComfortAnchor menuAnchor, hudAnchor;
     VrSettings settings;
     uint32_t lastFire[2]{}, lastDamage = 0;
@@ -1122,6 +1224,7 @@ struct Host {
                 chain.abandon();
             for (auto &wheel : wheels)
                 wheel.chain.abandon();
+            options.chain.abandon();
             menuChain.abandon();
             cursorChain.abandon();
             for (auto &chain : inset)
@@ -1139,6 +1242,7 @@ struct Host {
             chain.destroy();
         for (auto &wheel : wheels)
             wheel.chain.destroy();
+        options.chain.destroy();
         menuChain.destroy();
         cursorChain.destroy();
         for (auto &chain : inset)
@@ -1232,7 +1336,8 @@ struct Host {
         ownsChannel = false;
     }
     void initialize(const std::wstring &directory) {
-        settings = loadSettings(directory + L"SS2VR.ini");
+        settingsFile = directory + L"SS2VR.ini";
+        settings = loadSettings(settingsFile);
         const bool wine=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"wine_get_version")!=nullptr;
         log.write(wine ? "Wine environment: host inherits the game's prefix; Proton OpenXR uses its native runtime bridge" :
                          "Windows environment: using the packaged loader and selected Windows OpenXR runtime");
@@ -1378,6 +1483,8 @@ struct Host {
             wheel.chain.create(api, session, wheelSize, wheelSize / 4);
             wheel.bitmap.create(wheelSize, wheelSize / 4);
         }
+        options.chain.create(api, session, wheelSize, uint32_t(wheelSize * OptionsAspect));
+        options.bitmap.create(wheelSize, uint32_t(wheelSize * OptionsAspect));
         cursorChain.create(api, session, CursorSize, CursorSize);
         cursorUploaded = false;
         log.write("OpenXR D3D11 HMD session initialized; awaiting runtime READY and game dimensions");
@@ -1885,6 +1992,7 @@ struct Host {
                 retiredAll = chain.releaseAcquired() && retiredAll;
             for (auto &wheel : wheels)
                 retiredAll = wheel.chain.releaseAcquired() && retiredAll;
+            retiredAll = options.chain.releaseAcquired() && retiredAll;
             retiredAll = menuChain.releaseAcquired() && retiredAll;
             retiredAll = cursorChain.releaseAcquired() && retiredAll;
             for (auto &chain : inset)
@@ -2189,6 +2297,196 @@ struct Host {
             layers.erase(std::remove(layers.begin(), layers.end(), insetWorld), layers.end());
         return false;
     }
+    // --- VR options panel ---
+    enum OptionsItem : unsigned {
+        OptFoveation, OptInset, OptPeriphery, OptTurning, OptTurnSpeed, OptLasers, OptFireHaptic, OptDamageHaptic,
+        OptScale, OptInstancing, OptClose, OptCount
+    };
+    bool instancingSetting() const {
+        wchar_t value[8]{};
+        GetPrivateProfileStringW(L"Render", L"SinglePassInstancing", L"0", value, 8, settingsFile.c_str());
+        return std::wcstof(value, nullptr) >= .5f;
+    }
+    std::vector<OptionsRow> optionRows() const {
+        const auto percent = [](float v) { wchar_t b[16]; std::swprintf(b, 16, L"%d%%", int(std::lround(v * 100))); return std::wstring(b); };
+        const auto &f = settings.foveation;
+        std::vector<OptionsRow> rows(OptCount);
+        rows[OptFoveation] = {L"Foveated rendering", f.mode == 0 ? L"Off" : f.mode == 1 ? L"Eye-tracked" : L"Fixed (centre)",
+                              f.mode == 1 && !actions.gazeEnabled ? L"(no eye tracking: off)" : L""};
+        rows[OptInset] = {L"Sharp region size", percent(f.inset)};
+        rows[OptPeriphery] = {L"Periphery resolution", percent(f.periphery)};
+        rows[OptTurning] = {L"Turning", settings.snapTurn ? L"Snap" : L"Smooth"};
+        wchar_t speed[24];
+        std::swprintf(speed, 24, L"%d deg/s", int(std::lround(settings.smoothTurnRate * 180 / Pi)));
+        rows[OptTurnSpeed] = {L"Turn speed", speed};
+        rows[OptLasers] = {L"Aim lasers", settings.lasers ? L"On" : L"Off"};
+        rows[OptFireHaptic] = {L"Fire haptics", percent(settings.fireHaptic)};
+        rows[OptDamageHaptic] = {L"Damage haptics", percent(settings.damageHaptic)};
+        wchar_t scale[24];
+        std::swprintf(scale, 24, L"%.2gx", double(settings.renderScale));
+        rows[OptScale] = {L"Render scale", scale};
+        rows[OptInstancing] = {L"Instanced single pass", instancingSetting() ? L"On" : L"Off", L"(experimental)"};
+        rows[OptClose] = {L"Close", L""};
+        return rows;
+    }
+    void saveSetting(const wchar_t *section, const wchar_t *key, double value) {
+        wchar_t text[32];
+        std::swprintf(text, 32, L"%g", value);
+        if (!WritePrivateProfileStringW(section, key, text, settingsFile.c_str())) {
+            char line[160];
+            std::snprintf(line, sizeof line, "VR options: could not save %ls/%ls", section, key);
+            log.write(line);
+        }
+    }
+    static float stepped(float value, int direction, float step, float low, float high) {
+        const float next = std::round((value + direction * step) / step) * step;
+        return next > high + step * .5f ? low : next < low - step * .5f ? high : std::clamp(next, low, high);
+    }
+    void changeOption(unsigned item, int direction) {
+        auto &f = settings.foveation;
+        switch (item) {
+        case OptFoveation: f.mode = (f.mode + 3 + direction) % 3; saveSetting(L"Render", L"Foveation", f.mode); break;
+        case OptInset: f.inset = stepped(f.inset, direction, .05f, .25f, .7f); saveSetting(L"Render", L"FoveationInset", f.inset); break;
+        case OptPeriphery:
+            f.periphery = stepped(f.periphery, direction, .05f, .25f, .8f);
+            saveSetting(L"Render", L"FoveationPeriphery", f.periphery);
+            break;
+        case OptTurning: settings.snapTurn = !settings.snapTurn; saveSetting(L"Comfort", L"SnapTurn", settings.snapTurn); break;
+        case OptTurnSpeed: {
+            const float degrees = stepped(settings.smoothTurnRate * 180 / Pi, direction, 30, 30, 360);
+            settings.smoothTurnRate = degrees * Pi / 180;
+            saveSetting(L"Comfort", L"SmoothTurnDegreesPerSecond", degrees);
+            break;
+        }
+        case OptLasers: settings.lasers = !settings.lasers; saveSetting(L"Laser", L"Enabled", settings.lasers); break;
+        case OptFireHaptic:
+            settings.fireHaptic = stepped(settings.fireHaptic, direction, .1f, 0, 1);
+            saveSetting(L"Feedback", L"FireStrength", settings.fireHaptic);
+            break;
+        case OptDamageHaptic:
+            settings.damageHaptic = stepped(settings.damageHaptic, direction, .1f, 0, 1);
+            saveSetting(L"Feedback", L"DamageStrength", settings.damageHaptic);
+            break;
+        case OptScale: // Applies at once: the recommended eye size is republished every loop.
+            settings.renderScale = stepped(settings.renderScale, direction, .1f, .5f, 2.f);
+            saveSetting(L"Render", L"Scale", settings.renderScale);
+            break;
+        case OptInstancing: saveSetting(L"Render", L"SinglePassInstancing", instancingSetting() ? 0 : 1); break;
+        default: break;
+        }
+        char line[96];
+        std::snprintf(line, sizeof line, "VR options: changed item %u (direction %d)", item, direction);
+        log.write(line);
+    }
+    void openOptions(const Input &input) {
+        const float heading = horizontalHeading(input.head.q);
+        const Quat facing = yaw(heading);
+        options.anchor = {facing, input.head.p + rotate(facing, Vec3{0, -.12f, -OptionsDistance})};
+        options.open = true;
+        options.selected = 0;
+        options.uploaded = false;
+        options.stepX = options.stepY = 0;
+        // Controls already held when it opens act only after release.
+        options.triggerHeld[0] = input.trigger[0] > .5f; options.triggerHeld[1] = input.trigger[1] > .5f;
+        options.buttonHeld = options.closeHeld = true;
+        log.write("VR options opened");
+    }
+    // The wheel's options bubble: released while hovered (the game closes the wheel).
+    void watchOptionsBubble(const Ui &ui, const Input &input) {
+        const int32_t bubble = wheelBubbleHover(WheelBubble::VrOptions);
+        for (unsigned h = 0; h != 2; ++h) {
+            const bool open = ui.wheel[h].open != 0;
+            if (options.wheelOpen[h] && !open && options.wheelHover[h] == bubble && !options.open && input.headValid)
+                openOptions(input);
+            static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_WHEEL_TRACE", v, 2) == 1 && v[0] == L'1'; }();
+            if (trace && open && ui.wheel[h].hover != options.wheelHover[h]) {
+                char line[96];
+                std::snprintf(line, sizeof line, "Lab wheel hover hand=%u hover=%d count=%u", h, ui.wheel[h].hover, ui.wheel[h].count);
+                log.write(line);
+            }
+            options.wheelOpen[h] = open;
+            options.wheelHover[h] = open ? ui.wheel[h].hover : -1;
+        }
+    }
+    // Navigation from this loop's input; the input the game sees is then neutral.
+    void optionsInput(Input &input) {
+        const ULONGLONG now = GetTickCount64();
+        const auto axis = [&](unsigned c) {
+            const float r = input.axis[1][c], l = input.axis[0][c];
+            return std::abs(r) >= std::abs(l) ? r : l;
+        };
+        const auto edge = [&](float value, int &held, ULONGLONG &repeat) {
+            const int d = value > .6f ? 1 : value < -.6f ? -1 : 0;
+            int fire = 0;
+            if (d && (d != held || now >= repeat)) { fire = d; repeat = now + (d != held ? 400 : 160); }
+            held = d;
+            return fire;
+        };
+        if (const int y = edge(axis(1), options.stepY, options.repeatY))
+            options.selected = (options.selected + OptCount + (y > 0 ? OptCount - 1 : 1)) % OptCount;
+        if (const int x = edge(axis(0), options.stepX, options.repeatX))
+            if (options.selected != OptClose) changeOption(options.selected, x);
+        bool step = false;
+        for (unsigned h = 0; h != 2; ++h) {
+            const bool held = input.trigger[h] > .75f;
+            step = step || (held && !options.triggerHeld[h]);
+            options.triggerHeld[h] = held ? true : input.trigger[h] > .5f && options.triggerHeld[h];
+        }
+        const uint32_t buttons = input.buttons[0] | input.buttons[1];
+        const bool select = (buttons & (Use | Reload)) != 0, close = (buttons & (Menu | Jump)) != 0;
+        step = step || (select && !options.buttonHeld);
+        options.buttonHeld = select;
+        if (step) {
+            if (options.selected == OptClose) options.open = false;
+            else changeOption(options.selected, 1);
+        }
+        if (close && !options.closeHeld) options.open = false;
+        options.closeHeld = close;
+        if (!options.open) log.write("VR options closed");
+        for (unsigned h = 0; h != 2; ++h) {
+            input.trigger[h] = 0;
+            input.axis[h][0] = input.axis[h][1] = 0;
+            input.buttons[h] = 0;
+        }
+    }
+    void optionsLayer(const Input &input, XrCompositionLayerQuad &quad, std::vector<const XrCompositionLayerBaseHeader *> &output) {
+        if (!options.open || !input.focused || !input.headValid || !comfortablePanel(options.anchor, input.head, .3f)) return;
+        const auto rows = optionRows();
+        bool same = options.uploaded && options.drawnSelected == options.selected && rows.size() == options.drawn.size();
+        for (size_t i = 0; same && i < rows.size(); ++i) same = rows[i].value == options.drawn[i].value;
+        if (!same) {
+            options.bitmap.draw(rows, options.selected);
+            static const bool dump = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_OPTIONS_DUMP", v, 2) == 1 && v[0] == L'1'; }();
+            static unsigned dumps = 0;
+            if (dump && dumps < 3) { // Lab: the panel image beside the host log.
+                wchar_t name[32];
+                std::swprintf(name, 32, L"options-%u.ppm", dumps++);
+                if (FILE *f = _wfopen((settingsFile.substr(0, settingsFile.find_last_of(L"\\/") + 1) + name).c_str(), L"wb")) {
+                    const auto &bm = options.bitmap;
+                    std::fprintf(f, "P6\n%u %u\n255\n", bm.width, bm.height);
+                    for (size_t i = 0; i < size_t(bm.width) * bm.height; ++i) {
+                        const uint8_t rgb[3]{bm.bits[i * 4 + 2], bm.bits[i * 4 + 1], bm.bits[i * 4]};
+                        std::fwrite(rgb, 1, 3, f);
+                    }
+                    std::fclose(f);
+                }
+            }
+            options.uploaded = false;
+            if (!options.chain.upload(context.p, options.bitmap.bits)) { ++imageTimeouts; return; }
+            options.drawn = rows;
+            options.drawnSelected = options.selected;
+            options.uploaded = true;
+        }
+        if (!options.chain.ownership.previousImageAvailable()) return;
+        quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+        quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+        quad.space = local;
+        quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        quad.subImage = options.chain.subimage();
+        quad.pose = xrPose(options.anchor);
+        quad.size = {OptionsWidth, OptionsWidth * OptionsAspect};
+        output.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad));
+    }
     void wheelLayers(const Ui &ui, const Input &input, std::array<XrCompositionLayerQuad, 2> &layers,
                      std::vector<const XrCompositionLayerBaseHeader *> &output) {
         const ULONGLONG now = GetTickCount64();
@@ -2453,6 +2751,7 @@ struct Host {
             const bool validViews = viewsAt(frameState.predictedDisplayTime, views);
             viewsTracked = validViews;
             Input input = sample(frameState.predictedDisplayTime, views, validViews);
+            if (options.open) optionsInput(input);
             const bool recenterHeldNow = recenterHeld(input);
             recenterUi = recenterHeldNow && !recenterWasHeld;
             recenterWasHeld = recenterHeldNow;
@@ -2471,12 +2770,14 @@ struct Host {
             const bool published = publish(input, snapshot);
             if (published && !api.lossPending)
                 feedback(snapshot.ui, input, snapshot.menuVisible);
+            if (published) watchOptionsBubble(snapshot.ui, input);
+            if (snapshot.menuVisible) options.open = false;
             const bool hudPrepared = published && prepareHudAnchor(snapshot, input);
             std::array<XrCompositionLayerProjectionView, 2> projectionViews, insetViews;
             XrCompositionLayerProjection projectionLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             XrCompositionLayerProjection insetLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             std::array<XrCompositionLayerQuad, 2> quadLayers;
-            XrCompositionLayerQuad menuQuad{}, cursorQuad{};
+            XrCompositionLayerQuad menuQuad{}, cursorQuad{}, optionsQuad{};
             presentedPointer = {};
             if (published && !quit && !api.lossPending && frameState.shouldRender) {
                 if (snapshot.renderer && !snapshot.menuVisible && validViews && input.focused &&
@@ -2566,6 +2867,7 @@ struct Host {
                     } else {
                         menuAnchor.reset();
                         wheelLayers(snapshot.ui, input, quadLayers, layers);
+                        optionsLayer(input, optionsQuad, layers);
                     }
                 }
             }

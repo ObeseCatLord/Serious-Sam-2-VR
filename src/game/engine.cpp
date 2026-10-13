@@ -576,12 +576,40 @@ static void publishWheelPresentation(unsigned hand, const WeaponWheel &wheel) {
     }
     ReleaseSRWLockExclusive(&wheelPresentationLock);
 }
+// The host's VR options panel saves SS2VR.ini while the game runs: the
+// settings that are safe to change in play are re-applied when it changes.
+static std::wstring settingsFile;
+static FILETIME settingsSeen{};
+static bool settingsWritten(FILETIME &time) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (settingsFile.empty() || !GetFileAttributesExW(settingsFile.c_str(), GetFileExInfoStandard, &data)) return false;
+    time = data.ftLastWriteTime;
+    return true;
+}
+static void pollSettingsFile() {
+    static ULONGLONG next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + 500;
+    FILETIME written{};
+    if (!settingsWritten(written) || !CompareFileTime(&written, &settingsSeen)) return;
+    settingsSeen = written;
+    const VrSettings fresh = loadSettings(settingsFile);
+    settings.lasers = fresh.lasers;
+    settings.laserDistance = fresh.laserDistance;
+    settings.snapTurn = fresh.snapTurn;
+    settings.smoothTurnRate = fresh.smoothTurnRate;
+    settings.singlePassInstancing = fresh.singlePassInstancing;
+    single_pass::setInstancing(fresh.singlePassInstancing);
+    log("Settings reloaded: lasers=%d snapTurn=%d turnRate=%.0f instancing=%d", int(fresh.lasers), int(fresh.snapTurn),
+        double(fresh.smoothTurnRate * 180 / Pi), int(fresh.singlePassInstancing));
+}
 // One-shot actions chosen on a wheel bubble, by WheelBubble value. Simulation
 // stores the release tick; the player input poll (or the presentation, for the
 // game menu) consumes it once. Stale requests expire instead of firing late.
 static std::atomic<uint64_t> wheelRequests[WheelBubbleCount]{};
 static void requestWheelAction(WheelBubble action) {
-    static const char *const names[WheelBubbleCount] = {"Netricsa", "game menu", "quick save", "quick load"};
+    static const char *const names[WheelBubbleCount] = {"Netricsa", "game menu", "quick save", "quick load", "VR options"};
     if (action == WheelBubble::None) return;
     wheelRequests[uint32_t(action)].store(GetTickCount64(), std::memory_order_relaxed);
     log("Weapon wheel requested %s", names[uint32_t(action)]);
@@ -597,7 +625,7 @@ bool wheelMenuRequested(uint64_t now) noexcept {
 // Netricsa and the game menu are always offered; native quick save/load only in
 // single player, where the game owns the save.
 static uint32_t wheelBubbles() {
-    uint32_t mask = wheelBubbleBit(WheelBubble::Netricsa) | wheelBubbleBit(WheelBubble::Menu);
+    uint32_t mask = wheelBubbleBit(WheelBubble::Netricsa) | wheelBubbleBit(WheelBubble::Menu) | wheelBubbleBit(WheelBubble::VrOptions);
     if (singlePlayer && singlePlayer())
         mask |= wheelBubbleBit(WheelBubble::QuickSave) | wheelBubbleBit(WheelBubble::QuickLoad);
     return mask;
@@ -7377,6 +7405,11 @@ static void drawWheelSymbol(WheelBubble bubble,const WheelBillboard &b,float s) 
     case WheelBubble::Netricsa:
         box(-.12f,.36f,.12f,.6f);box(-.12f,-.6f,.12f,.2f);
         break;
+    case WheelBubble::VrOptions: // Three sliders.
+        for(const auto [v,knob]:{std::pair{.36f,.22f},std::pair{0.f,-.28f},std::pair{-.36f,.08f}}) {
+            box(-.58f,v-.05f,.58f,v+.05f);box(knob-.12f,v-.16f,knob+.12f,v+.16f);
+        }
+        break;
     default:
         break;
     }
@@ -7415,7 +7448,7 @@ static void drawWeaponWheel(unsigned hand,const Pose &head) {
     wheelBatch.ring(0xffffff38u,WheelBillboard{frame.p,ringRight,ringUp},cancel-.0015f,cancel+.0015f,40);
     constexpr uint32_t gold=0xffc23affu;
     const uint32_t handColour=hand ? 0x40dfffffu : 0x60ff40ffu; // Laser colours.
-    constexpr uint32_t bubbleFill[WheelBubbleCount]{0x1d7891d8u,0x6a44a8d8u,0x2f8a46d8u,0xb37a1cd8u};
+    constexpr uint32_t bubbleFill[WheelBubbleCount]{0x1d7891d8u,0x6a44a8d8u,0x2f8a46d8u,0xb37a1cd8u,0x4a5566d8u};
     const auto drawItem=[&](uint32_t i) {
         const auto &slot=ring.slot[i];
         const bool hovered=int(i)==view.hoverSlot;
@@ -7683,6 +7716,7 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
 static bool respawnRoute(const Snapshot &s);
 static bool netricsaOpen(const Snapshot &s);
 static void __fastcall poll(void *b, void *) {
+    pollSettingsFile();
     originalPoll(b);
     if (!ids[0])
         for (int i = 0; i < CommandCount; i++)
@@ -8907,8 +8941,11 @@ bool attach(bool headless) {
     if (!supported(headless))
         return false;
     std::wstring settingsDirectory;
-    if (moduleDirectory(nullptr,settingsDirectory))
-        settings=loadSettings(settingsDirectory+L"SS2VR\\SS2VR.ini");
+    if (moduleDirectory(nullptr,settingsDirectory)) {
+        settingsFile=settingsDirectory+L"SS2VR\\SS2VR.ini";
+        settings=loadSettings(settingsFile);
+        settingsWritten(settingsSeen);
+    }
     setDesktopWorld(settings.desktopWorld);
     setEyeReplay(settings.eyeReplay);
     setSinglePass(settings.singlePass);
