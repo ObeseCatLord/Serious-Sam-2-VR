@@ -4116,6 +4116,27 @@ static void __cdecl weaponDepthRange(float nearDepth, float farDepth) {
                 *nativeDepthNear==preparedWeaponWorld.nearDepth,*nativeDepthFar==preparedWeaponWorld.farDepth,
                 *nativeDepthNear,*nativeDepthFar);
         }
+        if (!executedWeaponWorld.valid && preparedWeaponWorld.valid && physicalCallbacksAvailable() &&
+            finiteMatrix(*nativeCurrentView) && finiteProjection(*nativeCurrentProjection) &&
+            validDepthRange(*nativeDepthNear, *nativeDepthFar)) {
+            // The root executed with other matrices than prepared (camera shake,
+            // a native FOV or depth change). The world was drawn with them, so the
+            // HUD, weapons and right eye follow them rather than dropping the pair.
+            const unsigned reason = unsigned(!sameWeaponView(preparedWeaponWorld.view, *nativeCurrentView)) |
+                unsigned(!sameProjectionXY(preparedWeaponWorld.projection, *nativeCurrentProjection)) << 1 |
+                unsigned(*nativeDepthNear != preparedWeaponWorld.nearDepth || *nativeDepthFar != preparedWeaponWorld.farDepth) << 2;
+            static unsigned logged = 0, lastReason = 0;
+            if (logged < 24 && reason != lastReason) {
+                ++logged; lastReason = reason;
+                const auto &pv = preparedWeaponWorld.view.m; const auto &nv = nativeCurrentView->m;
+                const auto &pp = preparedWeaponWorld.projection.m; const auto &np = nativeCurrentProjection->m;
+                log("Native root executed other matrices eye=%d view=%u projection=%u depth=%u dt=%.3f,%.3f,%.3f P %.4f/%.4f %.4f/%.4f %.4f/%.4f "
+                    "depth %.3f,%.3f/%.3f,%.3f", eyeIndex, reason & 1, (reason >> 1) & 1, (reason >> 2) & 1,
+                    nv[3] - pv[3], nv[7] - pv[7], nv[11] - pv[11], pp[0], np[0], pp[5], np[5], pp[2], np[2],
+                    preparedWeaponWorld.nearDepth, preparedWeaponWorld.farDepth, *nativeDepthNear, *nativeDepthFar);
+            }
+            executedWeaponWorld = {*nativeCurrentView, *nativeCurrentProjection, *nativeDepthNear, *nativeDepthFar, true};
+        }
         executedUiProjectionValid = executedWeaponWorld.valid && nativeAdjustedProjection &&
                                     finiteProjection(*nativeAdjustedProjection);
         if (executedUiProjectionValid)
