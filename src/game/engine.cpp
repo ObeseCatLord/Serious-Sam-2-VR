@@ -576,13 +576,15 @@ static void publishWheelPresentation(unsigned hand, const WeaponWheel &wheel) {
     }
     ReleaseSRWLockExclusive(&wheelPresentationLock);
 }
-// The host's VR options panel saves SS2VR.ini while the game runs: the
+// The host's VR options panel saves SS2VR.user.ini while the game runs: the
 // settings that are safe to change in play are re-applied when it changes.
 static std::wstring settingsFile;
 static FILETIME settingsSeen{};
 static bool settingsWritten(FILETIME &time) {
     WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (settingsFile.empty() || !GetFileAttributesExW(settingsFile.c_str(), GetFileExInfoStandard, &data)) return false;
+    time = {};
+    if (settingsFile.empty() || !GetFileAttributesExW(userSettingsFile(settingsFile).c_str(), GetFileExInfoStandard, &data))
+        return true; // No user file yet: an empty time, so its creation counts as a change.
     time = data.ftLastWriteTime;
     return true;
 }

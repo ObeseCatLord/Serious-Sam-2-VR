@@ -23,6 +23,25 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## New: VR options and foveated rendering (2026-10-13, late)
+
+- Open a weapon wheel (light trackpad press) and release on the new bubble with
+  three sliders: the VR options panel opens in front of you. Move between rows
+  with a stick, change a value with the stick sideways (or a trigger / A),
+  close with B or the menu button. Changes are saved at once to
+  `Bin/SS2VR/SS2VR.user.ini` (it overrides `SS2VR.ini` and survives updates;
+  delete it to return to the defaults).
+- Try "Foveated rendering": Eye-tracked follows your eyes when the runtime
+  offers eye tracking (otherwise it stays off; the row says so), Fixed keeps
+  the sharp region at the view centre. The periphery should only look softer,
+  with no seam at the sharp region's edge. Note the `Perf` lines with it on
+  and off.
+- Also check: snap/smooth turning and turn speed, lasers on/off and haptic
+  strength apply without restarting; render scale changes the image size.
+- Single pass got exact (sky, smoke, moon and waterfall match two-pass). If
+  you see a faint straight vertical edge in the sky near the outer edge of one
+  eye, note it (known, being traced).
+
 ## Changed after the second headset test (2026-10-13)
 
 - Both eyes now come from one render of the world (single-pass stereo):

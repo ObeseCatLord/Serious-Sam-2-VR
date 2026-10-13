@@ -31,6 +31,13 @@ with tempfile.TemporaryDirectory(prefix='ss2vr-installer-') as folder:
  except ValueError:pass
  assert collision.read_bytes()==b'modified payload';collision.write_bytes(files['Bin/d3d9.dll'])
  installer.uninstall(game,False);assert not collision.exists();assert (game/'Bin/Sam2.exe').read_bytes()==native
+ # The VR options panel's SS2VR.user.ini survives an update; the host log moves aside.
+ installer.install(game,package,False)
+ (game/'Bin/SS2VR/SS2VR.user.ini').write_bytes(b'[Render]\nFoveation=2\n');(game/'Bin/SS2VR/ss2vr_host.log').write_bytes(b'log')
+ installer.uninstall(game,False);installer.install(game,package,False)
+ assert (game/'Bin/SS2VR/SS2VR.user.ini').read_bytes()==b'[Render]\nFoveation=2\n' and (game/'Bin/ss2vr_host.log.previous').exists()
+ (game/'Bin/SS2VR/SS2VR.user.ini').unlink();(game/'Bin/ss2vr_host.log.previous').unlink();(game/'Bin/SS2VR.user.ini.previous').unlink()
+ installer.uninstall(game,False)
  # Unsafe paths must be rejected before any mutation.
  for relative in ['../escape','Bin/../escape','Bin/Engine.dll','Bin/SS2VR/../../escape',
                   'Content/SeriousSam2.mod','Content/SS2VR.mod/child','Bin/SS2VRServer.dll/child']:

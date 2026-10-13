@@ -1044,7 +1044,7 @@ struct WheelLayer {
 // GDI like the wheel cards. A stick moves between rows and changes the value
 // (a trigger or A steps it too); B, the menu button or the Close row close it.
 // Game input is held neutral while it is open. Values apply at once and are
-// written to SS2VR.ini; the game re-reads its settings when the file changes.
+// written to SS2VR.user.ini; the game re-reads its settings when it changes.
 struct OptionsRow {
     const wchar_t *label;
     std::wstring value;
@@ -2302,11 +2302,7 @@ struct Host {
         OptFoveation, OptInset, OptPeriphery, OptTurning, OptTurnSpeed, OptLasers, OptFireHaptic, OptDamageHaptic,
         OptScale, OptInstancing, OptClose, OptCount
     };
-    bool instancingSetting() const {
-        wchar_t value[8]{};
-        GetPrivateProfileStringW(L"Render", L"SinglePassInstancing", L"0", value, 8, settingsFile.c_str());
-        return std::wcstof(value, nullptr) >= .5f;
-    }
+    bool instancingSetting() const { return loadSettings(settingsFile).singlePassInstancing; }
     std::vector<OptionsRow> optionRows() const {
         const auto percent = [](float v) { wchar_t b[16]; std::swprintf(b, 16, L"%d%%", int(std::lround(v * 100))); return std::wstring(b); };
         const auto &f = settings.foveation;
@@ -2329,10 +2325,11 @@ struct Host {
         rows[OptClose] = {L"Close", L""};
         return rows;
     }
+    // Into SS2VR.user.ini (see userSettingsFile), which the game watches.
     void saveSetting(const wchar_t *section, const wchar_t *key, double value) {
         wchar_t text[32];
         std::swprintf(text, 32, L"%g", value);
-        if (!WritePrivateProfileStringW(section, key, text, settingsFile.c_str())) {
+        if (!WritePrivateProfileStringW(section, key, text, userSettingsFile(settingsFile).c_str())) {
             char line[160];
             std::snprintf(line, sizeof line, "VR options: could not save %ls/%ls", section, key);
             log.write(line);

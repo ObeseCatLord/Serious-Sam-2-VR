@@ -1,5 +1,39 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-13 (late) — exact single pass, foveated rendering, VR options
+
+- Single pass correctness: the engine read the viewport back mid-pass (it got
+  the double-wide viewport after an instanced draw); viewport, scissor, scissor
+  enable and shader getters now return the engine's values during the pass,
+  the engine's state is restored after every stereo draw, and render-target
+  switches (5 per pass) restore it and suspend the stereo bindings. This was
+  the source of the sky/moon/smoke/waterfall "instancing artifacts".
+- Instancing is exact: kill planes split half a pixel off the seam (D3D9
+  pixel centres are integers), the eye test goes only into the vertex
+  program's lowest unwritten texcoord set (pixel programs read unwritten sets),
+  and per-half draws use the same wide-viewport mapping. A same-frame mirror
+  target (lab) shows 0 differing pixels for every program. It saves ~0.1 ms of
+  render thread, so it stays opt-in.
+- The pass target is now a layout of regions (affine maps of eye NDC applied in
+  clip space through the per-region record; any engine viewport maps exactly).
+- Foveated rendering ([Render] Foveation 1 eye-tracked / 2 fixed): on zero-copy
+  pairs the host asks for foveated rendering (Request.foveated 2); the pass draws
+  both eyes' full views at FoveationPeriphery and a full-resolution
+  FoveationInset region around the gaze (XR_EXT_eye_gaze_interaction, centre
+  without it) into one atlas from the same traversal; each eye is the full
+  view stretched over the eye with the inset blended in (feathered edge).
+  Steam Frame's runtime foveation (XR_FB/META foveation) needs the app to render
+  into Vulkan swapchain images and does not apply to this D3D9 path.
+  Lab 1344x1512: eye GPU 1.25-1.40 -> 1.23-1.25 ms, render thread +0.3 ms; the
+  saving grows with resolution and render scale.
+- VR options panel: a weapon-wheel bubble opens a host panel (foveation and
+  its sizes, turning, turn speed, lasers, haptics, render scale, instancing).
+  Values apply at once and go to SS2VR.user.ini (overrides SS2VR.ini, kept
+  by the installer across updates); the game re-reads it when it changes.
+- Known: in some launches a translucent sky haze layer shows a straight edge
+  near the outer edge of one eye (x=1202 right / 141 left of 1344) in single
+  pass only (shifted and wide issue alike; not in two-pass). Not yet traced.
+
 ## 2026-10-13 — single-pass stereo, second headset test fixes
 
 - Single pass ([Render] SinglePass=1, default): the world is traversed once

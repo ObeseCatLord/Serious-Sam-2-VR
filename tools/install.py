@@ -54,16 +54,18 @@ def install(game, package, dry):
             raise ValueError('Game build does not match verified fingerprints: ' + name)
     folder = game/'Bin/SS2VR'
     view_cache = None
+    user_settings = None
     # Uninstall keeps the mod's own runtime files (host log, cached headset view
-    # size); a folder holding only those is ours.
+    # size, the VR options panel's SS2VR.user.ini); a folder holding only those is ours.
     leftovers = [] if folder.is_symlink() or not folder.is_dir() else list(folder.iterdir())
     if folder.is_dir() and not folder.is_symlink() and leftovers and \
        all(f.is_file() and not f.is_symlink() and
-           ((f.name.startswith('ss2vr_host') and f.suffix == '.log') or f.name == 'headset-view.ini')
+           ((f.name.startswith('ss2vr_host') and f.suffix == '.log') or f.name in ('headset-view.ini', 'SS2VR.user.ini'))
            for f in leftovers):
         if not dry:
             for f in leftovers:
                 if f.name == 'headset-view.ini': view_cache = f.read_bytes()
+                if f.name == 'SS2VR.user.ini': user_settings = f.read_bytes()
                 f.rename(game/'Bin'/(f.name + '.previous'))
             folder.rmdir()
     elif folder.exists() or folder.is_symlink():
@@ -118,6 +120,10 @@ def install(game, package, dry):
         # Keep the runtime's last recommended eye size so the canvas starts at it.
         cache = destination(game, 'Bin/SS2VR/headset-view.ini')
         if not cache.exists(): cache.write_bytes(view_cache)
+    if user_settings is not None:
+        # The user's VR options carry over to the new build.
+        chosen = destination(game, 'Bin/SS2VR/SS2VR.user.ini')
+        if not chosen.exists(): chosen.write_bytes(user_settings)
     print('Installed SS2VR development build. No game/runtime was launched.')
 
 def uninstall(game, dry):

@@ -4,13 +4,21 @@
 #include <string>
 #include <windows.h>
 namespace ss2vr {
+// Values chosen in the VR options panel live in SS2VR.user.ini beside SS2VR.ini
+// and override it (the packaged SS2VR.ini stays unmodified for the installer).
+inline std::wstring userSettingsFile(const std::wstring &filename) {
+    const size_t slash = filename.find_last_of(L"\\/");
+    return (slash == std::wstring::npos ? std::wstring() : filename.substr(0, slash + 1)) + L"SS2VR.user.ini";
+}
 inline VrSettings loadSettings(const std::wstring &filename) {
     VrSettings settings;
+    const std::wstring user = userSettingsFile(filename);
     auto number = [&](const wchar_t *section, const wchar_t *key, float fallback, float minimum,
                       float maximum) {
         wchar_t buffer[64]{}, defaultValue[64]{};
         std::swprintf(defaultValue, 64, L"%g", double(fallback));
-        DWORD length = GetPrivateProfileStringW(section, key, defaultValue, buffer, 64, filename.c_str());
+        DWORD length = GetPrivateProfileStringW(section, key, L"", buffer, 64, user.c_str());
+        if (!length) length = GetPrivateProfileStringW(section, key, defaultValue, buffer, 64, filename.c_str());
         wchar_t *end = nullptr;
         float value = std::wcstof(buffer, &end);
         if (!length || length >= 63 || end == buffer || *end || !std::isfinite(value))
