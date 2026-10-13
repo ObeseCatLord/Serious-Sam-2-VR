@@ -1,6 +1,6 @@
 # Implementation status — 2026-10-10
 
-## 2026-10-13 (evening) — eye replay off by default
+## 2026-10-13 (evening) — eye replay off by default, uzi laser
 
 - `[Render] EyeReplay` now defaults to 0. Replay only ever runs on two-pass
   frames (SinglePass=0, or frames single pass cannot render), and on
@@ -11,6 +11,14 @@
 - Single pass checked against two-pass (replay off) on City Metropolis and
   Branchester: same image. Branchester per pair: stereo CPU 1.7 ms vs 2.6-2.8
   ms, render thread 2.8 vs 3.9-4.0 ms per frame.
+- Lasers: the uzi beam came out of the barrel nub, 12 cm above the laser
+  emitter tube where the game's own uzi laser starts (found with the mod's
+  lasers off, V421). Its origin, the native shot origin, sits ~0.6 m behind
+  the displayed gun, so the beam ran through the gun and showed in gaps
+  behind it. It now starts 1 cm inside the tube's front face
+  (UziLaserEmitter; calibrated V422-V428, lab SS2VR_LAB_UZI_EMITTER=x,y,z). Beams were ~90 % opaque because the 9-line
+  bundle stacked 55 % alpha; lines are now ~30 % each in a 3 mm bundle,
+  measured 40-57 % opaque (native beam 40-80 %).
 
 ## 2026-10-13 (late) — exact single pass, foveated rendering, VR options
 

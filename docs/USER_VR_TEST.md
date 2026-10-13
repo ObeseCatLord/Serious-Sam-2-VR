@@ -52,8 +52,9 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 - Weapon wheel: a chosen weapon stays chosen.
 - Turrets: aim with the right stick (like the mouse on the desktop); the right
   trigger fires, A leaves.
-- Lasers are translucent; a hand without tracking shows no laser; the uzi
-  beam starts under the barrel.
+- Lasers are see-through like the game's own uzi laser; a hand without
+  tracking shows no laser; the uzi beam starts at the emitter tube under the
+  barrel and runs along the game's own beam.
 
 ## Fixed after the first headset test (2026-10-12)
 

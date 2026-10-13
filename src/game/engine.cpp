@@ -4737,6 +4737,11 @@ static bool vehicleLaserCurrent(const Snapshot &s, const Request &request,
     return laserSampleCurrent(s, request) && laserModelScratchIdle() &&
            readVehicleLaserSource(s, live) && live == expected;
 }
+// Uzi laser emitter (the tube under the barrel) from the native shot origin, in
+// the weapon's frame at scale 1. The shot origin sits far behind the displayed
+// gun, so the beam starts 1 cm inside the tube's front face, where the game's
+// own uzi laser starts (V428: front face 0.64 m ahead, 0.20 m below).
+constexpr Vec3 UziLaserEmitter{0, -.204f, -.63f};
 static bool vehicleLaserMuzzle(const Snapshot &s, const Request &request, VehicleLaserSource &source,
                                Pose &muzzle, Vec3 &rayDirection) {
     if (!laserModelScratchIdle() || !readVehicleLaserSource(s, source) ||
@@ -4837,11 +4842,17 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
                 { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,5);continue; }
             mechanism = getMechanism(s.player);
             direction = rotate(normalize(muzzle.q), {0, 0, -1});
-            // The uzi's beam starts at the rod under its barrel (V212 side view:
-            // 9.7 cm below, 9.4 cm behind the barrel tip at the base display size).
+            // The uzi's beam starts at the laser emitter tube under its barrel,
+            // where the game's own laser starts (V420/V421 side views).
             if (weapon == 4) {
-                const float scale = weaponDisplayScale(4) * settings.weaponScaleById[4] / weaponDisplayScale(4);
-                muzzle.p = muzzle.p + rotate(normalize(muzzle.q), Vec3{0, -.097f, .094f} * scale);
+                // Lab: SS2VR_LAB_UZI_EMITTER=x,y,z overrides the offset.
+                static const Vec3 emitter = [] {
+                    char v[64]{};
+                    Vec3 e = UziLaserEmitter;
+                    if (GetEnvironmentVariableA("SS2VR_LAB_UZI_EMITTER", v, sizeof v)) std::sscanf(v, "%f,%f,%f", &e.x, &e.y, &e.z);
+                    return e;
+                }();
+                muzzle.p = muzzle.p + rotate(normalize(muzzle.q), emitter * settings.weaponScaleById[4]);
             }
         }
         if (!laserSampleCurrent(s, queryRequest) || !trackedHandCurrent(s.input, copySnapshot().input, h))
@@ -4980,13 +4991,15 @@ static void drawLasers() {
         if (!a.valid) {
             laserTraceValue(LaserTraceStage::Draw,"sample-invalid",eyeSnapshot,h,eyeRequest.sequence,2);continue;
         }
-        // A laser-pointer red beam: a 2 mm bundle of lines, solid at any distance.
-        // ARGB (V109 capture: 0xff1a1aff drew blue); ~55 % opaque when blended.
-        const uint32_t color = translucent ? 0x8cff1a1au : 0xffff1a1au;
+        // A laser-pointer red beam: a 3 mm bundle of lines, visible at any distance.
+        // ARGB (V109 capture: 0xff1a1aff drew blue). Blended, each line is ~30 %
+        // opaque, so where lines overlap the beam is about as see-through as the
+        // game's own uzi laser (~40-80 %).
+        const uint32_t color = translucent ? 0x4cff1a1au : 0xffff1a1au;
         drawLine(a.muzzle.p, a.end, color, UINT32_MAX);
         for (unsigned k = 0; k != 8; ++k) {
             const float angle = k * Pi / 4;
-            const Vec3 side = rotate(a.muzzle.q, {.001f * std::cos(angle), .001f * std::sin(angle), 0});
+            const Vec3 side = rotate(a.muzzle.q, {.0015f * std::cos(angle), .0015f * std::sin(angle), 0});
             drawLine(a.muzzle.p + side, a.end + side, color, UINT32_MAX);
         }
         uint64_t order;
