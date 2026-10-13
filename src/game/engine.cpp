@@ -586,9 +586,11 @@ static void publishWheelPresentation(unsigned hand, const WeaponWheel &wheel) {
 using BloomRender = void(__thiscall *)(void *, void *);
 static BloomRender originalBloomRender = nullptr;
 static void __fastcall bloomRenderEffect(void *bloom, void *, void *command) {
+    // Unlocked even if native code unwinds through the bloom render (a stuck
+    // lock flattened every later single-pass draw).
     single_pass::setScreenLocked(true);
-    originalBloomRender(bloom, command);
-    single_pass::setScreenLocked(false);
+    withNativeFinally([&] { originalBloomRender(bloom, command); },
+                      [](bool) noexcept { single_pass::setScreenLocked(false); });
 }
 // The host's VR options panel saves SS2VR.user.ini while the game runs: the
 // settings that are safe to change in play are re-applied when it changes.
@@ -1898,7 +1900,9 @@ static void update(void *p) {
         for (unsigned h = 0; h < 2; ++h) {
             const bool valid = enabled && input.handValid[h] && finite(input.hand[h]);
             packet.grip[h].p = packet.head.p; // Canonical inactive-hand pose shares the current rig origin.
-            const Pose grip = rider.handheld() ? weaponGrip(input, h, s.ui.currentWeapon[h])
+            // Controller h holds the native slot mounted on it (a lone weapon may be on the other).
+            const unsigned held = s.handle[h] && mountHand(s, h) == h ? h : (mountHand(s, 1 - h) == h ? 1 - h : h);
+            const Pose grip = rider.handheld() ? weaponGrip(input, h, s.ui.currentWeapon[held])
                                                : input.hand[h];
             capture.grip[h] = grip; // Preserve the actual pre-clamp capture for retained taps.
             if (s.initialized && valid && finite(grip))
@@ -4549,6 +4553,12 @@ static const Vec3 *measuredEmitter(uint32_t nativeId) {
     default: return nullptr;
     }
 }
+// Emitter offsets were measured at the matched display size; they scale with the
+// model whenever [Weapons] Scale or a per-weapon Scale changes it.
+static float emitterScale(uint32_t nativeId) {
+    return (settings.weaponScale > 0 ? settings.weaponScale : 1.f) *
+           (nativeId < WeaponCount ? settings.weaponScaleById[nativeId] : 1.f);
+}
 static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snapshot = nullptr,
                       bool *calibrated = nullptr) {
     const unsigned previousDepth = nativeShotDepth;
@@ -4625,9 +4635,12 @@ static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snap
                        !weaponModelCalibrationMatches(modelEvidence,current,
                            weaponAlignmentSupported(modelEvidence.nativeId)))return;
                     Pose grip = compose(body, context.sample.pose.grip[context.hand]);
-                    const Pose target = retargetCalibratedMuzzle(
+                    Pose target = retargetCalibratedMuzzle(
                         camera, *out, compose(inverse(camera), modelPose).p, grip,
                         displacement, alignment);
+                    // Same measured emitters as the client's own shots and laser.
+                    if (const Vec3 *emitter = measuredEmitter(primaryField(w, 0xb4)))
+                        target = {normalize(grip.q), grip.p + rotate(normalize(grip.q), *emitter * emitterScale(primaryField(w, 0xb4)))};
                     if (finite(target))
                         *out = target;
                     return;
@@ -4648,8 +4661,10 @@ static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snap
                 auto c = calibration[context.hand];
                 ReleaseSRWLockShared(&snapshotLock);
                 const uint64_t now = GetTickCount64();
+                // The binding check below catches model changes; age only guards a
+                // render that stopped (a hitch of >100 ms made every shot native).
                 bool calibrationAdmitted = c.valid && c.handle == context.handle &&
-                    now >= c.tickMs && now - c.tickMs <= 100;
+                    now >= c.tickMs && now - c.tickMs <= 500;
                 const bool wantsAlignment=weaponAlignmentSupported(primaryField(w,0xb4));
                 diagnosticRejection=16;
                 if(calibrationAdmitted || wantsAlignment || c.alignmentApplied) {
@@ -4686,7 +4701,9 @@ static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snap
                                 int(attempted), int(captured), int(captured && weaponModelCalibrationMatches(c.modelBinding,binding,c.alignmentApplied)),
                                 int(c.alignmentApplied), int(s.input.handValid[0]), int(s.input.handValid[1]), notAdmitted);
                         invalidateMatchingCalibration(s,context.hand,1);
-                        return; // Never certify a cached model after a binding/reference change.
+                        // Never certify a cached model after a binding/reference change:
+                        // the shot leaves from the tracked hand (or its measured emitter)
+                        // uncalibrated instead of from the flat camera's native pose.
                     }
                 }
                 Pose target;
@@ -4699,7 +4716,7 @@ static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snap
                 // bolt) mapped to a point far off the displayed gun: shots and
                 // laser start at the measured emitter instead.
                 if (const Vec3 *emitter = measuredEmitter(primaryField(w, 0xb4)))
-                    target = {normalize(hand.q), hand.p + rotate(normalize(hand.q), *emitter * settings.weaponScaleById[primaryField(w, 0xb4)])};
+                    target = {normalize(hand.q), hand.p + rotate(normalize(hand.q), *emitter * emitterScale(primaryField(w, 0xb4)))};
                 diagnosticRejection=17;
                 if (!finite(target) || !localWeaponCurrent(w, s, context.hand))
                     return;
@@ -4992,6 +5009,10 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
     ReleaseSRWLockShared(&laserLock);
     laserQuerying = true;
     LaserAim sampled[2];
+    // A transient rejection (request replaced mid-sample, calibration refresh,
+    // native scratch busy) keeps the previous grip-relative beam (age-bounded at
+    // freeze) instead of blanking it for a frame.
+    bool transient[2]{};
     for (unsigned h = 0; h != 2; ++h) {
         // Slot h's weapon is held by controller m (a lone weapon may sit on the other hand).
         const unsigned m = s.rider.handheld() ? mountHand(s, h) : h;
@@ -5000,7 +5021,8 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
         if ((!settings.lasers && !(s.rider.handheld() && s.zoom[h])) || !s.input.handValid[m] ||
             (!s.rider.seated() && !s.input.gripValid[m]))
             { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,1);continue; }
-        Pose muzzle;
+        Pose muzzle, local{};
+        bool relative = false;
         Vec3 direction;
         VehicleLaserSource vehicle;
         const bool mounted = s.rider.seated();
@@ -5020,9 +5042,12 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
             const int weapon = *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4);
             bool calibrated = false;
             shooting(w, &muzzle, weapon == 13 ? originalSniperShot : originalShot, &s, &calibrated);
-            if (!finite(muzzle) || !calibrated || !localWeaponCurrent(w, s, h) || !laserModelScratchIdle())
-                { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,
-                    !finite(muzzle) ? 50 : !calibrated ? 51 : !localWeaponCurrent(w, s, h) ? 52 : 53);continue; }
+            const bool usable = calibrated || measuredEmitter(uint32_t(weapon)); // An emitter needs no model calibration.
+            if (!finite(muzzle) || !usable || !localWeaponCurrent(w, s, h) || !laserModelScratchIdle()) {
+                const unsigned reason = !finite(muzzle) ? 50 : !usable ? 51 : !localWeaponCurrent(w, s, h) ? 52 : 53;
+                transient[h] = reason == 51 || reason == 53;
+                laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,reason);continue;
+            }
             mechanism = getMechanism(s.player);
             direction = rotate(normalize(muzzle.q), {0, 0, -1});
             labShotMuzzle[h] = muzzle.p; // Where shots start (before the uzi laser's tube offset).
@@ -5037,11 +5062,15 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
                     if (GetEnvironmentVariableA("SS2VR_LAB_UZI_EMITTER", v, sizeof v)) std::sscanf(v, "%f,%f,%f", &e.x, &e.y, &e.z);
                     return e;
                 }();
-                muzzle.p = muzzle.p + rotate(normalize(muzzle.q), emitter * settings.weaponScaleById[4]);
+                muzzle.p = muzzle.p + rotate(normalize(muzzle.q), emitter * emitterScale(4));
             }
+            // The same grip pose shooting() and the model placement use.
+            const Pose grip = worldHandTracking(body, s.origin, s.turn, s.input.head, weaponGrip(s.input, m, weapon));
+            local = compose(inverse(grip), muzzle);
+            relative = finite(grip) && finite(local);
         }
         if (!laserSampleCurrent(s, queryRequest) || !trackedHandCurrent(s.input, copySnapshot().input, m))
-            { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,6);continue; }
+            { transient[h] = true; laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,6);continue; }
         const auto &old = existing[h];
         const uint64_t now = GetTickCount64();
         // Moving native aim may change without an origin change. Mounted rays
@@ -5072,24 +5101,36 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
         if (!std::isfinite(distance) || distance < 0 || distance > settings.laserDistance ||
             !laserSampleCurrent(s, queryRequest) || !trackedHandCurrent(s.input, copySnapshot().input, m) ||
             (mounted && !vehicleLaserCurrent(s, queryRequest, vehicle)))
-            { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,7);continue; }
+            { transient[h] = !mounted; laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,7);continue; }
         sampled[h] = {muzzle, body, ray.origin + ray.direction * distance, s.playerHandle, sourceHandle,
                       s.generation, s.input.sequence, GetTickCount64(), true, hit};
         sampled[h].kind = mounted ? LaserSourceKind::Vehicle : LaserSourceKind::Handheld;
         sampled[h].vehicle = vehicle;
         sampled[h].requestSequence = queryRequest.sequence;
+        sampled[h].local = local;
+        sampled[h].distance = distance;
+        sampled[h].relative = !mounted && relative;
     }
     originalRayInit(); // Runs native collision cleanup and resets all native ray state.
     laserQuerying = false;
     const auto live = copySnapshot();
     if (!laserSampleCurrent(s, queryRequest)) {
         sampled[0] = sampled[1] = {};
+        transient[0] = transient[1] = true;
     }
     for (unsigned h = 0; h != 2; ++h)
         if (sampled[h].valid && (!trackedHandCurrent(s.input, live.input, s.rider.handheld() ? mountHand(s, h) : h) ||
             (sampled[h].kind == LaserSourceKind::Vehicle &&
-             !vehicleLaserCurrent(s, queryRequest, sampled[h].vehicle))))
+             !vehicleLaserCurrent(s, queryRequest, sampled[h].vehicle)))) {
+            transient[h] = sampled[h].kind == LaserSourceKind::Handheld;
             sampled[h] = {};
+        }
+    for (unsigned h = 0; h != 2; ++h) {
+        const auto &old = existing[h];
+        if (!sampled[h].valid && transient[h] && old.valid && old.relative && old.kind == LaserSourceKind::Handheld &&
+            old.owner == s.playerHandle && old.weapon == s.handle[h] && old.generation == s.generation)
+            sampled[h] = old;
+    }
     AcquireSRWLockExclusive(&laserLock);
     for (unsigned h = 0; h != 2; ++h)
         laserAim[h] = sampled[h];
@@ -5127,8 +5168,11 @@ static void freezeLasers(const Request &request) {
     for (unsigned h = 0; h != 2; ++h) {
         frame.weapon[h] = frame.kind == LaserSourceKind::Vehicle ? eyeSnapshot.rider.ride : eyeSnapshot.handle[h];
         const unsigned m = frame.kind == LaserSourceKind::Vehicle ? h : mountHand(eyeSnapshot, h);
-        frame.handValid[h] = trackedHandCurrent(request.input, live.input, m) &&
-            (frame.kind == LaserSourceKind::Vehicle || (request.input.gripValid[m] && live.input.gripValid[m]));
+        // Handheld beams are drawn from this request's grip pose, like the weapon
+        // model, so only this request's tracking matters (a one-sample flicker of
+        // the latest input no longer hides a drawn weapon's beam).
+        frame.handValid[h] = frame.kind == LaserSourceKind::Vehicle ? trackedHandCurrent(request.input, live.input, m)
+            : m < 2 && request.input.handValid[m] && finite(request.input.hand[m]) && request.input.gripValid[m];
         frame.wheel[h] = eyeSnapshot.ui.wheel[m].open != 0;
         frame.selecting[h] = eyeSnapshot.selecting[h];
     }
@@ -5136,6 +5180,20 @@ static void freezeLasers(const Request &request) {
     const LaserAim observed[2]{laserAim[0],laserAim[1]};
     auto pair = freezeLaserPair(laserAim, frame);
     ReleaseSRWLockShared(&laserLock);
+    // Rebuild handheld beams from this frame's grip pose: the beam leaves the
+    // muzzle of the weapon exactly where weaponAbs draws it.
+    for (unsigned h = 0; h != 2; ++h) {
+        auto &a = pair[h];
+        if (!a.valid || !a.relative || a.kind != LaserSourceKind::Handheld) continue;
+        void *held = resolve(a.weapon);
+        const unsigned m = mountHand(eyeSnapshot, h);
+        const Pose grip = held ? worldHandTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, request.input.head,
+                                                   weaponGrip(request.input, m, int(primaryField(held, 0xb4)))) : Pose{};
+        const Pose muzzle = compose(grip, a.local);
+        if (!held || !finite(grip) || !finite(muzzle)) { a.valid = false; continue; }
+        a.muzzle = muzzle;
+        a.end = muzzle.p + rotate(normalize(muzzle.q), Vec3{0, 0, -1}) * a.distance;
+    }
     std::copy(pair.begin(), pair.end(), eyeLasers);
     for(unsigned h=0;h<2;++h) {
         uint64_t order;
@@ -5459,8 +5517,8 @@ static bool currentWeaponDraw(ScopeDrawBinding &out,int wantedId) {
         executingView != rootView || !rootView || !livePlayer(eyeSnapshot))
         return false;
     const unsigned hand = unsigned(physicalWeapon->hand);
-    if (hand >= 2 || !eyeRequest.input.handValid[hand] ||
-        !finite(weaponTracking(eyeRequest.input, hand)))
+    if (hand >= 2 || !eyeRequest.input.handValid[mountHand(eyeSnapshot, hand)] ||
+        !finite(weaponTracking(eyeRequest.input, mountHand(eyeSnapshot, hand))))
         return false;
     const uint32_t handle = eyeSnapshot.handle[hand];
     void *weapon = handle ? resolve(handle) : nullptr;
@@ -6377,9 +6435,10 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
             const IdleDrawIdentity identity{eyeRequest.sequence,eyeRequest.input.sequence,s.playerHandle,s.handle[h],
                 primaryField(w,0x24),s.generation,unsigned(h),unsigned(eyeIndex)};
             trace.placement(identity,out,staged,matrix(hand));
-            const bool gripValid=tracking.gripValid[h] && finite(tracking.grip[h]);
-            const auto rawGrip=gripValid?matrix(worldHandTracking(body,s.origin,s.turn,tracking.head,tracking.grip[h])):Matrix34{};
-            const auto rawAim=matrix(worldHandTracking(body,s.origin,s.turn,tracking.head,tracking.hand[h]));
+            const unsigned m=mountHand(s,unsigned(h));
+            const bool gripValid=tracking.gripValid[m] && finite(tracking.grip[m]);
+            const auto rawGrip=gripValid?matrix(worldHandTracking(body,s.origin,s.turn,tracking.head,tracking.grip[m])):Matrix34{};
+            const auto rawAim=matrix(worldHandTracking(body,s.origin,s.turn,tracking.head,tracking.hand[m]));
             trace.references(identity,rawGrip,gripValid,rawAim);
         }
         out = staged;
@@ -6423,7 +6482,8 @@ static void renderTrackedWeapon(void *w, Matrix34 m, bool sniper, uintptr_t call
     if (eyeIndex >= 0 && hand >= 0)
         eyeScopePoses.beginDraw(unsigned(hand)); // Supersedes earlier evidence even on early return/unwind.
     if (eyeIndex >= 0 && hand >= 0 &&
-        (!eyeRequest.input.handValid[hand] || !finite(weaponTracking(eyeRequest.input, unsigned(hand)))))
+        (!eyeRequest.input.handValid[mountHand(s, unsigned(hand))] ||
+         !finite(weaponTracking(eyeRequest.input, mountHand(s, unsigned(hand))))))
         return;
     physical = eyeIndex >= 0 && eyePlayer == s.player && hand >= 0 &&
                           executingView == rootView && rootView;

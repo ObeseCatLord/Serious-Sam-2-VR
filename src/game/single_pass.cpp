@@ -784,6 +784,14 @@ bool install(IDirect3DDevice9 *d, const Originals &o) noexcept {
 bool installed() noexcept { return hooked; }
 void setInstancing(bool enabled) noexcept { instancingEnabled = enabled; }
 void setScreenLocked(bool locked) noexcept { engineScreenLock = locked; }
+void releaseDeviceResources() noexcept {
+    // D3DPOOL_DEFAULT resources must be gone before IDirect3DDevice9::Reset; all
+    // are recreated on first use.
+    for (IUnknown **r : {reinterpret_cast<IUnknown **>(&ring), reinterpret_cast<IUnknown **>(&identityIndices),
+                         reinterpret_cast<IUnknown **>(&mirrorColor), reinterpret_cast<IUnknown **>(&mirrorDepth)})
+        if (*r) { (*r)->Release(); *r = nullptr; }
+    ringNext = 0;
+}
 void setEngineMatrices(const float *adjusted, const float *projection, const float *view) noexcept {
     engineAdjusted = adjusted; engineProjection = projection; engineView = view;
 }
@@ -798,6 +806,7 @@ bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, UINT width, UINT heig
     if (!hooked || !engineAdjusted || !engineProjection || !engineView || !target || !change[0].valid || !change[1].valid ||
         !width || !height || (regions && (!regions->count || regions->count > MaxRegions)))
         return false;
+    engineScreenLock = false; // Never inherited from an earlier, interrupted pass.
     active = true; wideTarget = target; eyeWidth = width; eyeHeight = height;
     layout = regions ? *regions : wideLayoutOf(width, height);
     wideLayout = !regions;

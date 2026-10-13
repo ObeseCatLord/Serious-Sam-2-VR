@@ -61,6 +61,12 @@ struct LaserAim {
     LaserSourceKind kind = LaserSourceKind::Handheld;
     VehicleLaserSource vehicle;
     uint64_t requestSequence = 0;
+    // Handheld: the muzzle relative to the weapon's grip pose it was computed
+    // from, and the hit distance, so each frame rebuilds the beam from the same
+    // grip pose that places the weapon model (never a stale world pose).
+    Pose local{};
+    float distance = 0;
+    bool relative = false;
 };
 struct LaserFrame {
     Pose body;
@@ -72,10 +78,14 @@ struct LaserFrame {
     uint64_t requestSequence = 0;
 };
 inline bool laserEligible(const LaserAim &aim, const LaserFrame &frame, unsigned hand) {
+    // A grip-relative handheld beam is rebuilt from the frame's own grip pose, so
+    // it does not need the sample's exact request (late-latched poses made those
+    // flicker); world-space (vehicle) beams still do.
+    const bool rebuilt = aim.relative && aim.kind == LaserSourceKind::Handheld;
     if (hand >= 2 || !aim.valid || !aim.owner || !aim.weapon || aim.owner != frame.owner ||
         aim.weapon != frame.weapon[hand] || aim.generation != frame.generation ||
-        aim.sequence != frame.sequence || frame.now < aim.tickMs || frame.now - aim.tickMs > 100 ||
-        aim.kind != frame.kind || aim.requestSequence != frame.requestSequence ||
+        (!rebuilt && aim.sequence != frame.sequence) || frame.now < aim.tickMs || frame.now - aim.tickMs > 100 ||
+        aim.kind != frame.kind || (!rebuilt && aim.requestSequence != frame.requestSequence) ||
         !frame.handValid[hand] || !finite(aim.muzzle) ||
         !finite(aim.body) || !finite(frame.body) || !std::isfinite(aim.end.x) || !std::isfinite(aim.end.y) ||
         !std::isfinite(aim.end.z))
@@ -86,6 +96,7 @@ inline bool laserEligible(const LaserAim &aim, const LaserFrame &frame, unsigned
             return false;
     } else if (frame.wheel[hand] || frame.selecting[hand])
         return false;
+    if (rebuilt) return finite(aim.local) && std::isfinite(aim.distance) && aim.distance >= 0;
     const Vec3 drift = aim.body.p - frame.body.p;
     const float alignment = aim.body.q.x * frame.body.q.x + aim.body.q.y * frame.body.q.y +
                             aim.body.q.z * frame.body.q.z + aim.body.q.w * frame.body.q.w;

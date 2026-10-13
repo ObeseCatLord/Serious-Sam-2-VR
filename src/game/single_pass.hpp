@@ -26,6 +26,8 @@ void setInstancing(bool enabled) noexcept; // [Render] SinglePassInstancing
 // reprojection): camera-attached effects, which two-pass renders draw in front
 // of each eye's own camera.
 void setScreenLocked(bool locked) noexcept;
+// Releases the pass's default-pool resources (before a device Reset).
+void releaseDeviceResources() noexcept;
 // Engine globals: adjusted projection, projection, view (read at draw time).
 void setEngineMatrices(const float *adjusted, const float *projection, const float *view) noexcept;
 // Where the eyes go in the pass's target. Each region is a pixel rectangle of

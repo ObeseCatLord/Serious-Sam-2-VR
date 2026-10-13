@@ -1741,6 +1741,7 @@ void deviceLost() {
     ++resourceGeneration; // Retire immutable entry epochs before clearing TLS.
     retireNativeFrameForReset();
     releaseTargets();
+    single_pass::releaseDeviceResources();
     retirePresentationOwner();
 }
 static HRESULT sourceBackbuffer(IDirect3DSurface9 **out) {
