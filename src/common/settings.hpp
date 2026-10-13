@@ -15,6 +15,7 @@ struct VrSettings {
     bool snapTurn = false;                 // Smooth stick turning unless enabled.
     float smoothTurnRate = 150 * Pi / 180; // Radians per second at full deflection.
     bool eyeReplay = true; // Right eye replayed from the left eye's recorded D3D9 calls.
+    bool singlePass = true; // Both eyes from one world traversal (double-wide target).
     bool shadowReuse = true; // Dynamic shadow images rendered once per frame and reused for the second eye.
     bool desktopWorld = false; // Also draw the world into the desktop window on VR frames (costs a third render).
     float uiAspect = 16.f / 9; // Aspect the game lays out its 2D view (menus, HUD, movies) at in VR.

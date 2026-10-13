@@ -28,7 +28,12 @@ bool vrInputLive() noexcept;
 // engine creates its window canvas; applied on the main thread's input poll).
 void installEyeCanvas() noexcept;
 void setDesktopWorld(bool render) noexcept;
+void setSinglePass(bool enabled) noexcept;
 void setEyeReplay(bool enabled) noexcept;
+void setSinglePassWorld(bool on) noexcept;
+bool singlePassChanges(const Request &real, const Request &centre, ss2vr::replay::EyeChange (&out)[2]) noexcept;
+bool singlePassCaptureCentre(const Request &centre) noexcept;
+bool singlePassAdoptEye(void *player, const Request &real, int i) noexcept;
 bool replayCaptureEyeGeometry(ss2vr::replay::EyeChange &out) noexcept;
 const ss2vr::replay::ViewState &replayRootState() noexcept;
 bool replayAdoptEye(const ss2vr::replay::EyeChange &change) noexcept;

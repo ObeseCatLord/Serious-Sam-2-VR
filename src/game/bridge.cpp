@@ -3,6 +3,7 @@
 #include "common/foveation.hpp"
 #include "common/winpath.hpp"
 #include "common/frame_policy.hpp"
+#include "common/single_pass_math.hpp"
 #include "common/native_ui.hpp"
 #include "common/native_ui_finish.hpp"
 #include "common/world_markers.hpp"
@@ -11,6 +12,7 @@
 #include "native_finally.hpp"
 #include "native_memory.hpp"
 #include "eye_replay.hpp"
+#include "single_pass.hpp"
 #include "scope_gpu.hpp"
 #include "scope_source_gpu.hpp"
 #include "common/scope_capture_command.hpp"
@@ -349,6 +351,8 @@ void validateLabOnlineIsolation(bool gameplay) {
 static IDirect3DDevice9 *device = nullptr, *creationDevice = nullptr;
 static DWORD creationThread = 0;
 static IDirect3DSurface9 *eye[2]{}, *depth[2]{}, *readback[2]{};
+// Single pass: one double-wide colour/depth pair (left eye | right eye).
+static IDirect3DSurface9 *wideColor = nullptr, *wideDepth = nullptr;
 // Zero-copy eye images (ABI14): one shared render target per IPC slot and eye.
 // The host opens them by handle and copies straight into its swapchains, so a
 // pair needs no readback. A slot's pair is published Ready at once and marked
@@ -959,6 +963,12 @@ void setEyeReplay(bool enabled) noexcept {
     wchar_t value[2]{}; // Lab A/B: SS2VR_LAB_EYE_REPLAY=0 renders the right eye natively.
     eyeReplay = enabled && !(GetEnvironmentVariableW(L"SS2VR_LAB_EYE_REPLAY", value, 2) == 1 && value[0] == L'0');
 }
+// Both eyes from one world traversal ([Render] SinglePass).
+static bool singlePassEnabled = false;
+void setSinglePass(bool enabled) noexcept {
+    wchar_t value[2]{}; // Lab A/B: SS2VR_LAB_SINGLE_PASS=0 renders each eye separately.
+    singlePassEnabled = enabled && !(GetEnvironmentVariableW(L"SS2VR_LAB_SINGLE_PASS", value, 2) == 1 && value[0] == L'0');
+}
 using Clear = HRESULT(WINAPI *)(IDirect3DDevice9 *,DWORD,const D3DRECT *,DWORD,D3DCOLOR,float,DWORD);
 using DrawUp = HRESULT(WINAPI *)(IDirect3DDevice9 *,D3DPRIMITIVETYPE,UINT,const void *,UINT);
 static Clear originalClear = nullptr;
@@ -1357,6 +1367,7 @@ static HRESULT WINAPI draw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT start,
         traceWorldDraw(d,count);
         countDraw();
         replay::recordDraw(type,start,count);
+        if(single_pass::drawing(d)) return single_pass::draw(d,type,start,count);
         return originalDraw(d,type,start,count);
     });
 }
@@ -1368,6 +1379,7 @@ static HRESULT forwardIndexed(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
         traceWorldDraw(d,count);
         countDraw();
         replay::recordDrawIndexed(type,base,minimum,vertices,start,count);
+        if(single_pass::drawing(d)) return single_pass::drawIndexed(d,type,base,minimum,vertices,start,count);
         return originalDrawIndexed(d,type,base,minimum,vertices,start,count);
     });
 }
@@ -1425,7 +1437,11 @@ static DrawTri originalDrawTri = nullptr;
 static Update originalUpdate = nullptr;
 static HRESULT WINAPI clear(IDirect3DDevice9 *d,DWORD count,const D3DRECT *rects,DWORD flags,D3DCOLOR color,float z,DWORD stencil) {
     scopeGpuOutput(d);
-    const auto call=[&]{ replay::recordClear(count,rects,flags,color,z,stencil); return originalClear(d,count,rects,flags,color,z,stencil); };
+    const auto call=[&]{
+        replay::recordClear(count,rects,flags,color,z,stencil);
+        if(single_pass::drawing(d)) return single_pass::clear(d,count,rects,flags,color,z,stencil);
+        return originalClear(d,count,rects,flags,color,z,stencil);
+    };
     return flags&D3DCLEAR_TARGET ? observeUiOutput(d,call,nullptr,true) : call();
 }
 static HRESULT WINAPI drawUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT count,const void *vertices,UINT stride) {
@@ -1558,6 +1574,9 @@ static void releaseTargets() {
     if (uiQuarantinedReadback) uiQuarantinedReadback->Release();
     uiQuarantinedReadback=nullptr;
     invalidateRenderer();
+    if (wideColor) wideColor->Release();
+    if (wideDepth) wideDepth->Release();
+    wideColor = wideDepth = nullptr;
     for (int i = 0; i < 2; i++) {
         for (auto p : {eye[i], depth[i], readback[i]})
             if (p)
@@ -1819,8 +1838,19 @@ static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 
         depthDesc.Width < width || depthDesc.Height < height || FAILED(device->GetViewport(&viewport)) ||
         viewport.X || viewport.Y || viewport.Width != width || viewport.Height != height)
         return false;
+    const auto ensureWide = [&] {
+        if (!singlePassEnabled || (wideColor && wideDepth)) return;
+        if (FAILED(device->CreateRenderTarget(width * 2, height, colorFormat, D3DMULTISAMPLE_NONE, 0, FALSE, &wideColor, nullptr)) ||
+            FAILED(device->CreateDepthStencilSurface(width * 2, height, depthFormat, D3DMULTISAMPLE_NONE, 0, TRUE, &wideDepth, nullptr))) {
+            if (wideColor) wideColor->Release();
+            if (wideDepth) wideDepth->Release();
+            wideColor = wideDepth = nullptr;
+            log("Single pass: %ux%u targets unavailable; eyes render separately", width * 2, height);
+        }
+    };
     if (eye[0] && desc.Width == width && desc.Height == height && depthDesc.Format == depthFormat &&
         desc.Format == colorFormat) {
+        ensureWide();
         createSharedImages();
         Lock l(channel);
         if (l)
@@ -1847,6 +1877,7 @@ static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 
             return false;
         }
     }
+    ensureWide();
     createSharedImages();
     Lock l(channel);
     if (l) {
@@ -1954,13 +1985,6 @@ void deviceReady(IDirect3DDevice9 *d) {
     uiRoutingReady = deviceHook(v[115], reinterpret_cast<void *>(drawRect), originalDrawRect, "Native UI rectangle observer") && uiRoutingReady;
     uiRoutingReady = deviceHook(v[116], reinterpret_cast<void *>(drawTri), originalDrawTri, "Native UI triangle observer") && uiRoutingReady;
     uiRoutingReady = deviceHook(v[30], reinterpret_cast<void *>(update), originalUpdate, "Native UI update observer") && uiRoutingReady;
-    {
-        replay::Originals originals;
-        originals.setRT = originalSetRT; originals.setDepth = originalSetDepth; originals.clear = originalClear;
-        originals.stretch = originalStretch; originals.fill = originalFill; originals.draw = originalDraw;
-        originals.drawIndexed = originalDrawIndexed;
-        replay::install(d, originals);
-    }
     const bool ready = hooksReady.load();
     static std::atomic<bool> firstWaiting{false}, firstReady{false};
     auto &reported = ready ? firstReady : firstWaiting;
@@ -2320,6 +2344,13 @@ static void presentBody(IDirect3DDevice9 *d) {
                 drawCensus = {};
             }
             {
+                const auto sp = single_pass::takeStats();
+                if (singlePassEnabled)
+                    log("Perf single pass: passes=%u draws/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f variants=%u failed=%u",
+                        sp.passes, sp.passes ? double(sp.draws) / sp.passes : 0., sp.passes ? double(sp.unpatched) / sp.passes : 0.,
+                        sp.passes ? double(sp.stateChanges) / sp.passes : 0., sp.variants, sp.failedVariants);
+            }
+            {
                 const auto r = replay::takeStats();
                 if (eyeReplay)
                     log("Perf eye replay: recorded=%u replayed=%u invalidated=%u fallbacks=%u commands/replay=%.0f draws/record=%.0f "
@@ -2530,6 +2561,24 @@ static void presentBody(IDirect3DDevice9 *d) {
         if (backbuffer) { backbuffer->Release(); backbuffer = nullptr; }
         if (aborted) { uiHalted = true; nestedNativePresentation(); }
     });
+}
+// The replay and single-pass modules hook the same device methods; the first
+// stereo frame (after the settings are known) installs the one in use.
+static void ensureStereoHooks(IDirect3DDevice9 *d) noexcept {
+    static bool done = false;
+    if (done || !originalDraw || !originalDrawIndexed || !originalClear) return;
+    done = true;
+    if (singlePassEnabled) {
+        single_pass::Originals originals;
+        originals.draw = originalDraw; originals.drawIndexed = originalDrawIndexed; originals.clear = originalClear;
+        single_pass::install(d, originals);
+    } else if (eyeReplay) {
+        replay::Originals originals;
+        originals.setRT = originalSetRT; originals.setDepth = originalSetDepth; originals.clear = originalClear;
+        originals.stretch = originalStretch; originals.fill = originalFill; originals.draw = originalDraw;
+        originals.drawIndexed = originalDrawIndexed;
+        replay::install(d, originals);
+    }
 }
 // Lab (SS2VR_LAB_REPLAY_VERIFY=1): on sampled frames the right eye is replayed,
 // copied aside, then rendered natively over it; the two images are compared and,
@@ -3597,12 +3646,60 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         }
         // Right eye replayed from the left eye's recorded calls when possible.
         static const bool labReplayVerify=[] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_REPLAY_VERIFY",value,2)==1 && value[0]==L'1'; }();
-        const bool useReplay=eyeReplay && !alternateEyes;
+        ensureStereoHooks(d);
+        // Single pass: one world traversal from a centre camera into the double-wide
+        // target, issued per eye half; each eye then adopts its derived camera.
+        const Request centre=ss2vr::single_pass::centreRequest(request);
+        ss2vr::replay::EyeChange singlePassChange[2];
+        const bool singlePassFrame=singlePassEnabled && !alternateEyes && wideColor && wideDepth &&
+            single_pass::installed() && singlePassChanges(request,centre,singlePassChange);
+        bool centreReady=false;
+        const bool useReplay=eyeReplay && !alternateEyes && !singlePassFrame;
         bool replayReady=false;
         ss2vr::replay::EyeChange replayChange;
         for(unsigned pass=0;pass<2 && ok;++pass) {
             const int i=labWorldEyeForPass(pass,request.sequence,alternateEyes);
             activeEye=i; eyeInvalid=false; renderRequest=request;
+            if(singlePassFrame) {
+                if(pass==0) {
+                    // The engine's target redirection (setRT/setDepth) follows uiFrame eye 0.
+                    std::swap(uiFrame.target[0],wideColor); std::swap(uiFrame.z[0],wideDepth);
+                    beginEye(puppet,centre,0);
+                    const RECT wideScissor{0,0,LONG(width*2),LONG(height)};
+                    D3DVIEWPORT9 wv{0,0,width*2,height,0,1};
+                    ok=preserveViewportDepth(d,wv) && SUCCEEDED(originalSetRT(d,0,uiFrame.target[0])) &&
+                       SUCCEEDED(originalSetDepth(d,uiFrame.z[0])) && SUCCEEDED(d->SetViewport(&wv)) &&
+                       SUCCEEDED(d->SetScissorRect(&wideScissor)) &&
+                       SUCCEEDED(d->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER|(hasStencil ? D3DCLEAR_STENCIL : 0),0xff000000,1,0));
+                    // The engine sets its own eye-sized viewport and scissor; restore them as one eye.
+                    D3DVIEWPORT9 ev{0,0,width,height,wv.MinZ,wv.MaxZ};
+                    ok=ok && SUCCEEDED(d->SetViewport(&ev)) && SUCCEEDED(d->SetScissorRect(&uiFrame.scissor));
+                    noteStage(2);
+                    const LARGE_INTEGER eyeStart=PerfClock::now();
+                    sampler::inEyes.store(true, std::memory_order_relaxed);
+                    if(ok && single_pass::begin(d,uiFrame.target[0],width,singlePassChange)) {
+                        setSinglePassWorld(true);
+                        ok=observedWorldRender(d,puppet,original,centre,0,traceDepth);
+                        setSinglePassWorld(false);
+                        single_pass::end(d);
+                    } else ok=false;
+                    sampler::inEyes.store(false, std::memory_order_relaxed);
+                    perf.eyeCpu[0]+=PerfClock::seconds(eyeStart,PerfClock::now());
+                    if(generation==graphicsResourceGeneration()) noteScopeViews(puppet,centre);
+                    centreReady=ok && generation==graphicsResourceGeneration() && singlePassCaptureCentre(centre);
+                    std::swap(uiFrame.target[0],wideColor); std::swap(uiFrame.z[0],wideDepth);
+                    for(unsigned k=0;k<2 && centreReady;++k) {
+                        const RECT half{LONG(k*width),0,LONG((k+1)*width),LONG(height)};
+                        centreReady=SUCCEEDED(originalStretch(d,wideColor,&half,uiFrame.target[k],nullptr,D3DTEXF_NONE));
+                    }
+                    noteStage(3);
+                    endEye();
+                }
+                D3DVIEWPORT9 ev{0,0,width,height,0,1};
+                ok=ok && centreReady && preserveViewportDepth(d,ev) && SUCCEEDED(originalSetRT(d,0,uiFrame.target[i])) &&
+                   SUCCEEDED(originalSetDepth(d,uiFrame.z[i])) && SUCCEEDED(d->SetViewport(&ev)) &&
+                   SUCCEEDED(d->SetScissorRect(&uiFrame.scissor)) && singlePassAdoptEye(puppet,request,i);
+            } else {
             beginEye(puppet,request,i);
             D3DVIEWPORT9 ev{0,0,width,height,0,1};
             ok=preserveViewportDepth(d,ev) && SUCCEEDED(originalSetRT(d,0,uiFrame.target[i])) && SUCCEEDED(originalSetDepth(d,uiFrame.z[i]));
@@ -3611,7 +3708,8 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             ok=ok && SUCCEEDED(d->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER|
                 (hasStencil ? D3DCLEAR_STENCIL : 0),0xff000000,1,0));
             noteStage(2);
-            if(ok) {
+            }
+            if(ok && !singlePassFrame) {
                 if(traceDepth) traceStereoDepth(d,request,i,"before-world");
                 const LARGE_INTEGER eyeStart=PerfClock::now();
                 sampler::inEyes.store(true, std::memory_order_relaxed);

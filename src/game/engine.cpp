@@ -1,4 +1,5 @@
 #include "eye_replay.hpp"
+#include "single_pass.hpp"
 #include "common/controls.hpp"
 #include "common/lab_preparation.hpp"
 #include "common/ride_control_observation.hpp"
@@ -3873,6 +3874,10 @@ void endEye() {
     eyeScopePoses = {};
     eyeNativeBaseFov = 0;
 }
+// True while the single-pass world renders from the centre camera (its per-eye
+// lab camera receipts come from singlePassAdoptEye instead).
+static bool singlePassWorld = false;
+void setSinglePassWorld(bool on) noexcept { singlePassWorld = on; }
 static Pose *__fastcall camera(void *p, void *, Pose *out) {
     originalCamera(p, out);
     auto s = copySnapshot();
@@ -3888,7 +3893,7 @@ static Pose *__fastcall camera(void *p, void *, Pose *out) {
         static uint32_t observedSession[2]{},observedReference[2]{},observedTracking[2]{};
         static unsigned cameraDiagnostics = 0;
         const auto &head = eyeRequest.input.head;
-        if (labTrace && cameraDiagnostics < 16384 && (observedRequest[eyeIndex]!=eyeRequest.sequence || observedSession[eyeIndex]!=eyeRequest.session ||
+        if (labTrace && !singlePassWorld && cameraDiagnostics < 16384 && (observedRequest[eyeIndex]!=eyeRequest.sequence || observedSession[eyeIndex]!=eyeRequest.session ||
             observedReference[eyeIndex]!=eyeRequest.reference || observedTracking[eyeIndex]!=eyeRequest.trackingGeneration)) {
             ++cameraDiagnostics; observedRequest[eyeIndex]=eyeRequest.sequence;
             observedSession[eyeIndex]=eyeRequest.session;observedReference[eyeIndex]=eyeRequest.reference;observedTracking[eyeIndex]=eyeRequest.trackingGeneration;
@@ -8542,6 +8547,71 @@ bool replayCaptureEyeGeometry(ss2vr::replay::EyeChange &out) noexcept {
     replayRightCamera = right;
     return out.valid;
 }
+// Single-pass stereo. The world pass ran as eye 0 of the centre request; each
+// eye's camera is the centre camera moved by that eye's offset and frustum.
+static ss2vr::replay::ViewState singlePassRoot;
+static WeaponWorldView singlePassRootWorld;
+static Request singlePassCentre;
+static bool singlePassEyeChange(const Request &real, const Request &centre, int i, ss2vr::replay::EyeChange &out) {
+    out = {};
+    if (!eyeAnchorReady || i < 0 || i > 1) return false;
+    const Pose c = worldEyeTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, real.input.head, centre.eye[0]);
+    const Pose e = worldEyeTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, real.input.head, real.eye[i]);
+    if (!finite(c) || !finite(e)) return false;
+    out = ss2vr::replay::eyeChange(matrix(compose(inverse(e), c)), centre.fov[0], real.fov[i]);
+    return out.valid;
+}
+bool singlePassChanges(const Request &real, const Request &centre, ss2vr::replay::EyeChange (&out)[2]) noexcept {
+    return singlePassEyeChange(real, centre, 0, out[0]) && singlePassEyeChange(real, centre, 1, out[1]);
+}
+// After the centre world pass (eye 0 of `centre`): keep its root capture.
+bool singlePassCaptureCentre(const Request &centre) noexcept {
+    if (!eyePlayer || eyeIndex != 0 || weaponPairFault || !rootCaptureAttempted || !executedWeaponWorld.valid ||
+        !executedUiProjectionValid) return false;
+    std::memcpy(singlePassRoot.adjusted.data(), executedUiProjection.m, sizeof(singlePassRoot.adjusted));
+    std::memcpy(singlePassRoot.projection.data(), executedWeaponWorld.projection.m, sizeof(singlePassRoot.projection));
+    std::memcpy(singlePassRoot.view.data(), executedWeaponWorld.view.m, sizeof(singlePassRoot.view));
+    singlePassRootWorld = executedWeaponWorld;
+    singlePassCentre = centre;
+    return true;
+}
+// Eye i's root capture (HUD projection, markers) derived from the centre pass,
+// as a native render of that eye would have produced it.
+bool singlePassAdoptEye(void *p, const Request &real, int i) noexcept {
+    ss2vr::replay::EyeChange change;
+    if (!p || !singlePassRootWorld.valid || !singlePassEyeChange(real, singlePassCentre, i, change)) return false;
+    eyePlayer = p;
+    eyeRequest = real;
+    eyeSnapshot.input = real.input;
+    eyeIndex = i;
+    const auto r = ss2vr::replay::rewrite(singlePassRoot, change);
+    if (!r.valid) return false;
+    WeaponWorldView world = singlePassRootWorld;
+    for (unsigned k = 0; k < 12; ++k) world.view.m[k] = float(r.view[k]);
+    for (unsigned k = 0; k < 16; ++k) world.projection.m[k] = float(r.projection[k]);
+    Matrix44 adjusted{};
+    for (unsigned k = 0; k < 16; ++k) adjusted.m[k] = float(r.adjusted[k]);
+    if (!finiteMatrix(world.view) || !finiteProjection(world.projection) || !finiteProjection(adjusted)) return false;
+    preparedWeaponWorld = executedWeaponWorld = world;
+    executedUiProjection = adjusted;
+    executedUiProjectionValid = true;
+    executedRootGeneration = graphicsResourceGeneration();
+    rootCaptureAttempted = true;
+    rootCaptureArmed = false;
+    // Lab receipt in the native camera format: this eye's camera as derived.
+    static const bool labTrace = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_TRACE",value,2)==1 && value[0]==L'1'; }();
+    static uint64_t loggedRequest[2]{};
+    static unsigned receipts = 0;
+    if (labTrace && receipts < 16384 && loggedRequest[i] != real.sequence) {
+        ++receipts; loggedRequest[i] = real.sequence;
+        const auto &head = real.input.head;
+        const Pose c = worldEyeTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, real.input.head, real.eye[i]);
+        log("Lab native camera eye=%d request=%llu session=%u reference=%u tracking=%u head=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f camera=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+            i,static_cast<unsigned long long>(real.sequence),real.session,real.reference,real.trackingGeneration,
+            head.p.x,head.p.y,head.p.z,head.q.x,head.q.y,head.q.z,head.q.w,c.p.x,c.p.y,c.p.z,c.q.x,c.q.y,c.q.z,c.q.w);
+    }
+    return true;
+}
 // Lab check (SS2VR_LAB_REPLAY_VERIFY=1): after a native right eye, compare its
 // root capture with what the replay derivation would have produced.
 void replayVerifyEye(const ss2vr::replay::EyeChange &change) noexcept {
@@ -8784,6 +8854,7 @@ bool attach(bool headless) {
         settings=loadSettings(settingsDirectory+L"SS2VR\\SS2VR.ini");
     setDesktopWorld(settings.desktopWorld);
     setEyeReplay(settings.eyeReplay);
+    setSinglePass(settings.singlePass);
     setLabAutoContinue(settings.labAutoContinue);
     auto g = GetModuleHandleW(L"Sam2Game.dll"), e = GetModuleHandleW(L"Engine.dll"),
          c = GetModuleHandleW(L"Core.dll");
@@ -9228,6 +9299,9 @@ bool attach(bool headless) {
             replay::setEngineMatrices(exported("?_gfx_mAdjustedProjection@SeriousEngine@@3VMatrix44f@1@A"),
                                       exported("?_gfx_mCurrentProjection@SeriousEngine@@3VMatrix44f@1@A"),
                                       exported("?_gfx_mCurrentView@SeriousEngine@@3VMatrix34f@1@A"));
+            single_pass::setEngineMatrices(exported("?_gfx_mAdjustedProjection@SeriousEngine@@3VMatrix44f@1@A"),
+                                           exported("?_gfx_mCurrentProjection@SeriousEngine@@3VMatrix44f@1@A"),
+                                           exported("?_gfx_mCurrentView@SeriousEngine@@3VMatrix34f@1@A"));
             ok = hook(e, "?gfxBindMatrix@SeriousEngine@@YAXW4GfxMatrixType@1@J@Z", reinterpret_cast<void *>(bindMatrix),
                       reinterpret_cast<void **>(&originalBindMatrix)) && ok;
         }
