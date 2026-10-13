@@ -1341,13 +1341,18 @@ struct Host {
         space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
         api.check(api.CreateReferenceSpace(session, &space, &viewSpace), "xrCreateReferenceSpace VIEW");
         actions.create(api, instance, session, frameController, eyeGazeSupported);
+        {
+            wchar_t lab[2]{}; // Lab: SS2VR_LAB_FOVEATION=0/1/2 overrides [Render] Foveation.
+            if (GetEnvironmentVariableW(L"SS2VR_LAB_FOVEATION", lab, 2) == 1 && lab[0] >= L'0' && lab[0] <= L'2')
+                settings.foveation.mode = int(lab[0] - L'0');
+        }
         const auto &f = settings.foveation;
         foveationActive = systemProperties.graphicsProperties.maxLayerCount >= 5 &&
             (f.mode == 2 || (f.mode == 1 && actions.gazeEnabled));
         {
             char line[192];
-            std::snprintf(line, sizeof line, "Foveated readback %s (mode=%d eyeGaze=%s inset=%.2f periphery=%.2f)",
-                          foveationActive ? "enabled" : "disabled", f.mode,
+            std::snprintf(line, sizeof line, "Foveated readback %s, rendering %s (mode=%d eyeGaze=%s inset=%.2f periphery=%.2f)",
+                          foveationActive ? "enabled" : "disabled", renderFoveation() ? "enabled" : "disabled", f.mode,
                           actions.gazeEnabled ? "tracked" : eyeGazeExtension ? "unsupported" : "unavailable",
                           f.inset, f.periphery);
             log.write(line);
@@ -1850,6 +1855,11 @@ struct Host {
                 }
             }
     }
+    // Foveated rendering in the game: [Render] Foveation 2 always, 1 with eye gaze.
+    bool renderFoveation() const {
+        const int mode = settings.foveation.mode;
+        return mode == 2 || (mode == 1 && actions.gazeEnabled);
+    }
     void insetChains(uint32_t width, uint32_t height) {
         if (inset[0].width == width && inset[0].height == height && inset[1].handle)
             return;
@@ -1921,13 +1931,16 @@ struct Host {
         }
         // No IPC lock across XR waits. Ready remains owned until BOTH images are writable.
         const bool left = eye[0].waitImage(), right = eye[1].waitImage();
-        const bool insetLeft = !foveationActive || inset[0].waitImage(), insetRight = !foveationActive || inset[1].waitImage();
+        // Inset images only for foveated readback (zero-copy pairs are never foveated
+        // readback: with foveated rendering the game returns full-size eyes).
+        const bool insets = foveationActive && !sharedOpened;
+        const bool insetLeft = !insets || inset[0].waitImage(), insetRight = !insets || inset[1].waitImage();
         if (!left || !right || !insetLeft || !insetRight) {
             ++imageTimeouts;
             return;
         }
         if (!bothImagesReady(eye[0].ownership, eye[1].ownership) ||
-            (foveationActive && !bothImagesReady(inset[0].ownership, inset[1].ownership)))
+            (insets && !bothImagesReady(inset[0].ownership, inset[1].ownership)))
             throw std::runtime_error("Stereo wait barrier failed");
         Request reply;
         HeadClearance clearance;
@@ -1958,16 +1971,16 @@ struct Host {
                     // lock: only this thread can request the slot again afterwards.
                     zeroCopy = slot.sharedImage != 0;
                     accepted = zeroCopy ?
-                        slot.gpuReady && slot.sharedImage == sharedOpened && !reply.foveated &&
+                        slot.gpuReady && slot.sharedImage == sharedOpened && reply.foveated != 1 &&
                             reply.width == sharedWidth && reply.height == sharedHeight &&
                             reply.width == eye[0].width && reply.height == eye[0].height &&
                             sharedEye[candidate][0].p && sharedEye[candidate][1].p :
                         currentPixels(channel.shared->pixels) &&
                         pixels.matches(slot.pixelGeneration, reply.width, reply.height) &&
-                        (!reply.foveated || foveationActive);
+                        (reply.foveated != 1 || insets);
                     for (unsigned h = 0; h < 2; h++)
                         source[h] = accepted && !zeroCopy ? pixels.buffer(slotPixelBuffer(candidate, h)) : nullptr;
-                    if (accepted && reply.foveated) {
+                    if (accepted && reply.foveated == 1) {
                         accepted = foveationFits(reply.width, reply.height, reply.lowWidth, reply.lowHeight,
                                                  reply.insetWidth, reply.insetHeight);
                         for (unsigned h = 0; accepted && h < 2; h++) {
@@ -2021,14 +2034,14 @@ struct Host {
             eye[0].uploadWaited(context.p, source[0]);
             eye[1].uploadWaited(context.p, source[1]);
         }
-        if (reply.foveated)
+        if (reply.foveated == 1)
             for (unsigned h = 0; h != 2; ++h) {
                 // The inset fades over its border so the seam to the base view is soft.
                 featherAlpha(insetSource[h], reply.insetWidth, reply.insetHeight, std::max(8u, reply.insetWidth / 16));
                 inset[h].uploadWaited(context.p, insetSource[h]);
                 cachedInset[h] = insetFov[h];
             }
-        else if (foveationActive)
+        else if (insets)
             for (auto &chain : inset)
                 chain.releaseWaited();
         hresult(device->GetDeviceRemovedReason(), "D3D11 device removed", log);
@@ -2039,7 +2052,7 @@ struct Host {
             // up (the runtime reprojects it to the current head pose) for a second.
             cachedDeadline = deadline - FrameAgeMs + CachedPairHoldMs;
             cachedPresentation = presentation;
-            cachedFoveated = reply.foveated != 0;
+            cachedFoveated = reply.foveated == 1;
             cachedValid = true;
         }
     }
@@ -2475,6 +2488,10 @@ struct Host {
                                    insetHeight = foveationExtent(snapshot.height, f.inset);
                     const bool foveated = foveationActive && !sharedOpened &&
                         foveationFits(snapshot.width, snapshot.height, lowWidth, lowHeight, insetWidth, insetHeight);
+                    // Zero-copy pairs: the game renders foveated itself (its single pass
+                    // draws a reduced full view and a full-resolution inset per eye and
+                    // returns full-size eyes), eye-tracked or at the view centre.
+                    const bool rendered = !foveated && sharedOpened && renderFoveation();
                     if (foveated) {
                         eyeChains(lowWidth, lowHeight);
                         insetChains(insetWidth, insetHeight);
@@ -2493,8 +2510,8 @@ struct Host {
                         const auto &v = views[h].fov;
                         request.fov[h] = {v.angleLeft, v.angleRight, v.angleUp, v.angleDown};
                     }
-                    if (foveated) {
-                        request.foveated = 1;
+                    if (foveated || rendered) {
+                        request.foveated = foveated ? 1 : 2;
                         request.lowWidth = lowWidth; request.lowHeight = lowHeight;
                         request.insetWidth = insetWidth; request.insetHeight = insetHeight;
                         Vec3 gaze;

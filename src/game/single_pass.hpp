@@ -24,9 +24,27 @@ bool installed() noexcept;
 void setInstancing(bool enabled) noexcept; // [Render] SinglePassInstancing
 // Engine globals: adjusted projection, projection, view (read at draw time).
 void setEngineMatrices(const float *adjusted, const float *projection, const float *view) noexcept;
-// Starts the pass on `target` (2W x H): `change[i]` maps the centre camera's
-// view/frustum to eye i's.
-bool begin(IDirect3DDevice9 *device, IDirect3DSurface9 *target, UINT eyeWidth, const ss2vr::replay::EyeChange (&change)[2]) noexcept;
+// Where the eyes go in the pass's target. Each region is a pixel rectangle of
+// the target showing part of one eye's view: eye NDC (x, y) maps to region NDC
+// (sx x + ox, sy y + oy). The default layout is the double-wide target (2W x H,
+// each eye's full view in one half); a foveated layout adds a full-resolution
+// inset per eye beside low-resolution full views.
+constexpr unsigned MaxRegions = 4;
+struct Region {
+    RECT rect{};
+    unsigned eye = 0;
+    float sx = 1, ox = 0, sy = 1, oy = 0;
+    bool scaled = true; // The eye's full view (only scaled): programs without a stereo variant draw here.
+};
+struct Layout {
+    UINT width = 0, height = 0;
+    unsigned count = 0;
+    Region region[MaxRegions];
+};
+// Starts the pass on `target`: `change[i]` maps the centre camera's view/frustum
+// to eye i's (W x H eyes); `layout` null for the double-wide target.
+bool begin(IDirect3DDevice9 *device, IDirect3DSurface9 *target, UINT eyeWidth, UINT eyeHeight,
+           const ss2vr::replay::EyeChange (&change)[2], const Layout *layout = nullptr) noexcept;
 void end(IDirect3DDevice9 *device) noexcept;
 // Whether a draw on this device belongs to the pass (active and RT0 is the wide target).
 bool drawing(IDirect3DDevice9 *device) noexcept;

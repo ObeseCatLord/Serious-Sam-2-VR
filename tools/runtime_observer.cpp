@@ -530,7 +530,7 @@ int wmain(int argc,wchar_t **argv) {
     };
     for(unsigned h=0;h<2;++h) {
         const auto base=std::wstring(argv[3])+(h?L"-right":L"-left");
-        const bool foveated=request.foveated&&request.lowWidth&&request.insetWidth;
+        const bool foveated=request.foveated==1&&request.lowWidth&&request.insetWidth; // 2: rendered foveated, full-size eyes.
         if(const int error=writeImage(base+L".ppm",pixels[h].data(),foveated?request.lowWidth:request.width,
                                       foveated?request.lowHeight:request.height))return error;
         if(foveated)
@@ -539,7 +539,7 @@ int wmain(int argc,wchar_t **argv) {
     }
     auto name=std::wstring(argv[3])+L"-metadata.json";
     auto *f=_wfopen(name.c_str(),L"wbx");if(!f)return 6;
-    const bool foveatedImage=request.foveated&&request.lowWidth&&request.insetWidth;
+    const bool foveatedImage=request.foveated==1&&request.lowWidth&&request.insetWidth;
     std::fprintf(f,"{\"sequence\":%llu,\"input_sequence\":%llu,\"input_tick_ms\":%llu,\"width\":%u,\"height\":%u,\"image_width\":%u,\"image_height\":%u,\"foveated\":%u,\"presentation\":%u,\"session\":%u,\"reference\":%u,\"tracking_generation\":%u,\"ui_requested\":%u,\"head\":",
         static_cast<unsigned long long>(request.sequence),static_cast<unsigned long long>(request.input.sequence),
         static_cast<unsigned long long>(request.input.tickMs),request.width,request.height,

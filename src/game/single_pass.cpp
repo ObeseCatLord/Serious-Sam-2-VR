@@ -48,7 +48,9 @@ DWORD colorWrites = 0xf;
 // Pass state.
 bool active = false;
 IDirect3DSurface9 *wideTarget = nullptr;
-UINT eyeWidth = 0;
+UINT eyeWidth = 0, eyeHeight = 0;
+Layout layout;      // Regions of the target the eyes are drawn into.
+bool wideLayout = true; // The plain double-wide layout (instancing possible).
 EyeChange changes[2];
 Stats stats;
 
@@ -142,15 +144,37 @@ IDirect3DPixelShader9 *pixelVariant(IDirect3DDevice9 *d, PixelInfo &info, unsign
 // Per-eye records for the current engine matrices, written to a ring on stream 15.
 IDirect3DVertexBuffer9 *ring = nullptr;
 constexpr UINT RingRecords = 2048, RecordBytes = sizeof(sp::EyeRecord);
-UINT ringNext = 0, eyeOffset[2]{}, instancedOffset = 0, wideOffset = 0;
+UINT ringNext = 0, eyeOffset[2]{}, instancedOffset = 0, regionOffset = 0;
 float cachedAdjusted[16]{}, cachedProjection[16]{}, cachedView[12]{};
+D3DVIEWPORT9 cachedViewport{};
+// Eye pixel x/y to the region's target pixels.
+float regionX(const Region &g, float x) noexcept {
+    const float ndc = g.sx * (2.f * x / float(eyeWidth) - 1.f) + g.ox;
+    return float(g.rect.left) + (ndc + 1.f) * .5f * float(g.rect.right - g.rect.left);
+}
+float regionY(const Region &g, float y) noexcept {
+    const float ndc = g.sy * (1.f - 2.f * y / float(eyeHeight)) + g.oy;
+    return float(g.rect.top) + (1.f - ndc) * .5f * float(g.rect.bottom - g.rect.top);
+}
+// An eye pixel rectangle in the region, clipped to it.
+RECT regionRect(const Region &g, LONG left, LONG top, LONG right, LONG bottom) noexcept {
+    RECT r{LONG(std::lround(regionX(g, float(left)))), LONG(std::lround(regionY(g, float(top)))),
+           LONG(std::lround(regionX(g, float(right)))), LONG(std::lround(regionY(g, float(bottom))))};
+    r.left = std::clamp(r.left, g.rect.left, g.rect.right); r.right = std::clamp(r.right, g.rect.left, g.rect.right);
+    r.top = std::clamp(r.top, g.rect.top, g.rect.bottom); r.bottom = std::clamp(r.bottom, g.rect.top, g.rect.bottom);
+    return r;
+}
+bool fullEye(const D3DVIEWPORT9 &v) noexcept { return !v.X && !v.Y && v.Width == eyeWidth && v.Height == eyeHeight; }
 bool recordsValid = false;
 bool recordsOrtho = false; // The current matrices are not a perspective view (fills, 2D).
 bool writeRecords(IDirect3DDevice9 *d) noexcept {
     if (recordsValid && !std::memcmp(cachedAdjusted, engineAdjusted, sizeof(cachedAdjusted)) &&
         !std::memcmp(cachedProjection, engineProjection, sizeof(cachedProjection)) &&
-        !std::memcmp(cachedView, engineView, sizeof(cachedView)))
+        !std::memcmp(cachedView, engineView, sizeof(cachedView)) &&
+        cachedViewport.X == engineViewport.X && cachedViewport.Y == engineViewport.Y &&
+        cachedViewport.Width == engineViewport.Width && cachedViewport.Height == engineViewport.Height)
         return true;
+    cachedViewport = engineViewport;
     std::memcpy(cachedAdjusted, engineAdjusted, sizeof(cachedAdjusted));
     std::memcpy(cachedProjection, engineProjection, sizeof(cachedProjection));
     std::memcpy(cachedView, engineView, sizeof(cachedView));
@@ -161,7 +185,7 @@ bool writeRecords(IDirect3DDevice9 *d) noexcept {
     // Records 0/1: each eye in its own viewport (per-half issue). Records 2/3:
     // the same, mapped into the eye's half of the wide viewport (x'' = x/2 -/+ w/2),
     // with the kill row -x'' (left) / +x'' (right), less half a pixel, for the pixel program.
-    sp::EyeRecord records[6];
+    sp::EyeRecord records[4 + MaxRegions];
     recordsOrtho = false;
     for (unsigned i = 0; i < 2; ++i) {
         const Rewrite r = rewrite(state, changes[i]);
@@ -180,22 +204,43 @@ bool writeRecords(IDirect3DDevice9 *d) noexcept {
             const float half = .5f / float(eyeWidth ? eyeWidth : 1) * records[i].r[3][c];
             wide.kill[c] = i ? wide.r[0][c] + half : -wide.r[0][c] - half;
         }
-        // Records 4/5: the wide mapping without the eye test (per-half issue on the wide viewport).
-        std::memcpy(records[4 + i].r, wide.r, sizeof(wide.r));
     }
+    // Records 4..: per region, the eye's clip space for the engine viewport mapped
+    // into the region of the whole target (the region path's issue; x_target =
+    // Ax x + Bx w, y_target = Ay y + By w). The plain wide layout with a full-eye
+    // viewport reuses the instanced rows, so both issue modes agree bit for bit.
+    const D3DVIEWPORT9 &v = engineViewport;
+    const float W = float(eyeWidth), H = float(eyeHeight), AW = float(layout.width), AH = float(layout.height);
+    const float av = float(v.Width) / W, bv = (2.f * float(v.X) + float(v.Width)) / W - 1.f;
+    const float cv = float(v.Height) / H, dv = 1.f - (2.f * float(v.Y) + float(v.Height)) / H;
+    for (unsigned j = 0; j < layout.count; ++j) {
+        const Region &g = layout.region[j];
+        auto &out = records[4 + j];
+        const auto &eye = records[g.eye];
+        std::memcpy(out.r, eye.r, sizeof(out.r));
+        if (wideLayout && fullEye(v)) { std::memcpy(out.r[0], records[2 + g.eye].r[0], sizeof(out.r[0])); continue; }
+        const float rw = float(g.rect.right - g.rect.left) / AW, rh = float(g.rect.bottom - g.rect.top) / AH;
+        const float ax = rw * g.sx * av, bx = rw * (g.sx * bv + g.ox) + (2.f * float(g.rect.left)) / AW + rw - 1.f;
+        const float ay = rh * g.sy * cv, by = rh * (g.sy * dv + g.oy) + 1.f - (2.f * float(g.rect.top)) / AH - rh;
+        for (unsigned c = 0; c < 4; ++c) {
+            out.r[0][c] = ax * eye.r[0][c] + bx * eye.r[3][c];
+            out.r[1][c] = ay * eye.r[1][c] + by * eye.r[3][c];
+        }
+    }
+    const UINT count = 4 + layout.count;
     if (!ring && FAILED(d->CreateVertexBuffer(RingRecords * RecordBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0,
                                               D3DPOOL_DEFAULT, &ring, nullptr)))
         return ring = nullptr, false;
     DWORD flags = D3DLOCK_NOOVERWRITE;
-    if (ringNext + 6 > RingRecords) { ringNext = 0; flags = D3DLOCK_DISCARD; }
+    if (ringNext + count > RingRecords) { ringNext = 0; flags = D3DLOCK_DISCARD; }
     void *mapped = nullptr;
-    if (FAILED(ring->Lock(ringNext * RecordBytes, 6 * RecordBytes, &mapped, flags)) || !mapped) return false;
-    std::memcpy(mapped, records, sizeof(records));
+    if (FAILED(ring->Lock(ringNext * RecordBytes, count * RecordBytes, &mapped, flags)) || !mapped) return false;
+    std::memcpy(mapped, records, count * RecordBytes);
     ring->Unlock();
     eyeOffset[0] = ringNext * RecordBytes; eyeOffset[1] = (ringNext + 1) * RecordBytes;
     instancedOffset = (ringNext + 2) * RecordBytes;
-    wideOffset = (ringNext + 4) * RecordBytes;
-    ringNext += 6;
+    regionOffset = (ringNext + 4) * RecordBytes;
+    ringNext += count;
     recordsValid = true;
     ++stats.stateChanges;
     return true;
@@ -236,43 +281,39 @@ HRESULT WINAPI hSetFvf(IDirect3DDevice9 *d, DWORD f) {
     if (active && !suspended && f) oSetVertexShader(d, engineShader); // FVF draws keep the original program.
     return hr;
 }
-// Device state as applied during the pass (lazily switched between draw modes).
-// The scissor rectangle applied: the engine's, the whole wide target, an eye
-// half (draws on the wide viewport clipped to one half), or unknown.
-enum class Rect { Engine, Wide, Left, Right, Unknown };
+// Device state as applied during the pass (lazily switched between draw modes):
+// the whole-target viewport, a scissor rectangle other than the engine's, and
+// the scissor test enabled by us while the engine has it off.
 bool appliedWide = false, appliedInstances = false;
-bool forcedScissor = false; // Scissor test enabled by us while the engine has it off.
-Rect appliedRect = Rect::Engine;
+bool forcedScissor = false;
+bool scissorApplied = false; // The device scissor is `appliedScissor`, not the engine's.
+RECT appliedScissor{};
 IDirect3DPixelShader9 *appliedPixelShader = nullptr;
-void applyRect(IDirect3DDevice9 *d, Rect want) noexcept {
-    if (appliedRect == want) return;
-    RECT r = engineScissor;
-    const LONG w = LONG(eyeWidth), h = LONG(engineViewport.Height);
-    if (want == Rect::Wide) r = {0, 0, 2 * w, h};
-    if (want == Rect::Left || want == Rect::Right) {
-        r = scissorEnabled ? RECT{std::max(engineScissor.left, 0L), engineScissor.top, std::min(engineScissor.right, w), engineScissor.bottom}
-                           : RECT{0, 0, w, h};
-        if (want == Rect::Right) { r.left += w; r.right += w; }
-    }
+void applyScissor(IDirect3DDevice9 *d, const RECT &r) noexcept {
+    if (scissorApplied && !std::memcmp(&appliedScissor, &r, sizeof(r))) return;
     oSetScissor(d, &r);
-    appliedRect = want;
+    appliedScissor = r; scissorApplied = true;
+}
+void engineScissorBack(IDirect3DDevice9 *d) noexcept {
+    if (!scissorApplied) return;
+    oSetScissor(d, &engineScissor);
+    scissorApplied = false;
 }
 void forceScissor(IDirect3DDevice9 *d, bool on) noexcept {
     if (forcedScissor == on) return;
     if (!scissorEnabled) oSetRenderState(d, D3DRS_SCISSORTESTENABLE, on ? TRUE : FALSE);
     forcedScissor = on;
 }
+// The whole target as the viewport (the engine's depth range).
 void applyWide(IDirect3DDevice9 *d) noexcept {
     if (appliedWide) return;
-    D3DVIEWPORT9 wide = engineViewport;
-    wide.Width = eyeWidth * 2;
+    D3DVIEWPORT9 wide{0, 0, layout.width, layout.height, engineViewport.MinZ, engineViewport.MaxZ};
     oSetViewport(d, &wide);
     appliedWide = true;
 }
 HRESULT WINAPI hSetViewport(IDirect3DDevice9 *d, const D3DVIEWPORT9 *v) {
     if (v) engineViewport = *v;
     appliedWide = false;
-    if (appliedRect != Rect::Engine) appliedRect = Rect::Unknown; // Half rectangles depend on the height.
     return oSetViewport(d, v);
 }
 HRESULT WINAPI hSetPixelShader(IDirect3DDevice9 *d, IDirect3DPixelShader9 *s) {
@@ -282,7 +323,7 @@ HRESULT WINAPI hSetPixelShader(IDirect3DDevice9 *d, IDirect3DPixelShader9 *s) {
 }
 HRESULT WINAPI hSetScissor(IDirect3DDevice9 *d, const RECT *r) {
     if (r) engineScissor = *r;
-    appliedRect = Rect::Engine;
+    scissorApplied = false;
     return oSetScissor(d, r);
 }
 HRESULT WINAPI hSetRenderState(IDirect3DDevice9 *d, D3DRENDERSTATETYPE s, DWORD v) {
@@ -290,7 +331,6 @@ HRESULT WINAPI hSetRenderState(IDirect3DDevice9 *d, D3DRENDERSTATETYPE s, DWORD 
     if (s == D3DRS_SCISSORTESTENABLE) {
         scissorEnabled = v != 0;
         forcedScissor = false;
-        if (appliedRect != Rect::Engine) appliedRect = Rect::Unknown;
     }
     return oSetRenderState(d, s, v);
 }
@@ -349,7 +389,7 @@ bool labRangeSet = false;
 // Engine viewport and scissor state (per-half issue by shifting the viewport, clears).
 void perHalfState(IDirect3DDevice9 *d) noexcept {
     if (appliedWide) { oSetViewport(d, &engineViewport); appliedWide = false; }
-    applyRect(d, Rect::Engine);
+    engineScissorBack(d);
     forceScissor(d, false);
     if (appliedInstances) { d->SetStreamSourceFreq(0, 1); appliedInstances = false; }
     if (appliedPixelShader != enginePixelShader) { oSetPixelShader(d, enginePixelShader); appliedPixelShader = enginePixelShader; }
@@ -363,13 +403,10 @@ bool labMirror() noexcept { return labMirrorMode() != 0; }
 template<class Call> bool instanced(IDirect3DDevice9 *d, Call call, HRESULT &hr) noexcept {
     static const bool linesOff = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_LINES", v, 2) == 1 && v[0] == L'0'; }();
     if (linesOff && (currentPrimitive == D3DPT_LINELIST || currentPrimitive == D3DPT_LINESTRIP)) return false;
-    static const bool disabled = [] {
-        wchar_t v[2]{};
-        if (GetEnvironmentVariableW(L"SS2VR_LAB_SP_INSTANCING", v, 2) == 1) return v[0] == L'0';
-        return !instancingEnabled && labMirrorMode() != 1;
-    }();
+    static const int labSetting = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_INSTANCING", v, 2) == 1 ? int(v[0] == L'1') : -1; }();
+    const bool disabled = !wideLayout || (labSetting >= 0 ? !labSetting : !instancingEnabled && labMirrorMode() != 1);
     static const bool orthoOff = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_ORTHO", v, 2) == 1 && v[0] == L'0'; }();
-    if (disabled || !enginePixelShader || engineViewport.X || engineViewport.Y || engineViewport.Width != eyeWidth ||
+    if (disabled || !enginePixelShader || !fullEye(engineViewport) ||
         (orthoOff && recordsOrtho))
         return false;
     static const bool backgroundOff = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_BACKGROUND", v, 2) == 1 && v[0] == L'0'; }();
@@ -439,7 +476,7 @@ template<class Call> bool instanced(IDirect3DDevice9 *d, Call call, HRESULT &hr)
             static_cast<void *>(enginePixelShader), k, pixel.words.empty() ? 0u : pixel.words[0], pixel.sets, written);
     if (labRangeSet && (eligible < labLo || eligible >= labHi)) return false;
     applyWide(d);
-    if (scissorEnabled || forcedScissor) applyRect(d, Rect::Wide);
+    if (scissorEnabled || forcedScissor) applyScissor(d, RECT{0, 0, LONG(layout.width), LONG(layout.height)});
     if (!appliedInstances) { d->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | 2u); appliedInstances = true; }
     if (appliedPixelShader != variant) { oSetPixelShader(d, variant); appliedPixelShader = variant; }
     d->SetStreamSource(15, ring, instancedOffset, RecordBytes);
@@ -463,10 +500,10 @@ template<class Call> void onMirror(IDirect3DDevice9 *d, Call body) noexcept {
     mirroring = true;
     // SetRenderTarget resets the viewport and scissor rectangle to the target.
     d->SetRenderTarget(0, mirrorColor); d->SetDepthStencilSurface(mirrorDepth);
-    oSetViewport(d, &engineViewport); oSetScissor(d, &engineScissor); appliedWide = false; appliedRect = Rect::Engine;
+    oSetViewport(d, &engineViewport); oSetScissor(d, &engineScissor); appliedWide = false; scissorApplied = false;
     body();
     d->SetRenderTarget(0, color); d->SetDepthStencilSurface(depth);
-    oSetViewport(d, &engineViewport); oSetScissor(d, &engineScissor); appliedWide = false; appliedRect = Rect::Engine;
+    oSetViewport(d, &engineViewport); oSetScissor(d, &engineScissor); appliedWide = false; scissorApplied = false;
     color->Release(); depth->Release();
     mirroring = false;
 }
@@ -511,50 +548,64 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
     return perHalf(d, call, stereo);
 }
 template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo, bool shifted) noexcept {
-    // Full-eye draws go on the wide viewport through the instanced mapping, one
-    // scissored half at a time, so their positions match instanced draws bit for
-    // bit (multi-pass surfaces mixing both otherwise disagree on edge pixels).
     static const bool wideOff = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_WIDEHALF", v, 2) == 1 && v[0] == L'0'; }();
-    // Fixed-function pixel stages stay on shifted viewports: on the wide viewport
-    // one drew a sky layer with a hard vertical edge in the right eye (lab, V302-V305).
-    if (!enginePixelShader) shifted = true;
     static const bool wideBisect = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_WIDEBISECT", v, 2) == 1 && v[0] == L'1'; }();
-    if (wideBisect && stereo && !shifted) {
+    if (wideBisect && stereo && !shifted && enginePixelShader) {
         const uint32_t hash = pixelInfo(enginePixelShader).hash;
         if (std::find(labPixelSeen.begin(), labPixelSeen.end(), hash) == labPixelSeen.end() && labPixelSeen.size() < 64) labPixelSeen.push_back(hash);
         if (labPixelRestrict && std::find(labPixelAllowed.begin(), labPixelAllowed.end(), hash) == labPixelAllowed.end()) shifted = true;
     }
-    if (stereo && !wideOff && !shifted && !engineViewport.X && !engineViewport.Y && engineViewport.Width == eyeWidth) {
+    // Region path: the whole target as the viewport, each region's mapping in its
+    // record and the region (with the engine viewport and scissor mapped into it)
+    // as the scissor. In the plain wide layout full-eye draws then match
+    // instanced draws bit for bit (multi-pass surfaces mix both).
+    if (stereo && ((!wideOff && !shifted) || !wideLayout)) {
         if (appliedInstances) { d->SetStreamSourceFreq(0, 1); appliedInstances = false; }
         if (appliedPixelShader != enginePixelShader) { oSetPixelShader(d, enginePixelShader); appliedPixelShader = enginePixelShader; }
         applyWide(d);
         forceScissor(d, true);
+        const D3DVIEWPORT9 &v = engineViewport;
+        RECT clip{LONG(v.X), LONG(v.Y), LONG(v.X + v.Width), LONG(v.Y + v.Height)};
+        if (scissorEnabled) {
+            clip.left = std::max(clip.left, engineScissor.left); clip.top = std::max(clip.top, engineScissor.top);
+            clip.right = std::min(clip.right, engineScissor.right); clip.bottom = std::min(clip.bottom, engineScissor.bottom);
+        }
         HRESULT hr = D3D_OK;
-        for (unsigned i = 0; i < 2; ++i) {
-            applyRect(d, i ? Rect::Right : Rect::Left);
-            d->SetStreamSource(15, ring, wideOffset + i * RecordBytes, RecordBytes);
+        for (unsigned j = 0; j < layout.count; ++j) {
+            const RECT r = regionRect(layout.region[j], clip.left, clip.top, clip.right, clip.bottom);
+            if (r.right <= r.left || r.bottom <= r.top) continue;
+            applyScissor(d, r);
+            d->SetStreamSource(15, ring, regionOffset + j * RecordBytes, RecordBytes);
             const HRESULT one = call(false);
             if (SUCCEEDED(hr)) hr = one;
         }
         return hr;
     }
+    // Shifted path (programs without a stereo variant, lab): the engine viewport
+    // placed in each eye's full view region; inset regions are skipped.
     perHalfState(d);
     if (!stereo) ++stats.unpatched;
-    if (stereo) d->SetStreamSource(15, ring, eyeOffset[0], RecordBytes);
-    HRESULT hr = call(false);
-    D3DVIEWPORT9 right = engineViewport;
-    right.X += eyeWidth;
-    oSetViewport(d, &right);
-    if (scissorEnabled) {
-        RECT r = engineScissor; r.left += LONG(eyeWidth); r.right += LONG(eyeWidth);
-        oSetScissor(d, &r);
+    HRESULT hr = D3D_OK;
+    const D3DVIEWPORT9 &v = engineViewport;
+    for (unsigned j = 0; j < layout.count; ++j) {
+        const Region &g = layout.region[j];
+        if (!g.scaled) continue;
+        const RECT r = regionRect(g, LONG(v.X), LONG(v.Y), LONG(v.X + v.Width), LONG(v.Y + v.Height));
+        if (r.right <= r.left || r.bottom <= r.top) continue;
+        D3DVIEWPORT9 placed{DWORD(r.left), DWORD(r.top), DWORD(r.right - r.left), DWORD(r.bottom - r.top), v.MinZ, v.MaxZ};
+        oSetViewport(d, &placed);
+        if (scissorEnabled) {
+            const RECT s = regionRect(g, engineScissor.left, engineScissor.top, engineScissor.right, engineScissor.bottom);
+            oSetScissor(d, &s);
+        }
+        if (stereo) d->SetStreamSource(15, ring, eyeOffset[g.eye], RecordBytes);
+        const HRESULT one = call(false);
+        if (SUCCEEDED(hr)) hr = one;
     }
-    if (stereo) d->SetStreamSource(15, ring, eyeOffset[1], RecordBytes);
-    const HRESULT second = call(false);
     oSetViewport(d, &engineViewport);
     if (scissorEnabled) oSetScissor(d, &engineScissor);
-    appliedRect = Rect::Engine;
-    return FAILED(hr) ? hr : second;
+    scissorApplied = false;
+    return hr;
 }
 } // namespace
 
@@ -592,15 +643,24 @@ void setInstancing(bool enabled) noexcept { instancingEnabled = enabled; }
 void setEngineMatrices(const float *adjusted, const float *projection, const float *view) noexcept {
     engineAdjusted = adjusted; engineProjection = projection; engineView = view;
 }
-bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, UINT width, const EyeChange (&change)[2]) noexcept {
-    if (!hooked || !engineAdjusted || !engineProjection || !engineView || !target || !change[0].valid || !change[1].valid)
+Layout wideLayoutOf(UINT width, UINT height) noexcept {
+    Layout l;
+    l.width = width * 2; l.height = height; l.count = 2;
+    for (unsigned i = 0; i < 2; ++i) l.region[i] = {RECT{LONG(i * width), 0, LONG((i + 1) * width), LONG(height)}, i, 1, 0, 1, 0, true};
+    return l;
+}
+bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, UINT width, UINT height, const EyeChange (&change)[2],
+           const Layout *regions) noexcept {
+    if (!hooked || !engineAdjusted || !engineProjection || !engineView || !target || !change[0].valid || !change[1].valid ||
+        !width || !height || (regions && (!regions->count || regions->count > MaxRegions)))
         return false;
-    active = true; wideTarget = target; eyeWidth = width;
+    active = true; wideTarget = target; eyeWidth = width; eyeHeight = height;
+    layout = regions ? *regions : wideLayoutOf(width, height);
+    wideLayout = !regions;
     changes[0] = change[0]; changes[1] = change[1];
     recordsValid = false;
     eligibleIndex = 0;
-    appliedWide = appliedInstances = forcedScissor = suspended = false;
-    appliedRect = Rect::Engine;
+    appliedWide = appliedInstances = forcedScissor = suspended = scissorApplied = false;
     appliedPixelShader = enginePixelShader;
     if (!identityIndices && SUCCEEDED(d->CreateIndexBuffer(65536 * 2, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT,
                                                             &identityIndices, nullptr))) {
@@ -613,7 +673,7 @@ bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, UINT width, const Eye
     }
     d->SetStreamSourceFreq(15, D3DSTREAMSOURCE_INSTANCEDATA | 1u);
     bindVariants(d);
-    if (labMirror()) {
+    if (labMirror() && wideLayout) {
         D3DSURFACE_DESC cd{}, zd{};
         IDirect3DSurface9 *depth = nullptr;
         if (!mirrorColor && SUCCEEDED(target->GetDesc(&cd)))
@@ -622,7 +682,7 @@ bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, UINT width, const Eye
             d->CreateDepthStencilSurface(zd.Width, zd.Height, zd.Format, D3DMULTISAMPLE_NONE, 0, TRUE, &mirrorDepth, nullptr);
         if (depth) depth->Release();
         onMirror(d, [&] {
-            D3DVIEWPORT9 full{0, 0, eyeWidth * 2, engineViewport.Height, 0, 1};
+            D3DVIEWPORT9 full{0, 0, layout.width, layout.height, 0, 1};
             oSetViewport(d, &full);
             bridge.clear(d, 0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0xff000000, 1, 0);
         });
@@ -652,12 +712,12 @@ void afterRenderTarget(IDirect3DDevice9 *d, DWORD index, IDirect3DSurface9 *targ
     const bool away = target != wideTarget;
     D3DSURFACE_DESC desc{};
     if (SUCCEEDED(target->GetDesc(&desc))) {
-        if (!away) desc.Width = eyeWidth;
+        if (!away) desc.Width = eyeWidth, desc.Height = eyeHeight;
         engineViewport = {0, 0, desc.Width, desc.Height, 0.f, 1.f};
         engineScissor = {0, 0, LONG(desc.Width), LONG(desc.Height)};
         if (!away) { oSetViewport(d, &engineViewport); oSetScissor(d, &engineScissor); }
     }
-    appliedWide = false; appliedRect = Rect::Engine;
+    appliedWide = false; scissorApplied = false;
     if (away == suspended) return;
     suspended = away;
     if (away) {
@@ -722,16 +782,32 @@ HRESULT clear(IDirect3DDevice9 *d, DWORD count, const D3DRECT *rects, DWORD flag
     return hr;
 }
 HRESULT clearHalves(IDirect3DDevice9 *d, DWORD count, const D3DRECT *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) noexcept {
+    // Each region: the engine viewport (and rectangles, and scissor) mapped into it.
     perHalfState(d);
-    HRESULT hr = bridge.clear(d, count, rects, flags, color, z, stencil);
-    D3DVIEWPORT9 right = engineViewport;
-    right.X += eyeWidth;
-    oSetViewport(d, &right);
-    std::vector<D3DRECT> shifted(rects ? count : 0);
-    for (DWORD i = 0; rects && i < count; ++i) { shifted[i] = rects[i]; shifted[i].x1 += LONG(eyeWidth); shifted[i].x2 += LONG(eyeWidth); }
-    const HRESULT second = bridge.clear(d, count, rects ? shifted.data() : nullptr, flags, color, z, stencil);
+    HRESULT hr = D3D_OK;
+    const D3DVIEWPORT9 &v = engineViewport;
+    std::vector<D3DRECT> mapped(rects ? count : 0);
+    for (unsigned j = 0; j < layout.count; ++j) {
+        const Region &g = layout.region[j];
+        const RECT r = regionRect(g, LONG(v.X), LONG(v.Y), LONG(v.X + v.Width), LONG(v.Y + v.Height));
+        if (r.right <= r.left || r.bottom <= r.top) continue;
+        D3DVIEWPORT9 placed{DWORD(r.left), DWORD(r.top), DWORD(r.right - r.left), DWORD(r.bottom - r.top), v.MinZ, v.MaxZ};
+        oSetViewport(d, &placed);
+        if (scissorEnabled) {
+            const RECT s = regionRect(g, engineScissor.left, engineScissor.top, engineScissor.right, engineScissor.bottom);
+            oSetScissor(d, &s);
+        }
+        for (DWORD k = 0; rects && k < count; ++k) {
+            const RECT m = regionRect(g, rects[k].x1, rects[k].y1, rects[k].x2, rects[k].y2);
+            mapped[k] = {m.left, m.top, m.right, m.bottom};
+        }
+        const HRESULT one = bridge.clear(d, count, rects ? mapped.data() : nullptr, flags, color, z, stencil);
+        if (SUCCEEDED(hr)) hr = one;
+    }
     oSetViewport(d, &engineViewport);
-    return FAILED(hr) ? hr : second;
+    if (scissorEnabled) oSetScissor(d, &engineScissor);
+    scissorApplied = false;
+    return hr;
 }
 void labInstanceRange(unsigned lo, unsigned hi, unsigned detail) noexcept { labLo = lo; labHi = hi; labDetail = detail; labRangeSet = true; }
 unsigned labEligibleCount() noexcept { return lastEligible; }

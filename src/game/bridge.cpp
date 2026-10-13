@@ -391,6 +391,7 @@ struct PerfClock {
     double hudCpu = 0; // Whole HUD draw path (desktop draw, capture, both eye duplicates, restore).
     double hudFlushCpu = 0;
     unsigned hudLayerDraws = 0, hudFallbackDraws = 0, hudFlushes = 0;
+    unsigned foveatedPairs = 0; // Pairs rendered through the foveated atlas.
     // Pairs rendered but not published, by the state they ended in.
     unsigned lostNoWorld = 0, lostFault = 0, lostNoOverlay = 0, lostIncomplete = 0, lostOther = 0;
     const char *lostReason = "none";
@@ -1568,6 +1569,107 @@ static void releaseScopeCache() noexcept {
     scopeShaderCache = nullptr; scopeCacheDevice = nullptr;
 }
 static void releaseMenuScaled();
+// Foveated single pass: the pass draws into an atlas holding each eye's full
+// view at reduced resolution and a full-resolution inset around the gaze; each
+// eye image is then the full view stretched over the eye with the inset drawn
+// over it (feathered border), so everything after the pass is unchanged.
+static IDirect3DTexture9 *foveaTexture = nullptr;
+static IDirect3DSurface9 *foveaColor = nullptr, *foveaDepth = nullptr;
+static IDirect3DStateBlock9 *foveaState = nullptr;
+static UINT atlasWidth = 0, atlasHeight = 0;
+static void releaseFovea() {
+    for (IUnknown *p : {static_cast<IUnknown *>(foveaColor), static_cast<IUnknown *>(foveaTexture),
+                        static_cast<IUnknown *>(foveaDepth), static_cast<IUnknown *>(foveaState)})
+        if (p) p->Release();
+    foveaColor = foveaDepth = nullptr; foveaTexture = nullptr; foveaState = nullptr;
+    atlasWidth = atlasHeight = 0;
+}
+struct FoveaFrame {
+    single_pass::Layout layout;
+    PixelRect inset[2];
+};
+// The layout for a request asking for foveated rendering (foveated == 2).
+static bool foveaLayout(const Request &q, UINT width, UINT height, FoveaFrame &f) {
+    const UINT lw = q.lowWidth, lh = q.lowHeight, iw = q.insetWidth, ih = q.insetHeight;
+    if (q.foveated != 2 || !lw || !lh || !iw || !ih || lw > width || lh > height || iw > width || ih > height) return false;
+    auto &l = f.layout;
+    l.width = std::max(2 * lw, 2 * iw); l.height = lh + ih; l.count = 4;
+    for (unsigned k = 0; k < 2; ++k) {
+        l.region[k] = {RECT{LONG(k * lw), 0, LONG((k + 1) * lw), LONG(lh)}, k, 1, 0, 1, 0, true};
+        const PixelRect r = insetCrop(q.fov[k], width, height, iw, ih, q.insetCentre[k][0], q.insetCentre[k][1]);
+        f.inset[k] = r;
+        // Eye NDC of the inset's centre and half extent: the inset's own NDC is (x - c) / e.
+        const float cx = (2.f * r.x + r.w) / width - 1.f, ex = float(r.w) / width;
+        const float cy = 1.f - (2.f * r.y + r.h) / height, ey = float(r.h) / height;
+        l.region[2 + k] = {RECT{LONG(k * iw), LONG(lh), LONG((k + 1) * iw), LONG(lh + ih)}, k, 1.f / ex, -cx / ex, 1.f / ey, -cy / ey, false};
+    }
+    return true;
+}
+static bool ensureFovea(IDirect3DDevice9 *d, UINT width, UINT height, D3DFORMAT color, D3DFORMAT depth) {
+    if (foveaColor && atlasWidth == width && atlasHeight == height) return true;
+    releaseFovea();
+    if (FAILED(d->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, color, D3DPOOL_DEFAULT, &foveaTexture, nullptr)) ||
+        FAILED(foveaTexture->GetSurfaceLevel(0, &foveaColor)) ||
+        FAILED(d->CreateDepthStencilSurface(width, height, depth, D3DMULTISAMPLE_NONE, 0, TRUE, &foveaDepth, nullptr)) ||
+        FAILED(d->CreateStateBlock(D3DSBT_ALL, &foveaState))) {
+        log("Foveated single pass: %ux%u atlas unavailable", width, height);
+        releaseFovea();
+        return false;
+    }
+    atlasWidth = width; atlasHeight = height;
+    log("Foveated single pass: atlas %ux%u", width, height);
+    return true;
+}
+// Eye k from the atlas into `target` (width x height).
+static bool composeFovea(IDirect3DDevice9 *d, const FoveaFrame &f, unsigned k, IDirect3DSurface9 *target, UINT width, UINT height) {
+    const RECT low = f.layout.region[k].rect, inset = f.layout.region[2 + k].rect;
+    if (FAILED(originalStretch(d, foveaColor, &low, target, nullptr, D3DTEXF_LINEAR))) return false;
+    if (!foveaState || FAILED(foveaState->Capture())) return false;
+    struct Vertex { float x, y, z, rhw; D3DCOLOR color; float u, v; };
+    const PixelRect &r = f.inset[k];
+    const float band = float(std::max(8, r.w / 16));
+    const float xs[4]{float(r.x), r.x + band, r.x + r.w - band, float(r.x + r.w)};
+    const float ys[4]{float(r.y), r.y + band, r.y + r.h - band, float(r.y + r.h)};
+    Vertex v[16];
+    for (unsigned j = 0; j < 4; ++j)
+        for (unsigned i = 0; i < 4; ++i) {
+            const bool inner = (i == 1 || i == 2) && (j == 1 || j == 2);
+            v[j * 4 + i] = {xs[i] - .5f, ys[j] - .5f, 0, 1, D3DCOLOR_ARGB(inner ? 255 : 0, 255, 255, 255),
+                            (inset.left + xs[i] - r.x) / float(atlasWidth), (inset.top + ys[j] - r.y) / float(atlasHeight)};
+        }
+    uint16_t indices[54];
+    unsigned n = 0;
+    for (uint16_t j = 0; j < 3; ++j)
+        for (uint16_t i = 0; i < 3; ++i) {
+            const uint16_t a = j * 4 + i;
+            for (uint16_t e : {a, uint16_t(a + 1), uint16_t(a + 4), uint16_t(a + 1), uint16_t(a + 5), uint16_t(a + 4)}) indices[n++] = e;
+        }
+    const D3DVIEWPORT9 full{0, 0, width, height, 0, 1};
+    bool ok = SUCCEEDED(originalSetRT(d, 0, target)) && SUCCEEDED(d->SetViewport(&full));
+    d->SetVertexShader(nullptr); d->SetPixelShader(nullptr);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    d->SetTexture(0, foveaTexture);
+    for (DWORD stage = 1; stage < 8; ++stage) d->SetTexture(stage, nullptr);
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1); d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1); d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+    d->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0); d->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    d->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE); d->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT); d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    d->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP); d->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    d->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+    const std::pair<D3DRENDERSTATETYPE, DWORD> states[]{
+        {D3DRS_ZENABLE, FALSE}, {D3DRS_ZWRITEENABLE, FALSE}, {D3DRS_ALPHATESTENABLE, FALSE}, {D3DRS_ALPHABLENDENABLE, TRUE},
+        {D3DRS_SRCBLEND, D3DBLEND_SRCALPHA}, {D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA}, {D3DRS_BLENDOP, D3DBLENDOP_ADD},
+        {D3DRS_SEPARATEALPHABLENDENABLE, FALSE}, {D3DRS_CULLMODE, D3DCULL_NONE}, {D3DRS_FOGENABLE, FALSE},
+        {D3DRS_LIGHTING, FALSE}, {D3DRS_STENCILENABLE, FALSE}, {D3DRS_SCISSORTESTENABLE, FALSE},
+        {D3DRS_COLORWRITEENABLE, 0x7}, {D3DRS_SRGBWRITEENABLE, FALSE}, {D3DRS_CLIPPLANEENABLE, 0},
+        {D3DRS_FILLMODE, D3DFILL_SOLID}, {D3DRS_SHADEMODE, D3DSHADE_GOURAUD}};
+    for (const auto &[state, value] : states) d->SetRenderState(state, value);
+    ok = ok && SUCCEEDED(originalDrawIndexedUp(d, D3DPT_TRIANGLELIST, 0, 16, 18, indices, D3DFMT_INDEX16, v, sizeof(Vertex)));
+    foveaState->Apply();
+    return ok;
+}
 static void releaseTargets() {
     ++resourceGeneration;
     releaseScopeCache();
@@ -1583,6 +1685,7 @@ static void releaseTargets() {
     if (wideColor) wideColor->Release();
     if (wideDepth) wideDepth->Release();
     wideColor = wideDepth = nullptr;
+    releaseFovea();
     for (int i = 0; i < 2; i++) {
         for (auto p : {eye[i], depth[i], readback[i]})
             if (p)
@@ -2352,11 +2455,11 @@ static void presentBody(IDirect3DDevice9 *d) {
             {
                 const auto sp = single_pass::takeStats();
                 if (singlePassEnabled)
-                    log("Perf single pass: passes=%u draws/pass=%.0f instanced/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f target switches/pass=%.1f up/pass=%.1f variants=%u failed=%u",
+                    log("Perf single pass: passes=%u draws/pass=%.0f instanced/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f target switches/pass=%.1f up/pass=%.1f variants=%u failed=%u foveated=%u atlas=%ux%u",
                         sp.passes, sp.passes ? double(sp.draws) / sp.passes : 0., sp.passes ? double(sp.instanced) / sp.passes : 0.,
                         sp.passes ? double(sp.unpatched) / sp.passes : 0.,
                         sp.passes ? double(sp.stateChanges) / sp.passes : 0., sp.passes ? double(sp.suspensions) / sp.passes : 0., sp.passes ? double(sp.userPointer) / sp.passes : 0.,
-                        sp.variants, sp.failedVariants);
+                        sp.variants, sp.failedVariants, perf.foveatedPairs, atlasWidth, atlasHeight);
             }
             {
                 const auto r = replay::takeStats();
@@ -2975,7 +3078,7 @@ static bool readFoveatedEye(unsigned i) {
     return true;
 }
 static bool readUiEye(unsigned i,bool dim,float visibility) {
-    if (!dim && uiFrame.request.foveated) return readFoveatedEye(i);
+    if (!dim && uiFrame.request.foveated == 1) return readFoveatedEye(i);
     auto *d=uiFrame.device;
     auto *read=uiFrame.read[i];
     const LARGE_INTEGER t0=PerfClock::now();
@@ -3629,7 +3732,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
     uiFrame.generation=resourceGeneration.load();
     uiFrame.device=device;
     device->AddRef();
-    uiFrame.zeroCopy=zeroCopy && !request.foveated && sharedSurface[chosen][0] && sharedSurface[chosen][1];
+    uiFrame.zeroCopy=zeroCopy && request.foveated != 1 && sharedSurface[chosen][0] && sharedSurface[chosen][1];
     for(unsigned i=0;i<2;++i) {
         uiFrame.target[i]=uiFrame.zeroCopy ? sharedSurface[chosen][i] : eye[i]; uiFrame.target[i]->AddRef();
         uiFrame.z[i]=depth[i]; depth[i]->AddRef();
@@ -3719,6 +3822,16 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         const bool singlePassFrame=singlePassEnabled && !alternateEyes && wideColor && wideDepth &&
             single_pass::installed() && singlePassChanges(request,centre,singlePassChange);
         bool centreReady=false;
+        // Foveated: the pass draws into the atlas instead of the double-wide target.
+        FoveaFrame fovea;
+        bool foveated=false;
+        if(singlePassFrame && foveaLayout(request,width,height,fovea)) {
+            D3DSURFACE_DESC cd{}, zd{};
+            foveated=SUCCEEDED(wideColor->GetDesc(&cd)) && SUCCEEDED(wideDepth->GetDesc(&zd)) &&
+                ensureFovea(d,fovea.layout.width,fovea.layout.height,cd.Format,zd.Format);
+        }
+        IDirect3DSurface9 *&passColor=foveated ? foveaColor : wideColor, *&passDepth=foveated ? foveaDepth : wideDepth;
+        const UINT passWidth=foveated ? fovea.layout.width : width*2, passHeight=foveated ? fovea.layout.height : height;
         const bool useReplay=eyeReplay && !alternateEyes && !singlePassFrame;
         bool replayReady=false;
         ss2vr::replay::EyeChange replayChange;
@@ -3728,10 +3841,10 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             if(singlePassFrame) {
                 if(pass==0) {
                     // The engine's target redirection (setRT/setDepth) follows uiFrame eye 0.
-                    std::swap(uiFrame.target[0],wideColor); std::swap(uiFrame.z[0],wideDepth);
+                    std::swap(uiFrame.target[0],passColor); std::swap(uiFrame.z[0],passDepth);
                     beginEye(puppet,centre,0);
-                    const RECT wideScissor{0,0,LONG(width*2),LONG(height)};
-                    D3DVIEWPORT9 wv{0,0,width*2,height,0,1};
+                    const RECT wideScissor{0,0,LONG(passWidth),LONG(passHeight)};
+                    D3DVIEWPORT9 wv{0,0,passWidth,passHeight,0,1};
                     ok=preserveViewportDepth(d,wv) && SUCCEEDED(originalSetRT(d,0,uiFrame.target[0])) &&
                        SUCCEEDED(originalSetDepth(d,uiFrame.z[0])) && SUCCEEDED(d->SetViewport(&wv)) &&
                        SUCCEEDED(d->SetScissorRect(&wideScissor)) &&
@@ -3747,8 +3860,8 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                     // and binary-search the first draw whose instancing changes the image.
                     static const bool spBisect=[] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_BISECT",v,2)==1 && v[0]==L'1'; }();
                     static unsigned spFrames=0, spLo=0, spHi=0; static bool spDone=false;
-                    const bool spCompare=spBisect && !spDone && ++spFrames%30==0;
-                    if(ok && spCompare && single_pass::begin(d,uiFrame.target[0],width,singlePassChange)) {
+                    const bool spCompare=spBisect && !foveated && !spDone && ++spFrames%30==0;
+                    if(ok && spCompare && single_pass::begin(d,uiFrame.target[0],width,height,singlePassChange)) {
                         single_pass::labInstanceRange(0,0,~0u);
                         setSinglePassWorld(true);
                         ok=observedWorldRender(d,puppet,original,centre,0,false);
@@ -3763,7 +3876,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                         ok=ok && SUCCEEDED(d->SetViewport(&ev2)) && SUCCEEDED(d->SetScissorRect(&uiFrame.scissor));
                         if(!spHi) spHi=1000000;
                         const unsigned mid=spLo+(spHi-spLo)/2;
-                        if(ok && single_pass::begin(d,uiFrame.target[0],width,singlePassChange)) {
+                        if(ok && single_pass::begin(d,uiFrame.target[0],width,height,singlePassChange)) {
                             single_pass::labInstanceRange(0,mid,spHi-spLo<=1 ? spLo : ~0u);
                             setSinglePassWorld(true);
                             ok=observedWorldRender(d,puppet,original,centre,0,traceDepth);
@@ -3776,7 +3889,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                             else if(differing>200) spHi=mid; else spLo=mid;
                             log("Single pass bisect allowed=[0,%u) differing=%zu eligible=%u -> range [%u,%u)",mid,differing,eligible,spLo,spHi);
                         } else ok=false;
-                    } else if(ok && single_pass::begin(d,uiFrame.target[0],width,singlePassChange)) {
+                    } else if(ok && single_pass::begin(d,uiFrame.target[0],width,height,singlePassChange,foveated ? &fovea.layout : nullptr)) {
                         // Lab (SS2VR_LAB_SP_REGION=x0,y0,x1,y1 of the left eye): across frames,
                         // binary-search the first eligible draw whose instancing changes the
                         // mean luminance of that region (e.g. where the moon must be).
@@ -3827,10 +3940,32 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                     perf.eyeCpu[0]+=PerfClock::seconds(eyeStart,PerfClock::now());
                     if(generation==graphicsResourceGeneration()) noteScopeViews(puppet,centre);
                     centreReady=ok && generation==graphicsResourceGeneration() && singlePassCaptureCentre(centre);
-                    std::swap(uiFrame.target[0],wideColor); std::swap(uiFrame.z[0],wideDepth);
+                    std::swap(uiFrame.target[0],passColor); std::swap(uiFrame.z[0],passDepth);
                     for(unsigned k=0;k<2 && centreReady;++k) {
                         const RECT half{LONG(k*width),0,LONG((k+1)*width),LONG(height)};
-                        centreReady=SUCCEEDED(originalStretch(d,wideColor,&half,uiFrame.target[k],nullptr,D3DTEXF_NONE));
+                        centreReady=foveated ? composeFovea(d,fovea,k,uiFrame.target[k],width,height) :
+                            SUCCEEDED(originalStretch(d,wideColor,&half,uiFrame.target[k],nullptr,D3DTEXF_NONE));
+                    }
+                    if(foveated) ++perf.foveatedPairs;
+                    {
+                        // Lab (SS2VR_LAB_FOVEA_DUMP=1): the atlas and both composed eyes of the 300th foveated pair.
+                        static const bool dump=[]{ wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_FOVEA_DUMP",v,2)==1 && v[0]==L'1'; }();
+                        static unsigned dumped=0, pixelDumps=0;
+                        const bool pixelPair=foveated && !uiFrame.zeroCopy && pixelDumps<1;
+                        if(dump && foveated && (++dumped==300 || pixelPair)) {
+                            if(pixelPair) ++pixelDumps;
+                            log("Foveated lab dump zeroCopy=%u slot=%d",unsigned(uiFrame.zeroCopy),uiFrame.slot);
+                            std::vector<uint8_t> px; D3DSURFACE_DESC desc{};
+                            const std::pair<IDirect3DSurface9 *,const wchar_t *> shots[]{{foveaColor,pixelPair ? L"fovea-atlas-px.ppm" : L"fovea-atlas.ppm"},{uiFrame.target[0],pixelPair ? L"fovea-eye0-px.ppm" : L"fovea-eye0.ppm"},
+                                {uiFrame.target[1],pixelPair ? L"fovea-eye1-px.ppm" : L"fovea-eye1.ppm"}};
+                            for(const auto &[surface,name]:shots)
+                                if(surface && SUCCEEDED(surface->GetDesc(&desc)) && replay_compare::read(d,surface,px)) replay_compare::write(name,px,desc.Width,desc.Height);
+                            for(unsigned k=0;k<4;++k) {
+                                const auto &g=fovea.layout.region[k];
+                                log("Foveated lab region %u rect=%ld,%ld,%ld,%ld eye=%u s=%.3f,%.3f o=%.3f,%.3f",k,g.rect.left,g.rect.top,g.rect.right,g.rect.bottom,g.eye,g.sx,g.sy,g.ox,g.oy);
+                            }
+                            for(unsigned k=0;k<2;++k) log("Foveated lab inset eye=%u rect=%d,%d %dx%d",k,fovea.inset[k].x,fovea.inset[k].y,fovea.inset[k].w,fovea.inset[k].h);
+                        }
                     }
                     noteStage(3);
                     endEye();
