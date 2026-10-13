@@ -1,5 +1,6 @@
 #include "eye_replay.hpp"
 #include "single_pass.hpp"
+#include "common/turret_look.hpp"
 #include "common/controls.hpp"
 #include "common/lab_preparation.hpp"
 #include "common/ride_control_observation.hpp"
@@ -7660,14 +7661,8 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 if (turretRide != captured.rider.ride || now - turretClock > 500) { turretLook = look; turretRide = captured.rider.ride; }
                 const float dt = turretClock && now > turretClock ? std::min(.1f, float(now - turretClock) / 1000.f) : 0.f;
                 turretClock = now;
-                const auto rate = [](float axis) {
-                    if (!std::isfinite(axis) || std::abs(axis) < .15f) return 0.f;
-                    return std::copysign((std::min(1.f, std::abs(axis)) - .15f) / .85f, axis);
-                };
-                turretLook.x -= rate(captured.input.axis[1][0]) * settings.smoothTurnRate * dt;
-                turretLook.y += rate(captured.input.axis[1][1]) * settings.smoothTurnRate * dt;
-                turretLook.y = std::clamp(turretLook.y, -1.4f, 1.4f);
-                turretLook.z = 0;
+                turretLook = advanceTurretLook(turretLook, captured.input.axis[1][0], captured.input.axis[1][1],
+                                               settings.smoothTurnRate, dt);
                 if (std::isfinite(turretLook.x) && std::isfinite(turretLook.y)) look = turretLook;
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (steeringWheelHeading(look)) {
