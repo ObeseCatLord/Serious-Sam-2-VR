@@ -52,4 +52,8 @@ struct Stats {
     const char *lastReason = "none";
 };
 Stats takeStats() noexcept;
+// Lab bisection: the next play() skips draws [lo, hi) (counting Draw and
+// DrawIndexed) and logs the constants of draw `detail` (~0u for none).
+void labSkipDraws(unsigned lo, unsigned hi, unsigned detail) noexcept;
+unsigned labDrawCount() noexcept;
 } // namespace ss2vr::game::replay

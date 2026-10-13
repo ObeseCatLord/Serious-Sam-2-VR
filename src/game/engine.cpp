@@ -613,6 +613,7 @@ static void orderWheelWeapons(WheelUi &ui) {
 static TriggerGate gates[2];
 static HeldZoomInput zoomInputs[2];
 static uint32_t lastButtons[2]{};
+static const char *lastWeaponSelection = nullptr; // Weapon-change trace provenance.
 static bool turnLatched = false;
 static int pendingSelection[2]{-1, -1};
 static uint64_t selectionTick[2]{}, physicalSequence = 0;
@@ -1621,6 +1622,9 @@ static void update(void *p) {
         if (pendingSelection[h] >= 0 && !multiplayer::remoteClient() && canChange(p, h) &&
             nativeRiderCurrent(p, rider)) {
             soloMountHand = unsigned(h);
+            static char selectionAction[48];
+            std::snprintf(selectionAction, sizeof(selectionAction), "selection id=%d hand=%d", pendingSelection[h], h);
+            lastWeaponSelection = selectionAction;
             setWeapon(p, pendingSelection[h], h, 1);
             if (!nativeRiderCurrent(p, rider))
                 return; // A native lifecycle callback superseded this transaction.
@@ -1643,9 +1647,30 @@ static void update(void *p) {
             s.fire[m] = false;
         }
     // Use existing dual-wield policy. Retry while native weapons cannot yet transition.
+    static const char *lastWeaponAction = "start";
+    if (lastWeaponSelection) { lastWeaponAction = lastWeaponSelection; lastWeaponSelection = nullptr; }
     if (enabled && rider.handheld() && !multiplayer::remoteClient() && !isDual(p) && !s.fire[0] && !s.fire[1] &&
-        canChange(p, 0) && canChange(p, 1) && nativeRiderCurrent(p, rider))
+        canChange(p, 0) && canChange(p, 1) && nativeRiderCurrent(p, rider)) {
         toggleDual(p, 0);
+        lastWeaponAction = "dual toggle";
+    }
+    {
+        // Bounded trace of every native weapon change per hand and what preceded it.
+        static int previousIds[2]{-2, -2};
+        static unsigned traced = 0;
+        int ids[2]{-1, -1};
+        for (unsigned h = 0; h < 2; ++h) {
+            const uint32_t handle = nativeHandle(p, int(h));
+            if (void *w = handle ? resolve(handle) : nullptr) ids[h] = *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4);
+        }
+        if ((ids[0] != previousIds[0] || ids[1] != previousIds[1]) && traced < 200) {
+            ++traced;
+            log("Weapons now left=%d right=%d (was %d,%d) dual=%d after %s", ids[0], ids[1], previousIds[0], previousIds[1],
+                isDual(p), lastWeaponAction);
+            lastWeaponAction = "native";
+        }
+        previousIds[0] = ids[0]; previousIds[1] = ids[1];
+    }
     if (!nativeRiderCurrent(p, rider))
         return;
     refreshOwnership(s, p);

@@ -1,4 +1,5 @@
 #include "eye_replay.hpp"
+#include <unordered_map>
 #include "game.hpp"
 #include <MinHook.h>
 #include <algorithm>
@@ -13,7 +14,7 @@ enum class Op : uint8_t {
     RenderState, TextureStage, Sampler, Texture, VertexShader, PixelShader, VSConstF, VSConstI, VSConstB,
     PSConstF, PSConstI, PSConstB, Stream, StreamFreq, Indices, Declaration, Fvf, Viewport, Scissor, ClipPlane,
     Transform, Material, Light, LightEnable, RenderTarget, Depth, Clear, Stretch, Fill, Draw, DrawIndexed,
-    UpdateTexture
+    UpdateTexture, ApplyBlock
 };
 struct Cmd {
     Op op;
@@ -22,6 +23,7 @@ struct Cmd {
     uint32_t data = 0;          // arena word offset
     uint32_t state = ~0u;       // tagged matrix upload: ViewState index
     uint8_t indexSource = 0;    // DrawIndexed: 0 bound buffer, 2/4 copied 16/32-bit indices (index arena)
+    uint32_t vertexDraw = ~0u;  // Index into vertexDraws: vertices copied from dynamic buffers
 };
 // Device method types (IDirect3DDevice9 vtable order).
 using SetTransformF = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DTRANSFORMSTATETYPE, const D3DMATRIX *);
@@ -49,6 +51,12 @@ using UpdateTextureF = HRESULT(WINAPI *)(IDirect3DDevice9 *, IDirect3DBaseTextur
 using LockVertexF = HRESULT(WINAPI *)(IDirect3DVertexBuffer9 *, UINT, UINT, void **, DWORD);
 using LockIndexF = HRESULT(WINAPI *)(IDirect3DIndexBuffer9 *, UINT, UINT, void **, DWORD);
 using UnlockIndexF = HRESULT(WINAPI *)(IDirect3DIndexBuffer9 *);
+using UnlockVertexF = HRESULT(WINAPI *)(IDirect3DVertexBuffer9 *);
+using BlockF = HRESULT(WINAPI *)(IDirect3DStateBlock9 *);
+using BeginBlockF = HRESULT(WINAPI *)(IDirect3DDevice9 *);
+BlockF oApplyBlock = nullptr;
+BeginBlockF oBeginBlock = nullptr;
+unsigned blockApplies = 0, blockBegins = 0; // Recording census.
 
 SetTransformF oSetTransform = nullptr; SetViewportF oSetViewport = nullptr; SetMaterialF oSetMaterial = nullptr;
 SetLightF oSetLight = nullptr; LightEnableF oLightEnable = nullptr; SetClipPlaneF oSetClipPlane = nullptr;
@@ -60,6 +68,61 @@ SetStreamFreqF oSetStreamFreq = nullptr; SetIndicesF oSetIndices = nullptr; SetP
 SetConstFF oSetPSConstF = nullptr; SetConstIF oSetPSConstI = nullptr; SetConstBF oSetPSConstB = nullptr;
 UpdateTextureF oUpdateTexture = nullptr; LockVertexF oLockVertex = nullptr; LockIndexF oLockIndex = nullptr;
 UnlockIndexF oUnlockIndex = nullptr;
+UnlockVertexF oUnlockVertex = nullptr;
+// Dynamic vertex buffers likewise: the engine rewrites regions of them with
+// NOOVERWRITE within a frame after earlier draws used them (CPU-built water,
+// foliage and particles), so recorded draws copy their vertices out of the
+// shadow. Draws that mix such a stream with others (or instance) cannot be
+// copied; their ranges are watched and a later overwrite invalidates.
+struct VertexShadow {
+    IDirect3DVertexBuffer9 *buffer = nullptr;
+    std::vector<uint8_t> data;
+    uint8_t *mapped = nullptr;
+    UINT lockOffset = 0, lockBytes = 0;
+    bool dynamic = false, locked = false;
+    std::vector<std::pair<UINT, UINT>> watched; // Byte ranges referenced by uncopied recorded draws.
+};
+std::vector<VertexShadow> vertexShadows;
+VertexShadow *vertexShadowOf(IDirect3DVertexBuffer9 *b, bool create) noexcept {
+    if (!b) return nullptr;
+    for (auto &v : vertexShadows) if (v.buffer == b) {
+        if (!create) return &v;
+        D3DVERTEXBUFFER_DESC desc{};
+        if (FAILED(b->GetDesc(&desc))) return nullptr;
+        if (v.data.size() == desc.Size || !v.dynamic) return &v;
+        v = {}; v.buffer = b; v.dynamic = (desc.Usage & D3DUSAGE_DYNAMIC) != 0; // Recycled pointer.
+        if (v.dynamic) v.data.resize(desc.Size);
+        return &v;
+    }
+    if (!create) return nullptr;
+    D3DVERTEXBUFFER_DESC desc{};
+    if (FAILED(b->GetDesc(&desc))) return nullptr;
+    VertexShadow v; v.buffer = b; v.dynamic = (desc.Usage & D3DUSAGE_DYNAMIC) != 0;
+    if (v.dynamic) v.data.resize(desc.Size);
+    vertexShadows.push_back(std::move(v));
+    return &vertexShadows.back();
+}
+struct StreamBinding { IDirect3DVertexBuffer9 *buffer = nullptr; UINT offset = 0, stride = 0, frequency = 1; };
+StreamBinding currentStreams[16], initialStreams[16];
+uint32_t currentStreamMask = 1; // Streams the current declaration (or FVF) reads.
+struct VertexDraw { uint16_t mask = 0; uint32_t slot = 0; uint16_t stride[16]{}; };
+std::vector<VertexDraw> vertexDraws;
+std::vector<uint8_t> vertexArena[16];
+IDirect3DVertexBuffer9 *replayVertices[16]{};
+UINT replayVertexBytes[16]{};
+uint32_t streamMaskOf(IDirect3DVertexDeclaration9 *decl) noexcept {
+    static std::unordered_map<const void *, uint32_t> known;
+    if (!decl) return 1;
+    if (const auto it = known.find(decl); it != known.end()) return it->second;
+    D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1]{};
+    UINT count = MAXD3DDECLLENGTH + 1;
+    uint32_t mask = 0;
+    if (SUCCEEDED(decl->GetDeclaration(elements, &count)))
+        for (UINT i = 0; i < count && elements[i].Stream != 0xff; ++i) if (elements[i].Stream < 16) mask |= 1u << elements[i].Stream;
+    if (!mask) mask = 1;
+    if (known.size() < 4096) known.emplace(decl, mask);
+    return mask;
+}
 // Dynamic index buffers are written through a CPU shadow (copied to the real
 // mapping on unlock): the engine's index ring wraps several times per frame,
 // so recorded draws copy their indices out of the shadow for the replay.
@@ -200,6 +263,17 @@ HRESULT WINAPI hSetClipPlane(IDirect3DDevice9 *d, DWORD i, const float *plane) {
     if (live() && plane) { auto &c = push(Op::ClipPlane); c.a = i; c.data = store(plane, 16); snapshotState(c); }
     return oSetClipPlane(d, i, plane);
 }
+// State blocks applied while recording are replayed as such; a block recorded
+// (Begin/EndStateBlock) mid-recording would be applied immediately on replay,
+// so it invalidates the recording.
+HRESULT WINAPI hApplyBlock(IDirect3DStateBlock9 *b) {
+    if (live() && b != initial) { auto &c = push(Op::ApplyBlock); c.p = b; reference(b); ++blockApplies; }
+    return oApplyBlock(b);
+}
+HRESULT WINAPI hBeginBlock(IDirect3DDevice9 *d) {
+    if (live()) { ++blockBegins; valid = false; reason = "state block recorded"; }
+    return oBeginBlock(d);
+}
 HRESULT WINAPI hSetRenderState(IDirect3DDevice9 *d, D3DRENDERSTATETYPE s, DWORD v) {
     if (live()) { auto &c = push(Op::RenderState); c.a = s; c.b = v; }
     return oSetRenderState(d, s, v);
@@ -221,10 +295,12 @@ HRESULT WINAPI hSetScissor(IDirect3DDevice9 *d, const RECT *r) {
     return oSetScissor(d, r);
 }
 HRESULT WINAPI hSetDeclaration(IDirect3DDevice9 *d, IDirect3DVertexDeclaration9 *v) {
+    currentStreamMask = streamMaskOf(v);
     if (live()) { auto &c = push(Op::Declaration); c.p = v; reference(v); }
     return oSetDeclaration(d, v);
 }
 HRESULT WINAPI hSetFvf(IDirect3DDevice9 *d, DWORD f) {
+    if (f) currentStreamMask = 1;
     if (live()) { auto &c = push(Op::Fvf); c.a = f; }
     return oSetFvf(d, f);
 }
@@ -249,10 +325,12 @@ HRESULT WINAPI hSetVSConstB(IDirect3DDevice9 *d, UINT r, const BOOL *v, UINT n) 
     return oSetVSConstB(d, r, v, n);
 }
 HRESULT WINAPI hSetStream(IDirect3DDevice9 *d, UINT s, IDirect3DVertexBuffer9 *b, UINT offset, UINT stride) {
+    if (s < 16) { currentStreams[s].buffer = b; currentStreams[s].offset = offset; currentStreams[s].stride = stride; }
     if (live()) { auto &c = push(Op::Stream); c.a = s; c.p = b; c.b = offset; c.c = stride; reference(b); }
     return oSetStream(d, s, b, offset, stride);
 }
 HRESULT WINAPI hSetStreamFreq(IDirect3DDevice9 *d, UINT s, UINT f) {
+    if (s < 16) currentStreams[s].frequency = f;
     if (live()) { auto &c = push(Op::StreamFreq); c.a = s; c.b = f; }
     return oSetStreamFreq(d, s, f);
 }
@@ -287,10 +365,33 @@ HRESULT WINAPI hLockIndex(IDirect3DIndexBuffer9 *, UINT, UINT, void **, DWORD);
 void countLock(unsigned kind, DWORD flags, bool referencedBuffer) noexcept;
 HRESULT WINAPI hLockVertex(IDirect3DVertexBuffer9 *b, UINT offset, UINT size, void **data, DWORD flags) {
     countLock(0, flags, isReferenced(b));
-    if (window && valid && !(flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY)) && isReferenced(b)) {
+    VertexShadow *shadow = (flags & D3DLOCK_READONLY) ? nullptr : vertexShadowOf(b, true);
+    const bool shadowed = shadow && shadow->dynamic && !shadow->locked;
+    if (!shadowed && window && valid && !(flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY)) && isReferenced(b)) {
         valid = false; reason = "vertex data overwritten";
     }
-    return oLockVertex(b, offset, size, data, flags);
+    if (shadowed && window && valid && !shadow->watched.empty()) {
+        const UINT end = size ? offset + size : UINT(shadow->data.size());
+        for (const auto &[lo, hi] : shadow->watched)
+            if (offset < hi && lo < end) { valid = false; reason = "watched vertex data overwritten"; break; }
+    }
+    const HRESULT hr = oLockVertex(b, offset, size, data, flags);
+    if (SUCCEEDED(hr) && shadowed && data && *data) {
+        const UINT bytes = size ? size : UINT(shadow->data.size()) - std::min<UINT>(offset, UINT(shadow->data.size()));
+        if (uint64_t(offset) + bytes <= shadow->data.size()) {
+            shadow->mapped = static_cast<uint8_t *>(*data);
+            shadow->lockOffset = offset; shadow->lockBytes = bytes; shadow->locked = true;
+            *data = shadow->data.data() + offset;
+        }
+    }
+    return hr;
+}
+HRESULT WINAPI hUnlockVertex(IDirect3DVertexBuffer9 *b) {
+    if (VertexShadow *v = vertexShadowOf(b, false); v && v->locked) {
+        std::memcpy(v->mapped, v->data.data() + v->lockOffset, v->lockBytes);
+        v->locked = false; v->mapped = nullptr;
+    }
+    return oUnlockVertex(b);
 }
 unsigned lockStats[2][4]{}; // [vertex/index][noOverwrite, discard, plain, readonly] during the window
 unsigned lockReferenced[2]{};
@@ -358,12 +459,20 @@ bool install(IDirect3DDevice9 *d, const Originals &o) noexcept {
         hook(v[109], reinterpret_cast<void *>(hSetPSConstF), oSetPSConstF) &&
         hook(v[111], reinterpret_cast<void *>(hSetPSConstI), oSetPSConstI) &&
         hook(v[113], reinterpret_cast<void *>(hSetPSConstB), oSetPSConstB) &&
-        hook(v[31], reinterpret_cast<void *>(hUpdateTexture), oUpdateTexture);
+        hook(v[31], reinterpret_cast<void *>(hUpdateTexture), oUpdateTexture) &&
+        hook(v[60], reinterpret_cast<void *>(hBeginBlock), oBeginBlock);
+    {
+        IDirect3DStateBlock9 *probe = nullptr;
+        ok = ok && SUCCEEDED(d->CreateStateBlock(D3DSBT_PIXELSTATE, &probe)) && probe &&
+             hook((*reinterpret_cast<void ***>(probe))[5], reinterpret_cast<void *>(hApplyBlock), oApplyBlock);
+        if (probe) probe->Release();
+    }
     IDirect3DVertexBuffer9 *vb = nullptr;
     IDirect3DIndexBuffer9 *ib = nullptr;
     ok = ok && SUCCEEDED(d->CreateVertexBuffer(64, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vb, nullptr)) && vb &&
         SUCCEEDED(d->CreateIndexBuffer(64, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, nullptr)) && ib &&
         hook((*reinterpret_cast<void ***>(vb))[11], reinterpret_cast<void *>(hLockVertex), oLockVertex) &&
+        hook((*reinterpret_cast<void ***>(vb))[12], reinterpret_cast<void *>(hUnlockVertex), oUnlockVertex) &&
         hook((*reinterpret_cast<void ***>(ib))[11], reinterpret_cast<void *>(hLockIndex), oLockIndex) &&
         hook((*reinterpret_cast<void ***>(ib))[12], reinterpret_cast<void *>(hUnlockIndex), oUnlockIndex);
     if (vb) vb->Release();
@@ -385,6 +494,10 @@ bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *de
     if (FAILED(initial->Capture())) return false;
     cmds.clear(); arena.clear(); states.clear(); rewrites.clear();
     indexArena[0].clear(); indexArena[1].clear();
+    for (auto &a : vertexArena) a.clear();
+    vertexDraws.clear();
+    for (auto &v : vertexShadows) v.watched.clear();
+    std::copy(std::begin(currentStreams), std::end(currentStreams), std::begin(initialStreams));
     initialIndices = currentIndices; reference(initialIndices);
     recordedTarget = target; recordedDepth = depth;
     valid = true; reason = "none"; active = true; window = true; tagPending = false;
@@ -424,14 +537,61 @@ void recordFill(IDirect3DSurface9 *s, const RECT *r, D3DCOLOR color) noexcept {
     if (!live()) return;
     auto &c = push(Op::Fill); c.p = s; c.a = color; reference(s); c.b = r ? store(r, sizeof(RECT)) : ~0u;
 }
+// Copy (or watch) the vertices a recorded draw reads from dynamic buffers:
+// vertices [first, first + count) of every stream the declaration reads.
+void captureVertices(Cmd &c, UINT first, UINT count) noexcept {
+    const uint32_t mask = currentStreamMask;
+    bool anyDynamic = false, allDynamic = true;
+    for (unsigned k = 0; k < 16; ++k) {
+        if (!(mask & (1u << k))) continue;
+        const auto &binding = currentStreams[k];
+        VertexShadow *v = vertexShadowOf(binding.buffer, false);
+        const bool dynamic = v && v->dynamic;
+        anyDynamic = anyDynamic || dynamic;
+        allDynamic = allDynamic && dynamic && binding.frequency == 1 && binding.stride;
+    }
+    if (!anyDynamic || !count) return;
+    if (!allDynamic) {
+        for (unsigned k = 0; k < 16; ++k) {
+            if (!(mask & (1u << k))) continue;
+            const auto &binding = currentStreams[k];
+            if (VertexShadow *v = vertexShadowOf(binding.buffer, false); v && v->dynamic) {
+                if (binding.frequency != 1) { valid = false; reason = "instanced dynamic vertices"; return; }
+                v->watched.emplace_back(binding.offset + first * binding.stride, binding.offset + (first + count) * binding.stride);
+            }
+        }
+        return;
+    }
+    VertexDraw draw; draw.mask = uint16_t(mask);
+    uint32_t slot = 0;
+    for (unsigned k = 0; k < 16; ++k)
+        if (mask & (1u << k)) slot = std::max<uint32_t>(slot, uint32_t((vertexArena[k].size() + currentStreams[k].stride - 1) / currentStreams[k].stride));
+    for (unsigned k = 0; k < 16; ++k) {
+        if (!(mask & (1u << k))) continue;
+        const auto &binding = currentStreams[k];
+        const VertexShadow *v = vertexShadowOf(binding.buffer, false);
+        const uint64_t from = uint64_t(binding.offset) + uint64_t(first) * binding.stride, bytes = uint64_t(count) * binding.stride;
+        if (from + bytes > v->data.size()) { valid = false; reason = "vertex range outside buffer"; return; }
+        auto &out = vertexArena[k];
+        out.resize(size_t(slot) * binding.stride);
+        out.insert(out.end(), v->data.begin() + size_t(from), v->data.begin() + size_t(from + bytes));
+        draw.stride[k] = uint16_t(binding.stride);
+    }
+    draw.slot = slot;
+    c.vertexDraw = uint32_t(vertexDraws.size());
+    vertexDraws.push_back(draw);
+}
 void recordDraw(D3DPRIMITIVETYPE type, UINT start, UINT count) noexcept {
     if (!live()) return;
     auto &c = push(Op::Draw); c.a = type; c.b = start; c.c = count; ++stats.draws;
+    captureVertices(c, start, indexCount(type, count));
 }
 void recordDrawIndexed(D3DPRIMITIVETYPE type, INT base, UINT minimum, UINT vertices, UINT start, UINT count) noexcept {
     if (!live()) return;
     auto &c = push(Op::DrawIndexed); c.a = type; c.b = uint32_t(base); c.c = minimum; c.d = vertices; c.e = start; c.f = count;
     ++stats.draws;
+    if (base >= 0 || INT(minimum) + base >= 0) captureVertices(c, UINT(base + INT(minimum)), vertices);
+    if (!valid) return;
     IndexShadow *shadow = nullptr;
     for (auto &s : shadows) if (s.buffer == currentIndices) { shadow = &s; break; }
     if (shadow && shadow->dynamic) {
@@ -442,6 +602,21 @@ void recordDrawIndexed(D3DPRIMITIVETYPE type, INT base, UINT minimum, UINT verti
         out.insert(out.end(), shadow->data.begin() + size_t(start) * width, shadow->data.begin() + size_t(start + n) * width);
         c.indexSource = uint8_t(width);
     }
+}
+extern unsigned labSkipLo, labSkipHi, labDetail, labDraws;
+// Whether a vertex declaration carries pre-transformed (POSITIONT) positions; cached per object.
+static bool positionTransformed(IDirect3DVertexDeclaration9 *decl) noexcept {
+    static std::unordered_map<const void *, bool> known;
+    if (!decl) return false;
+    if (const auto it = known.find(decl); it != known.end()) return it->second;
+    D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1]{};
+    UINT count = MAXD3DDECLLENGTH + 1;
+    bool transformed = false;
+    if (SUCCEEDED(decl->GetDeclaration(elements, &count)))
+        for (UINT i = 0; i < count && elements[i].Stream != 0xff; ++i)
+            transformed = transformed || elements[i].Usage == D3DDECLUSAGE_POSITIONT;
+    if (known.size() < 4096) known.emplace(decl, transformed);
+    return transformed;
 }
 bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *depth, const EyeChange &change,
           const ViewState &root) noexcept {
@@ -475,6 +650,40 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
         ok = ok && SUCCEEDED(oLockIndex(replayIndices[k], 0, UINT(source.size()), &mapped, D3DLOCK_DISCARD)) && mapped;
         if (ok) { std::memcpy(mapped, source.data(), source.size()); ok = SUCCEEDED(oUnlockIndex(replayIndices[k])); }
     }
+    for (unsigned k = 0; k < 16 && ok; ++k) {
+        const auto &source = vertexArena[k];
+        if (source.empty()) continue;
+        if (replayVertexBytes[k] < source.size()) {
+            if (replayVertices[k]) replayVertices[k]->Release();
+            replayVertices[k] = nullptr;
+            const UINT bytes = UINT(source.size() + source.size() / 2);
+            ok = SUCCEEDED(d->CreateVertexBuffer(bytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT,
+                                                 &replayVertices[k], nullptr)) && replayVertices[k];
+            replayVertexBytes[k] = ok ? bytes : 0;
+        }
+        void *mapped = nullptr;
+        // Locked through the original: the replay buffers are not shadowed.
+        ok = ok && SUCCEEDED(oLockVertex(replayVertices[k], 0, UINT(source.size()), &mapped, D3DLOCK_DISCARD)) && mapped;
+        if (ok) { std::memcpy(mapped, source.data(), source.size()); ok = SUCCEEDED(oUnlockVertex(replayVertices[k])); }
+    }
+    StreamBinding logicalStreams[16];
+    std::copy(std::begin(initialStreams), std::end(initialStreams), std::begin(logicalStreams));
+    // Bind a draw's copied vertices, run it, then restore the logical streams.
+    const auto withCopiedVertices = [&](const Cmd &c, auto &&draw) -> HRESULT {
+        if (c.vertexDraw == ~0u) return draw(0);
+        const auto &v = vertexDraws[c.vertexDraw];
+        HRESULT result = D3D_OK;
+        for (unsigned k = 0; k < 16 && SUCCEEDED(result); ++k)
+            if (v.mask & (1u << k)) result = oSetStream(d, k, replayVertices[k], 0, v.stride[k]);
+        if (SUCCEEDED(result)) result = draw(v.slot);
+        for (unsigned k = 0; k < 16; ++k)
+            if (v.mask & (1u << k)) {
+                const auto &l = logicalStreams[k];
+                const HRESULT restored = oSetStream(d, k, l.buffer, l.offset, l.stride);
+                if (SUCCEEDED(result)) result = restored;
+            }
+        return result;
+    };
     IDirect3DIndexBuffer9 *logicalIndices = initialIndices, *boundIndices = initialIndices;
     // Fallback view states for blocks drawn after the root view returned (the
     // engine globals then no longer hold the eye view): the root view and its
@@ -485,7 +694,21 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
     float rows[16];
     std::vector<float> block;
     unsigned blockRewrites = 0, blockMisses = 0, pendingMiss = 0, fallbacks[2]{}, pendingFallback = 0, drawKinds[8]{};
-    unsigned frustumRewrites = 0;
+    unsigned frustumRewrites = 0, blockPath = 0;
+    unsigned drawIndex = 0;
+    static const std::pair<unsigned, unsigned> detailRange = [] {
+        wchar_t v[32]{}; unsigned a = 0, b = 0;
+        if (GetEnvironmentVariableW(L"SS2VR_LAB_REPLAY_DETAIL", v, 32)) swscanf(v, L"%u,%u", &a, &b);
+        return std::pair<unsigned, unsigned>{a, b};
+    }();
+    static unsigned detailFrames = 0, playCalls = 0;
+    const bool detailFrame = detailRange.second && detailFrames < 1 && ++playCalls >= 3;
+    if (detailFrame) ++detailFrames;
+    const auto detailed = [&](unsigned i) { return i == labDetail || (detailFrame && i >= detailRange.first && i < detailRange.second); };
+    const float *lastBlockRows = nullptr; float lastBlockOut[16]{}; unsigned lastBlockReg = 0;
+    // Pre-transformed (screen-space) draws keep the left eye's screen positions.
+    bool transformedFvf = false, transformedDecl = false;
+    unsigned transformedDraws = 0, transformedPrims = 0;
     // A sizeable draw whose view matrix is not recognized would sit at the left
     // eye's position in the right eye (terrain showing objects through it): the
     // caller renders that frame's right eye natively instead.
@@ -510,6 +733,7 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
         case Op::VSConstF:
             if (c.state != ~0u && c.e) {
                 rewriteUpload(c.e, rewriteOf(c.state), reinterpret_cast<const float *>(w), c.b, rows);
+                if (c.e == 0x47 || c.e < 0x46 || c.e > 0x4a) blockPath = 20 + (c.e & 0xff) % 70; // Tagged MVP-like upload.
                 hr = oSetVSConstF(d, c.a, rows, c.b);
             } else if (c.state != ~0u) {
                 // Block upload: rewrite its c1..c4 rows when they are this view's MVP.
@@ -523,6 +747,7 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
                 else if (rewriteIfMvp(backgroundRewrite, mvp, rows)) path = 3;
                 else if (rewriteFrustumMvp(own, mvp, rows)) path = 4;
                 if (path) {
+                    lastBlockRows = reinterpret_cast<const float *>(w) + size_t(c.f) * 4; std::memcpy(lastBlockOut, rows, sizeof(rows)); lastBlockReg = c.a;
                     std::memcpy(mvp, rows, sizeof(rows)); ++blockRewrites;
                     if (path == 4) ++frustumRewrites;
                     else if (path > 1) { ++fallbacks[path - 2]; pendingFallback = path * 65536 + c.a * 256 + c.b; }
@@ -542,6 +767,7 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
                     }
                 }
                 lastPath = path ? path : (own.identity ? 8 : 9);
+                blockPath = lastPath;
                 hr = oSetVSConstF(d, c.a, block.data(), c.b);
             } else hr = oSetVSConstF(d, c.a, reinterpret_cast<const float *>(w), c.b);
             break;
@@ -550,14 +776,21 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
         case Op::PSConstF: hr = oSetPSConstF(d, c.a, reinterpret_cast<const float *>(w), c.b); break;
         case Op::PSConstI: hr = oSetPSConstI(d, c.a, reinterpret_cast<const int *>(w), c.b); break;
         case Op::PSConstB: hr = oSetPSConstB(d, c.a, reinterpret_cast<const BOOL *>(w), c.b); break;
-        case Op::Stream: hr = oSetStream(d, c.a, static_cast<IDirect3DVertexBuffer9 *>(c.p), c.b, c.c); break;
+        case Op::Stream:
+            hr = oSetStream(d, c.a, static_cast<IDirect3DVertexBuffer9 *>(c.p), c.b, c.c);
+            if (c.a < 16) logicalStreams[c.a] = {static_cast<IDirect3DVertexBuffer9 *>(c.p), c.b, c.c, logicalStreams[c.a].frequency};
+            break;
         case Op::StreamFreq: hr = oSetStreamFreq(d, c.a, c.b); break;
         case Op::Indices:
             logicalIndices = static_cast<IDirect3DIndexBuffer9 *>(c.p);
             hr = oSetIndices(d, logicalIndices); boundIndices = logicalIndices;
             break;
-        case Op::Declaration: hr = oSetDeclaration(d, static_cast<IDirect3DVertexDeclaration9 *>(c.p)); break;
-        case Op::Fvf: hr = oSetFvf(d, c.a); break;
+        case Op::Declaration:
+            hr = oSetDeclaration(d, static_cast<IDirect3DVertexDeclaration9 *>(c.p));
+            transformedDecl = positionTransformed(static_cast<IDirect3DVertexDeclaration9 *>(c.p));
+            transformedFvf = false;
+            break;
+        case Op::Fvf: hr = oSetFvf(d, c.a); transformedFvf = (c.a & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW; transformedDecl = false; break;
         case Op::Viewport: hr = oSetViewport(d, reinterpret_cast<const D3DVIEWPORT9 *>(w)); break;
         case Op::Scissor: hr = oSetScissor(d, reinterpret_cast<const RECT *>(w)); break;
         case Op::ClipPlane: {
@@ -583,7 +816,16 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
             // Lab bisection: SS2VR_LAB_REPLAY_SKIP=1 skips non-indexed draws, =2 line draws only.
             static const int labSkip = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_REPLAY_SKIP", value, 2) == 1 ? int(value[0] - L'0') : 0; }();
             const bool line = c.a == D3DPT_LINELIST || c.a == D3DPT_LINESTRIP;
-            if (!(labSkip == 1 || (labSkip == 2 && line))) hr = bridge.draw(d, D3DPRIMITIVETYPE(c.a), c.b, c.c);
+            if (transformedFvf || transformedDecl) { ++transformedDraws; transformedPrims += c.c; }
+            const bool bisectSkip = drawIndex >= labSkipLo && drawIndex < labSkipHi;
+            if (detailed(drawIndex))
+                log("Eye replay bisect draw %u: plain type=%u prims=%u blockPath=%u vs=%04x", drawIndex, c.a, c.c, blockPath,
+                    unsigned(reinterpret_cast<uintptr_t>(lastVs) & 0xffff));
+            ++drawIndex;
+            if (!(labSkip == 1 || (labSkip == 2 && line)) && !bisectSkip)
+                hr = withCopiedVertices(c, [&](uint32_t slot) {
+                    return bridge.draw(d, D3DPRIMITIVETYPE(c.a), c.vertexDraw == ~0u ? c.b : slot, c.c);
+                });
             ++drawKinds[std::min<uint32_t>(c.a, 7)];
         }
             if (pendingMiss && missedUsed < 440)
@@ -594,9 +836,28 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
         case Op::DrawIndexed: {
             IDirect3DIndexBuffer9 *wanted = c.indexSource ? replayIndices[c.indexSource == 4 ? 1 : 0] : logicalIndices;
             if (wanted != boundIndices) { hr = oSetIndices(d, wanted); boundIndices = wanted; }
+            if (transformedFvf || transformedDecl) { ++transformedDraws; transformedPrims += c.f; }
             static const bool labSkipMisses = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_REPLAY_SKIP_MISSES", value, 2) == 1 && value[0] == L'1'; }();
-            if (SUCCEEDED(hr) && !(labSkipMisses && pendingMiss))
-                hr = bridge.drawIndexed(d, D3DPRIMITIVETYPE(c.a), INT(c.b), c.c, c.d, c.indexSource ? c.data : c.e, c.f);
+            // Lab bisection: SS2VR_LAB_REPLAY_SKIP_PATH=<n> skips draws whose MVP took rewrite path n.
+            static const int labSkipPath = [] { wchar_t value[8]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_REPLAY_SKIP_PATH", value, 8) ? _wtoi(value) : -1; }();
+            const bool skipPath = labSkipPath >= 0 && unsigned(labSkipPath) == blockPath;
+            const bool bisectSkip = drawIndex >= labSkipLo && drawIndex < labSkipHi;
+            if (detailed(drawIndex)) {
+                const float *i = lastBlockRows, *o = lastBlockOut;
+                log("Eye replay bisect draw %u: indexed prims=%u block=c%u:%u path=%u vs=%04x", drawIndex, c.f, lastBlock >> 8,
+                    lastBlock & 255, blockPath, unsigned(reinterpret_cast<uintptr_t>(lastVs) & 0xffff));
+                if (i) log("Eye replay bisect rows in %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f "
+                           "out %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f",
+                           i[0],i[1],i[2],i[3],i[4],i[5],i[6],i[7],i[8],i[9],i[10],i[11],i[12],i[13],i[14],i[15],
+                           o[0],o[1],o[2],o[3],o[4],o[5],o[6],o[7],o[8],o[9],o[10],o[11],o[12],o[13],o[14],o[15]);
+            }
+            ++drawIndex;
+            if (SUCCEEDED(hr) && !(labSkipMisses && pendingMiss) && !skipPath && !bisectSkip)
+                hr = withCopiedVertices(c, [&](uint32_t slot) {
+                    // Copied vertices start at `slot` with vertex (base + minimum) first.
+                    const INT base = c.vertexDraw == ~0u ? INT(c.b) : INT(slot) - INT(c.c);
+                    return bridge.drawIndexed(d, D3DPRIMITIVETYPE(c.a), base, c.c, c.d, c.indexSource ? c.data : c.e, c.f);
+                });
             recent[recentCount++ % 48] = {c.f, lastBlock, lastPath, lastVs};
             lastPath = 0;
             if (pendingMiss && missedUsed < 440)
@@ -608,10 +869,12 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
             pendingMiss = 0; pendingFallback = 0;
             break;
         }
+        case Op::ApplyBlock: hr = oApplyBlock(static_cast<IDirect3DStateBlock9 *>(c.p)); break;
         case Op::UpdateTexture: hr = oUpdateTexture(d, static_cast<IDirect3DBaseTexture9 *>(c.p), static_cast<IDirect3DBaseTexture9 *>(c.q)); break;
         }
         ok = SUCCEEDED(hr) && !unrecognized;
     }
+    labDraws = drawIndex; labSkipLo = labSkipHi = 0; labDetail = ~0u;
     if (boundIndices != logicalIndices) ok = SUCCEEDED(oSetIndices(d, logicalIndices)) && ok; // Engine's binding as it left it.
     static unsigned diagnostics = 0, replays = 0, loggedDraws = 0, changeLogs = 0;
     ++replays;
@@ -658,6 +921,9 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
             log("%s", tail);
         }
         log("Eye replay plain draws points=%u lines=%u strips=%u triangles=%u tristrips=%u fans=%u", drawKinds[1], drawKinds[2], drawKinds[3], drawKinds[4], drawKinds[5], drawKinds[6]);
+        log("Eye replay pre-transformed draws=%u primitives=%u state block applies=%u begins=%u", transformedDraws,
+            transformedPrims, blockApplies, blockBegins);
+        blockApplies = blockBegins = 0;
         log("Eye replay states=%zu rewritten=%u identity=%u invalid=%u change=%u P0 rows %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f",
             states.size(), rewritten, identity, invalid, unsigned(change.valid), p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
         log("Eye replay AP0 %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f V0 t=%.3f,%.3f,%.3f E t=%.4f,%.4f,%.4f",
@@ -674,6 +940,9 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
     }
     return ok;
 }
+unsigned labSkipLo = 0, labSkipHi = 0, labDetail = ~0u, labDraws = 0;
+void labSkipDraws(unsigned lo, unsigned hi, unsigned detail) noexcept { labSkipLo = lo; labSkipHi = hi; labDetail = detail; }
+unsigned labDrawCount() noexcept { return labDraws; }
 Stats takeStats() noexcept {
     const Stats out = stats; stats = {};
     log("Eye replay locks vertex noOverwrite=%u discard=%u plain=%u read=%u referencedOverwrite=%u | index noOverwrite=%u discard=%u plain=%u read=%u referencedOverwrite=%u",

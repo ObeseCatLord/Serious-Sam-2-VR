@@ -2531,6 +2531,112 @@ static void presentBody(IDirect3DDevice9 *d) {
         if (aborted) { uiHalted = true; nestedNativePresentation(); }
     });
 }
+// Lab (SS2VR_LAB_REPLAY_VERIFY=1): on sampled frames the right eye is replayed,
+// copied aside, then rendered natively over it; the two images are compared and,
+// when they differ, written beside the game as PPMs (replay-N.ppm, native-N.ppm).
+namespace replay_compare {
+IDirect3DSurface9 *copy = nullptr;
+UINT copyWidth = 0, copyHeight = 0;
+unsigned frames = 0, written = 0;
+bool due() noexcept { return ++frames % 45 == 0; }
+// SS2VR_LAB_REPLAY_BISECT=x0,y0,x1,y1: find the draw whose replay puts wrong
+// pixels in that rectangle (skip half of [lo,hi) per compared frame).
+struct Bisect { bool on = false; int x0 = 0, y0 = 0, x1 = 0, y1 = 0; unsigned lo = 0, hi = 0, baseline = 0, step = 0; bool done = false; };
+Bisect bisect = [] {
+    Bisect b; wchar_t v[64]{};
+    if (GetEnvironmentVariableW(L"SS2VR_LAB_REPLAY_BISECT", v, 64)) b.on = swscanf(v, L"%d,%d,%d,%d", &b.x0, &b.y0, &b.x1, &b.y1) == 4;
+    return b;
+}();
+void prepare() noexcept {
+    if (!bisect.on || bisect.done) return;
+    if (!bisect.hi) { replay::labSkipDraws(0, 0, ~0u); return; } // Baseline frame.
+    const unsigned mid = (bisect.lo + bisect.hi) / 2;
+    replay::labSkipDraws(bisect.lo, mid, bisect.hi - bisect.lo == 1 ? bisect.lo : ~0u);
+}
+bool keep(IDirect3DDevice9 *d, IDirect3DSurface9 *target) noexcept {
+    D3DSURFACE_DESC desc{};
+    if (!target || FAILED(target->GetDesc(&desc))) return false;
+    if (!copy || copyWidth != desc.Width || copyHeight != desc.Height) {
+        if (copy) copy->Release();
+        copy = nullptr;
+        if (FAILED(d->CreateRenderTarget(desc.Width, desc.Height, desc.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &copy, nullptr)))
+            return false;
+        copyWidth = desc.Width; copyHeight = desc.Height;
+    }
+    return SUCCEEDED(originalStretch(d, target, nullptr, copy, nullptr, D3DTEXF_NONE));
+}
+static bool read(IDirect3DDevice9 *d, IDirect3DSurface9 *rt, std::vector<uint8_t> &out) {
+    D3DSURFACE_DESC desc{};
+    IDirect3DSurface9 *cpu = nullptr;
+    if (FAILED(rt->GetDesc(&desc)) ||
+        FAILED(d->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &cpu, nullptr)))
+        return false;
+    bool ok = SUCCEEDED(d->GetRenderTargetData(rt, cpu));
+    D3DLOCKED_RECT r{};
+    if (ok && SUCCEEDED(cpu->LockRect(&r, nullptr, D3DLOCK_READONLY))) {
+        out.resize(size_t(desc.Width) * desc.Height * 4);
+        for (UINT y = 0; y < desc.Height; ++y)
+            memcpy(out.data() + size_t(y) * desc.Width * 4, static_cast<uint8_t *>(r.pBits) + size_t(y) * r.Pitch, desc.Width * 4);
+        cpu->UnlockRect();
+    } else ok = false;
+    cpu->Release();
+    return ok;
+}
+static void write(const wchar_t *name, const std::vector<uint8_t> &bgra, UINT w, UINT h) {
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (wchar_t *slash = wcsrchr(path, L'\\')) slash[1] = 0;
+    wcscat_s(path, name);
+    if (FILE *f = _wfopen(path, L"wb")) {
+        fprintf(f, "P6\n%u %u\n255\n", w, h);
+        std::vector<uint8_t> row(size_t(w) * 3);
+        for (UINT y = 0; y < h; ++y) {
+            for (UINT x = 0; x < w; ++x) {
+                const uint8_t *p = bgra.data() + (size_t(y) * w + x) * 4;
+                row[x*3] = p[2]; row[x*3+1] = p[1]; row[x*3+2] = p[0];
+            }
+            fwrite(row.data(), 1, row.size(), f);
+        }
+        fclose(f);
+    }
+}
+void compare(IDirect3DDevice9 *d, IDirect3DSurface9 *target) noexcept {
+    std::vector<uint8_t> native, replayed;
+    if (!copy || !read(d, target, native) || !read(d, copy, replayed) || native.size() != replayed.size()) return;
+    size_t differing = 0;
+    for (size_t i = 0; i < native.size(); i += 4) {
+        const int diff = std::abs(int(native[i]) - replayed[i]) + std::abs(int(native[i+1]) - replayed[i+1]) +
+                         std::abs(int(native[i+2]) - replayed[i+2]);
+        if (diff > 90) ++differing;
+    }
+    log("Eye replay compare frame=%u differing=%zu of %zu pixels", frames, differing, native.size() / 4);
+    if (bisect.on && !bisect.done) {
+        unsigned region = 0;
+        for (int y = std::max(0, bisect.y0); y < std::min<int>(bisect.y1, copyHeight); ++y)
+            for (int x = std::max(0, bisect.x0); x < std::min<int>(bisect.x1, copyWidth); ++x) {
+                const size_t i = (size_t(y) * copyWidth + x) * 4;
+                // Whitish replay pixels where the native image has none (the misplaced object).
+                const int lo = std::min({int(replayed[i]), int(replayed[i+1]), int(replayed[i+2])});
+                const int nlo = std::min({int(native[i]), int(native[i+1]), int(native[i+2])});
+                if (lo > 185 && nlo < 150) ++region;
+            }
+        if (!bisect.hi) { bisect.baseline = region; bisect.lo = 0; bisect.hi = replay::labDrawCount(); }
+        else {
+            const unsigned mid = (bisect.lo + bisect.hi) / 2;
+            const bool inLower = region * 2 < bisect.baseline; // Skipping [lo,mid) removed the artifact.
+            if (bisect.hi - bisect.lo == 1) bisect.done = true;
+            else if (inLower) bisect.hi = mid; else bisect.lo = mid;
+        }
+        log("Eye replay bisect step=%u region=%u baseline=%u range=[%u,%u)", bisect.step++, region, bisect.baseline, bisect.lo, bisect.hi);
+    }
+    if (written < 8 && differing > native.size() / 4 / 1000) {
+        wchar_t name[64];
+        swprintf(name, 64, L"replay-%u.ppm", written); write(name, replayed, copyWidth, copyHeight);
+        swprintf(name, 64, L"native-%u.ppm", written); write(name, native, copyWidth, copyHeight);
+        ++written;
+    }
+}
+} // namespace replay_compare
 static bool eyeTargetCurrent(int index) {
     D3DVIEWPORT9 viewport{};
     const bool matches=index>=0 && index<2 && activeEye==index && uiFrame.device &&
@@ -3510,8 +3616,19 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                 const LARGE_INTEGER eyeStart=PerfClock::now();
                 sampler::inEyes.store(true, std::memory_order_relaxed);
                 bool replayed=false;
+                bool compareShot=false;
                 if(useReplay && pass==1 && replayReady && labReplayVerify) {
-                    // Lab verification: native right eye, then compare the derived matrices.
+                    // Lab verification: native right eye, then compare the derived matrices
+                    // (and, on sampled frames, the replayed image against the native one).
+                    if(replay_compare::due() && (replay_compare::prepare(), true) && replay::play(d,uiFrame.target[i],uiFrame.z[i],replayChange,replayRootState()) &&
+                       replay_compare::keep(d,uiFrame.target[i])) {
+                        compareShot=true;
+                        D3DVIEWPORT9 again{0,0,width,height,0,1};
+                        ok=preserveViewportDepth(d,again) && SUCCEEDED(originalSetRT(d,0,uiFrame.target[i])) &&
+                           SUCCEEDED(originalSetDepth(d,uiFrame.z[i])) && SUCCEEDED(d->SetViewport(&again)) &&
+                           SUCCEEDED(d->SetScissorRect(&uiFrame.scissor)) &&
+                           SUCCEEDED(d->Clear(0,nullptr,D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER|(hasStencil ? D3DCLEAR_STENCIL : 0),0xff000000,1,0));
+                    }
                 } else if(useReplay && pass==1 && replayReady && generation==graphicsResourceGeneration()) {
                     replayed=replay::play(d,uiFrame.target[i],uiFrame.z[i],replayChange,replayRootState()) && replayAdoptEye(replayChange);
                     if(!replayed) {
@@ -3527,6 +3644,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                 const bool record=useReplay && pass==0 && replay::begin(d,uiFrame.target[i],uiFrame.z[i]);
                 if(!replayed && ok) ok=observedWorldRender(d,puppet,original,request,i,traceDepth);
                 if(useReplay && pass==1 && replayReady && labReplayVerify && ok) replayVerifyEye(replayChange);
+                if(compareShot && ok) replay_compare::compare(d,uiFrame.target[i]);
                 if(record) {
                     replay::end();
                     replayReady=ok && generation==graphicsResourceGeneration() && replay::usable() &&

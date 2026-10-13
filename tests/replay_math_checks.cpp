@@ -59,6 +59,18 @@ int main() {
                 assert(rewriteFrustumMvp(r, in, out));
                 for (unsigned i = 0; i < 16; ++i) got[i] = out[i];
                 assert(close(got, far1, 2e-3));
+                // Depth-biased projection (z row nudged, as for decals or translucent
+                // effects) on a model hundreds of metres out: must not pass as this
+                // view's MVP, and the frustum path keeps its depth function.
+                M4 b0 = ap0, b1 = ap1;
+                b0[10] *= 1.0005; b1[10] *= 1.0005;
+                const M4 farModel = m4(matrix(Pose{normalize(Quat{.1f, .4f, 0, 1}), Vec3{420.f, 12.f, -380.f}}).m, 3);
+                const M4 bias0 = multiply(multiply(b0, v0), farModel), bias1 = multiply(multiply(b1, v1), farModel);
+                for (unsigned i = 0; i < 16; ++i) in[i] = float(bias0[i]);
+                assert(!rewriteIfMvp(r, in, out));
+                assert(rewriteFrustumMvp(r, in, out));
+                for (unsigned i = 0; i < 16; ++i) got[i] = out[i];
+                assert(close(got, bias1, 2e-3));
                 for (unsigned i = 0; i < 16; ++i) in[i] = float(mvp0[i]);
             }
             // The derived projections keep their perspective rows bit-exact.
