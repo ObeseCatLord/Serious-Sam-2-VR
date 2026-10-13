@@ -1447,13 +1447,17 @@ static HRESULT WINAPI clear(IDirect3DDevice9 *d,DWORD count,const D3DRECT *rects
 static HRESULT WINAPI drawUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT count,const void *vertices,UINT stride) {
     scopeGpuOutput(d);
     replay::invalidate("user-pointer draw");
-    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);return originalDrawUp(d,type,count,vertices,stride); },nullptr,true);
+    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);
+        if(single_pass::drawing(d)) return single_pass::drawUp(d,type,count,vertices,stride);
+        return originalDrawUp(d,type,count,vertices,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawIndexedUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT minimum,UINT vertices,UINT count,
                                     const void *indices,D3DFORMAT format,const void *data,UINT stride) {
     scopeGpuOutput(d);
     replay::invalidate("user-pointer draw");
-    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); },nullptr,true);
+    return observeUiOutput(d,[&]{ traceWorldDraw(d,count);
+        if(single_pass::drawing(d)) return single_pass::drawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride);
+        return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawRect(IDirect3DDevice9 *d,UINT handle,const float *segments,const D3DRECTPATCH_INFO *info) {
     scopeGpuOutput(d);
@@ -1519,7 +1523,9 @@ static HRESULT WINAPI setRT(IDirect3DDevice9 *d, DWORD index, IDirect3DSurface9 
     if ((activeEye >= 0 || scopeScratch) && index == 0 && sameSurface(target, desktopTarget))
         target = uiFrame.slot >= 0 ? uiFrame.target[scopeScratch ? 0 : activeEye] : eye[scopeScratch ? 0 : activeEye];
     replay::recordRenderTarget(index, target);
+    single_pass::beforeRenderTarget(d, index);
     HRESULT result = originalSetRT(d, index, target);
+    if (SUCCEEDED(result)) single_pass::afterRenderTarget(d, index, target);
     if ((activeEye >= 0 || scopeScratch) && FAILED(result))
         eyeInvalid = true;
     if (index == 0 && target && activeEye < 0 && !scopeScratch && SUCCEEDED(result)) {
@@ -2346,10 +2352,11 @@ static void presentBody(IDirect3DDevice9 *d) {
             {
                 const auto sp = single_pass::takeStats();
                 if (singlePassEnabled)
-                    log("Perf single pass: passes=%u draws/pass=%.0f instanced/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f variants=%u failed=%u",
+                    log("Perf single pass: passes=%u draws/pass=%.0f instanced/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f target switches/pass=%.1f up/pass=%.1f variants=%u failed=%u",
                         sp.passes, sp.passes ? double(sp.draws) / sp.passes : 0., sp.passes ? double(sp.instanced) / sp.passes : 0.,
                         sp.passes ? double(sp.unpatched) / sp.passes : 0.,
-                        sp.passes ? double(sp.stateChanges) / sp.passes : 0., sp.variants, sp.failedVariants);
+                        sp.passes ? double(sp.stateChanges) / sp.passes : 0., sp.passes ? double(sp.suspensions) / sp.passes : 0., sp.passes ? double(sp.userPointer) / sp.passes : 0.,
+                        sp.variants, sp.failedVariants);
             }
             {
                 const auto r = replay::takeStats();
@@ -2572,6 +2579,7 @@ static void ensureStereoHooks(IDirect3DDevice9 *d) noexcept {
     if (singlePassEnabled) {
         single_pass::Originals originals;
         originals.draw = originalDraw; originals.drawIndexed = originalDrawIndexed; originals.clear = originalClear;
+        originals.drawUp = originalDrawUp; originals.drawIndexedUp = originalDrawIndexedUp;
         single_pass::install(d, originals);
     } else if (eyeReplay) {
         replay::Originals originals;
@@ -2650,16 +2658,43 @@ static void write(const wchar_t *name, const std::vector<uint8_t> &bgra, UINT w,
         fclose(f);
     }
 }
+size_t differingBetween(IDirect3DDevice9 *d, IDirect3DSurface9 *a, IDirect3DSurface9 *b) noexcept {
+    std::vector<uint8_t> pa, pb;
+    D3DSURFACE_DESC desc{};
+    if (!a || !b || FAILED(a->GetDesc(&desc)) || !read(d, a, pa) || !read(d, b, pb) || pa.size() != pb.size()) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < pa.size(); i += 4)
+        if (std::abs(int(pa[i]) - pb[i]) + std::abs(int(pa[i+1]) - pb[i+1]) + std::abs(int(pa[i+2]) - pb[i+2]) > 30) ++count;
+    static unsigned saved = 0;
+    if (count > 4 && saved < 12) {
+        wchar_t name[64];
+        swprintf(name, 64, L"mirror-a-%u.ppm", saved); write(name, pa, desc.Width, desc.Height);
+        swprintf(name, 64, L"mirror-b-%u.ppm", saved); write(name, pb, desc.Width, desc.Height);
+        ++saved;
+    }
+    return count;
+}
 double regionLuma(IDirect3DDevice9 *d, IDirect3DSurface9 *target, int x0, int y0, int x1, int y1) noexcept {
     std::vector<uint8_t> pixels;
     D3DSURFACE_DESC desc{};
     if (!target || FAILED(target->GetDesc(&desc)) || !read(d, target, pixels)) return -1;
     double sum = 0; size_t n = 0;
+    static const wchar_t kind = [] { wchar_t v[4]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_METRIC", v, 4) ? v[0] : L'l'; }();
+    if (kind == L's') { // Seam: median luma step between columns x0 and x1 over rows y0..y1.
+        std::vector<double> steps;
+        auto luma = [&](int x, int y) { const uint8_t *p = pixels.data() + (size_t(y) * desc.Width + x) * 4; return .2126 * p[2] + .7152 * p[1] + .0722 * p[0]; };
+        for (int y = std::max(0, y0); y < std::min<int>(y1, desc.Height); ++y)
+            if (x0 >= 0 && x1 < int(desc.Width)) steps.push_back(std::abs(luma(x1, y) - luma(x0, y)));
+        if (steps.empty()) return -1;
+        std::nth_element(steps.begin(), steps.begin() + steps.size() / 2, steps.end());
+        return steps[steps.size() / 2];
+    }
     for (int y = std::max(0, y0); y < std::min<int>(y1, desc.Height); ++y)
         for (int x = std::max(0, x0); x < std::min<int>(x1, desc.Width); ++x) {
             const uint8_t *p = pixels.data() + (size_t(y) * desc.Width + x) * 4;
-            static const bool red = [] { wchar_t v[4]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_METRIC", v, 4) && v[0] == L'r'; }();
-            if (red) sum += (p[2] > 170 && p[1] < 90 && p[0] < 90) ? 255. : 0.;
+            static const wchar_t metric = [] { wchar_t v[4]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_METRIC", v, 4) ? v[0] : L'l'; }();
+            if (metric == L'r') sum += (p[2] > 170 && p[1] < 90 && p[0] < 90) ? 255. : 0.;
+            else if (metric == L'd') sum += (.2126 * p[2] + .7152 * p[1] + .0722 * p[0]) < 90 ? 255. : 0.;
             else sum += .2126 * p[2] + .7152 * p[1] + .0722 * p[0];
             ++n;
         }
@@ -3750,21 +3785,29 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                             if(GetEnvironmentVariableW(L"SS2VR_LAB_SP_REGION",v,64)) b.on=swscanf(v,L"%d,%d,%d,%d",&b.x0,&b.y0,&b.x1,&b.y1)==4;
                             return b; }();
                         const bool measure=rb.on && !rb.done && ++rb.frame%20==0;
+                        static const bool sweep=[]{ wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_SWEEP",v,2)==1 && v[0]==L'1'; }();
                         // Bisection over the instanced pixel programs (stable across frames).
                         static std::vector<uint32_t> psList;
                         if(rb.on && !rb.done) {
                             if(rb.step==0) single_pass::labAllowPixelShaders({},true);       // none instanced
                             else if(rb.step==1) single_pass::labAllowPixelShaders({},false); // all
+                            else if(single_pass::labMirrorTarget() || sweep) single_pass::labAllowPixelShaders(rb.step-2<psList.size() ? std::vector<uint32_t>{psList[rb.step-2]} : psList,true);
                             else single_pass::labAllowPixelShaders(std::vector<uint32_t>(psList.begin()+rb.lo,psList.begin()+(rb.lo+rb.hi)/2),true);
                         } else if(rb.on) single_pass::labAllowPixelShaders({},false);
                         setSinglePassWorld(true);
                         ok=observedWorldRender(d,puppet,original,centre,0,traceDepth);
                         if(measure && ok) {
-                            const double l=replay_compare::regionLuma(d,uiFrame.target[0],rb.x0,rb.y0,rb.x1,rb.y1);
+                            IDirect3DSurface9 *mirror=single_pass::labMirrorTarget();
+                            const double l=mirror ? double(replay_compare::differingBetween(d,uiFrame.target[0],mirror)) :
+                                replay_compare::regionLuma(d,uiFrame.target[0],rb.x0,rb.y0,rb.x1,rb.y1);
                             const unsigned eligible=single_pass::labEligibleCount();
                             if(rb.step==0) rb.good=l;
                             else if(rb.step==1) { rb.bad=l; psList=single_pass::labInstancedPixelShaders(); rb.lo=0; rb.hi=unsigned(psList.size()); }
-                            else {
+                            else if(single_pass::labMirrorTarget() || sweep) {
+                                // Mirror: one program instanced at a time (same-frame, exact).
+                                if(rb.step-2<psList.size()) log("Single pass mirror program %08x differing=%.0f",psList[rb.step-2],l);
+                                else rb.done=true;
+                            } else {
                                 const unsigned mid=(rb.lo+rb.hi)/2;
                                 const bool broken=std::abs(l-rb.bad)<std::abs(l-rb.good);
                                 if(broken) rb.hi=mid; else rb.lo=mid;

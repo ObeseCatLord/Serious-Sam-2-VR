@@ -11,8 +11,13 @@
 namespace ss2vr::game::single_pass {
 using Draw = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DPRIMITIVETYPE, UINT, UINT);
 using DrawIndexed = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+using DrawUp = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DPRIMITIVETYPE, UINT, const void *, UINT);
+using DrawIndexedUp = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void *, D3DFORMAT, const void *, UINT);
 using Clear = HRESULT(WINAPI *)(IDirect3DDevice9 *, DWORD, const D3DRECT *, DWORD, D3DCOLOR, float, DWORD);
-struct Originals { Draw draw = nullptr; DrawIndexed drawIndexed = nullptr; Clear clear = nullptr; };
+struct Originals {
+    Draw draw = nullptr; DrawIndexed drawIndexed = nullptr; DrawUp drawUp = nullptr; DrawIndexedUp drawIndexedUp = nullptr;
+    Clear clear = nullptr;
+};
 // Hooks shader/declaration binding, viewport, scissor and render states.
 bool install(IDirect3DDevice9 *device, const Originals &originals) noexcept;
 bool installed() noexcept;
@@ -25,11 +30,18 @@ bool begin(IDirect3DDevice9 *device, IDirect3DSurface9 *target, UINT eyeWidth, c
 void end(IDirect3DDevice9 *device) noexcept;
 // Whether a draw on this device belongs to the pass (active and RT0 is the wide target).
 bool drawing(IDirect3DDevice9 *device) noexcept;
+// Around the engine's SetRenderTarget: the pass restores the engine's state
+// first, and suspends its stereo bindings while another target is bound.
+void beforeRenderTarget(IDirect3DDevice9 *device, DWORD index) noexcept;
+void afterRenderTarget(IDirect3DDevice9 *device, DWORD index, IDirect3DSurface9 *target) noexcept;
 HRESULT draw(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT start, UINT count) noexcept;
 HRESULT drawIndexed(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, INT base, UINT minimum, UINT vertices, UINT start, UINT count) noexcept;
+HRESULT drawUp(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT count, const void *data, UINT stride) noexcept;
+HRESULT drawIndexedUp(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT minimum, UINT vertices, UINT count, const void *indices,
+                      D3DFORMAT format, const void *data, UINT stride) noexcept;
 HRESULT clear(IDirect3DDevice9 *d, DWORD count, const D3DRECT *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) noexcept;
 struct Stats {
-    unsigned passes = 0, draws = 0, instanced = 0, unpatched = 0, stateChanges = 0, variants = 0, failedVariants = 0;
+    unsigned passes = 0, draws = 0, instanced = 0, unpatched = 0, stateChanges = 0, variants = 0, failedVariants = 0, suspensions = 0, userPointer = 0;
 };
 Stats takeStats() noexcept;
 // Lab: instance only eligible draws with index in [lo, hi) (counted per pass);
@@ -40,4 +52,5 @@ unsigned labEligibleCount() noexcept;
 // (empty vector = all) restricting which may instance.
 std::vector<uint32_t> labInstancedPixelShaders() noexcept;
 void labAllowPixelShaders(const std::vector<uint32_t> &hashes, bool restrict) noexcept;
+IDirect3DSurface9 *labMirrorTarget() noexcept; // Mirror image of the last pass (lab).
 } // namespace ss2vr::game::single_pass

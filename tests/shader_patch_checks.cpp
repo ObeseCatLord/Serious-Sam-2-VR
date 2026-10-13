@@ -24,7 +24,10 @@ int main() {
     assert(inspect(out.data(), out.size(), patched));
     assert(patched.inputsDeclared == ((1u << 0) | (1u << 2) | (0x3fu << 10)));
     assert(patched.positionWrites == 4);              // Four dp4 rows, the m4x4 now writes r11.
-    assert(patched.texcoordsWritten == 0xff);         // oT1..oT7 carry the eye test.
+    assert(patched.texcoordsWritten == 0xff);         // oT1 carries the eye test, oT2..oT7 v10.
+    assert(killSet(info) == 1);
+    for (size_t i = 0; i + 3 < out.size(); ++i)        // The only dp4 into a texcoord output is oT1.x.
+        if (out[i] == 0x09 && ((out[i + 1] >> 28) & 7) == TexCrdOut) assert(out[i + 1] == dst(TexCrdOut, 1, 0x1));
     assert(patched.temps == 12);
     // The m4x4 destination is r11 with the full mask.
     bool found = false;

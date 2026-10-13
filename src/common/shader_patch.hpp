@@ -11,7 +11,9 @@
 //   oT<k>.x         = K . p        (eye half test for the pixel shader's texkill)
 //   oT<k>.yzw       = v10.yzw      (v10 = 0,1,1,1)
 //
-// for every texcoord output k in 0..7 the program does not write itself. The
+// for the lowest texcoord output k the program does not write itself (the
+// other unwritten outputs get v10: pixel programs may read sets their vertex
+// program leaves unwritten, and must not see the eye test there). The
 // original writes to oPos are redirected to a free temporary. Nothing else
 // changes: constants (bones index dynamically up to c255) are not touched.
 namespace ss2vr::shader_patch {
@@ -27,6 +29,12 @@ struct VertexInfo {
     unsigned positionWrites = 0;
     unsigned instructions = 0;
 };
+// The texcoord output carrying the eye test (8 when the program writes all).
+inline unsigned killSet(const VertexInfo &original) {
+    unsigned k = 0;
+    while (k < 8 && (original.texcoordsWritten & (1u << k))) ++k;
+    return k;
+}
 
 namespace detail {
 inline unsigned regType(uint32_t t) { return ((t >> 28) & 7u) | ((t >> 8) & 0x18u); }
@@ -133,12 +141,15 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
     }
     for (unsigned k = 0; k < 8; ++k) {
         if (info.texcoordsWritten & (1u << k)) continue;
-        result.push_back(0x09u); // dp4 oTk.x, p, v15
-        result.push_back(dst(TexCrdOut, k, 0x1));
-        result.push_back(src(Temp, position));
-        result.push_back(src(Input, FirstStereoInput + 5));
-        result.push_back(0x01u); // mov oTk.yzw, v10
-        result.push_back(dst(TexCrdOut, k, 0xe));
+        const bool test = k == killSet(info);
+        if (test) {
+            result.push_back(0x09u); // dp4 oTk.x, p, v15
+            result.push_back(dst(TexCrdOut, k, 0x1));
+            result.push_back(src(Temp, position));
+            result.push_back(src(Input, FirstStereoInput + 5));
+        }
+        result.push_back(0x01u); // mov oTk.yzw (or .xyzw), v10
+        result.push_back(dst(TexCrdOut, k, test ? 0xe : 0xf));
         result.push_back(src(Input, FirstStereoInput));
     }
     result.push_back(0x0000ffffu);
