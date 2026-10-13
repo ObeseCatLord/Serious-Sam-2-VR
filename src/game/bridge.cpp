@@ -1625,7 +1625,6 @@ static bool ensureFovea(IDirect3DDevice9 *d, UINT width, UINT height, D3DFORMAT 
 // Eye k from the atlas into `target` (width x height).
 static bool composeFovea(IDirect3DDevice9 *d, const FoveaFrame &f, unsigned k, IDirect3DSurface9 *target, UINT width, UINT height) {
     const RECT low = f.layout.region[k].rect, inset = f.layout.region[2 + k].rect;
-    if (FAILED(originalStretch(d, foveaColor, &low, target, nullptr, D3DTEXF_LINEAR))) return false;
     if (!foveaState || FAILED(foveaState->Capture())) return false;
     struct Vertex { float x, y, z, rhw; D3DCOLOR color; float u, v; };
     const PixelRect &r = f.inset[k];
@@ -1668,6 +1667,21 @@ static bool composeFovea(IDirect3DDevice9 *d, const FoveaFrame &f, unsigned k, I
         {D3DRS_COLORWRITEENABLE, 0x7}, {D3DRS_SRGBWRITEENABLE, FALSE}, {D3DRS_CLIPPLANEENABLE, 0},
         {D3DRS_FILLMODE, D3DFILL_SOLID}, {D3DRS_SHADEMODE, D3DSHADE_GOURAUD}};
     for (const auto &[state, value] : states) d->SetRenderState(state, value);
+    // The full view, filtered over the eye: texel centres at the region's edges
+    // map to the eye's edge pixels, so filtering never reads the next region.
+    {
+        const float rw = float(low.right - low.left), rh = float(low.bottom - low.top);
+        const float sx = (rw - 1) / float(std::max(1u, width - 1)), sy = (rh - 1) / float(std::max(1u, height - 1));
+        const float u0 = (low.left + .5f - .5f * sx) / float(atlasWidth), u1 = (low.left + .5f + (width - .5f) * sx) / float(atlasWidth);
+        const float v0 = (low.top + .5f - .5f * sy) / float(atlasHeight), v1 = (low.top + .5f + (height - .5f) * sy) / float(atlasHeight);
+        const Vertex quad[4]{{-.5f, -.5f, 0, 1, 0xffffffffu, u0, v0}, {width - .5f, -.5f, 0, 1, 0xffffffffu, u1, v0},
+                             {width - .5f, height - .5f, 0, 1, 0xffffffffu, u1, v1}, {-.5f, height - .5f, 0, 1, 0xffffffffu, u0, v1}};
+        d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR); d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        ok = ok && SUCCEEDED(originalDrawUp(d, D3DPT_TRIANGLEFAN, 2, quad, sizeof(Vertex)));
+        d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT); d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    }
     ok = ok && SUCCEEDED(originalDrawIndexedUp(d, D3DPT_TRIANGLELIST, 0, 16, 18, indices, D3DFMT_INDEX16, v, sizeof(Vertex)));
     foveaState->Apply();
     return ok;

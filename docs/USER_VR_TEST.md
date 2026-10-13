@@ -32,7 +32,9 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
   `Bin/SS2VR/SS2VR.user.ini` (it overrides `SS2VR.ini` and survives updates;
   delete it to return to the defaults).
 - Try "Foveated rendering": Eye-tracked follows your eyes when the runtime
-  offers eye tracking (otherwise it stays off; the row says so), Fixed keeps
+  offers eye tracking (XR_EXT_eye_gaze_interaction or, on Steam Frame,
+  XR_META_foveation_eye_tracked; `ss2vr_host.log` says which; otherwise it
+  stays off and the row says so), Fixed keeps
   the sharp region at the view centre. The periphery should only look softer,
   with no seam at the sharp region's edge. Note the `Perf` lines with it on
   and off.

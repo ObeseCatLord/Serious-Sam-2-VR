@@ -307,9 +307,10 @@ struct Swapchain {
         handle = XR_NULL_HANDLE;
         images.clear();
     }
-    void create(Api &functions, XrSession session, uint32_t w, uint32_t h) {
+    void create(Api &functions, XrSession session, uint32_t w, uint32_t h, const void *next = nullptr) {
         api = &functions;
         XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        info.next = next;
         info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
                           XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         info.format = api->colorFormat;
@@ -1178,6 +1179,17 @@ struct Host {
     // full-resolution crop submitted as a second projection layer.
     Swapchain inset[2];
     bool eyeGazeExtension = false, eyeGazeSupported = false, foveationActive = false, cachedFoveated = false;
+    // XR_META_foveation_eye_tracked (with XR_FB_foveation, _configuration and
+    // XR_FB_swapchain_update_state; e.g. Steam Frame through SteamVR): the
+    // runtime's per-eye foveation centres steer the in-game sharp region when
+    // XR_EXT_eye_gaze_interaction is not offered. The profile is applied to the
+    // eye swapchains as the extension requires; any failure leaves it unused.
+    bool metaFoveationExtension = false, metaFoveation = false;
+    PFN_xrCreateFoveationProfileFB createFoveationProfile = nullptr;
+    PFN_xrDestroyFoveationProfileFB destroyFoveationProfile = nullptr;
+    PFN_xrUpdateSwapchainFB updateSwapchain = nullptr;
+    PFN_xrGetFoveationEyeTrackedStateMETA foveationEyeTrackedState = nullptr;
+    XrFoveationProfileFB foveationProfile = XR_NULL_HANDLE;
     Fov cachedInset[2];
     Vec3 lastGaze{};
     ULONGLONG lastGazeTick = 0;
@@ -1238,6 +1250,8 @@ struct Host {
             api.loader.h = nullptr;
             return;
         }
+        if (foveationProfile && destroyFoveationProfile) destroyFoveationProfile(foveationProfile);
+        foveationProfile = XR_NULL_HANDLE;
         for (auto &chain : eye)
             chain.destroy();
         for (auto &wheel : wheels)
@@ -1364,8 +1378,16 @@ struct Host {
         eyeGazeExtension = settings.foveation.mode != 0 && std::any_of(extensions.begin(), extensions.end(),
             [](const auto &e) { return !std::strcmp(e.extensionName, "XR_EXT_eye_gaze_interaction"); });
         std::vector<const char *> enabled{XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+        enabled.reserve(8);
         if (frameController) enabled.push_back(frameExtension);
         if (eyeGazeExtension) enabled.push_back("XR_EXT_eye_gaze_interaction");
+        const char *const metaNames[]{XR_FB_FOVEATION_EXTENSION_NAME, XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME,
+                                      XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME, XR_META_FOVEATION_EYE_TRACKED_EXTENSION_NAME};
+        metaFoveationExtension = settings.foveation.mode != 0 && std::all_of(std::begin(metaNames), std::end(metaNames), [&](const char *name) {
+            return std::any_of(extensions.begin(), extensions.end(), [&](const auto &e) { return !std::strcmp(e.extensionName, name); });
+        });
+        if (metaFoveationExtension)
+            for (const char *name : metaNames) enabled.push_back(name);
         XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
         std::strcpy(create.applicationInfo.applicationName, "Serious Sam 2 VR");
         std::strcpy(create.applicationInfo.engineName, "SS2VR host");
@@ -1392,10 +1414,26 @@ struct Host {
         get.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
         api.check(api.GetSystem(instance, &get, &system), "xrGetSystem HMD");
         XrSystemEyeGazeInteractionPropertiesEXT gazeProperties{XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT};
+        XrSystemFoveationEyeTrackedPropertiesMETA metaProperties{XR_TYPE_SYSTEM_FOVEATION_EYE_TRACKED_PROPERTIES_META};
         if (eyeGazeExtension) systemProperties.next = &gazeProperties;
+        if (metaFoveationExtension) { metaProperties.next = const_cast<void *>(systemProperties.next); systemProperties.next = &metaProperties; }
         api.check(api.GetSystemProperties(instance, system, &systemProperties), "xrGetSystemProperties");
         systemProperties.next = nullptr;
         eyeGazeSupported = eyeGazeExtension && gazeProperties.supportsEyeGazeInteraction;
+        if (metaFoveationExtension && metaProperties.supportsFoveationEyeTracked) {
+            const auto optional = [&](const char *name) {
+                PFN_xrVoidFunction fn = nullptr;
+                return XR_SUCCEEDED(api.GetInstanceProcAddr(instance, name, &fn)) ? fn : nullptr;
+            };
+            createFoveationProfile = reinterpret_cast<PFN_xrCreateFoveationProfileFB>(optional("xrCreateFoveationProfileFB"));
+            destroyFoveationProfile = reinterpret_cast<PFN_xrDestroyFoveationProfileFB>(optional("xrDestroyFoveationProfileFB"));
+            updateSwapchain = reinterpret_cast<PFN_xrUpdateSwapchainFB>(optional("xrUpdateSwapchainFB"));
+            foveationEyeTrackedState = reinterpret_cast<PFN_xrGetFoveationEyeTrackedStateMETA>(optional("xrGetFoveationEyeTrackedStateMETA"));
+            metaFoveation = createFoveationProfile && destroyFoveationProfile && updateSwapchain && foveationEyeTrackedState;
+        }
+        log.write(metaFoveation ? "Eye-tracked foveation (XR_META_foveation_eye_tracked) available" :
+                  metaFoveationExtension ? "Eye-tracked foveation extensions present but unsupported by the system" :
+                                           "Eye-tracked foveation (XR_META_foveation_eye_tracked) not offered");
         if (systemProperties.graphicsProperties.maxLayerCount < 4)
             throw std::runtime_error("Runtime cannot present stereo, HUD and two wheel layers");
         api.check(api.EnumerateViewConfigurations(instance, system, 0, &count, nullptr),
@@ -1886,8 +1924,23 @@ struct Host {
             throw std::runtime_error("GPU did not drain before eye swapchain resize");
         for (auto &chain : eye)
             chain.destroy();
-        for (unsigned h = 0; h != 2; ++h)
+        XrSwapchainCreateInfoFoveationFB foveationInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO_FOVEATION_FB};
+        for (unsigned h = 0; h != 2; ++h) {
+            if (metaFoveation) {
+                try {
+                    eye[h].create(api, session, width, height, &foveationInfo);
+                    continue;
+                } catch (const std::exception &) {
+                    log.write("Eye swapchain refused foveation info; eye-tracked foveation centres unused");
+                    metaFoveation = false;
+                    for (auto &chain : eye) chain.destroy();
+                    h = ~0u; // Recreate both without it.
+                    continue;
+                }
+            }
             eye[h].create(api, session, width, height);
+        }
+        applyEyeTrackedProfile();
         char message[128];
         std::snprintf(message, sizeof(message), "Stereo BGRA eye swapchains: %u x %u", width, height);
         log.write(message);
@@ -1984,11 +2037,54 @@ struct Host {
         gaze = rotate(input.head.q, Vec3{-std::sin(a) * std::cos(b), std::sin(b), -std::cos(a) * std::cos(b)});
         return true;
     }
+    // The eye-tracked foveation profile on both eye swapchains (the runtime then
+    // reports per-eye foveation centres); disables the path on any failure.
+    void applyEyeTrackedProfile() {
+        if (!metaFoveation) return;
+        if (!foveationProfile) {
+            XrFoveationEyeTrackedProfileCreateInfoMETA tracked{XR_TYPE_FOVEATION_EYE_TRACKED_PROFILE_CREATE_INFO_META};
+            XrFoveationLevelProfileCreateInfoFB level{XR_TYPE_FOVEATION_LEVEL_PROFILE_CREATE_INFO_FB};
+            level.next = &tracked;
+            level.level = XR_FOVEATION_LEVEL_LOW_FB;
+            level.verticalOffset = 0;
+            level.dynamic = XR_FOVEATION_DYNAMIC_DISABLED_FB;
+            XrFoveationProfileCreateInfoFB create{XR_TYPE_FOVEATION_PROFILE_CREATE_INFO_FB};
+            create.next = &level;
+            const XrResult result = createFoveationProfile(session, &create, &foveationProfile);
+            if (XR_FAILED(result)) {
+                log.result("xrCreateFoveationProfileFB", result);
+                metaFoveation = false; foveationProfile = XR_NULL_HANDLE;
+                return;
+            }
+        }
+        for (auto &chain : eye) {
+            XrSwapchainStateFoveationFB state{XR_TYPE_SWAPCHAIN_STATE_FOVEATION_FB};
+            state.profile = foveationProfile;
+            const XrResult result = updateSwapchain(chain.handle, reinterpret_cast<const XrSwapchainStateBaseHeaderFB *>(&state));
+            if (XR_FAILED(result)) { log.result("xrUpdateSwapchainFB foveation", result); metaFoveation = false; return; }
+        }
+        log.write("Eye-tracked foveation profile applied to the eye swapchains");
+    }
+    // Per-eye foveation centres (NDC) as view tangents; false while invalid.
+    bool metaEyeCentres(const Fov (&fov)[2], float (&centre)[2][2]) {
+        if (!metaFoveation || !foveationEyeTrackedState) return false;
+        XrFoveationEyeTrackedStateMETA state{XR_TYPE_FOVEATION_EYE_TRACKED_STATE_META};
+        if (XR_FAILED(foveationEyeTrackedState(session, &state)) || !(state.flags & XR_FOVEATION_EYE_TRACKED_STATE_VALID_BIT_META))
+            return false;
+        for (unsigned h = 0; h != 2; ++h) {
+            const float x = std::clamp(state.foveationCenter[h].x, -1.f, 1.f), y = std::clamp(state.foveationCenter[h].y, -1.f, 1.f);
+            if (!std::isfinite(x) || !std::isfinite(y)) return false;
+            const float l = std::tan(fov[h].left), r = std::tan(fov[h].right), d = std::tan(fov[h].down), u = std::tan(fov[h].up);
+            centre[h][0] = l + (x + 1) * .5f * (r - l);
+            centre[h][1] = d + (y + 1) * .5f * (u - d);
+        }
+        return true;
+    }
     // Foveated rendering in the game: [Render] Foveation 2 always, 1 with eye gaze.
     bool renderFoveation() const {
         const int mode = settings.foveation.mode;
         float y = 0, p = 0;
-        return mode == 2 || (mode == 1 && (actions.gazeEnabled || labGazeAngles(y, p)));
+        return mode == 2 || (mode == 1 && (actions.gazeEnabled || metaFoveation || labGazeAngles(y, p)));
     }
     void insetChains(uint32_t width, uint32_t height) {
         if (inset[0].width == width && inset[0].height == height && inset[1].handle)
@@ -2335,7 +2431,7 @@ struct Host {
         const auto &f = settings.foveation;
         std::vector<OptionsRow> rows(OptCount);
         rows[OptFoveation] = {L"Foveated rendering", f.mode == 0 ? L"Off" : f.mode == 1 ? L"Eye-tracked" : L"Fixed (centre)",
-                              f.mode == 1 && !actions.gazeEnabled ? L"(no eye tracking: off)" : L""};
+                              f.mode == 1 && !actions.gazeEnabled && !metaFoveation ? L"(no eye tracking: off)" : L""};
         rows[OptInset] = {L"Sharp region size", percent(f.inset)};
         rows[OptPeriphery] = {L"Periphery resolution", percent(f.periphery)};
         rows[OptTurning] = {L"Turning", settings.snapTurn ? L"Snap" : L"Smooth"};
@@ -2847,11 +2943,14 @@ struct Host {
                         }
                         // Hold the last gaze through blinks, then return to the view centre.
                         const bool gazeFresh = lastGazeTick && now - lastGazeTick < 500;
+                        float metaCentres[2][2];
+                        const bool metaFresh = !gazeFresh && metaEyeCentres(request.fov, metaCentres);
                         for (unsigned h = 0; h != 2; ++h) {
                             const Fov &fov = request.fov[h];
                             float tx = (std::tan(fov.left) + std::tan(fov.right)) * .5f;
                             float ty = (std::tan(fov.up) + std::tan(fov.down)) * .5f;
                             if (gazeFresh) gazeTangent(request.eye[h].q, lastGaze, fov, tx, ty);
+                            else if (metaFresh) { tx = metaCentres[h][0]; ty = metaCentres[h][1]; }
                             request.insetCentre[h][0] = tx;
                             request.insetCentre[h][1] = ty;
                         }

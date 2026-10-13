@@ -23,7 +23,14 @@
   without it) into one atlas from the same traversal; each eye is the full
   view stretched over the eye with the inset blended in (feathered edge).
   Steam Frame's runtime foveation (XR_FB/META foveation) needs the app to render
-  into Vulkan swapchain images and does not apply to this D3D9 path.
+  into Vulkan swapchain images and does not apply to this D3D9 path; its eye
+  tracking does: with XR_META_foveation_eye_tracked (+ XR_FB_foveation,
+  _configuration, XR_FB_swapchain_update_state) the host applies an
+  eye-tracked foveation profile to the eye swapchains and uses
+  xrGetFoveationEyeTrackedStateMETA's per-eye centres for the sharp region
+  when XR_EXT_eye_gaze_interaction is absent (each step falls back silently;
+  not offered by Monado, so unexercised in the lab). The low-resolution view
+  is upscaled with its UVs inside its atlas region (no seam column).
   Lab 1344x1512: eye GPU 1.25-1.40 -> 1.23-1.25 ms, render thread +0.3 ms; the
   saving grows with resolution and render scale.
 - VR options panel: a weapon-wheel bubble opens a host panel (foveation and
