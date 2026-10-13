@@ -37,8 +37,15 @@ int main() {
         worlds[i] = executedWeaponView(prepared, prepared.view, projection(fovs[i], .19f, 71), 0, 1);
         check(worldMarkerViewValid(worlds[i], eyes[i], fovs[i], dimensions, 1024, 896),
               "Actual adjusted full native eye projection admitted without replacing its Z rows");
-        check(!worldMarkerViewValid(worlds[i], eyes[1-i], fovs[i], dimensions, 1024, 896),
-              "Another translated eye cannot supply view provenance");
+        // Native camera bob/shake moves the executed view by centimetres; an
+        // unrelated camera a metre away (cinematic, another player) is rejected.
+        check(worldMarkerViewValid(worlds[i], compose(eyes[i], Pose{yaw(.02f), {.012f, -.005f, .001f}}), fovs[i],
+                                   dimensions, 1024, 896),
+              "A shaken native camera near the tracked eye supplies view provenance");
+        check(!worldMarkerViewValid(worlds[i], compose(eyes[i], Pose{{}, {1.f, 0, 0}}), fovs[i], dimensions, 1024, 896),
+              "A camera a metre away cannot supply view provenance");
+        check(!worldMarkerViewValid(worlds[i], compose(eyes[i], Pose{yaw(.6f), {}}), fovs[i], dimensions, 1024, 896),
+              "A camera turned away cannot supply view provenance");
         check(!worldMarkerViewValid(worlds[i], eyes[i], fovs[1-i], dimensions, 1024, 896),
               "Opposite asymmetric FOV cannot supply projection provenance");
         for (const float distance : {.10f, 1.f, 80.f}) {
