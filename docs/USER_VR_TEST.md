@@ -52,6 +52,10 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 - Weapon wheel: a chosen weapon stays chosen.
 - Turrets: aim with the right stick (like the mouse on the desktop); the right
   trigger fires, A leaves.
+- With one controller switched off, the other hand's gun still fires from its
+  muzzle and its laser points where it aims; switching weapons on the wheel no
+  longer leaves the old weapon firing too.
+- The zap gun's shots and laser start between its prongs.
 - Lasers are see-through like the game's own uzi laser; a hand without
   tracking shows no laser; the uzi beam starts at the emitter tube under the
   barrel and runs along the game's own beam.

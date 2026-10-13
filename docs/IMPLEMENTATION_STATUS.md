@@ -1,5 +1,32 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-13 (night) — one controller off; ghost fire; zap gun muzzle
+
+- One controller off (lab: monado driver lactive=0 / ractive=0,
+  scripts/one_hand.py): the remaining gun's calibration was invalidated
+  whenever a second native caller (Sam2Game 22BF20, an attachment query that
+  runs while the other controller is off) asked for its placement, so its
+  shots were uncalibrated and its laser flickered off. Foreign callers now get
+  the native placement without invalidating the render's calibration.
+- A lone weapon is mounted on the tracked hand when the hand that chose it is
+  off, and every tracking check of a weapon (muzzle eligibility, render
+  placement, laser sample/freeze, fire admission) uses the controller holding
+  it rather than its native slot.
+- Ghost fire: after a wheel selection the replaced weapon entity kept its fire
+  button and fired with every trigger pull of the held weapon, from the native
+  placement, spending its own ammo (V443: Auto SG 199 -> 198 -> 197 while the
+  zap gun fired). IsWeaponFiringPressed now answers no for a weapon the local
+  VR player holds in neither hand (refusing OnFire instead made the game
+  auto-switch weapons). The hook is now installed always, not only for melee.
+- Zap gun: its native shot leaves from the camera, which mapped the muzzle
+  (shots and laser) 0.4 m beside and 0.5 m above the held gun, toward the other
+  hand (V453, eye-space log). Shots and laser now start between the prongs
+  (measuredEmitter, V455). A per-weapon audit (V454) lists muzzle-grip offsets;
+  bomb, saw, double SG, colt and sniper are worth a visual check.
+- Lab: SS2VR_LAB_SHOT_LOG=1 logs shots (caller, slot, mount, calibrated,
+  origin, ammo, unheld-weapon refs), laser sample/muzzle state changes,
+  calibration admission failures/invalidations and eye-space laser geometry.
+
 ## 2026-10-13 (evening) — eye replay off by default, uzi laser
 
 - `[Render] EyeReplay` now defaults to 0. Replay only ever runs on two-pass
