@@ -334,6 +334,14 @@ static uintptr_t weaponFrustumReturn = 0, weaponInverseReturn = 0, weaponDepthRe
 static DepthRange expectedDepthRange = nullptr;
 static ProjectionSet expectedProjectionSet = nullptr;
 static HandlePointer resolve = nullptr;
+// Seated in a turret (CTurretPuppetEntity): the right stick aims it as the
+// mouse does on the desktop, instead of turning the view.
+static bool seatedInTurret(const RiderIdentity &rider) {
+    if (!rider.seated() || !laserTurretVtable) return false;
+    void *ride = resolve(rider.ride);
+    uint32_t table = 0;
+    return ride && readableMemory(ride, 4) && (std::memcpy(&table, ride, 4), table == laserTurretVtable);
+}
 static PointerHandle pointerHandle = nullptr;
 static IntThis isLocal = nullptr, isDual = nullptr, isNetricsa = nullptr, health = nullptr, armor = nullptr;
 static IntThis isAlive = nullptr, thirdPerson = nullptr;
@@ -1474,7 +1482,7 @@ static void update(void *p) {
     }
     float ax = input.axis[1][0];
     bool turningAllowed = enabled && !resettingControls && !wheels[1].open &&
-        !(input.buttons[1] & Button::WheelOpen) && std::isfinite(ax);
+        !(input.buttons[1] & Button::WheelOpen) && std::isfinite(ax) && !seatedInTurret(rider);
     static LARGE_INTEGER lastTurnClock{};
     LARGE_INTEGER turnClock{}, turnFrequency{};
     QueryPerformanceCounter(&turnClock);
@@ -1649,10 +1657,21 @@ static void update(void *p) {
         }
     // Use existing dual-wield policy. Retry while native weapons cannot yet transition.
     static const char *lastWeaponAction = "start";
-    if (lastWeaponSelection) { lastWeaponAction = lastWeaponSelection; lastWeaponSelection = nullptr; }
-    if (enabled && rider.handheld() && !multiplayer::remoteClient() && !isDual(p) && !s.fire[0] && !s.fire[1] &&
+    // Dual wielding is switched on once per player (each hand its own weapon).
+    // After that a weapon chosen on a wheel that the game will not pair (it
+    // drops dual mode) must stay: toggling back restored the previous pair.
+    static uint32_t dualPlayer = 0;
+    static uint64_t lastSelection = 0;
+    if (lastWeaponSelection) {
+        lastWeaponAction = lastWeaponSelection; lastWeaponSelection = nullptr;
+        lastSelection = GetTickCount64();
+    }
+    if (s.playerHandle != dualPlayer && isDual(p)) dualPlayer = s.playerHandle;
+    if (enabled && rider.handheld() && !multiplayer::remoteClient() && s.playerHandle != dualPlayer && !isDual(p) &&
+        !s.fire[0] && !s.fire[1] && GetTickCount64() - lastSelection > 2000 &&
         canChange(p, 0) && canChange(p, 1) && nativeRiderCurrent(p, rider)) {
         toggleDual(p, 0);
+        dualPlayer = s.playerHandle;
         lastWeaponAction = "dual toggle";
     }
     {
@@ -4685,7 +4704,10 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
     laserQuerying = true;
     LaserAim sampled[2];
     for (unsigned h = 0; h != 2; ++h) {
-        if ((!settings.lasers && !(s.rider.handheld() && s.zoom[h])) || !s.input.handValid[h])
+        // The weapon hides when its grip pose is lost; the aim pose can stay valid
+        // (last pose, untracked) and drew a stale, skewed beam.
+        if ((!settings.lasers && !(s.rider.handheld() && s.zoom[h])) || !s.input.handValid[h] ||
+            (!s.rider.seated() && !s.input.gripValid[h]))
             { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,1);continue; }
         Pose muzzle;
         Vec3 direction;
@@ -4711,6 +4733,12 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
                 { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,5);continue; }
             mechanism = getMechanism(s.player);
             direction = rotate(normalize(muzzle.q), {0, 0, -1});
+            // The uzi's beam starts at the rod under its barrel (V212 side view:
+            // 9.7 cm below, 9.4 cm behind the barrel tip at the base display size).
+            if (weapon == 4) {
+                const float scale = weaponDisplayScale(4) * settings.weaponScaleById[4] / weaponDisplayScale(4);
+                muzzle.p = muzzle.p + rotate(normalize(muzzle.q), Vec3{0, -.097f, .094f} * scale);
+            }
         }
         if (!laserSampleCurrent(s, queryRequest) || !trackedHandCurrent(s.input, copySnapshot().input, h))
             { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,6);continue; }
@@ -4798,7 +4826,8 @@ static void freezeLasers(const Request &request) {
     const auto live = copySnapshot();
     for (unsigned h = 0; h != 2; ++h) {
         frame.weapon[h] = frame.kind == LaserSourceKind::Vehicle ? eyeSnapshot.rider.ride : eyeSnapshot.handle[h];
-        frame.handValid[h] = trackedHandCurrent(request.input, live.input, h);
+        frame.handValid[h] = trackedHandCurrent(request.input, live.input, h) &&
+            (frame.kind == LaserSourceKind::Vehicle || (request.input.gripValid[h] && live.input.gripValid[h]));
         frame.wheel[h] = eyeSnapshot.ui.wheel[h].open != 0;
         frame.selecting[h] = eyeSnapshot.selecting[h];
     }
@@ -4833,9 +4862,13 @@ static void drawLasers() {
     const bool wasDepth = *depthEnabled != 0, wasWrite = *depthWriting != 0;
     const bool wasBlend = *blending != 0, wasAlpha = *alphaTesting != 0;
     const int priorComparison = *depthComparison;
+    // Translucent beams (source alpha over the frame) when the blend state can be restored.
+    const bool translucent = nativeBlendType && blendSource && blendDestination && setBlendFunction && *setBlendFunction;
+    const int priorSource = translucent ? *blendSource : 0, priorDestination = translucent ? *blendDestination : 0;
     (*enableDepth)();
     (*disableDepthWrite)();
-    (*disableBlend)();
+    if (translucent) nativeBlendType(501); // GFU_BT_TRANSLUCENT
+    else (*disableBlend)();
     (*disableAlpha)();
     (*setDepthComparison)(42); // GfxD3D table at RVA11274 maps native index42 to D3DCMP_LESSEQUAL.
     for (unsigned h = 0; h != 2; ++h) {
@@ -4844,7 +4877,8 @@ static void drawLasers() {
             laserTraceValue(LaserTraceStage::Draw,"sample-invalid",eyeSnapshot,h,eyeRequest.sequence,2);continue;
         }
         // A laser-pointer red beam: a 2 mm bundle of lines, solid at any distance.
-        const uint32_t color = 0xffff1a1au; // ARGB (V109 capture: 0xff1a1aff drew blue).
+        // ARGB (V109 capture: 0xff1a1aff drew blue); ~55 % opaque when blended.
+        const uint32_t color = translucent ? 0x8cff1a1au : 0xffff1a1au;
         drawLine(a.muzzle.p, a.end, color, UINT32_MAX);
         for (unsigned k = 0; k != 8; ++k) {
             const float angle = k * Pi / 4;
@@ -4874,8 +4908,11 @@ static void drawLasers() {
         (*disableDepth)();
     if (wasWrite)
         (*enableDepthWrite)();
+    if (translucent) (*setBlendFunction)(priorSource, priorDestination);
     if (wasBlend)
         (*enableBlend)();
+    else
+        (*disableBlend)();
     if (wasAlpha)
         (*enableAlpha)();
     (*setDepthComparison)(priorComparison);
@@ -7566,7 +7603,27 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
             const Pose aim = worldHandTracking(anchor, captured.origin, captured.turn,
                 captured.input.head, captured.input.hand[1]);
             Vec3 desired;
-            if (steeringWheelHeading(look)) {
+            static Vec3 turretLook{};
+            static uint32_t turretRide = 0;
+            static uint64_t turretClock = 0;
+            if (seatedInTurret(captured.rider) && fresh(captured.input)) {
+                // Right stick: heading and pitch rates (smooth-turn rate), from the
+                // look the turret had when the rider sat down.
+                const uint64_t now = GetTickCount64();
+                if (turretRide != captured.rider.ride || now - turretClock > 500) { turretLook = look; turretRide = captured.rider.ride; }
+                const float dt = turretClock && now > turretClock ? std::min(.1f, float(now - turretClock) / 1000.f) : 0.f;
+                turretClock = now;
+                const auto rate = [](float axis) {
+                    if (!std::isfinite(axis) || std::abs(axis) < .15f) return 0.f;
+                    return std::copysign((std::min(1.f, std::abs(axis)) - .15f) / .85f, axis);
+                };
+                turretLook.x -= rate(captured.input.axis[1][0]) * settings.smoothTurnRate * dt;
+                turretLook.y += rate(captured.input.axis[1][1]) * settings.smoothTurnRate * dt;
+                turretLook.y = std::clamp(turretLook.y, -1.4f, 1.4f);
+                turretLook.z = 0;
+                if (std::isfinite(turretLook.x) && std::isfinite(turretLook.y)) look = turretLook;
+                nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
+            } else if (steeringWheelHeading(look)) {
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (trackedHandCurrent(captured.input,snapshot.input,1) && validNativeBodyPose(aim)) {
                 quaternionEuler(&desired, aim.q);

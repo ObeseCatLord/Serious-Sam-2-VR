@@ -4,6 +4,7 @@
 //   head=x,y,z,yaw,pitch,roll  lpos=x,y,z  rpos=x,y,z  lrot=yaw,pitch,roll  rrot=...
 //   ltrig= rtrig= lgrip= rgrip= (0..1)  lstick=x,y rstick=x,y lpad=x,y (-1..1)
 //   la= lb= ra= rb= lsys= rsys= lclick= rclick= (0/1)  lforce= rforce= (trackpad force 0..1)
+//   lactive= ractive= (0/1, default 1: 0 drops that controller's tracking)
 // Compile against the exact private Monado headers, like monado_pose_driver.
 #include "remote/r_interface.h"
 #include <arpa/inet.h>
@@ -57,7 +58,7 @@ int main(int n,char **a) {
     long port=42431;
     std::vector<double> head{0,1.6,0,0,0,0},pos[2]{{-.25,1.3,-.5},{.25,1.3,-.5}},rot[2]{{0,0,0},{0,0,0}};
     double trig[2]{},grip[2]{},force[2]{};std::vector<double> stick[2]{{0,0},{0,0}},pad{0,0};
-    bool ab[2][2]{},sys[2]{},click[2]{};
+    bool ab[2][2]{},sys[2]{},click[2]{},active[2]{true,true};
     for(int i=1;i<n;++i) {
         const char *eq=std::strchr(a[i],'=');
         if(!eq){std::fprintf(stderr,"bad argument %s\n",a[i]);return 2;}
@@ -76,6 +77,7 @@ int main(int n,char **a) {
         else if(key=="la"||key=="ra"||key=="lb"||key=="rb"){ok=scalar(flag,0,1);ab[key[0]=='r'][key[1]=='b']=flag>0;}
         else if(key=="lsys"||key=="rsys"){ok=scalar(flag,0,1);sys[key[0]=='r']=flag>0;}
         else if(key=="lclick"||key=="rclick"){ok=scalar(flag,0,1);click[key[0]=='r']=flag>0;}
+        else if(key=="lactive"||key=="ractive"){ok=scalar(flag,0,1);active[key[0]=='r']=flag>0;}
         else ok=false;
         if(!ok){std::fprintf(stderr,"bad argument %s\n",a[i]);return 2;}
     }
@@ -100,7 +102,7 @@ int main(int n,char **a) {
         view.pose.position.x=h?.032f:-.032f;
         view.fov={-.85f,.85f,.85f,-.85f};
         auto &c=h?packet.right:packet.left;
-        c.active=true;c.hand_tracking_active=false;
+        c.active=active[h];c.hand_tracking_active=false;
         c.pose.orientation=euler(rot[h]);
         c.pose.position={float(pos[h][0]),float(pos[h][1]),float(pos[h][2])};
         c.trigger_value.x=float(trig[h]);c.trigger_click=trig[h]>.65;c.trigger_touch=trig[h]>0;

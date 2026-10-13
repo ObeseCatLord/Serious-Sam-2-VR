@@ -1,5 +1,35 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-13 — single-pass stereo, second headset test fixes
+
+- Single pass ([Render] SinglePass=1, default): the world is traversed once
+  from a centre camera (midpoint of the eyes, frustum = union of both eyes plus
+  a margin) into a 2W x H target. Every draw of the pass is issued once per eye
+  half; a patched vs_1_1 program (src/common/shader_patch.hpp, 39/39 engine
+  programs) reads the eye's clip-space reprojection R = AP_eye * E * AP_c^-1
+  (replay_math rewrite) from v10..v15 on stream 15, so constants are untouched
+  (skinned programs def c255 and index bones from c17). Each eye then adopts
+  its derived camera for the HUD projection and markers; the halves are copied
+  into the per-eye images (no host change). Replaces the record/replay right
+  eye, whose occlusion artifacts (objects through terrain) came from replaying
+  one eye's draws; both halves now use the same live data.
+- Lab: eyes 3.4 -> 1.8-2.1 ms per pair (Jungle), 1.3 ms (Metropolis); render
+  thread 5.1 -> 2.9-4.0 ms; images match a two-pass render (geometry; specular
+  is from the centre camera).
+- Instancing (SinglePassInstancing=1, off): one two-instance draw with a
+  texkill per half; artifacts remain (1.x pixel programs: translucent objects
+  through occluders, missing smoke; 2.0: bleeding beams, sky streaks). Query
+  boxes (colour writes off) stay per half (instanced they culled visible
+  objects).
+- The root's executed matrices are followed when they differ from the
+  prepared ones (camera bob/shake ~1.3 cm on the headset dropped most pairs);
+  world markers accept a camera within 30 cm / 10 degrees of the eye.
+- Dual wielding is switched on once per player; a wheel choice the game does
+  not pair is kept (toggling back restored the previous weapons).
+- Turrets: the right stick aims (smooth-turn rate), the view no longer turns.
+- Lasers: ~55 % translucent; need the grip pose too; the uzi beam starts at
+  the rod under the barrel.
+
 ## 2026-10-12 (night) — first headset test fixes
 
 - Flat screen: the host compared the scaled flat image (<=1920x1080) with the

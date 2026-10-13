@@ -23,6 +23,18 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the second headset test (2026-10-13)
+
+- Both eyes now come from one render of the world (single-pass stereo):
+  nothing should show through terrain or walls in either eye, and the frame
+  rate should be higher. If an eye looks wrong, say whether it goes away with
+  `[Render] SinglePass=0`.
+- Weapon wheel: a chosen weapon stays chosen.
+- Turrets: aim with the right stick (like the mouse on the desktop); the right
+  trigger fires, A leaves.
+- Lasers are translucent; a hand without tracking shows no laser; the uzi
+  beam starts under the barrel.
+
 ## Fixed after the first headset test (2026-10-12)
 
 Check these first; they were reported broken:
