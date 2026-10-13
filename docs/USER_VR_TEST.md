@@ -55,7 +55,8 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 - With one controller switched off, the other hand's gun still fires from its
   muzzle and its laser points where it aims; switching weapons on the wheel no
   longer leaves the old weapon firing too.
-- The zap gun's shots and laser start between its prongs.
+- Shots leave the barrels: zap gun between its prongs, double shotgun, uzi
+  and sniper from their barrel tips (the uzi's laser from the tube below).
 - Lasers are see-through like the game's own uzi laser; a hand without
   tracking shows no laser; the uzi beam starts at the emitter tube under the
   barrel and runs along the game's own beam.

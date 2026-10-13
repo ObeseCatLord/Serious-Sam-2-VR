@@ -1,5 +1,17 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-13 (late night) — shots leave the barrels
+
+- Every weapon's shot origin (the same point starts its laser) was checked in
+  lab side views with SS2VR_LAB_MUZZLE_MARK=1 (green: shot origin; blue: grip;
+  magenta: 0.5 m ahead of the grip for scale; scripts/muzzle_views.py,
+  V457-V462). At or near the barrel already: auto shotgun, minigun, rockets,
+  grenades, plasma, cannon, colt, Klodovik. Moved to the barrel
+  (measuredEmitter): double shotgun (was at the receiver), uzi (was above the
+  rear of the receiver; its laser stays on the emitter tube), sniper (was
+  1.2 m behind the muzzle brake, level with the scope), zap gun.
+  Saw and Serious Bomb have no barrel and were left alone.
+
 ## 2026-10-13 (night) — one controller off; ghost fire; zap gun muzzle
 
 - One controller off (lab: monado driver lactive=0 / ractive=0,

@@ -4459,13 +4459,24 @@ static MuzzleContext muzzleContext(void *weapon, const Snapshot &s, bool explici
     }
     return context;
 }
-// Emitter of a weapon from its tracked grip (weapon frame: -Z forward, +Y up)
-// at scale 1, for weapons whose native shot origin is not on the displayed gun.
-// Zap gun: the gap between the prongs (V451 side view; native shot origin was
-// 0.4 m beside and 0.5 m above the gun, V453).
+// Muzzle of a weapon from its grip (weapon frame: -Z forward, +Y up) at scale 1,
+// for weapons whose native shot origin is not at the displayed barrel (lab side
+// views with grip and 0.5 m scale marks, SS2VR_LAB_MUZZLE_MARK=1, V451-V461).
+// Zap gun: between the prongs (native origin 0.4 m beside, 0.5 m above).
+// Double shotgun: barrel tips (native origin at the receiver). Uzi: barrel nub
+// (native origin above the rear of the receiver). Sniper: muzzle brake (native
+// origin 1.2 m behind it, level with the scope). The others start at or near
+// their barrels already.
 static const Vec3 *measuredEmitter(uint32_t nativeId) {
-    static const Vec3 zap{0, .014f, -.52f};
-    return nativeId == 1 ? &zap : nullptr;
+    static const Vec3 zap{0, .014f, -.52f}, doubleShotgun{0, .087f, -.80f}, uzi{0, .16f, -.67f},
+        sniper{0, .30f, -1.85f};
+    switch (nativeId) {
+    case 1: return &zap;
+    case 3: return &doubleShotgun;
+    case 4: return &uzi;
+    case 13: return &sniper;
+    default: return nullptr;
+    }
 }
 static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snapshot = nullptr,
                       bool *calibrated = nullptr) {
@@ -4831,11 +4842,15 @@ static bool vehicleLaserCurrent(const Snapshot &s, const Request &request,
     return laserSampleCurrent(s, request) && laserModelScratchIdle() &&
            readVehicleLaserSource(s, live) && live == expected;
 }
-// Uzi laser emitter (the tube under the barrel) from the native shot origin, in
-// the weapon's frame at scale 1. The shot origin sits far behind the displayed
-// gun, so the beam starts 1 cm inside the tube's front face, where the game's
-// own uzi laser starts (V428: front face 0.64 m ahead, 0.20 m below).
-constexpr Vec3 UziLaserEmitter{0, -.204f, -.63f};
+// Uzi laser emitter (the tube under the barrel) from the uzi's muzzle (its
+// barrel nub, measuredEmitter), in the weapon's frame at scale 1: the beam starts
+// 1 cm inside the tube's front face, where the game's own uzi laser starts
+// (V428-V429: 12 cm below the nub, its front 3.5 cm behind it).
+constexpr Vec3 UziLaserEmitter{0, -.118f, .021f};
+// Lab (SS2VR_LAB_MUZZLE_MARK=1): the shot origin of each hand's weapon, drawn as
+// a green cross through any geometry.
+static Vec3 labShotMuzzle[2];
+static bool labShotMuzzleValid[2];
 static bool vehicleLaserMuzzle(const Snapshot &s, const Request &request, VehicleLaserSource &source,
                                Pose &muzzle, Vec3 &rayDirection) {
     if (!laserModelScratchIdle() || !readVehicleLaserSource(s, source) ||
@@ -4939,6 +4954,8 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
                     !finite(muzzle) ? 50 : !calibrated ? 51 : !localWeaponCurrent(w, s, h) ? 52 : 53);continue; }
             mechanism = getMechanism(s.player);
             direction = rotate(normalize(muzzle.q), {0, 0, -1});
+            labShotMuzzle[h] = muzzle.p; // Where shots start (before the uzi laser's tube offset).
+            labShotMuzzleValid[h] = true;
             // The uzi's beam starts at the laser emitter tube under its barrel,
             // where the game's own laser starts (V420/V421 side views).
             if (weapon == 4) {
@@ -5139,6 +5156,27 @@ static void drawLasers() {
                     radius * std::sin(angle + Pi / 12), 0}), color, UINT32_MAX);
             }
         }
+    }
+    static const bool muzzleMark = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_MUZZLE_MARK", v, 2) == 1 && v[0] == L'1'; }();
+    if (muzzleMark) {
+        (*disableDepth)();
+        for (unsigned h = 0; h != 2; ++h)
+            if (eyeLasers[h].valid && labShotMuzzleValid[h]) {
+                // Green: shot origin. Blue: the weapon's grip; magenta: 0.5 m ahead of it (scale).
+                const unsigned m = eyeSnapshot.rider.handheld() ? mountHand(eyeSnapshot, h) : h;
+                void *held = eyeLasers[h].weapon ? resolve(eyeLasers[h].weapon) : nullptr;
+                const Pose grip = worldHandTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, eyeRequest.input.head,
+                    calibratedGrip(eyeRequest.input, m, held ? int(primaryField(held, 0xb4)) : -1, settings));
+                const std::pair<Vec3, uint32_t> marks[]{{labShotMuzzle[h], 0xff00ff00u}, {grip.p, 0xff0000ffu},
+                    {grip.p + rotate(normalize(grip.q), Vec3{0, 0, -.5f}), 0xffff00ffu}};
+                for (const auto &[c, color] : marks)
+                    for (const Vec3 axis : {Vec3{.02f, 0, 0}, Vec3{0, .02f, 0}, Vec3{0, 0, .02f}})
+                        for (int k = -1; k <= 1; ++k) {
+                            const Vec3 o{k * .001f, k * .001f, 0};
+                            drawLine(c - axis + o, c + axis + o, color, UINT32_MAX);
+                        }
+            }
+        (*enableDepth)();
     }
     if (!wasDepth)
         (*disableDepth)();
