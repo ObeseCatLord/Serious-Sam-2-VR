@@ -39,6 +39,7 @@ using namespace ss2vr;
 static_assert(sizeof(void *) == 8, "The OpenXR host must be built for x64");
 constexpr XrDuration ImageWaitNs = 2'000'000;
 constexpr ULONGLONG UiFreshMs = 250;
+constexpr uint64_t CachedPairHoldMs = 1000;
 
 template <class T> struct Com {
     T *p = nullptr;
@@ -475,13 +476,14 @@ struct Actions {
     XrActionSet set = XR_NULL_HANDLE;
     XrPath hand[2]{};
     XrAction aim{}, grip{}, haptic{}, trigger{}, stick{}, wheel{}, wheelValue{}, use{}, jump{}, menu{}, reload{}, netricsa{},
-        recenter{}, sprint{}, wheelOpen{};
+        recenter{}, sprint{}, wheelOpen{}, wheelOpenValue{};
     XrSpace aimSpace[2]{}, gripSpace[2]{};
     // XR_EXT_eye_gaze_interaction: one gaze pose without subaction paths.
     XrAction gaze{};
     XrSpace gazeSpace{};
     bool gazeEnabled = false;
-    XrPath viveProfile = XR_NULL_PATH, currentProfile[2]{};
+    XrPath viveProfile = XR_NULL_PATH, indexProfile = XR_NULL_PATH, currentProfile[2]{};
+    bool wheelForceDown[2]{};
     ActionStream primaryStream[2], zoomStream[2], gripPoseStream[2];
     SqueezeAdmission squeeze[2];
     WheelOpenGate wheelGate[2];
@@ -546,6 +548,7 @@ struct Actions {
         hand[0] = path(api, instance, "/user/hand/left");
         hand[1] = path(api, instance, "/user/hand/right");
         viveProfile = path(api, instance, "/interaction_profiles/htc/vive_controller");
+        indexProfile = path(api, instance, "/interaction_profiles/valve/index_controller");
         XrActionSetCreateInfo create{XR_TYPE_ACTION_SET_CREATE_INFO};
         std::strcpy(create.actionSetName, "ss2vr");
         std::strcpy(create.localizedActionSetName, "Serious Sam 2 VR");
@@ -558,6 +561,7 @@ struct Actions {
         wheel = action(api, "wheel_click", "Grip: jump, carry and vehicle grasp (click)", XR_ACTION_TYPE_BOOLEAN_INPUT);
         wheelValue = action(api, "wheel_value", "Grip: jump, carry and vehicle grasp (value)", XR_ACTION_TYPE_FLOAT_INPUT);
         wheelOpen = action(api, "wheel_open", "Hold for the weapon wheel", XR_ACTION_TYPE_BOOLEAN_INPUT);
+        wheelOpenValue = action(api, "wheel_open_force", "Press for the weapon wheel (force)", XR_ACTION_TYPE_FLOAT_INPUT);
         use = action(api, "use", "Use", XR_ACTION_TYPE_BOOLEAN_INPUT);
         jump = action(api, "jump", "Jump (the grip also jumps on foot)", XR_ACTION_TYPE_BOOLEAN_INPUT);
         menu = action(api, "menu", "Pause and menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
@@ -617,8 +621,10 @@ struct Actions {
                                   h ? "/user/hand/right/output/haptic" : "/user/hand/left/output/haptic")});
                 bind(trigger, h, "trigger/value");
                 bind(stick, h, profile.axis);
+                // Index squeeze/value is finger curl (high whenever the controller
+                // is held); its force sensor is the deliberate grab.
                 bind(profile.analogGrip ? wheelValue : wheel, h,
-                     profile.analogGrip ? "squeeze/value" : "squeeze/click");
+                     !profile.analogGrip ? "squeeze/click" : profile.kind == 1 ? "squeeze/force" : "squeeze/value");
             }
             const std::string click = std::string(profile.axis) + "/click";
             bind(sprint, 0, click);
@@ -639,8 +645,10 @@ struct Actions {
                 bind(use, 1, "a/click");
                 bind(jump, 1, "b/click");
                 bind(menu, 0, "b/click");
-                bind(wheelOpen, 0, "trackpad/force");
-                bind(wheelOpen, 1, "trackpad/force");
+                // A float, thresholded here: the runtime's boolean conversion of
+                // trackpad force needs a hard press.
+                bind(wheelOpenValue, 0, "trackpad/force");
+                bind(wheelOpenValue, 1, "trackpad/force");
                 break;
             case 2:
                 bind(menu, 0, "menu/click");
@@ -750,6 +758,7 @@ struct Actions {
                 gripPoseStream[h].invalidate();
                 squeeze[h].invalidate();
                 wheelGate[h].sample(false, false, false); // A profile change is a loss, not a release.
+                wheelForceDown[h] = false;
             }
             auto info = get(aim, h);
             XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE};
@@ -797,20 +806,26 @@ struct Actions {
             // even when the boolean source is pressed. Preserve raw chord input.
             const auto wheelClick = booleanState(api, session, wheel, h);
             const auto wheelAnalog = floatState(api, session, wheelValue, h);
+            const bool indexHand = currentProfile[h] == indexProfile;
             const auto rawSqueeze = squeezeSample(wheelClick.isActive != XR_FALSE, wheelClick.currentState,
-                wheelAnalog.isActive != XR_FALSE, wheelAnalog.currentState);
+                wheelAnalog.isActive != XR_FALSE, wheelAnalog.currentState, indexHand ? .4f : .65f);
             squeezeSources[h] = rawSqueeze.sources;
             squeezeValuesValid[h] = rawSqueeze.valid;
             if (rawSqueeze.down) input.buttons[h] |= Wheel;
             const auto openState = booleanState(api, session, wheelOpen, h);
-            wheelOpenActive[h] = openState.isActive != XR_FALSE;
-            wheelOpenDown[h] = wheelOpenActive[h] && openState.currentState;
+            const auto openForce = floatState(api, session, wheelOpenValue, h);
+            const bool forceActive = openForce.isActive != XR_FALSE && std::isfinite(openForce.currentState);
+            wheelForceDown[h] = forceActive && openForce.currentState > (wheelForceDown[h] ? .12f : .25f);
+            wheelOpenActive[h] = openState.isActive != XR_FALSE || forceActive;
+            wheelOpenDown[h] = (openState.isActive && openState.currentState) || wheelForceDown[h];
             if (boolean(api, session, use, h))
                 input.buttons[h] |= Use;
             const auto jumpState = booleanState(api, session, jump, h);
             const auto sprintState = booleanState(api, session, sprint, h);
             if (jumpState.isActive && jumpState.currentState)
                 input.buttons[h] |= Jump;
+            if (jumpState.isActive)
+                input.buttons[h] |= JumpBound;
             if (boolean(api, session, menu, h))
                 input.buttons[h] |= Menu;
             if (boolean(api, session, reload, h))
@@ -1564,6 +1579,9 @@ struct Host {
             }
         }
     }
+    // Loading blocks the game's presentation for seconds at a time: keep the
+    // last flat frame (the loading screen) up instead of showing nothing.
+    static constexpr ULONGLONG MenuHoldMs = 60000;
     struct Snapshot {
         uint32_t width = 0, height = 0;
         bool renderer = false;
@@ -1606,7 +1624,7 @@ struct Host {
         openSharedImages(shared.images);
         reapLocked();
         snapshot = {shared.width, shared.height, shared.rendererReady != 0, shared.ui,
-                    shared.menu.visible && GetTickCount64() - shared.menu.tickMs < 250};
+                    shared.menu.visible && GetTickCount64() - shared.menu.tickMs < MenuHoldMs};
         return true;
     }
     void publishWorldSubmission() {
@@ -2017,7 +2035,9 @@ struct Host {
         if (!api.lossPending) {
             cachedRequest = reply;
             cachedClearance = clearance;
-            cachedDeadline = deadline;
+            // A dropped pair or two must not blank the world: the last pair stays
+            // up (the runtime reprojects it to the current head pose) for a second.
+            cachedDeadline = deadline - FrameAgeMs + CachedPairHoldMs;
             cachedPresentation = presentation;
             cachedFoveated = reply.foveated != 0;
             cachedValid = true;
@@ -2231,14 +2251,14 @@ struct Host {
             if (!lock)
                 return;
             const auto &menu = channel.shared->menu;
-            if (!menu.visible || GetTickCount64() - menu.tickMs > 250 || !menu.width || !menu.height ||
+            if (!menu.visible || GetTickCount64() - menu.tickMs > MenuHoldMs || !menu.width || !menu.height ||
                 menu.width > MaxDimension || menu.height > MaxDimension)
                 return;
             width = menu.width;
             height = menu.height;
             sequence = menu.sequence;
             menuGeneration = menu.interactionGeneration;
-            if (!currentPixels(channel.shared->pixels) || !pixels.matches(menu.pixelGeneration, width, height))
+            if (!currentPixels(channel.shared->pixels) || !pixels.holds(menu.pixelGeneration, width, height))
                 return;
             if (sequence != menuSequence || menuChain.width != width || menuChain.height != height) {
                 menuSourcePixels.resize(size_t(width) * height * 4);

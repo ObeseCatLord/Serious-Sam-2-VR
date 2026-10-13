@@ -52,6 +52,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <string>
 #include <vector>
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -427,7 +428,7 @@ struct Snapshot {
     Pose origin;
     uint64_t rigRevision = 0;
     float turn = 0;
-    bool initialized = false, fire[2]{}, use = false, jump = false, sprint = false;
+    bool initialized = false, fire[2]{}, use = false, jump = false, sprint = false, grenade = false;
     bool selecting[2]{}, zoom[2]{};
     uint32_t generation = 0, networkGeneration = 0;
     Ui ui;
@@ -1633,8 +1634,10 @@ static void update(void *p) {
         }
     }
     // Fire flags are native-slot indexed: a lone weapon mounted on the other
-    // hand fires from that hand's trigger.
-    for (unsigned n = 0; n < 2; ++n)
+    // hand fires from that hand's trigger. Seated (turrets, vehicles) the right
+    // trigger is the ride's Fire and the left its AltFire, whatever weapon
+    // handles the player still carries.
+    for (unsigned n = 0; n < 2 && rider.handheld(); ++n)
         if (const unsigned m = mountHand(s, n); m != n) {
             s.fire[n] = s.fire[m];
             s.fire[m] = false;
@@ -1667,17 +1670,25 @@ static void update(void *p) {
         }
     }
     s.use = enabled && !resettingControls && ((input.buttons[0] | input.buttons[1]) & Button::Use);
-    uint32_t contextualButtons = 0;
+    uint32_t contextualButtons = 0, leftContextual = 0, rightContextual = 0;
     for (unsigned h=0;h<2;++h)
     {
         // Physical hand h: the native slot mounted on it (a lone two-handed sniper
         // in slot 0 may be mounted on the right hand).
         const unsigned slot = s.handle[h] ? h : (mountHand(s, 1 - h) == h ? 1 - h : h);
-        contextualButtons |= contextualSniperButtons(input,h,
+        const uint32_t handButtons = contextualSniperButtons(input,h,
             enabled && rider.handheld() && !aliased(s) && nativeSniper(s.handle[slot] ? resolve(s.handle[slot]) : nullptr));
+        contextualButtons |= handButtons;
+        (h ? rightContextual : leftContextual) = handButtons;
     }
-    s.jump = enabled && !resettingControls && ((contextualButtons & Button::Jump) || gripJumps[0].jumping || gripJumps[1].jumping);
-    s.sprint = enabled && !resettingControls && (contextualButtons & Button::Sprint);
+    // A profile with a jump button (Index B) keeps the grip for grabbing only.
+    const bool gripJump = !((input.buttons[0] | input.buttons[1]) & Button::JumpBound);
+    s.jump = enabled && !resettingControls && ((contextualButtons & Button::Jump) ||
+        (gripJump && (gripJumps[0].jumping || gripJumps[1].jumping)));
+    // Left stick click sprints; the right one zooms a sniper (above) and
+    // otherwise throws a hand grenade.
+    s.sprint = enabled && !resettingControls && (leftContextual & Button::Sprint);
+    s.grenade = enabled && !resettingControls && rider.handheld() && (rightContextual & Button::Sprint);
     lastButtons[0] = input.buttons[0];
     lastButtons[1] = input.buttons[1];
     if (!singlePlayer()) {
@@ -3542,6 +3553,9 @@ thread_local bool executedUiProjectionValid = false;
 thread_local uint64_t executedRootGeneration = 0;
 thread_local bool rootCaptureArmed = false, rootCaptureAttempted = false;
 thread_local bool weaponPairFault = false;
+// Source line of the first pair fault in the current eye (diagnostics only).
+thread_local unsigned weaponPairFaultLine = 0;
+#define SS2VR_PAIR_FAULT() (weaponPairFaultLine = weaponPairFaultLine ? weaponPairFaultLine : __LINE__, weaponPairFault = true)
 thread_local ScopeObservationBank eyeScopePoses;
 static thread_local float eyeNativeBaseFov = 0;
 static thread_local bool scopePreview = false;
@@ -3602,7 +3616,7 @@ static void __fastcall viewExecute(void *command, void *) {
         if (sourceRoot) scopeSource.executed = true;
         if (root) {
             rootCaptureArmed = false;
-            if (!executedWeaponWorld.valid) weaponPairFault = true;
+            if (!executedWeaponWorld.valid) SS2VR_PAIR_FAULT();
             LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart);
             drawLasers();
             notePerfSection(1, sectionStart);
@@ -3613,7 +3627,7 @@ static void __fastcall viewExecute(void *command, void *) {
         }
     }, [&](bool aborted) noexcept {
         executingView = !aborted && generation == graphicsResourceGeneration() ? previousExecution : nullptr;
-        if (aborted) { weaponPairFault = true; rootCaptureArmed = false; }
+        if (aborted) { SS2VR_PAIR_FAULT(); rootCaptureArmed = false; }
     });
 }
 static void __fastcall viewPrepare(void *command, void *, const Matrix34 &view, const Matrix44 &projection,
@@ -3641,7 +3655,7 @@ static void __fastcall viewPrepare(void *command, void *, const Matrix34 &view, 
         if (rootView) {
             static unsigned duplicateDiagnostics=0;
             if(duplicateDiagnostics<4) { ++duplicateDiagnostics; log("Native root duplicate rejected eye=%d",eyeIndex); }
-            weaponPairFault = true; // Another root cannot inherit this eye's execution capture.
+            SS2VR_PAIR_FAULT(); // Another root cannot inherit this eye's execution capture.
             preparedWeaponWorld = {};
             executedWeaponWorld = {};
             executedUiProjectionValid = false;
@@ -3687,6 +3701,7 @@ bool headFramePrepared(void* player,const Request& request) noexcept {
 bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
     remoteOwner=0;
     weaponPairFault = false;
+    weaponPairFaultLine = 0;
     eyeWorldVisibility = 1;
     eyeHeadClearance={};headVolumeDrawSafe=true;pairHeadNearBits=0;
     eyeSnapshot = copySnapshot();
@@ -3875,6 +3890,32 @@ static Pose *__fastcall camera(void *p, void *, Pose *out) {
     }
     return out;
 }
+// Ride boarding (TryFindBestRideAndSeat, and OnUse's re-check) picks the seat
+// inside a cone around CPlayerPuppetEntity::GetViewOrigin, the native operator
+// look. In VR that look does not follow the head (turning is the mod's own), so
+// Use near a turret found no seat. Those two callers see the tracked head.
+using ViewOrigin = Pose *(__thiscall *)(void *, Pose *, int);
+static ViewOrigin originalViewOrigin = nullptr;
+static uintptr_t boardingSeatReturn = 0, useSeatReturn = 0;
+static Pose *__fastcall playerViewOrigin(void *p, void *, Pose *out, int purpose) {
+#ifdef _MSC_VER
+    const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+#else
+    const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#endif
+    originalViewOrigin(p, out, purpose);
+    if (caller != boardingSeatReturn && caller != useSeatReturn) return out;
+    const auto s = copySnapshot();
+    if (p == s.player && s.rider.handheld() && nativeRiderCurrent(p, s.rider) && vrSession(s) && fresh(s.input) &&
+        nativeMainThread && nativeMainThread()) {
+        Pose body;
+        if (trackingAnchor(p, body)) {
+            const Pose head = worldHeadTracking(body, s.origin, s.turn, s.input.head);
+            if (finite(head)) *out = head;
+        }
+    }
+    return out;
+}
 static int __fastcall renderThirdPerson(void *p, void *) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -3926,7 +3967,7 @@ static Matrix44 *__fastcall project(void *p, void *, Matrix44 *out) {
         nativeProjectionObservation = !aborted && generation == graphicsResourceGeneration() ? previous : nullptr;
         if (aborted && observe) eyeNativeBaseFov = 0;
     });
-    if (!completed) { weaponPairFault = true; return out; }
+    if (!completed) { SS2VR_PAIR_FAULT(); return out; }
     if (generation != graphicsResourceGeneration()) return out;
     if (p == eyePlayer && scopeSource.active) {
         const float nz = out->m[11]/(out->m[10]-1), fz = out->m[11]/(out->m[10]+1);
@@ -4006,7 +4047,7 @@ static Matrix44 *__cdecl weaponFrustum(Matrix44 *out, float fov, float aspect, f
     if (physicalWeapon && caller == weaponFrustumReturn) {
         if (physicalWeapon->pass.projection(*out))
             return out;
-        weaponPairFault = true;
+        SS2VR_PAIR_FAULT();
     }
     return originalFrustum(out, fov, aspect, nz, fz);
 }
@@ -4019,7 +4060,7 @@ static Matrix34 *__cdecl weaponMatrixInverse(Matrix34 *out, const Matrix34 &inco
     if (physicalWeapon && caller == weaponInverseReturn) {
         if (physicalWeapon->pass.view(*out))
             return out;
-        weaponPairFault = true;
+        SS2VR_PAIR_FAULT();
     }
     return originalMatrixInverse(out, incomingCamera);
 }
@@ -4040,7 +4081,7 @@ static void __cdecl weaponDepthRange(float nearDepth, float farDepth) {
         physicalWeapon->pass.graphicsSetup(); // Callback mismatch still reaches native graphics setup.
         if (!physicalCallbacksAvailable() || !physicalWeapon->pass.depth(nearDepth, farDepth)) {
             physicalWeapon->pass.failed = true;
-            weaponPairFault = true;
+            SS2VR_PAIR_FAULT();
         }
     }
     static unsigned depthDiagnostics=0;
@@ -4058,7 +4099,7 @@ static void __cdecl weaponDepthRange(float nearDepth, float farDepth) {
             std::memcmp(nativeCurrentProjection, &physicalWeapon->entryProjection, sizeof(Matrix44)) ||
             *nativeDepthNear != physicalWeapon->entryNear || *nativeDepthFar != physicalWeapon->entryFar) {
             physicalWeapon->pass.failed = true;
-            weaponPairFault = true;
+            SS2VR_PAIR_FAULT();
         }
     }
     if (capture) {
@@ -4081,7 +4122,7 @@ static void __cdecl weaponDepthRange(float nearDepth, float farDepth) {
             executedUiProjection = *nativeAdjustedProjection;
         executedRootGeneration = executedUiProjectionValid ? generation : 0;
         if (!executedWeaponWorld.valid)
-            weaponPairFault = true;
+            SS2VR_PAIR_FAULT();
     }
 }
 // Copy while this eye still owns its completed root, before marker ortho setup
@@ -4092,11 +4133,11 @@ bool copyExecutedUiProjection(void *player, const Request &request, int index, M
         sameRequest(request,eyeRequest);
     const bool admitted=current && rootCaptureAttempted && executedWeaponWorld.valid &&
         executedUiProjectionValid && !weaponPairFault;
-    static unsigned diagnostics=0;
-    if (!admitted && diagnostics<4) {
-        ++diagnostics;
-        log("Native eye projection rejected eye=%d current=%u rootAttempted=%u worldValid=%u uiProjection=%u weaponFault=%u",
-            index,current,rootCaptureAttempted,executedWeaponWorld.valid,executedUiProjectionValid,weaponPairFault);
+    static unsigned diagnostics=0, lastLine=0;
+    if (!admitted && (diagnostics<4 || (weaponPairFaultLine!=lastLine && diagnostics<32))) {
+        ++diagnostics; lastLine=weaponPairFaultLine;
+        log("Native eye projection rejected eye=%d current=%u rootAttempted=%u worldValid=%u uiProjection=%u weaponFault=%u at=%u",
+            index,current,rootCaptureAttempted,executedWeaponWorld.valid,executedUiProjectionValid,weaponPairFault,weaponPairFaultLine);
     }
     if (!admitted) return false;
     out = executedUiProjection;
@@ -4124,7 +4165,7 @@ bool copyExecutedRideCamera(uint32_t player,uint64_t generation,int index,RideCa
 }
 static void finishPhysicalWeapon(PhysicalWeaponInvocation &invocation, uint64_t generation) noexcept {
     if (generation != graphicsResourceGeneration() || invocation.pass.complete()) return;
-    weaponPairFault = true;
+    SS2VR_PAIR_FAULT();
     if (!invocation.pass.cleanupRequired() || !physicalCallbacksAvailable()) return;
     auto *previous = physicalWeapon;
     physicalWeapon = nullptr;
@@ -5568,7 +5609,7 @@ void retireScopeGeometry(bool fatal) noexcept {
         physicalWeapon->scopePose.imageCoordinates = {};
         physicalWeapon->scopePose.opaqueColorCandidate = false;
     }
-    if (fatal) weaponPairFault = true;
+    if (fatal) SS2VR_PAIR_FAULT();
 }
 bool recordScopeGeometry(const ScopeRasterObservation &sample, const ScopeCapGeometry &cap,
                          const ScopeUvTransform &nativeUv, bool opaqueColorCandidate) {
@@ -5790,7 +5831,7 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
     auto reject = [&]() {
         if (physical) {
             physicalWeapon->pass.placed(false);
-            weaponPairFault = true;
+            SS2VR_PAIR_FAULT();
             return 0; // Native Render skips model draw, then adapter repairs missing restore.
         }
         return result;
@@ -5929,7 +5970,7 @@ static void renderTrackedWeapon(void *w, Matrix34 m, bool sniper, uintptr_t call
     bool routePublished=false;
     const auto generation = graphicsResourceGeneration();
     auto *previous = physicalWeapon;
-    if (previous) { previous->pass.failed = true; weaponPairFault = true;
+    if (previous) { previous->pass.failed = true; SS2VR_PAIR_FAULT();
         if(previous->idle)previous->idle->reject(IdleWeaponTrace::Rejection::NestedGun); }
     physicalWeapon = nullptr;
     PhysicalWeaponInvocation invocation;
@@ -5953,7 +5994,7 @@ static void renderTrackedWeapon(void *w, Matrix34 m, bool sniper, uintptr_t call
         if (!trackedWeaponSession(s) || !executedWeaponWorld.valid || !physicalCallbacksAvailable() ||
             !finiteProjection(*nativeCurrentProjection) ||
             !validDepthRange(*nativeDepthNear, *nativeDepthFar)) {
-            weaponPairFault = true;
+            SS2VR_PAIR_FAULT();
             return;
         }
         invocation = {w, hand, {executedWeaponWorld}, *nativeCurrentProjection,
@@ -5998,7 +6039,7 @@ static void renderTrackedWeapon(void *w, Matrix34 m, bool sniper, uintptr_t call
         if (!aborted && physical && generation == graphicsResourceGeneration())
             finishPhysicalWeapon(invocation, generation);
         physicalWeapon = !aborted && generation == graphicsResourceGeneration() ? previous : nullptr;
-        if (aborted) {weaponPairFault = true;if(invocation.idle)invocation.idle->reject(IdleWeaponTrace::Rejection::GunAbort);}
+        if (aborted) {SS2VR_PAIR_FAULT();if(invocation.idle)invocation.idle->reject(IdleWeaponTrace::Rejection::GunAbort);}
         if(invocation.idle)invocation.idle->submissions.completeOuter(originalReturned,
             physical && !aborted && invocation.pass.complete(),
             !aborted && generation==graphicsResourceGeneration(),!weaponPairFault,!aborted);
@@ -6041,7 +6082,7 @@ static bool markerDrawPortCurrent(void *drawPort, const Request &request, WorldM
     return worldMarkerDimensions(rectangle, request.width, request.height, out);
 }
 static bool nativeMarkerPostlude(void *player, const Request &request, int index) {
-    const auto reject = [] { weaponPairFault = true; return false; };
+    const auto reject = [] { SS2VR_PAIR_FAULT(); return false; };
     if (!markerFrameCurrent(player, request, index))
         return reject();
     // Native renFinishRender has destroyed rootView. These are value copies;
@@ -6317,7 +6358,7 @@ static CommandInt originalDown = nullptr, originalPressed = nullptr, originalRel
 static VoidThis originalPoll = nullptr;
 static DataGet getData = nullptr;
 static uint32_t *(__cdecl *toId)(uint32_t *, const char *) = nullptr;
-constexpr int CommandCount = 18;
+constexpr int CommandCount = 19;
 // Quick save/load are queried with IsCommandPressed on these same player
 // bindings (Sam2Game player-controls vtable 2C3424 slot 7, RVA F2880, called
 // from slot 3 before plcmdFire). Only wheel pulses drive them; otherwise the
@@ -6327,7 +6368,7 @@ static uint32_t ids[CommandCount]{};
 static const char *commands[] = {"plcmdX+",   "plcmdX-",        "plcmdZ+",  "plcmdZ-",     "plcmdY+",
                                  "plcmdFire", "plcmdAltFire",   "plcmdUse", "plcmdSprint", "plcmdH+",
                                  "plcmdH-",   "plcmdMouseLook", "plcmdP+",  "plcmdP-",     "plcmdReloadWeapon",
-                                 "plcmdDisplayNetricsa", "plccmdQuickSave", "plccmdQuickLoad"};
+                                 "plcmdDisplayNetricsa", "plccmdQuickSave", "plccmdQuickLoad", "plcmdTertFire"};
 static_assert(sizeof(commands) / sizeof(commands[0]) == CommandCount);
 static void *playerBindings = nullptr;
 static float values[CommandCount]{}, priorValues[CommandCount]{};
@@ -6650,7 +6691,7 @@ static bool currentControls(int index, const Snapshot &snapshot, const ControlSa
         return true;
     unsigned hand = index == 5 ? 1u : 0u;
     // Coupled dual weapons: the left trigger also drives native Fire (see poll).
-    if (index == 5 && active && !snapshot.fire[1] && snapshot.fire[0] &&
+    if (index == 5 && active && !snapshot.fire[1] && snapshot.fire[0] && captured.rider.handheld() &&
         coupledNativeFire.load(std::memory_order_relaxed))
         hand = 0;
     if ((active && !snapshot.fire[hand]) || !primaryActionEligible(captured.input, hand) ||
@@ -7413,6 +7454,34 @@ static int __cdecl appForeground() {
         return 1;
     return originalAppForeground ? originalAppForeground() : 0;
 }
+// Native prompts ("Press {plcmdUse} to enter") name the bound keyboard key.
+// While VR input is live the commands the controllers drive name their VR
+// button instead; CInputBindings::SubstituteCommands copies the text first, so
+// the rewritten copy only lives for the call.
+using SubstituteCommands = void *(__thiscall *)(void *, void *, const char *);
+static SubstituteCommands originalSubstitute = nullptr;
+static void *__fastcall substituteCommands(void *bindings, void *, void *result, const char *text) {
+    if (!text || !vrInputLive() || !std::strchr(text, '{')) return originalSubstitute(bindings, result, text);
+    static const std::pair<const char *, const char *> names[] = {
+        {"{plcmdUse}", "A"}, {"{plcmdFire}", "the right trigger"}, {"{plcmdAltFire}", "the left trigger"},
+        {"{plcmdReloadWeapon}", "left A"}, {"{plcmdDisplayNetricsa}", "the wheel's Netricsa bubble"},
+        {"{plcmdTertFire}", "the right stick click"}, {"{plcmdY+}", "B"}};
+    std::string out = text;
+    for (const auto &[from, to] : names)
+        for (size_t at = out.find(from); at != std::string::npos; at = out.find(from, at + std::strlen(to)))
+            out.replace(at, std::strlen(from), to);
+    return originalSubstitute(bindings, result, out.c_str());
+}
+// Mouse look turns the native body under the tracked head: a desk mouse nudged
+// mid-session, or the cursor the menu pointer moves, would pitch or turn the
+// whole world. While VR input is live the mouse axes read as still; keys and
+// mouse buttons are unchanged.
+using ControlValue = float(__thiscall *)(void *, long);
+static ControlValue originalMouseControl = nullptr;
+static float __fastcall mouseControlValue(void *device, void *, long control) {
+    if (control >= 0x78 && control <= 0x7b && vrInputLive()) return 0.f; // Mouse X+, X-, Y+, Y-
+    return originalMouseControl(device, control);
+}
 static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -7582,7 +7651,8 @@ static void __fastcall poll(void *b, void *) {
         values[2] = std::max(0.f, direction.z);
         values[3] = std::max(0.f, -direction.z);
         values[4] = s.jump ? 1 : 0;
-        const bool coupled = coupledNativeFire.load(std::memory_order_relaxed) && s.handle[0] && s.handle[1];
+        const bool coupled = coupledNativeFire.load(std::memory_order_relaxed) && s.handle[0] && s.handle[1] &&
+            s.rider.handheld();
         // A grip-held object is thrown by releasing the grip, never by the native Fire charge.
         const bool carrying = gripCarrying.load(std::memory_order_relaxed);
         values[5] = (!carrying && (fire[1] || (coupled && fire[0]))) ? 1 : 0;
@@ -7596,18 +7666,23 @@ static void __fastcall poll(void *b, void *) {
         values[15] = ((buttons & Netricsa) || takeWheelRequest(WheelBubble::Netricsa, now)) ? 1 : 0;
         values[16] = takeWheelRequest(WheelBubble::QuickSave, now) ? 1 : 0;
         values[17] = takeWheelRequest(WheelBubble::QuickLoad, now) ? 1 : 0;
+        values[18] = s.grenade ? 1 : 0; // Throw hand grenade.
     }
     const unsigned traceState = unsigned(enabled) | unsigned(values[5] > 0) << 1 | unsigned(values[6] > 0) << 2 |
-        unsigned(values[7] > 0) << 3 | unsigned(values[4] > 0) << 4 | unsigned(respawn) << 5 | unsigned(netricsa) << 6;
+        unsigned(values[7] > 0) << 3 | unsigned(values[4] > 0) << 4 | unsigned(respawn) << 5 | unsigned(netricsa) << 6 |
+        unsigned(s.rider.seated()) << 7;
     ReleaseSRWLockExclusive(&controlsLock);
     static unsigned traced = 0, previousTrace = ~0u;
+    static bool previousSeated = false;
+    if (s.rider.seated() != previousSeated) { previousSeated = s.rider.seated(); traced = std::min(traced, 120u); }
     if (traceState != previousTrace && traced < 160) {
         previousTrace = traceState;
         ++traced;
-        log("Input poll enabled=%d live=%d init=%d fresh=%d recenter=%d gameplay=%d uiAge=%llu rider=%d fire=%d,%d use=%d "
-            "jump=%d respawn=%d netricsa=%d", enabled, livePlayer(s), s.initialized, fresh(s.input),
+        log("Input poll enabled=%d live=%d init=%d fresh=%d recenter=%d gameplay=%d uiAge=%llu rider=%d seated=%d state=%u "
+            "fire=%d,%d values=%.0f,%.0f use=%d jump=%d respawn=%d netricsa=%d", enabled, livePlayer(s), s.initialized, fresh(s.input),
             recenterHeld(s.input), s.ui.gameplay, static_cast<unsigned long long>(GetTickCount64() - s.ui.tickMs),
-            nativeRiderCurrent(s.player, s.rider), fire[1], fire[0], s.use, s.jump, respawn, netricsa);
+            nativeRiderCurrent(s.player, s.rider), s.rider.seated(), unsigned(s.rider.state), fire[1], fire[0], values[5], values[6],
+            s.use, s.jump, respawn, netricsa);
     }
 }
 static int commandIndex(void *b, uint32_t id) {
@@ -8215,7 +8290,7 @@ static __attribute__((noinline)) void runPostSimulationSniper(SimulationInterval
         if(s.use || s.jump || s.sprint || s.input.zoomDownMask)return fail("nonneutral");
         for(unsigned hand=0;hand<2;++hand)
             if(s.input.trigger[hand]!=0 || s.input.axis[hand][0]!=0 || s.input.axis[hand][1]!=0 ||
-               s.input.buttons[hand] || s.fire[hand] || s.zoom[hand] || s.selecting[hand] ||
+               (s.input.buttons[hand] & ~Button::JumpBound) || s.fire[hand] || s.zoom[hand] || s.selecting[hand] ||
                s.ui.wheel[hand].open) return fail("nonneutral");
         uint32_t gameHandle=0;nativeGameInfo(&gameHandle);
         void *game=gameHandle?resolve(gameHandle):nullptr;
@@ -8445,15 +8520,34 @@ void replayVerifyEye(const ss2vr::replay::EyeChange &change) noexcept {
 // After beginEye(1) and a successful replay: the right eye's root capture, as
 // a native right-eye render would have produced it.
 bool replayAdoptEye(const ss2vr::replay::EyeChange &change) noexcept {
-    if (!eyePlayer || eyeIndex != 1 || weaponPairFault || !replayRootWorld.valid) return false;
+    static unsigned rejections = 0;
+    if (!eyePlayer || eyeIndex != 1 || weaponPairFault || !replayRootWorld.valid) {
+        if (rejections < 8) {
+            ++rejections;
+            log("Eye replay adopt rejected player=%d eye=%d pairFault=%d rootWorld=%d", eyePlayer != nullptr, eyeIndex,
+                int(weaponPairFault), int(replayRootWorld.valid));
+        }
+        return false;
+    }
     const auto r = ss2vr::replay::rewrite(replayRoot, change);
-    if (!r.valid) return false;
+    if (!r.valid) {
+        if (rejections < 8) { ++rejections; log("Eye replay adopt rejected: root rewrite invalid"); }
+        return false;
+    }
     WeaponWorldView world = replayRootWorld;
     for (unsigned i = 0; i < 12; ++i) world.view.m[i] = float(r.view[i]);
     for (unsigned i = 0; i < 16; ++i) world.projection.m[i] = float(r.projection[i]);
     Matrix44 adjusted{};
     for (unsigned i = 0; i < 16; ++i) adjusted.m[i] = float(r.adjusted[i]);
-    if (!finiteMatrix(world.view) || !finiteProjection(world.projection) || !finiteProjection(adjusted)) return false;
+    if (!finiteMatrix(world.view) || !finiteProjection(world.projection) || !finiteProjection(adjusted)) {
+        if (rejections < 8) {
+            ++rejections;
+            log("Eye replay adopt rejected: view=%d projection=%d adjusted=%d P row3 %.4f %.4f %.4f %.4f", finiteMatrix(world.view),
+                finiteProjection(world.projection), finiteProjection(adjusted), world.projection.m[12], world.projection.m[13],
+                world.projection.m[14], world.projection.m[15]);
+        }
+        return false;
+    }
     preparedWeaponWorld = world;
     executedWeaponWorld = world;
     executedUiProjection = adjusted;
@@ -8744,6 +8838,8 @@ bool attach(bool headless) {
     sniperCrossDeleteReturn = reinterpret_cast<uintptr_t>(g)+0x171a54;
     mountedAvatarReturn = reinterpret_cast<uintptr_t>(g) + 0x943b6;
     mountedClampReturn = reinterpret_cast<uintptr_t>(g) + 0xf3255;
+    boardingSeatReturn = reinterpret_cast<uintptr_t>(g) + 0xea4fe;
+    useSeatReturn = reinterpret_cast<uintptr_t>(g) + 0xea465;
     playerControlsReturn = reinterpret_cast<uintptr_t>(g) + 0xf35d3;
     inactivePlayerControlsReturn = reinterpret_cast<uintptr_t>(g) + 0xf2ddc;
     controlsGameBase = reinterpret_cast<uintptr_t>(g);
@@ -8999,6 +9095,8 @@ bool attach(bool headless) {
         H(g, "?GetProjectionMatrix@CPuppetEntity@SeriousEngine@@QAE?AVMatrix44f@2@XZ", project,
           originalProjection);
         H(g, "?Render3D@CPuppetEntity@SeriousEngine@@UAEXXZ", render, originalRender);
+        H(g, "?GetViewOrigin@CPlayerPuppetEntity@SeriousEngine@@UAE?AVQuatVect@2@W4LOSRequestPurpose@2@@Z", playerViewOrigin,
+          originalViewOrigin);
         H(g, "?RenderView@CPlayerBrainEntity@SeriousEngine@@UAEXXZ", brainRender, originalBrainRender);
         H(g, "?RenderOverlay@CPlayerPuppetEntity@SeriousEngine@@UAEXH@Z", overlayRender, originalOverlayRender);
         H(e, "?gfuFill@SeriousEngine@@YAXK@Z", nativeFill, originalNativeFill);
@@ -9092,6 +9190,9 @@ bool attach(bool headless) {
         H(g, "?HandleObjectCarrying@CPuppetEntity@SeriousEngine@@QAEXXZ", carryStep, originalCarrying);
         H(g, "?IsComboWeaponsEnabled@CGameInfoEntity@SeriousEngine@@QAEHXZ", comboWeapons, originalComboWeapons);
         H(e, "?PollValues@CInputBindings@SeriousEngine@@QAEXXZ", poll, originalPoll);
+        H(e, "?GetControlValue@CKbdMouseInputDevice@SeriousEngine@@UAEMJ@Z", mouseControlValue, originalMouseControl);
+        H(e, "?SubstituteCommands@CInputBindings@SeriousEngine@@QAE?AVCString@2@PBD@Z", substituteCommands,
+          originalSubstitute);
         H(e, "?GetCommandValue@CInputBindings@SeriousEngine@@QAEMVIDENT@2@@Z", commandValue, originalValue);
         H(e, "?IsCommandDown@CInputBindings@SeriousEngine@@QAEHVIDENT@2@@Z", commandDown, originalDown);
         H(e, "?IsCommandPressed@CInputBindings@SeriousEngine@@QAEHVIDENT@2@@Z", commandPressed,

@@ -485,6 +485,12 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
     float rows[16];
     std::vector<float> block;
     unsigned blockRewrites = 0, blockMisses = 0, pendingMiss = 0, fallbacks[2]{}, pendingFallback = 0, drawKinds[8]{};
+    unsigned frustumRewrites = 0;
+    // A sizeable draw whose view matrix is not recognized would sit at the left
+    // eye's position in the right eye (terrain showing objects through it): the
+    // caller renders that frame's right eye natively instead.
+    constexpr unsigned MissedPrimitiveLimit = 16;
+    bool unrecognized = false;
     struct Recent { uint32_t prims, block, path; const void *vs; };
     Recent recent[48]{}; unsigned recentCount = 0;
     uint32_t lastBlock = 0, lastPath = 0; const void *lastVs = nullptr;
@@ -515,10 +521,26 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
                 if (rewriteIfMvp(own, mvp, rows)) path = 1;
                 else if (rewriteIfMvp(rootRewrite, mvp, rows)) path = 2;
                 else if (rewriteIfMvp(backgroundRewrite, mvp, rows)) path = 3;
+                else if (rewriteFrustumMvp(own, mvp, rows)) path = 4;
                 if (path) {
                     std::memcpy(mvp, rows, sizeof(rows)); ++blockRewrites;
-                    if (path > 1) { ++fallbacks[path - 2]; pendingFallback = path * 65536 + c.a * 256 + c.b; }
-                } else if (!own.identity) { ++blockMisses; pendingMiss = c.a * 256 + c.b; }
+                    if (path == 4) ++frustumRewrites;
+                    else if (path > 1) { ++fallbacks[path - 2]; pendingFallback = path * 65536 + c.a * 256 + c.b; }
+                } else if (!own.identity) {
+                    ++blockMisses; pendingMiss = c.a * 256 + c.b;
+                    static unsigned missDumps = 0;
+                    if (missDumps < 12 && own.modelValid) {
+                        ++missDumps;
+                        const M4 m = multiply(own.toModel, m4(mvp, 4));
+                        log("Eye replay miss c%u:%u at %u rows %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f "
+                            "model %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.5f %.5f %.5f %.5f",
+                            c.a, c.b, c.f, mvp[0],mvp[1],mvp[2],mvp[3],mvp[4],mvp[5],mvp[6],mvp[7],mvp[8],mvp[9],mvp[10],mvp[11],
+                            mvp[12],mvp[13],mvp[14],mvp[15], m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11],m[12],m[13],m[14],m[15]);
+                        const auto &q = states[c.state].adjusted;
+                        log("Eye replay miss state AP %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f",
+                            q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],q[8],q[9],q[10],q[11],q[12],q[13],q[14],q[15]);
+                    }
+                }
                 lastPath = path ? path : (own.identity ? 8 : 9);
                 hr = oSetVSConstF(d, c.a, block.data(), c.b);
             } else hr = oSetVSConstF(d, c.a, reinterpret_cast<const float *>(w), c.b);
@@ -566,6 +588,7 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
         }
             if (pendingMiss && missedUsed < 440)
                 missedUsed += snprintf(missed + missedUsed, sizeof(missed) - missedUsed, " c%u:%u->T%u/%u", pendingMiss >> 8, pendingMiss & 255, c.a, c.c);
+            if (pendingMiss && c.c > MissedPrimitiveLimit) unrecognized = true;
             pendingMiss = 0;
             break;
         case Op::DrawIndexed: {
@@ -578,6 +601,7 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
             lastPath = 0;
             if (pendingMiss && missedUsed < 440)
                 missedUsed += snprintf(missed + missedUsed, sizeof(missed) - missedUsed, " c%u:%u->t%u/%u", pendingMiss >> 8, pendingMiss & 255, c.a, c.f);
+            if (pendingMiss && c.f > MissedPrimitiveLimit) unrecognized = true;
             if (pendingFallback && fellUsed < 440)
                 fellUsed += snprintf(fell + fellUsed, sizeof(fell) - fellUsed, " %s:c%u:%u->t%u/%u", pendingFallback >> 16 == 2 ? "root" : "sky",
                                      (pendingFallback >> 8) & 255, pendingFallback & 255, c.a, c.f);
@@ -586,7 +610,7 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
         }
         case Op::UpdateTexture: hr = oUpdateTexture(d, static_cast<IDirect3DBaseTexture9 *>(c.p), static_cast<IDirect3DBaseTexture9 *>(c.q)); break;
         }
-        ok = SUCCEEDED(hr);
+        ok = SUCCEEDED(hr) && !unrecognized;
     }
     if (boundIndices != logicalIndices) ok = SUCCEEDED(oSetIndices(d, logicalIndices)) && ok; // Engine's binding as it left it.
     static unsigned diagnostics = 0, replays = 0, loggedDraws = 0, changeLogs = 0;
@@ -622,7 +646,7 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
         }
         const auto &p = states[0].projection, &a = states[0].adjusted;
         const auto &v = states[0].view;
-        log("Eye replay block MVP rewrites=%u misses=%u:%s", blockRewrites, blockMisses, missed);
+        log("Eye replay block MVP rewrites=%u (frustum %u) misses=%u:%s", blockRewrites, frustumRewrites, blockMisses, missed);
         log("Eye replay fallback rewrites root=%u sky=%u:%s", fallbacks[0], fallbacks[1], fell);
         {
             char tail[1500]; int used = snprintf(tail, sizeof(tail), "Eye replay last indexed draws (prims block path vs):");
@@ -643,7 +667,11 @@ bool play(IDirect3DDevice9 *d, IDirect3DSurface9 *target, IDirect3DSurface9 *dep
     LARGE_INTEGER end{}; QueryPerformanceCounter(&end);
     stats.replayMs += 1000.0 * double(end.QuadPart - start.QuadPart) / double(frequency.QuadPart);
     stats.commands += unsigned(cmds.size());
-    if (ok) ++stats.replayed; else { valid = false; reason = "replay call failed"; }
+    if (ok) ++stats.replayed; else { valid = false; reason = unrecognized ? "unrecognized view matrix" : "replay call failed"; }
+    if (unrecognized) {
+        static unsigned logged = 0;
+        if (logged < 8) { ++logged; log("Eye replay abandoned: unrecognized view matrix:%s", missed); }
+    }
     return ok;
 }
 Stats takeStats() noexcept {

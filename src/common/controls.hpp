@@ -36,12 +36,15 @@ struct SqueezeSample {
     uint32_t sources = 0;
     bool valid = false, down = false;
 };
-inline SqueezeSample squeezeSample(bool clickActive, uint32_t clickDown, bool analogActive, float value) {
+// Index grips report squeeze force (a resting hand reads ~0), so they take a
+// lower threshold than curl-style analog grips.
+inline SqueezeSample squeezeSample(bool clickActive, uint32_t clickDown, bool analogActive, float value,
+                                   float threshold = .65f) {
     return {(clickActive ? 1u : 0u) | (analogActive ? 2u : 0u),
             (!clickActive || clickDown <= 1) && (!analogActive ||
                 (std::isfinite(value) && value >= 0.f && value <= 1.f)),
             (clickActive && clickDown == 1) ||
-                (analogActive && std::isfinite(value) && value > .65f)};
+                (analogActive && std::isfinite(value) && value > threshold)};
 }
 struct SqueezeAdmission {
     uint32_t epoch = 1, sources = 0;

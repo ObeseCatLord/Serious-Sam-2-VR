@@ -102,6 +102,10 @@ struct PixelStore {
     uint64_t bytes() const { return pixelBufferBytes(width, height); }
     uint8_t *buffer(unsigned index) const { return index < PixelBufferCount ? view[index] : nullptr; }
     bool matches(uint32_t g, uint32_t w, uint32_t h) const { return view[0] && generation == g && width == w && height == h; }
+    // A smaller image (the scaled flat screen) fits in a buffer of this generation.
+    bool holds(uint32_t g, uint32_t w, uint32_t h) const {
+        return view[0] && generation == g && w && h && uint64_t(w) * h <= uint64_t(width) * height;
+    }
     bool open(const std::wstring &token, uint32_t g, uint32_t w, uint32_t h, bool create) {
         close();
         const uint64_t size = pixelBufferBytes(w, h);

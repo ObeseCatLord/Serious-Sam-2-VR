@@ -105,6 +105,7 @@ inline EyeChange eyeChange(const Matrix34 &eye0ToEye1, Fov eye0, Fov eye1) noexc
 // R = AP1 * E * AP0^-1 that turns any eye-0 MVP into the eye-1 MVP.
 struct Rewrite {
     M4 adjusted{}, projection{}, view{}, clip{}, viewChange{};
+    M4 adjusted0{};      // AP0, the recorded adjusted projection
     M4 toModel{};        // (AP0 * V0)^-1: recovers the model matrix from an MVP
     bool modelValid = false;
     bool identity = true, valid = false;
@@ -129,9 +130,15 @@ inline Rewrite rewrite(const ViewState &s, const EyeChange &e) noexcept {
     const M4 adjust = multiply(ap0, p0inv);                       // A
     out.projection = multiply(e.frustum, p0);                      // T * P0
     out.adjusted = multiply(adjust, out.projection);               // A * T * P0
+    // T only moves x and y: the z and w rows stay bit-exact (consumers test
+    // the perspective row for exact values), as do A*T*P0's when A keeps them.
+    for (unsigned i = 8; i < 16; ++i) out.projection[i] = p0[i];
+    if (std::abs(adjust[8]) < 1e-9 && std::abs(adjust[9]) < 1e-9 && std::abs(adjust[12]) < 1e-9 && std::abs(adjust[13]) < 1e-9)
+        for (unsigned i = 8; i < 16; ++i) out.adjusted[i] = ap0[i];
     out.view = multiply(out.viewChange, v0);                       // E * V0
     out.clip = multiply(multiply(out.adjusted, out.viewChange), ap0inv);
     for (double v : out.clip) if (!std::isfinite(v)) return out;
+    out.adjusted0 = ap0;
     out.modelValid = invert(multiply(ap0, v0), out.toModel);
     out.identity = false;
     out.valid = true;
@@ -166,6 +173,47 @@ inline bool rewriteIfMvp(const Rewrite &r, const float *in, float *out) noexcept
         return false;
     const M4 mvp = multiply(r.clip, m4(in, 4));
     for (unsigned i = 0; i < 16; ++i) out[i] = float(mvp[i]);
+    return true;
+}
+// An MVP drawn through this view's frustum but with its own depth row (another
+// near/far, an oblique clip plane): its x, y and w rows are AP0's rows times an
+// affine X (view * model). Solve X from those rows, express the depth row as a
+// view-space functional g (z = g . X), and rebuild the eye-1 MVP as
+// [AP1.x; AP1.y; g; AP1.w] * E * X: the same depth function, moved with the eye.
+inline bool rewriteFrustumMvp(const Rewrite &r, const float *in, float *out) noexcept {
+    std::memcpy(out, in, 16 * sizeof(float));
+    if (!r.valid || r.identity) return false;
+    const M4 &p = r.adjusted0;
+    const M4 m = m4(in, 4);
+    // Q: AP0's x, y, w rows restricted to the first three columns.
+    const double q[3][3] = {{p[0], p[1], p[2]}, {p[4], p[5], p[6]}, {p[12], p[13], p[14]}};
+    const double det = q[0][0] * (q[1][1] * q[2][2] - q[1][2] * q[2][1]) - q[0][1] * (q[1][0] * q[2][2] - q[1][2] * q[2][0]) +
+                       q[0][2] * (q[1][0] * q[2][1] - q[1][1] * q[2][0]);
+    if (!std::isfinite(det) || std::abs(det) < 1e-12) return false;
+    if (std::abs(m[12]) + std::abs(m[13]) + std::abs(m[14]) < 1e-9) return false; // Not perspective.
+    double qi[3][3];
+    qi[0][0] = (q[1][1] * q[2][2] - q[1][2] * q[2][1]) / det; qi[0][1] = (q[0][2] * q[2][1] - q[0][1] * q[2][2]) / det;
+    qi[0][2] = (q[0][1] * q[1][2] - q[0][2] * q[1][1]) / det; qi[1][0] = (q[1][2] * q[2][0] - q[1][0] * q[2][2]) / det;
+    qi[1][1] = (q[0][0] * q[2][2] - q[0][2] * q[2][0]) / det; qi[1][2] = (q[0][2] * q[1][0] - q[0][0] * q[1][2]) / det;
+    qi[2][0] = (q[1][0] * q[2][1] - q[1][1] * q[2][0]) / det; qi[2][1] = (q[0][1] * q[2][0] - q[0][0] * q[2][1]) / det;
+    qi[2][2] = (q[0][0] * q[1][1] - q[0][1] * q[1][0]) / det;
+    M4 x{};
+    x[15] = 1;
+    for (unsigned j = 0; j < 4; ++j) {
+        const double t = j == 3 ? 1 : 0; // X's fourth row is (0,0,0,1).
+        const double rhs[3] = {m[j] - p[3] * t, m[4 + j] - p[7] * t, m[12 + j] - p[15] * t};
+        for (unsigned k = 0; k < 3; ++k) x[4 * k + j] = qi[k][0] * rhs[0] + qi[k][1] * rhs[1] + qi[k][2] * rhs[2];
+    }
+    M4 xi;
+    if (!invert(x, xi)) return false;
+    M4 g{}; // Row 2: the depth row as a functional of X's space.
+    for (unsigned c = 0; c < 4; ++c)
+        for (unsigned k = 0; k < 4; ++k) g[8 + c] += m[8 + k] * xi[4 * k + c];
+    M4 p1 = r.adjusted;
+    for (unsigned c = 0; c < 4; ++c) p1[8 + c] = g[8 + c];
+    const M4 result = multiply(multiply(p1, r.viewChange), x);
+    for (double v : result) if (!std::isfinite(v)) return false;
+    for (unsigned i = 0; i < 16; ++i) out[i] = float(result[i]);
     return true;
 }
 // Clip-space user plane (row vector, plane . clip >= 0) for the eye-1 clip space.

@@ -14,7 +14,7 @@ constexpr Vec3 Id13ModelHandleReference{0.f, .003122344828160041f, .006718217565
 // Grip anchor per native weapon, in pre-stretch first-person model coordinates:
 // the point placed at the controller's grip. First-person models put their
 // origin near the camera with the gun up to a metre away, so every weapon needs
-// one. Revolvers, uzi and double shotgun use their authored Hand bone (logged by
+// one. Revolvers and uzi use their authored Hand bone (logged by
 // the private weapon audit, V101); zap gun and sniper keep their measured
 // handles; the rest are handle points chosen on each model and checked against
 // the controller position in lab captures.
@@ -25,8 +25,8 @@ struct WeaponGrip {
 inline constexpr WeaponGrip WeaponGrips[] = {
     {0, {0.f, .11f, .02f}},          // Circular saw: top trigger handle (V111 side view)
     {1, Id1ModelHandleReference},     // Zap gun
-    {2, {0.f, -.075f, -.091f}},      // Auto shotgun
-    {3, {-.0379f, -.021f, -.2626f}}, // Double shotgun: Hand bone
+    {2, {0.f, -.030f, .097f}},       // Auto shotgun: rear pistol grip (V212 side view)
+    {3, {-.0379f, .025f, -.035f}},   // Double shotgun: stock wrist behind the hammers (V212)
     {4, {0.f, .0999f, -.0632f}},     // Uzi: Hand bone
     {5, {0.f, -.059f, .264f}},       // Minigun: rear handle
     {6, {0.f, -.118f, -.058f}},      // Rocket launcher: rear grip

@@ -23,6 +23,27 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Fixed after the first headset test (2026-10-12)
+
+Check these first; they were reported broken:
+
+- Menus, the pause menu, loading screens and cutscenes appear on the flat
+  screen (they were black). Pause with left B (Index); resuming must not tilt
+  the view (mouse look is now ignored while VR input is live).
+- No blackouts during play: a dropped frame keeps the last image up instead of
+  going black. If the world still freezes or blacks out, note the weapon and
+  what you did; the log now names the cause (`Native eye projection rejected
+  ... at=`).
+- Index controls: holding the controller no longer jumps or grabs (grab is a
+  firm grip squeeze, jump is right B); a light trackpad press opens that hand's
+  weapon wheel; right stick click throws a grenade (zooms with the sniper).
+- Right eye: nothing shows through terrain or walls in the right eye only.
+- Turrets: look at the turret and press A; the HUD prompt says "Press A to
+  enter". Inside, the right hand aims (laser), the right trigger fires, the left
+  trigger alt-fires, A leaves.
+- Shotguns: your hand sits on the auto shotgun's pistol grip and on the double
+  shotgun's stock behind the hammers.
+
 ## World rendering and tracking
 
 1. Start a level. The world surrounds you at the headset's field of view, in
@@ -44,7 +65,8 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 The right eye is drawn by replaying the left eye's draw calls with the view
 changed (`[Render] EyeReplay=1`). Look for anything that appears only in the
 right eye, sits at the wrong depth there, or flickers between eyes, and say
-whether it goes away with `EyeReplay=0`. While a weapon wheel is open the right
+whether it goes away with `EyeReplay=0`. While a weapon wheel is open, in
+vehicles, and on frames with a draw the replay cannot place exactly, the right
 eye is rendered normally.
 
 ## Weapons

@@ -1,5 +1,34 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-12 (night) — first headset test fixes
+
+- Flat screen: the host compared the scaled flat image (<=1920x1080) with the
+  pixel-section size and rejected every menu, loading screen and cutscene since
+  the GPU scaling change; it now checks capacity. The last flat frame stays up
+  while loading blocks presentation (up to 60 s).
+- Blackouts: the host reused its last stereo pair for only 150 ms, so runs of
+  dropped pairs (left-eye root-capture faults, seen with the double shotgun on
+  the headset only) went black; the pair is now held for 1 s. Fault sites log
+  their source line (`at=`); the trigger is not reproduced in the lab.
+- Right-eye replay: block MVPs drawn through the eye frustum with another depth
+  row are decomposed from their x/y/w rows (`rewriteFrustumMvp`, tested); a
+  draw still unrecognized (>16 primitives) renders that right eye natively.
+  Derived projections keep their perspective rows bit-exact (a float mismatch
+  had discarded every replay on Metropolis).
+- Index: grip = squeeze force > 0.4 (squeeze value is finger curl; holding the
+  controller jumped constantly), wheel = trackpad force > 0.25 thresholded in
+  the host, jump = right B only (`JumpBound` button bit disables grip jump);
+  right stick click throws a grenade (`plcmdTertFire`) unless a sniper zooms.
+- Mouse axes (CKbdMouseInputDevice controls 0x78-0x7b) read 0 while VR input is
+  live: the menu pointer's cursor moves pitched the view after a pause.
+- Turrets: ride boarding picks the seat in a cone around
+  CPlayerPuppetEntity::GetViewOrigin, the native look that VR never turns; the
+  two boarding callers (0xEA4FE, 0xEA465) now see the tracked head. Seated, the
+  right trigger is Fire and the left AltFire (no lone-weapon remap). Native
+  prompts name VR buttons via a CInputBindings::SubstituteCommands rewrite.
+- Grips: auto shotgun on its pistol grip, double shotgun on the stock wrist
+  (V212/V216 side views).
+
 ## 2026-10-12 (later) — right eye by record and replay; mod overhead cut
 
 - The right eye is no longer a second engine render. The left eye's world

@@ -13,7 +13,9 @@ constexpr uint64_t pixelBufferBytes(uint32_t width, uint32_t height) { return ui
 // Wheel is the grip (squeeze): grasp, carry, recenter chord and on-foot jump.
 // WheelOpen is the separate hold-to-open weapon wheel button.
 enum Button : uint32_t {
-    Wheel = 1, Use = 2, Jump = 4, Menu = 8, Recenter = 16, Sprint = 32, Reload = 64, Netricsa = 128, WheelOpen = 256
+    Wheel = 1, Use = 2, Jump = 4, Menu = 8, Recenter = 16, Sprint = 32, Reload = 64, Netricsa = 128, WheelOpen = 256,
+    // The hand's profile has a dedicated jump button (Index B): the grip only grabs.
+    JumpBound = 512
 };
 enum FramePresentation : uint32_t { NativeUiComplete = 1 };
 enum class SlotState : uint32_t { Empty, Requested, Rendering, Ready };

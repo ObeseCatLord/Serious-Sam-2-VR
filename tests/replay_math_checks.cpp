@@ -44,6 +44,25 @@ int main() {
             assert(rewriteIfMvp(r, in, out));
             for (unsigned i = 0; i < 16; ++i) got[i] = out[i];
             assert(close(got, mvp1, 2e-3));
+            // The frustum decomposition reproduces a standard MVP too.
+            assert(rewriteFrustumMvp(r, in, out));
+            for (unsigned i = 0; i < 16; ++i) got[i] = out[i];
+            assert(close(got, mvp1, 2e-3));
+            // Same frustum, another depth range (distant terrain): not affine
+            // under AP0, but the frustum decomposition gives the eye-1 MVP.
+            if (!background) {
+                const M4 f0 = multiply(adjust, m4(projection(fov0, 2.f, 90000).m, 4));
+                const M4 f1 = multiply(adjust, m4(projection(fov1, 2.f, 90000).m, 4));
+                const M4 far0 = multiply(multiply(f0, v0), model), far1 = multiply(multiply(f1, v1), model);
+                for (unsigned i = 0; i < 16; ++i) in[i] = float(far0[i]);
+                assert(!rewriteIfMvp(r, in, out));
+                assert(rewriteFrustumMvp(r, in, out));
+                for (unsigned i = 0; i < 16; ++i) got[i] = out[i];
+                assert(close(got, far1, 2e-3));
+                for (unsigned i = 0; i < 16; ++i) in[i] = float(mvp0[i]);
+            }
+            // The derived projections keep their perspective rows bit-exact.
+            assert(r.projection[14] == p0[14] && r.projection[15] == p0[15] && r.adjusted[14] == ap0[14]);
             // Rows that are not an MVP of this view (e.g. a texture matrix) stay unchanged.
             float other[16]{.5f,0,0,.5f, 0,.5f,0,.5f, 0,0,1,0, 0,0,0,1};
             assert(!rewriteIfMvp(r, other, out));
