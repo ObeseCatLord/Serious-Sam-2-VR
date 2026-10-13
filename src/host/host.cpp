@@ -1769,7 +1769,7 @@ struct Host {
     // Reopen the game's pixel sections when it publishes a new generation.
     // Private lab only: one zero-copy left eye written as a PPM beside the log,
     // proving what the headset receives (lab captures otherwise use pixel pairs).
-    void probeZeroCopy(ID3D11Texture2D *source) {
+    void probeZeroCopy(ID3D11Texture2D *source, const wchar_t *name = L"zero-copy-probe-left.ppm") {
         wchar_t lab[2]{};
         if (GetEnvironmentVariableW(L"SS2VR_LAB_PRIVATE_DISPLAY", lab, 2) != 1 || lab[0] != L'1' || !source)
             return;
@@ -1786,7 +1786,7 @@ struct Host {
         D3D11_MAPPED_SUBRESOURCE mapped{};
         if (FAILED(context->Map(staging.p, 0, D3D11_MAP_READ, 0, &mapped)))
             return;
-        if (auto *file = _wfopen((executableDirectory() + L"zero-copy-probe-left.ppm").c_str(), L"wb")) {
+        if (auto *file = _wfopen((executableDirectory() + name).c_str(), L"wb")) {
             std::fprintf(file, "P6\n%u %u\n255\n", description.Width, description.Height);
             std::vector<uint8_t> row(size_t(description.Width) * 3);
             for (uint32_t y = 0; y < description.Height; ++y) {
@@ -1962,10 +1962,33 @@ struct Host {
                 }
             }
     }
+    // Lab (SS2VR_LAB_GAZE=yaw,pitch in degrees, head-relative): a simulated eye
+    // tracker for the eye-tracked foveation path (the lab runtime has none).
+    static bool labGazeAngles(float &yawDegrees, float &pitchDegrees) {
+        static const int set = [] {
+            wchar_t v[32]{};
+            return GetEnvironmentVariableW(L"SS2VR_LAB_GAZE", v, 32) ? 1 : 0;
+        }();
+        static float y = 0, p = 0;
+        static const bool parsed = [] {
+            wchar_t v[32]{};
+            return GetEnvironmentVariableW(L"SS2VR_LAB_GAZE", v, 32) && swscanf(v, L"%f,%f", &y, &p) == 2;
+        }();
+        yawDegrees = y; pitchDegrees = p;
+        return set && parsed;
+    }
+    static bool labGaze(const Input &input, Vec3 &gaze) {
+        float y = 0, p = 0;
+        if (!labGazeAngles(y, p) || !input.headValid) return false;
+        const float a = y * Pi / 180, b = p * Pi / 180;
+        gaze = rotate(input.head.q, Vec3{-std::sin(a) * std::cos(b), std::sin(b), -std::cos(a) * std::cos(b)});
+        return true;
+    }
     // Foveated rendering in the game: [Render] Foveation 2 always, 1 with eye gaze.
     bool renderFoveation() const {
         const int mode = settings.foveation.mode;
-        return mode == 2 || (mode == 1 && actions.gazeEnabled);
+        float y = 0, p = 0;
+        return mode == 2 || (mode == 1 && (actions.gazeEnabled || labGazeAngles(y, p)));
     }
     void insetChains(uint32_t width, uint32_t height) {
         if (inset[0].width == width && inset[0].height == height && inset[1].handle)
@@ -2138,6 +2161,10 @@ struct Host {
             perfPairAge += double(GetTickCount64() - (deadline - FrameAgeMs));
             if (++zeroCopyPairs == 600)
                 probeZeroCopy(sharedEye[candidate][0].p);
+            if (zeroCopyPairs == 600 || zeroCopyPairs == 1500) // Lab: both eyes, early and later.
+                probeZeroCopy(sharedEye[candidate][1].p, zeroCopyPairs == 600 ? L"zero-copy-probe-right.ppm" : L"zero-copy-probe-right-late.ppm");
+            if (zeroCopyPairs == 1500)
+                probeZeroCopy(sharedEye[candidate][0].p, L"zero-copy-probe-left-late.ppm");
         } else {
             eye[0].uploadWaited(context.p, source[0]);
             eye[1].uploadWaited(context.p, source[1]);
@@ -2814,7 +2841,7 @@ struct Host {
                         request.insetWidth = insetWidth; request.insetHeight = insetHeight;
                         Vec3 gaze;
                         const ULONGLONG now = GetTickCount64();
-                        if (actions.gazeDirection(api, session, local, frameState.predictedDisplayTime, gaze)) {
+                        if (labGaze(input, gaze) || actions.gazeDirection(api, session, local, frameState.predictedDisplayTime, gaze)) {
                             lastGaze = gaze;
                             lastGazeTick = now;
                         }

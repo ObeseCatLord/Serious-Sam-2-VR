@@ -1038,10 +1038,12 @@ static bool hudLayerAlpha(IDirect3DDevice9 *d,DWORD &source,DWORD &destination) 
 struct HudVertex { float x, y, z, rhw, u, v; };
 // Composite the layer onto the desktop backbuffer and both eyes; restores all
 // device state (state block) and the bound render target. Clears the layer flag.
+static void labDumpHudLayer(IDirect3DDevice9 *d) noexcept;
 static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
     if (!uiFrame.hudLayerDirty) return true;
     uiFrame.hudLayerDirty = false;
     if (!hudLayer || hudLayerDevice != d) return false;
+    labDumpHudLayer(d);
     const LARGE_INTEGER start = PerfClock::now();
     ++perf.hudFlushes;
     hudLayer->GenerateMipSubLevels();
@@ -2455,10 +2457,10 @@ static void presentBody(IDirect3DDevice9 *d) {
             {
                 const auto sp = single_pass::takeStats();
                 if (singlePassEnabled)
-                    log("Perf single pass: passes=%u draws/pass=%.0f instanced/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f target switches/pass=%.1f up/pass=%.1f variants=%u failed=%u foveated=%u atlas=%ux%u",
+                    log("Perf single pass: passes=%u draws/pass=%.0f instanced/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f target switches/pass=%.1f up/pass=%.1f locked/pass=%.1f variants=%u failed=%u foveated=%u atlas=%ux%u",
                         sp.passes, sp.passes ? double(sp.draws) / sp.passes : 0., sp.passes ? double(sp.instanced) / sp.passes : 0.,
                         sp.passes ? double(sp.unpatched) / sp.passes : 0.,
-                        sp.passes ? double(sp.stateChanges) / sp.passes : 0., sp.passes ? double(sp.suspensions) / sp.passes : 0., sp.passes ? double(sp.userPointer) / sp.passes : 0.,
+                        sp.passes ? double(sp.stateChanges) / sp.passes : 0., sp.passes ? double(sp.suspensions) / sp.passes : 0., sp.passes ? double(sp.userPointer) / sp.passes : 0., sp.passes ? double(sp.screenLocked) / sp.passes : 0.,
                         sp.variants, sp.failedVariants, perf.foveatedPairs, atlasWidth, atlasHeight);
             }
             {
@@ -2854,6 +2856,25 @@ void compare(IDirect3DDevice9 *d, IDirect3DSurface9 *target) noexcept {
     }
 }
 } // namespace replay_compare
+// Lab (SS2VR_LAB_STAGE_DUMP=1): the right eye image at stages of the 1500th stereo pair.
+static unsigned labStagePair = 0;
+static void labStageDump(IDirect3DDevice9 *d, IDirect3DSurface9 *target, const wchar_t *name) noexcept {
+    static const bool dump = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_STAGE_DUMP", v, 2) == 1 && v[0] == L'1'; }();
+    std::vector<uint8_t> px; D3DSURFACE_DESC desc{};
+    if (dump && labStagePair == 1500 && target && SUCCEEDED(target->GetDesc(&desc)) && replay_compare::read(d, target, px))
+        replay_compare::write(name, px, desc.Width, desc.Height);
+}
+// Lab (SS2VR_LAB_HUD_DUMP=1): the HUD layer's colour and alpha at its 1500th flush.
+static void labDumpHudLayer(IDirect3DDevice9 *d) noexcept {
+    static const bool dump = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_HUD_DUMP", v, 2) == 1 && v[0] == L'1'; }();
+    static unsigned flushes = 0;
+    std::vector<uint8_t> px; D3DSURFACE_DESC desc{};
+    if (!dump || ++flushes != 1500 || !hudLayerSurface || FAILED(hudLayerSurface->GetDesc(&desc)) || !replay_compare::read(d, hudLayerSurface, px))
+        return;
+    replay_compare::write(L"hud-color.ppm", px, desc.Width, desc.Height);
+    for (size_t i = 0; i < px.size(); i += 4) px[i] = px[i + 1] = px[i + 2] = px[i + 3];
+    replay_compare::write(L"hud-alpha.ppm", px, desc.Width, desc.Height);
+}
 static bool eyeTargetCurrent(int index) {
     D3DVIEWPORT9 viewport{};
     const bool matches=index>=0 && index<2 && activeEye==index && uiFrame.device &&
@@ -3002,6 +3023,7 @@ void nativeUiEndOverlay(bool completed) noexcept {
     if (uiFrame.slot<0 || !uiFrame.ui) return;
     if (completed && uiFrame.overlay && !uiFrame.fade && !uiDraw.busy && !uiFrame.fault && uiFrame.device)
         flushHudLayer(uiFrame.device);
+    if (uiFrame.device) labStageDump(uiFrame.device, uiFrame.target[1], L"stage-d-overlay.ppm");
     uiFrame.hudLayerDirty=false;
     if (!completed || !uiFrame.overlay || uiFrame.fade || uiDraw.busy) nativeUiFault();
     uiFrame.complete=completed && uiFrame.overlay && !uiFrame.fault;
@@ -3897,7 +3919,8 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                             decltype(rb) b; wchar_t v[64]{};
                             if(GetEnvironmentVariableW(L"SS2VR_LAB_SP_REGION",v,64)) b.on=swscanf(v,L"%d,%d,%d,%d",&b.x0,&b.y0,&b.x1,&b.y1)==4;
                             return b; }();
-                        const bool measure=rb.on && !rb.done && ++rb.frame%20==0;
+                        static const unsigned sweepDelay=[]{ wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_SWEEP_DELAY",v,16) ? unsigned(wcstoul(v,nullptr,10)) : 0u; }();
+                        const bool measure=rb.on && !rb.done && ++rb.frame>sweepDelay && rb.frame%20==0;
                         static const bool sweep=[]{ wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_SWEEP",v,2)==1 && v[0]==L'1'; }();
                         // Bisection over the instanced pixel programs (stable across frames).
                         static std::vector<uint32_t> psList;
@@ -3930,7 +3953,8 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                                 }
                             }
                             (void)eligible;
-                            log("Single pass region bisect step=%u luma=%.2f good=%.2f bad=%.2f eligible=%u range=[%u,%u)",rb.step,l,rb.good,rb.bad,eligible,rb.lo,rb.hi);
+                            log("Single pass region bisect step=%u luma=%.2f good=%.2f bad=%.2f eligible=%u range=[%u,%u) leftSeam=%.2f",rb.step,l,rb.good,rb.bad,eligible,rb.lo,rb.hi,
+                                replay_compare::regionLuma(d,uiFrame.target[0],140,100,142,500));
                             ++rb.step;
                         }
                         setSinglePassWorld(false);
@@ -3947,6 +3971,8 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                             SUCCEEDED(originalStretch(d,wideColor,&half,uiFrame.target[k],nullptr,D3DTEXF_NONE));
                     }
                     if(foveated) ++perf.foveatedPairs;
+                    ++labStagePair;
+                    labStageDump(d,uiFrame.target[1],L"stage-a-pass.ppm");
                     {
                         // Lab (SS2VR_LAB_FOVEA_DUMP=1): the atlas and both composed eyes of the 300th foveated pair.
                         static const bool dump=[]{ wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_FOVEA_DUMP",v,2)==1 && v[0]==L'1'; }();
@@ -4063,6 +4089,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                         generation==graphicsResourceGeneration();
                     if(traceDepth && generation==graphicsResourceGeneration()) traceStereoDepth(d,request,i,"after-postlude");
                     if(traceEye) log("Native eye postlude eye=%d completed=%u",i,complete);
+                    if(i==1) labStageDump(d,uiFrame.target[1],L"stage-b-postlude.ppm");
                     return complete;
                 });
             if(!ok && !stageNoted) noteStage(targetCurrent ? 7 : 6);
@@ -4070,6 +4097,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             gpuProfile.mark(pass+1);
             if(ok && generation == graphicsResourceGeneration() && !uiFrame.zeroCopy && (!uiFrame.ui || visibility!=1)) ok=readUiEye(i,uiFrame.ui,visibility);
             noteStage(8);
+            if(i==1) labStageDump(d,uiFrame.target[1],L"stage-c-eye.ppm");
         }
         replay::reset();
         activeEye=-1; endEye(); desktopTarget=desktopDepth=nullptr;

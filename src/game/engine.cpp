@@ -576,6 +576,18 @@ static void publishWheelPresentation(unsigned hand, const WeaponWheel &wheel) {
     }
     ReleaseSRWLockExclusive(&wheelPresentationLock);
 }
+// Bloom (ProcRender efxBloom, called from CEffectRenCmd::Execute) draws a
+// view-covering glow quad about 0.4 m in front of the camera; two-pass renders
+// draw it in front of each eye's own camera. The single pass draws it
+// screen-locked: reprojected per eye, the eye offset at that distance left one
+// eye's glow ending in a straight edge inside the view (lab, V341-V375).
+using BloomRender = void(__thiscall *)(void *, void *);
+static BloomRender originalBloomRender = nullptr;
+static void __fastcall bloomRenderEffect(void *bloom, void *, void *command) {
+    single_pass::setScreenLocked(true);
+    originalBloomRender(bloom, command);
+    single_pass::setScreenLocked(false);
+}
 // The host's VR options panel saves SS2VR.user.ini while the game runs: the
 // settings that are safe to change in play are re-applied when it changes.
 static std::wstring settingsFile;
@@ -9088,6 +9100,13 @@ bool attach(bool headless) {
     if (!headless) {
         S(c, "?mthQuaternionToEuler@SeriousEngine@@YA?AVVector3f@1@ABVQuaternion4f@1@@Z", quaternionEuler);
         S(g, "?GetOperatorMoveDir@CLeggedPuppetEntity@SeriousEngine@@UAE?AVVector3f@2@V32@0@Z", nativeOperatorMoveDir);
+        if (quaternionEuler) { // Native look convention of OpenXR turns left / pitches up (turret stick signs).
+            Vec3 left{}, up{};
+            quaternionEuler(&left, yaw(.5f));
+            quaternionEuler(&up, Quat{std::sin(.15f), 0, 0, std::cos(.15f)});
+            log("Native euler of yaw +0.5 (left)=%.3f,%.3f,%.3f pitch +0.3 (up)=%.3f,%.3f,%.3f",
+                left.x, left.y, left.z, up.x, up.y, up.z);
+        }
     }
     S(c, "?mthMatrixToQuatVect@SeriousEngine@@YA?AVQuatVect@1@ABVMatrix34f@1@@Z", matrixPose);
     S(c, "?strConvertStringToID@SeriousEngine@@YA?AVIDENT@1@PBD@Z", toId);
@@ -9407,6 +9426,13 @@ bool attach(bool headless) {
         H(g, "?HandleObjectCarrying@CPuppetEntity@SeriousEngine@@QAEXXZ", carryStep, originalCarrying);
         H(g, "?IsComboWeaponsEnabled@CGameInfoEntity@SeriousEngine@@QAEHXZ", comboWeapons, originalComboWeapons);
         H(e, "?PollValues@CInputBindings@SeriousEngine@@QAEXXZ", poll, originalPoll);
+        if (!headless) {
+            // Optional: bloom renders screen-locked when ProcRender is loaded.
+            const HMODULE procRender = GetModuleHandleW(L"ProcRender.dll");
+            const char *bloom = "?RenderEffect@CBloomRenderable@SeriousEngine@@UAEXPAVCEffectRenCmd@2@@Z";
+            if (procRender && GetProcAddress(procRender, bloom)) H(procRender, bloom, bloomRenderEffect, originalBloomRender);
+            else log("Bloom renderable not hooked (ProcRender.dll %s)", procRender ? "lacks the export" : "not loaded");
+        }
         H(e, "?GetControlValue@CKbdMouseInputDevice@SeriousEngine@@UAEMJ@Z", mouseControlValue, originalMouseControl);
         H(e, "?SubstituteCommands@CInputBindings@SeriousEngine@@QAE?AVCString@2@PBD@Z", substituteCommands,
           originalSubstitute);

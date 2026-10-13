@@ -3,7 +3,9 @@
 #include "game.hpp"
 #include <MinHook.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <unordered_map>
 #include <vector>
 
@@ -16,6 +18,8 @@ using SetDeclarationF = HRESULT(WINAPI *)(IDirect3DDevice9 *, IDirect3DVertexDec
 using SetFvfF = HRESULT(WINAPI *)(IDirect3DDevice9 *, DWORD);
 using SetViewportF = HRESULT(WINAPI *)(IDirect3DDevice9 *, const D3DVIEWPORT9 *);
 using SetScissorF = HRESULT(WINAPI *)(IDirect3DDevice9 *, const RECT *);
+using SetClipPlaneF = HRESULT(WINAPI *)(IDirect3DDevice9 *, DWORD, const float *);
+using GetClipPlaneF = HRESULT(WINAPI *)(IDirect3DDevice9 *, DWORD, float *);
 using SetRenderStateF = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DRENDERSTATETYPE, DWORD);
 using SetPixelShaderF = HRESULT(WINAPI *)(IDirect3DDevice9 *, IDirect3DPixelShader9 *);
 SetVertexShaderF oSetVertexShader = nullptr;
@@ -23,6 +27,8 @@ SetDeclarationF oSetDeclaration = nullptr;
 SetFvfF oSetFvf = nullptr;
 SetViewportF oSetViewport = nullptr;
 SetScissorF oSetScissor = nullptr;
+SetClipPlaneF oSetClipPlane = nullptr;
+GetClipPlaneF oGetClipPlane = nullptr;
 SetRenderStateF oSetRenderState = nullptr;
 SetPixelShaderF oSetPixelShader = nullptr;
 Originals bridge;
@@ -44,6 +50,12 @@ D3DVIEWPORT9 engineViewport{};
 RECT engineScissor{};
 bool scissorEnabled = false;
 DWORD colorWrites = 0xf;
+// User clip planes: D3D9 applies them to the vertex program's clip-space output,
+// and the engine sets them for the centre camera's clip space; each eye region
+// gets them transformed by the inverse of its clip-space map.
+float enginePlanes[6][4]{};
+DWORD clipPlanes = 0;           // D3DRS_CLIPPLANEENABLE as set by the engine.
+bool planesApplied = false;     // The device holds transformed planes.
 
 // Pass state.
 bool active = false;
@@ -164,10 +176,39 @@ RECT regionRect(const Region &g, LONG left, LONG top, LONG right, LONG bottom) n
     r.top = std::clamp(r.top, g.rect.top, g.rect.bottom); r.bottom = std::clamp(r.bottom, g.rect.top, g.rect.bottom);
     return r;
 }
+double inverseMap[2 + MaxRegions][16]{};
+bool inverseValid[2 + MaxRegions]{};
+bool invert4(const double *m, double *out) noexcept {
+    double inv[16];
+    inv[0] = m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5];
+    const double det = m[0]*inv[0]+m[1]*inv[4]+m[2]*inv[8]+m[3]*inv[12];
+    if (!(std::abs(det) > 1e-30) || !std::isfinite(det)) return false;
+    for (unsigned i = 0; i < 16; ++i) out[i] = inv[i] / det;
+    return true;
+}
 bool fullEye(const D3DVIEWPORT9 &v) noexcept { return !v.X && !v.Y && v.Width == eyeWidth && v.Height == eyeHeight; }
 bool recordsValid = false;
 bool recordsOrtho = false; // The current matrices are not a perspective view (fills, 2D).
+bool screenLocked = false; // Records built for the centre view in every eye.
+bool engineScreenLock = false; // setScreenLocked: inside a camera-attached effect.
 bool writeRecords(IDirect3DDevice9 *d) noexcept {
+    static bool lockedRecords = false;
+    if (lockedRecords != screenLocked) { recordsValid = false; lockedRecords = screenLocked; }
     if (recordsValid && !std::memcmp(cachedAdjusted, engineAdjusted, sizeof(cachedAdjusted)) &&
         !std::memcmp(cachedProjection, engineProjection, sizeof(cachedProjection)) &&
         !std::memcmp(cachedView, engineView, sizeof(cachedView)) &&
@@ -188,7 +229,8 @@ bool writeRecords(IDirect3DDevice9 *d) noexcept {
     sp::EyeRecord records[4 + MaxRegions];
     recordsOrtho = false;
     for (unsigned i = 0; i < 2; ++i) {
-        const Rewrite r = rewrite(state, changes[i]);
+        Rewrite r = rewrite(state, changes[i]);
+        if (screenLocked) r.identity = true;
         recordsOrtho = recordsOrtho || !r.valid || r.identity;
         for (unsigned row = 0; row < 4; ++row)
             for (unsigned c = 0; c < 4; ++c)
@@ -226,6 +268,14 @@ bool writeRecords(IDirect3DDevice9 *d) noexcept {
             out.r[0][c] = ax * eye.r[0][c] + bx * eye.r[3][c];
             out.r[1][c] = ay * eye.r[1][c] + by * eye.r[3][c];
         }
+    }
+    // Inverse clip maps for transforming clip planes (eye records, then regions).
+    for (unsigned k = 0; k < 2 + layout.count; ++k) {
+        const auto &rec = records[k < 2 ? k : 4 + (k - 2)];
+        double m[16];
+        for (unsigned row = 0; row < 4; ++row)
+            for (unsigned c = 0; c < 4; ++c) m[4 * row + c] = rec.r[row][c];
+        inverseValid[k] = invert4(m, inverseMap[k]);
     }
     const UINT count = 4 + layout.count;
     if (!ring && FAILED(d->CreateVertexBuffer(RingRecords * RecordBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0,
@@ -321,6 +371,26 @@ HRESULT WINAPI hSetPixelShader(IDirect3DDevice9 *d, IDirect3DPixelShader9 *s) {
     appliedPixelShader = s;
     return oSetPixelShader(d, s);
 }
+HRESULT WINAPI hSetClipPlane(IDirect3DDevice9 *d, DWORD index, const float *plane) {
+    if (index < 6 && plane) std::memcpy(enginePlanes[index], plane, sizeof(enginePlanes[index]));
+    planesApplied = false;
+    return oSetClipPlane(d, index, plane);
+}
+// Transformed planes for the map with inverse slot `k` (P_k = inverse^T P), or the engine's.
+void applyPlanes(IDirect3DDevice9 *d, int k) noexcept {
+    if (!clipPlanes) return;
+    for (DWORD i = 0; i < 6; ++i) {
+        if (!(clipPlanes & (1u << i))) continue;
+        if (k < 0 || !inverseValid[k]) { oSetClipPlane(d, i, enginePlanes[i]); continue; }
+        const double *n = inverseMap[k];
+        float plane[4];
+        for (unsigned c = 0; c < 4; ++c)
+            plane[c] = float(n[c] * enginePlanes[i][0] + n[4 + c] * enginePlanes[i][1] + n[8 + c] * enginePlanes[i][2] +
+                             n[12 + c] * enginePlanes[i][3]);
+        oSetClipPlane(d, i, plane);
+    }
+    planesApplied = k >= 0;
+}
 HRESULT WINAPI hSetScissor(IDirect3DDevice9 *d, const RECT *r) {
     if (r) engineScissor = *r;
     scissorApplied = false;
@@ -328,6 +398,7 @@ HRESULT WINAPI hSetScissor(IDirect3DDevice9 *d, const RECT *r) {
 }
 HRESULT WINAPI hSetRenderState(IDirect3DDevice9 *d, D3DRENDERSTATETYPE s, DWORD v) {
     if (s == D3DRS_COLORWRITEENABLE) colorWrites = v;
+    if (s == D3DRS_CLIPPLANEENABLE) clipPlanes = v & 0x3f;
     if (s == D3DRS_SCISSORTESTENABLE) {
         scissorEnabled = v != 0;
         forcedScissor = false;
@@ -347,6 +418,11 @@ GetVertexShaderF oGetVertexShader = nullptr; GetDeclarationF oGetDeclaration = n
 HRESULT WINAPI hGetViewport(IDirect3DDevice9 *d, D3DVIEWPORT9 *v) {
     if (!active || !v) return oGetViewport(d, v);
     *v = engineViewport;
+    return D3D_OK;
+}
+HRESULT WINAPI hGetClipPlane(IDirect3DDevice9 *d, DWORD index, float *plane) {
+    if (!active || !plane || index >= 6) return oGetClipPlane(d, index, plane);
+    std::memcpy(plane, enginePlanes[index], sizeof(enginePlanes[index]));
     return D3D_OK;
 }
 HRESULT WINAPI hGetScissor(IDirect3DDevice9 *d, RECT *r) {
@@ -391,6 +467,7 @@ void perHalfState(IDirect3DDevice9 *d) noexcept {
     if (appliedWide) { oSetViewport(d, &engineViewport); appliedWide = false; }
     engineScissorBack(d);
     forceScissor(d, false);
+    if (planesApplied) applyPlanes(d, -1);
     if (appliedInstances) { d->SetStreamSourceFreq(0, 1); appliedInstances = false; }
     if (appliedPixelShader != enginePixelShader) { oSetPixelShader(d, enginePixelShader); appliedPixelShader = enginePixelShader; }
 }
@@ -414,6 +491,7 @@ template<class Call> bool instanced(IDirect3DDevice9 *d, Call call, HRESULT &hr)
     // Occlusion-query boxes (colour writes off) drawn instanced gave wrong query
     // results (the engine then culled visible objects, e.g. the moon); they stay per half.
     if (!colorWrites) return false;
+    if (clipPlanes) return false; // One plane set cannot serve both instances.
 
     if (scissorEnabled && (engineScissor.left > 0 || engineScissor.top > 0 || engineScissor.right < LONG(eyeWidth) ||
                            engineScissor.bottom < LONG(engineViewport.Height)))
@@ -519,6 +597,19 @@ template<class Call> HRESULT bothHalves(IDirect3DDevice9 *d, Call call, bool ins
     return hr;
 }
 template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool instancing) noexcept {
+    static const uint32_t lockHash = [] { wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_SCREENLOCK", v, 16) ? uint32_t(wcstoul(v, nullptr, 16)) : 0u; }();
+    screenLocked = engineScreenLock || (lockHash && enginePixelShader && pixelInfo(enginePixelShader).hash == lockHash);
+    if (screenLocked) ++stats.screenLocked;
+    // Lab (SS2VR_LAB_SP_SKIP=1): the allowed pixel programs (0 = fixed function)
+    // are not drawn at all; with the region sweep this finds a program by its effect.
+    static const bool labSkip = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_SKIP", v, 2) == 1 && v[0] == L'1'; }();
+    if (labSkip) {
+        const uint32_t hash = enginePixelShader ? pixelInfo(enginePixelShader).hash : 0u;
+        if (std::find(labPixelSeen.begin(), labPixelSeen.end(), hash) == labPixelSeen.end() && labPixelSeen.size() < 64)
+            labPixelSeen.push_back(hash);
+        if (labPixelRestrict && std::find(labPixelAllowed.begin(), labPixelAllowed.end(), hash) != labPixelAllowed.end())
+            return D3D_OK;
+    }
     const bool stereo = stereoBound();
     if (stereo && !writeRecords(d)) return call(false);
     HRESULT result = D3D_OK;
@@ -570,11 +661,59 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
             clip.left = std::max(clip.left, engineScissor.left); clip.top = std::max(clip.top, engineScissor.top);
             clip.right = std::min(clip.right, engineScissor.right); clip.bottom = std::min(clip.bottom, engineScissor.bottom);
         }
+        {
+            static const uint32_t logHash = [] { wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_LOGDRAW", v, 16) ? uint32_t(wcstoul(v, nullptr, 16)) : 0u; }();
+            static unsigned logged = 0;
+            if (logHash && enginePixelShader && pixelInfo(enginePixelShader).hash == logHash && logged < 3) {
+                ++logged;
+                DWORD blend = 0, src = 0, dst = 0, z = 0, cull = 0, fog = 0, alphaRef = 0, alphaTest = 0;
+                d->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend); d->GetRenderState(D3DRS_SRCBLEND, &src); d->GetRenderState(D3DRS_DESTBLEND, &dst);
+                d->GetRenderState(D3DRS_ZENABLE, &z); d->GetRenderState(D3DRS_CULLMODE, &cull); d->GetRenderState(D3DRS_FOGENABLE, &fog);
+                d->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTest); d->GetRenderState(D3DRS_ALPHAREF, &alphaRef);
+                float c[16]{}; d->GetVertexShaderConstantF(0, c, 4);
+                log("Single pass lab draw ps=%08x prim=%u planes=%lx scissor=%u vp=%lu,%lu %lux%lu z=%.2f-%.2f ortho=%u blend=%lu %lu/%lu z=%lu cull=%lu fog=%lu atest=%lu/%lu view0=%u c0=%.3f,%.3f,%.3f,%.3f c1=%.3f,%.3f,%.3f,%.3f",
+                    logHash, unsigned(currentPrimitive), clipPlanes, unsigned(scissorEnabled), v.X, v.Y, v.Width, v.Height, v.MinZ, v.MaxZ,
+                    unsigned(recordsOrtho), blend, src, dst, z, cull, fog, alphaTest, alphaRef,
+                    unsigned(engineView[3] == 0 && engineView[7] == 0 && engineView[11] == 0), c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+                // Heuristic stack scan (no frame pointers): dwords pointing into engine modules.
+                char line[1400]; size_t at = 0; unsigned found = 0;
+                const auto *sp = reinterpret_cast<const uintptr_t *>(&found);
+                const auto *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+                const auto *top = static_cast<const uintptr_t *>(tib->StackBase);
+                for (const uintptr_t *w = sp; w + 1 <= top && found < 28 && at < sizeof(line) - 64; ++w) {
+                    const uintptr_t value = *w;
+                    HMODULE m = nullptr;
+                    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                            reinterpret_cast<LPCWSTR>(value), &m) || !m) continue;
+                    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(m);
+                    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(reinterpret_cast<const uint8_t *>(m) + dos->e_lfanew);
+                    const uintptr_t start = reinterpret_cast<uintptr_t>(m);
+                    if (value < start + 0x1000 || value >= start + nt->OptionalHeader.SizeOfImage) continue;
+                    wchar_t name[MAX_PATH]{}; GetModuleFileNameW(m, name, MAX_PATH);
+                    const wchar_t *base = wcsrchr(name, L'\\'); base = base ? base + 1 : name;
+                    if (!_wcsicmp(base, L"d3d9.dll") || !wcsstr(name, L"Bin")) continue;
+                    ++found;
+                    at += size_t(std::snprintf(line + at, sizeof(line) - at, " %.4ls+%lx", base,
+                        static_cast<unsigned long>(value - reinterpret_cast<uintptr_t>(m))));
+                }
+                log("Single pass lab draw stack:%s", line);
+                float k[96]{}; d->GetVertexShaderConstantF(0, k, 24);
+                for (unsigned r = 0; r < 24; r += 4)
+                    log("Single pass lab draw c%u..: %.4f,%.4f,%.4f,%.4f | %.4f,%.4f,%.4f,%.4f | %.4f,%.4f,%.4f,%.4f | %.4f,%.4f,%.4f,%.4f", r,
+                        k[4*r],k[4*r+1],k[4*r+2],k[4*r+3],k[4*r+4],k[4*r+5],k[4*r+6],k[4*r+7],k[4*r+8],k[4*r+9],k[4*r+10],k[4*r+11],k[4*r+12],k[4*r+13],k[4*r+14],k[4*r+15]);
+                log("Single pass lab draw vs=%p adjusted=%.4f,%.4f,%.4f,%.4f / %.4f,%.4f,%.4f,%.4f", static_cast<void *>(engineShader),
+                    engineAdjusted[0], engineAdjusted[1], engineAdjusted[2], engineAdjusted[3], engineAdjusted[4], engineAdjusted[5], engineAdjusted[6], engineAdjusted[7]);
+                for (DWORD i = 0; i < 6; ++i)
+                    if (clipPlanes & (1u << i))
+                        log("Single pass lab draw plane %lu = %.4f,%.4f,%.4f,%.4f", i, enginePlanes[i][0], enginePlanes[i][1], enginePlanes[i][2], enginePlanes[i][3]);
+            }
+        }
         HRESULT hr = D3D_OK;
         for (unsigned j = 0; j < layout.count; ++j) {
             const RECT r = regionRect(layout.region[j], clip.left, clip.top, clip.right, clip.bottom);
             if (r.right <= r.left || r.bottom <= r.top) continue;
             applyScissor(d, r);
+            applyPlanes(d, int(2 + j));
             d->SetStreamSource(15, ring, regionOffset + j * RecordBytes, RecordBytes);
             const HRESULT one = call(false);
             if (SUCCEEDED(hr)) hr = one;
@@ -598,7 +737,7 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
             const RECT s = regionRect(g, engineScissor.left, engineScissor.top, engineScissor.right, engineScissor.bottom);
             oSetScissor(d, &s);
         }
-        if (stereo) d->SetStreamSource(15, ring, eyeOffset[g.eye], RecordBytes);
+        if (stereo) { d->SetStreamSource(15, ring, eyeOffset[g.eye], RecordBytes); applyPlanes(d, int(g.eye)); }
         const HRESULT one = call(false);
         if (SUCCEEDED(hr)) hr = one;
     }
@@ -619,6 +758,8 @@ bool install(IDirect3DDevice9 *d, const Originals &o) noexcept {
              hook(v[47], reinterpret_cast<void *>(hSetViewport), oSetViewport) &&
              hook(v[75], reinterpret_cast<void *>(hSetScissor), oSetScissor) &&
              hook(v[48], reinterpret_cast<void *>(hGetViewport), oGetViewport) &&
+             hook(v[50], reinterpret_cast<void *>(hSetClipPlane), oSetClipPlane) &&
+             hook(v[51], reinterpret_cast<void *>(hGetClipPlane), oGetClipPlane) &&
              hook(v[76], reinterpret_cast<void *>(hGetScissor), oGetScissor) &&
              hook(v[58], reinterpret_cast<void *>(hGetRenderState), oGetRenderState) &&
              hook(v[93], reinterpret_cast<void *>(hGetVertexShader), oGetVertexShader) &&
@@ -635,11 +776,14 @@ bool install(IDirect3DDevice9 *d, const Originals &o) noexcept {
     d->GetViewport(&engineViewport); d->GetScissorRect(&engineScissor);
     DWORD scissor = 0; d->GetRenderState(D3DRS_SCISSORTESTENABLE, &scissor); scissorEnabled = scissor != 0;
     d->GetRenderState(D3DRS_COLORWRITEENABLE, &colorWrites);
+    DWORD planes = 0; d->GetRenderState(D3DRS_CLIPPLANEENABLE, &planes); clipPlanes = planes & 0x3f;
+    for (DWORD i = 0; i < 6; ++i) d->GetClipPlane(i, enginePlanes[i]);
     log("Single pass hooks installed=%u", unsigned(hooked));
     return hooked;
 }
 bool installed() noexcept { return hooked; }
 void setInstancing(bool enabled) noexcept { instancingEnabled = enabled; }
+void setScreenLocked(bool locked) noexcept { engineScreenLock = locked; }
 void setEngineMatrices(const float *adjusted, const float *projection, const float *view) noexcept {
     engineAdjusted = adjusted; engineProjection = projection; engineView = view;
 }

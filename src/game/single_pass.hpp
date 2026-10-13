@@ -22,6 +22,10 @@ struct Originals {
 bool install(IDirect3DDevice9 *device, const Originals &originals) noexcept;
 bool installed() noexcept;
 void setInstancing(bool enabled) noexcept; // [Render] SinglePassInstancing
+// Draws made while set show the centre view in every eye (no per-eye
+// reprojection): camera-attached effects, which two-pass renders draw in front
+// of each eye's own camera.
+void setScreenLocked(bool locked) noexcept;
 // Engine globals: adjusted projection, projection, view (read at draw time).
 void setEngineMatrices(const float *adjusted, const float *projection, const float *view) noexcept;
 // Where the eyes go in the pass's target. Each region is a pixel rectangle of
@@ -59,7 +63,7 @@ HRESULT drawIndexedUp(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT minimum, 
                       D3DFORMAT format, const void *data, UINT stride) noexcept;
 HRESULT clear(IDirect3DDevice9 *d, DWORD count, const D3DRECT *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) noexcept;
 struct Stats {
-    unsigned passes = 0, draws = 0, instanced = 0, unpatched = 0, stateChanges = 0, variants = 0, failedVariants = 0, suspensions = 0, userPointer = 0;
+    unsigned passes = 0, draws = 0, instanced = 0, unpatched = 0, stateChanges = 0, variants = 0, failedVariants = 0, suspensions = 0, userPointer = 0, screenLocked = 0;
 };
 Stats takeStats() noexcept;
 // Lab: instance only eligible draws with index in [lo, hi) (counted per pass);
