@@ -14,7 +14,7 @@ struct VrSettings {
     FoveationSettings foveation;
     bool snapTurn = false;                 // Smooth stick turning unless enabled.
     float smoothTurnRate = 150 * Pi / 180; // Radians per second at full deflection.
-    bool eyeReplay = true; // Right eye replayed from the left eye's recorded D3D9 calls.
+    bool eyeReplay = false; // Right eye replayed from the left eye's recorded D3D9 calls.
     bool singlePass = true; // Both eyes from one world traversal (double-wide target).
     bool singlePassInstancing = false; // One instanced draw per world draw (lab: artifacts).
     bool shadowReuse = true; // Dynamic shadow images rendered once per frame and reused for the second eye.

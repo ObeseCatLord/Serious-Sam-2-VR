@@ -92,14 +92,13 @@ Check these first; they were reported broken:
 5. Roomscale: walk physically to a wall, a corner, stairs and a low roof, and
    also push with the stick. Note clipping, pushing back, or jumps of the origin.
 
-## Right-eye replay
+## Single-pass stereo
 
-The right eye is drawn by replaying the left eye's draw calls with the view
-changed (`[Render] EyeReplay=1`). Look for anything that appears only in the
-right eye, sits at the wrong depth there, or flickers between eyes, and say
-whether it goes away with `EyeReplay=0`. While a weapon wheel is open, in
-vehicles, and on frames with a draw the replay cannot place exactly, the right
-eye is rendered normally.
+Both eyes come from one world render (`[Render] SinglePass=1`). Look for
+anything that appears only in one eye, sits at the wrong depth there, shows
+through walls or terrain, or flickers between eyes, and say whether it goes
+away with `SinglePass=0`. The old right-eye replay (`EyeReplay`) is now off by
+default because it could lose world geometry in the right eye.
 
 ## Weapons
 

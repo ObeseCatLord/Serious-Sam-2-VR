@@ -1,5 +1,17 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-13 (evening) — eye replay off by default
+
+- `[Render] EyeReplay` now defaults to 0. Replay only ever runs on two-pass
+  frames (SinglePass=0, or frames single pass cannot render), and on
+  Branchester the replayed right eye lost the static world (white fog, only
+  entities and far platforms drawn) on every launch; native two-pass is correct
+  there. The user's last headset session (City Metropolis, replay build)
+  logged block MVP misses, the same family as the through-terrain artifacts.
+- Single pass checked against two-pass (replay off) on City Metropolis and
+  Branchester: same image. Branchester per pair: stereo CPU 1.7 ms vs 2.6-2.8
+  ms, render thread 2.8 vs 3.9-4.0 ms per frame.
+
 ## 2026-10-13 (late) — exact single pass, foveated rendering, VR options
 
 - Single pass correctness: the engine read the viewport back mid-pass (it got

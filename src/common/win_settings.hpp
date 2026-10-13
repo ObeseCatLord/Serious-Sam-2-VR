@@ -45,7 +45,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.foveation.mode = int(number(L"Render", L"Foveation", 1, 0, 2) + .5f);
     settings.desktopWorld = number(L"Render", L"DesktopWorld", 0, 0, 1) >= .5f;
     settings.shadowReuse = number(L"Render", L"ShadowReuse", 1, 0, 1) >= .5f;
-    settings.eyeReplay = number(L"Render", L"EyeReplay", 1, 0, 1) >= .5f;
+    settings.eyeReplay = number(L"Render", L"EyeReplay", 0, 0, 1) >= .5f;
     settings.singlePass = number(L"Render", L"SinglePass", 1, 0, 1) >= .5f;
     settings.singlePassInstancing = number(L"Render", L"SinglePassInstancing", 0, 0, 1) >= .5f;
     settings.uiAspect = number(L"Render", L"UiAspect", 16.f / 9, 1.f, 2.5f);
