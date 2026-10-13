@@ -1,5 +1,23 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-14 — two-handed hold of a weapon held alone
+
+- Dual wielding: with the stock USE COMBO WEAPONS option on, each hand can hold
+  any weapon, the minigun and sniper included (lab: minigun left, shotgun
+  right). With it off the game holds big weapons alone and the other hand is
+  empty.
+- A weapon held alone can now be steadied by the free hand: its grip, pressed
+  ahead of the holding hand at or below the barrel line (within 18 cm sideways,
+  35 cm below to 15 cm above, up to 2.5 m ahead), grabs it; while held the
+  weapon turns so the grabbed point stays toward the free hand (shots, laser
+  and the model follow; roll stays with the holding hand); releasing the grip
+  lets go. The free hand's grip then neither carries objects nor jumps.
+  common/two_hand.hpp + tests/two_hand_checks.cpp; engine weaponGrip().
+  Lab: SS2VR_LAB_NO_DUAL=1 leaves dual wielding off; scripts/two_hand_hold.py
+  (V464 minigun, V465 sniper: grab, swing with the free hand, release).
+- No hand model is drawn for the free hand (the game has none outside weapon
+  meshes).
+
 ## 2026-10-13 (late night) — shots leave the barrels
 
 - Every weapon's shot origin (the same point starts its laser) was checked in

@@ -1,6 +1,7 @@
 #include "eye_replay.hpp"
 #include "single_pass.hpp"
 #include "common/turret_look.hpp"
+#include "common/two_hand.hpp"
 #include "common/controls.hpp"
 #include "common/lab_preparation.hpp"
 #include "common/ride_control_observation.hpp"
@@ -1198,6 +1199,28 @@ static unsigned mountHand(const Snapshot &s, unsigned nativeHand) {
     }
     return nativeHand;
 }
+// Two-handed hold of a weapon held alone (common/two_hand.hpp): the holding
+// controller, where the free hand grabbed it in the weapon's frame, and which
+// weapon. Written by the input poll, read wherever the weapon is posed.
+struct TwoHandHold { int holder = -1; Vec3 grabbed{}; uint32_t handle = 0; };
+static SRWLOCK twoHandLock = SRWLOCK_INIT;
+static TwoHandHold twoHand;
+static TwoHandHold currentTwoHand() {
+    AcquireSRWLockShared(&twoHandLock);
+    const TwoHandHold hold = twoHand;
+    ReleaseSRWLockShared(&twoHandLock);
+    return hold;
+}
+// The weapon pose of a controller: its calibrated grip, turned toward the free
+// hand while the free hand holds the weapon too.
+static Pose weaponGrip(const Input &input, unsigned hand, int weapon) {
+    const Pose grip = calibratedGrip(input, hand, weapon, settings);
+    if (hand > 1) return grip;
+    const auto hold = currentTwoHand();
+    const unsigned freeHand = 1 - hand;
+    if (hold.holder != int(hand) || !input.handValid[freeHand] || !finite(input.hand[freeHand])) return grip;
+    return twoHandAim(grip, hold.grabbed, weaponTracking(input, freeHand).p);
+}
 static int handOf(void *weapon, const Snapshot &s) {
     if (!s.rider.handheld() || !nativeRiderCurrent(s.player, s.rider))
         return -1;
@@ -1575,6 +1598,52 @@ static void update(void *p) {
         if (s.turn > Pi) s.turn -= 2 * Pi;
         if (s.turn < -Pi) s.turn += 2 * Pi;
     }
+    // Two-handed hold: a weapon held alone can be grabbed by the free hand's grip
+    // near it (ahead of the holding hand, at or below the barrel). That grip then
+    // neither carries objects nor jumps until released.
+    bool twoHandGrip[2]{};
+    {
+        static bool previousGrip[2]{};
+        const bool alone = enabled && !resettingControls && rider.handheld() && !aliased(s) &&
+            ((s.handle[0] != 0) != (s.handle[1] != 0));
+        const unsigned slot = s.handle[0] ? 0u : 1u;
+        const int holder = alone ? int(mountHand(s, slot)) : -1;
+        const auto current = currentTwoHand();
+        TwoHandHold next;
+        bool grip[2]{};
+        for (unsigned h = 0; h < 2; ++h)
+            grip[h] = enabled && input.handValid[h] && finite(input.hand[h]) && (input.buttons[h] & Wheel) && !wheels[h].open;
+        if (holder >= 0 && controllerTracked(input, unsigned(holder))) {
+            const unsigned freeHand = 1u - unsigned(holder);
+            if (grip[freeHand] && current.holder == holder && current.handle == s.handle[slot])
+                next = current;
+            else if (grip[freeHand] && !previousGrip[freeHand]) {
+                void *w = resolve(s.handle[slot]);
+                const int id = w ? int(primaryField(w, 0xb4)) : -1;
+                const Vec3 local = twoHandLocal(calibratedGrip(input, unsigned(holder), id, settings),
+                                                weaponTracking(input, freeHand).p);
+                if (twoHandGrabbable(local, 2.5f)) next = {holder, local, s.handle[slot]};
+                else {
+                    static unsigned missed = 0;
+                    if (++missed <= 20)
+                        log("Two-handed grab missed id=%d free hand at %.2f,%.2f,%.2f in the weapon's frame", id, local.x,
+                            local.y, local.z);
+                }
+            }
+            twoHandGrip[freeHand] = next.holder >= 0 || (current.holder == holder && grip[freeHand]);
+        }
+        if (next.holder != current.holder || next.handle != current.handle) {
+            AcquireSRWLockExclusive(&twoHandLock);
+            twoHand = next;
+            ReleaseSRWLockExclusive(&twoHandLock);
+            if (next.holder >= 0)
+                log("Two-handed hold on hand=%d grabbed at %.2f,%.2f,%.2f", next.holder, next.grabbed.x, next.grabbed.y,
+                    next.grabbed.z);
+            else
+                log("Two-handed hold released");
+        }
+        previousGrip[0] = grip[0]; previousGrip[1] = grip[1];
+    }
     for (int h = 0; h < 2; h++) {
         if (!nativeRiderCurrent(p, rider))
             return;
@@ -1596,7 +1665,7 @@ static void update(void *p) {
         orderWheelWeapons(ui);
         bool valid = enabled && !resettingControls && input.handValid[h] && finite(input.hand[h]);
         bool wheelAllowed = valid && rider.handheld() && !(input.blockedWheels & (1u << h));
-        const bool gripDown = valid && (input.buttons[h] & Wheel);
+        const bool gripDown = valid && (input.buttons[h] & Wheel) && !twoHandGrip[h];
         if (gripDown && !gripCarry.gripDown[h] && rider.handheld() && gripCarry.hand < 0 &&
             gripCarry.requestHand < 0 && !wheels[h].open && gripCarryAuthority(p)) {
             Snapshot reach = s;
@@ -1735,7 +1804,9 @@ static void update(void *p) {
         lastSelection = GetTickCount64();
     }
     if (s.playerHandle != dualPlayer && isDual(p)) dualPlayer = s.playerHandle;
-    if (enabled && rider.handheld() && !multiplayer::remoteClient() && s.playerHandle != dualPlayer && !isDual(p) &&
+    // Lab (SS2VR_LAB_NO_DUAL=1): leave dual wielding off, so weapons are held alone.
+    static const bool labNoDual = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_NO_DUAL", v, 2) == 1 && v[0] == L'1'; }();
+    if (enabled && !labNoDual && rider.handheld() && !multiplayer::remoteClient() && s.playerHandle != dualPlayer && !isDual(p) &&
         !s.fire[0] && !s.fire[1] && GetTickCount64() - lastSelection > 2000 &&
         canChange(p, 0) && canChange(p, 1) && nativeRiderCurrent(p, rider)) {
         toggleDual(p, 0);
@@ -1827,7 +1898,7 @@ static void update(void *p) {
         for (unsigned h = 0; h < 2; ++h) {
             const bool valid = enabled && input.handValid[h] && finite(input.hand[h]);
             packet.grip[h].p = packet.head.p; // Canonical inactive-hand pose shares the current rig origin.
-            const Pose grip = rider.handheld() ? calibratedGrip(input, h, s.ui.currentWeapon[h], settings)
+            const Pose grip = rider.handheld() ? weaponGrip(input, h, s.ui.currentWeapon[h])
                                                : input.hand[h];
             capture.grip[h] = grip; // Preserve the actual pre-clamp capture for retained taps.
             if (s.initialized && valid && finite(grip))
@@ -4571,8 +4642,8 @@ static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snap
                     return;
                 Pose hand = worldHandTracking(
                     body, s.origin, s.turn, s.input.head,
-                    calibratedGrip(s.input, mountHand(s, context.hand),
-                                   *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4), settings));
+                    weaponGrip(s.input, mountHand(s, context.hand),
+                               *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4)));
                 AcquireSRWLockShared(&snapshotLock);
                 auto c = calibration[context.hand];
                 ReleaseSRWLockShared(&snapshotLock);
@@ -5166,7 +5237,7 @@ static void drawLasers() {
                 const unsigned m = eyeSnapshot.rider.handheld() ? mountHand(eyeSnapshot, h) : h;
                 void *held = eyeLasers[h].weapon ? resolve(eyeLasers[h].weapon) : nullptr;
                 const Pose grip = worldHandTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, eyeRequest.input.head,
-                    calibratedGrip(eyeRequest.input, m, held ? int(primaryField(held, 0xb4)) : -1, settings));
+                    weaponGrip(eyeRequest.input, m, held ? int(primaryField(held, 0xb4)) : -1));
                 const std::pair<Vec3, uint32_t> marks[]{{labShotMuzzle[h], 0xff00ff00u}, {grip.p, 0xff0000ffu},
                     {grip.p + rotate(normalize(grip.q), Vec3{0, 0, -.5f}), 0xffff00ffu}};
                 for (const auto &[c, color] : marks)
@@ -6245,7 +6316,7 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
         return reject();
     const Pose hand = worldHandTracking(
         body, s.origin, s.turn, tracking.head,
-        calibratedGrip(tracking, mountHand(s, unsigned(h)), *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4), settings));
+        weaponGrip(tracking, mountHand(s, unsigned(h)), *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4)));
     // The weapon is held along the controller's aim axis: the flat viewmodel's
     // tilt toward the screen centre is dropped so barrel, laser and shots agree,
     // but a model authored turned (e.g. the auto shotgun, a half turn) keeps it.

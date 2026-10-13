@@ -55,6 +55,9 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 - With one controller switched off, the other hand's gun still fires from its
   muzzle and its laser points where it aims; switching weapons on the wheel no
   longer leaves the old weapon firing too.
+- A weapon held alone (minigun, sniper, ... with combo weapons off): squeeze the
+  other hand's grip under the barrel to hold it with both hands; it aims along
+  your two hands until you let go.
 - Shots leave the barrels: zap gun between its prongs, double shotgun, uzi
   and sniper from their barrel tips (the uzi's laser from the tube below).
 - Lasers are see-through like the game's own uzi laser; a hand without
