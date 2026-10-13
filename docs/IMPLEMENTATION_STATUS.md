@@ -28,8 +28,12 @@
   _configuration, XR_FB_swapchain_update_state) the host applies an
   eye-tracked foveation profile to the eye swapchains and uses
   xrGetFoveationEyeTrackedStateMETA's per-eye centres for the sharp region
-  when XR_EXT_eye_gaze_interaction is absent (each step falls back silently;
-  not offered by Monado, so unexercised in the lab). The low-resolution view
+  when XR_EXT_eye_gaze_interaction is absent (each step falls back silently).
+  Lab: tools/lab_foveation_layer.cpp, an implicit OpenXR API layer offering
+  the four extensions over Monado (registered in a fixture prefix), ran the
+  whole path: swapchains with foveation info, eye-tracked profile created and
+  applied, state read per frame; a reported centre of NDC (-0.4,-0.3) put the
+  sharp region at exactly the expected rect (134,681 of 1344x1512). The low-resolution view
   is upscaled with its UVs inside its atlas region (no seam column).
   Lab 1344x1512: eye GPU 1.25-1.40 -> 1.23-1.25 ms, render thread +0.3 ms; the
   saving grows with resolution and render scale.

@@ -3989,6 +3989,66 @@ static Pose *__fastcall camera(void *p, void *, Pose *out) {
 using ViewOrigin = Pose *(__thiscall *)(void *, Pose *, int);
 static ViewOrigin originalViewOrigin = nullptr;
 static uintptr_t boardingSeatReturn = 0, useSeatReturn = 0;
+// Lab (SS2VR_LAB_TURRET=1): boarding sees a view origin just in front of the
+// world's first turret, looking back at it, so Use boards it from anywhere
+// (the lab cannot walk to one). The turret is found in the world info's puppet
+// array (+0x58) by its vtable; its camera comes from CPuppetEntity::GetCameraPlacement.
+static bool labTurretMode() {
+    static const bool on = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_TURRET", v, 2) == 1 && v[0] == L'1'; }();
+    return on;
+}
+static void *labFindTurret() {
+    void *info = nativeWorldInfo ? nativeWorldInfo() : nullptr;
+    if (!info || !laserTurretVtable) return nullptr;
+    uint32_t raw[4]{};
+    if (!readableMemory(static_cast<uint8_t *>(info) + 0x58, sizeof(raw))) return nullptr;
+    std::memcpy(raw, static_cast<uint8_t *>(info) + 0x58, sizeof(raw));
+    static unsigned probes = 0;
+    if (probes++ < 2) log("Lab turret probe info+0x58=%08x %08x %08x %08x", raw[0], raw[1], raw[2], raw[3]);
+    // CStaticStackArray-like: capacity, data, count.
+    const uint32_t data = raw[1], count = raw[2];
+    if (!count || count > 4096 || !readableMemory(reinterpret_cast<void *>(uintptr_t(data)), count * 4)) {
+        static unsigned unreadable = 0;
+        if (unreadable++ < 2) log("Lab turret puppet array unreadable data=%08x count=%u", data, count);
+        return nullptr;
+    }
+    void *turret = nullptr;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t entry = 0;
+        std::memcpy(&entry, reinterpret_cast<void *>(uintptr_t(data) + i * 4), 4);
+        // Entries may be entity pointers or handles.
+        void *candidate = reinterpret_cast<void *>(uintptr_t(entry));
+        if (!candidate || !readableMemory(candidate, 4)) candidate = resolve ? resolve(entry) : nullptr;
+        uintptr_t table = 0;
+        static unsigned listed = 0;
+        if (!candidate || !readableMemory(candidate, 4)) {
+            if (listed++ < 24) log("Lab turret puppet %u/%u entry=%08x unresolved", i, count, entry);
+            continue;
+        }
+        std::memcpy(&table, candidate, 4);
+        if (listed++ < 24) log("Lab turret puppet %u/%u entry=%08x vtable rva=%lx", i, count, entry,
+                               static_cast<unsigned long>(table - laserTurretVtable + 0x2b39e8));
+        if (table == laserTurretVtable && !turret) turret = candidate;
+    }
+    static unsigned found = 0;
+    if (turret && found++ < 2) log("Lab turret found at %p", turret);
+    return turret;
+}
+static bool labTurretView(Pose &out) {
+    void *turret = labFindTurret();
+    if (!turret) return false;
+    using CameraPlacement = Pose *(__thiscall *)(void *, Pose *);
+    const auto table = *static_cast<uintptr_t **>(turret);
+    Pose camera{};
+    reinterpret_cast<CameraPlacement>(table[0x5f4 / 4])(turret, &camera);
+    if (!finite(camera)) return false;
+    const Vec3 forward = rotate(camera.q, Vec3{0, 0, -1});
+    out.p = camera.p + forward * 1.0f;
+    out.q = normalize(multiply(camera.q, yaw(Pi))); // Facing back at the turret.
+    static unsigned logged = 0;
+    if (logged++ < 4) log("Lab turret view camera=%.2f,%.2f,%.2f eye=%.2f,%.2f,%.2f", camera.p.x, camera.p.y, camera.p.z, out.p.x, out.p.y, out.p.z);
+    return true;
+}
 static Pose *__fastcall playerViewOrigin(void *p, void *, Pose *out, int purpose) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -3997,6 +4057,7 @@ static Pose *__fastcall playerViewOrigin(void *p, void *, Pose *out, int purpose
 #endif
     originalViewOrigin(p, out, purpose);
     if (caller != boardingSeatReturn && caller != useSeatReturn) return out;
+    if (labTurretMode() && nativeMainThread && nativeMainThread() && labTurretView(*out)) return out;
     const auto s = copySnapshot();
     if (p == s.player && s.rider.handheld() && nativeRiderCurrent(p, s.rider) && vrSession(s) && fresh(s.input) &&
         nativeMainThread && nativeMainThread()) {
@@ -7663,6 +7724,12 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 turretClock = now;
                 turretLook = advanceTurretLook(turretLook, captured.input.axis[1][0], captured.input.axis[1][1],
                                                settings.smoothTurnRate, dt);
+                if (labTurretMode()) {
+                    static unsigned calls = 0;
+                    if (calls++ % 25 == 0)
+                        log("Lab turret look heading=%.3f pitch=%.3f stick=%.2f,%.2f", turretLook.x, turretLook.y,
+                            captured.input.axis[1][0], captured.input.axis[1][1]);
+                }
                 if (std::isfinite(turretLook.x) && std::isfinite(turretLook.y)) look = turretLook;
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (steeringWheelHeading(look)) {
