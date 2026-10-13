@@ -30,9 +30,16 @@
   its sizes, turning, turn speed, lasers, haptics, render scale, instancing).
   Values apply at once and go to SS2VR.user.ini (overrides SS2VR.ini, kept
   by the installer across updates); the game re-reads it when it changes.
-- Known: in some launches a translucent sky haze layer shows a straight edge
-  near the outer edge of one eye (x=1202 right / 141 left of 1344) in single
-  pass only (shifted and wide issue alike; not in two-pass). Not yet traced.
+- Bloom (ProcRender CBloomRenderable/efxBloom) is a view-covering glow quad
+  ~0.4 m in front of the camera; reprojected per eye it ended in a straight
+  edge in one eye (x=1202 / 141 of 1344, ~2 of 3 launches). It is now drawn
+  screen-locked, as two-pass draws it per eye camera (lab 0 of 8 launches).
+  User clip planes are transformed per eye region (D3D9 applies them in the
+  vertex program's clip space).
+- Verified in the lab: eye-tracked foveation with a simulated gaze
+  (SS2VR_LAB_GAZE: the inset follows it), the uzi beam leaves the rod under
+  the barrel (side capture), turret right-stick signs match the native look
+  convention (heading +left, pitch +up; stick right turns right, up looks up).
 
 ## 2026-10-13 — single-pass stereo, second headset test fixes
 

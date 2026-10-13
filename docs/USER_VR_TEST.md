@@ -38,9 +38,8 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
   and off.
 - Also check: snap/smooth turning and turn speed, lasers on/off and haptic
   strength apply without restarting; render scale changes the image size.
-- Single pass got exact (sky, smoke, moon and waterfall match two-pass). If
-  you see a faint straight vertical edge in the sky near the outer edge of one
-  eye, note it (known, being traced).
+- Single pass got exact (sky, smoke, moon, waterfall and the sun's bloom glow
+  match two-pass).
 
 ## Changed after the second headset test (2026-10-13)
 
