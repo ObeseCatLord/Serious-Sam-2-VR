@@ -7,6 +7,7 @@
 
 #include "common/model_tree.hpp"
 #include "common/head_palette.hpp"
+#include "common/arm_ik.hpp"
 #include "common/palette_provenance.hpp"
 #include "common/presentation_identity.hpp"
 #include "common/frame_policy.hpp"
@@ -91,6 +92,18 @@ static VoidCdecl originalModelPass = nullptr, originalPalettePass = nullptr;
 static void(__cdecl *originalAnimationEnd)(void *) = nullptr;
 static uint32_t idleAnimationName = 0;
 static uint32_t headName = 0;
+// Arm IK (networked VRIK): bone names per side (0 left, 1 right): upper arm,
+// forearm, hand of the player skeletons (Models/Player/*).
+static uint32_t armNames[2][3]{};
+// How the model pass moved each remote weapon this pair (world delta, desired x
+// native^-1), so the palette pass moves that hand's bones the same way.
+struct ArmWeaponDelta {
+    uint32_t owner = 0;
+    void *body = nullptr;
+    Matrix34 delta{};
+    bool valid = false;
+};
+static std::array<std::array<ArmWeaponDelta, 2>, MaxBindings> armWeaponDeltas{};
 static uint32_t scopeName = 0, scopeBoneName = 0;
 static bool headTrackingEnabled = false;
 static bool rideObservationEnabled = false;
@@ -488,6 +501,13 @@ static void postModelPassBody(const multiplayer::PresentationReadGuard& presenta
                 !retargetModelSubtree(std::span<ModelRecord>(changed), root, desired))
                 continue;
             selected[selectedCount++] = root;
+            if (frozenPair && currentFrozenOwner) {
+                Matrix34 inverse;
+                auto &stored = armWeaponDeltas[size_t(&entry - bank.data())][hand];
+                stored.valid = affineInverse(records[root].world, inverse);
+                if (stored.valid) stored = {currentFrozenOwner, binding.bodyModelInstance,
+                                            affineMultiply(desired, inverse), finiteMatrix(affineMultiply(desired, inverse))};
+            }
         }
     }
 
@@ -542,6 +562,98 @@ struct HeadPassStorage {
     std::vector<PaletteBone> boneViews;
     std::vector<uint8_t> ownersUsed;
 };
+// Networked VRIK: each arm of a remote VR player's body reaches for that
+// player's tracked hand. A hand holding a weapon follows it (the bones move as
+// the model pass moved the weapon, so the hand keeps its native hold); an
+// empty hand reaches its tracked grip. Bones stay native when anything needed
+// is missing (unknown skeleton, untracked hand, unreadable bone data).
+static bool poseArms(const FrozenBinding &entry, size_t bankIndex, size_t owner, std::span<const NativeBone> bones,
+                     std::span<const PaletteBone> boneViews, std::span<const PaletteMap> mappings,
+                     std::span<const int32_t> drawOwners, std::span<const Matrix34> worlds,
+                     std::vector<Matrix34> &palette) {
+    if (!armNames[1][2] || owner >= worlds.size() || palette.size() != mappings.size()) return false;
+    void *evaluated = nullptr;
+    Matrix34 *canonical = nullptr;
+    int32_t canonicalCount = 0;
+    std::memcpy(&evaluated, reinterpret_cast<void *>(engineBase + 0x2eab68), 4);
+    if (!readableMemory(evaluated, 0x28)) return false;
+    std::memcpy(&canonical, static_cast<uint8_t *>(evaluated) + 0x20, 4);
+    std::memcpy(&canonicalCount, static_cast<uint8_t *>(evaluated) + 0x24, 4);
+    if (canonicalCount < int32_t(bones.size()) || size_t(canonicalCount) > MaxNativeBones ||
+        !readableMemory(canonical, size_t(canonicalCount) * sizeof(Matrix34)))
+        return false;
+    Matrix34 inverseWorld;
+    if (!affineInverse(worlds[owner], inverseWorld)) return false;
+    const auto &pose = entry.binding.sample.pose;
+    bool any = false;
+    for (unsigned side = 0; side < 2; ++side) {
+        if (!(pose.validMask & (1u << (side + 1))) || !finite(pose.grip[side])) continue;
+        // The side's three bones on this body, as posed model-space frames:
+        // canonical (skinning) x bind, the bind being the inverse of the
+        // definition's matrix at +0x48 (V477: joint spacing = bone lengths).
+        size_t index[3]{bones.size(), bones.size(), bones.size()};
+        for (size_t b = 0; b < boneViews.size(); ++b)
+            if (boneViews[b].owner == int32_t(owner) && boneViews[b].named)
+                for (unsigned k = 0; k < 3; ++k)
+                    if (boneViews[b].name == armNames[side][k]) index[k] = b;
+        Matrix34 frame[3];
+        bool ok = true;
+        for (unsigned k = 0; k < 3 && ok; ++k) {
+            ok = index[k] < bones.size() && bones[index[k]].definition &&
+                 readableMemory(static_cast<const uint8_t *>(bones[index[k]].definition) + 0x48, sizeof(Matrix34));
+            Matrix34 inverseBind, bind;
+            if (ok) std::memcpy(&inverseBind, static_cast<const uint8_t *>(bones[index[k]].definition) + 0x48, sizeof(Matrix34));
+            ok = ok && affineInverse(inverseBind, bind);
+            if (ok) frame[k] = affineMultiply(canonical[index[k]], bind);
+            ok = ok && finiteMatrix(frame[k]);
+        }
+        if (!ok) continue;
+        // Target hand frame in model space.
+        const auto &weapon = armWeaponDeltas[bankIndex][side];
+        Matrix34 handTarget;
+        bool oriented = false;
+        if (weapon.valid && weapon.owner == currentFrozenOwner && weapon.body == entry.binding.bodyModelInstance) {
+            handTarget = affineMultiply(inverseWorld, affineMultiply(weapon.delta, affineMultiply(worlds[owner], frame[2])));
+            oriented = true;
+        } else {
+            // Empty hand: the wrist 7 cm behind the tracked grip point, native hand orientation.
+            const Pose grip = compose(entry.body, pose.grip[side]);
+            const Vec3 wrist = grip.p + rotate(normalize(grip.q), Vec3{0, 0, .07f});
+            handTarget = frame[2];
+            const Vec3 local = matrixApply(inverseWorld, wrist);
+            handTarget.m[3] = local.x; handTarget.m[7] = local.y; handTarget.m[11] = local.z;
+        }
+        if (!finiteMatrix(handTarget)) continue;
+        ArmDeltas deltas;
+        if (!solveArm({frame[0], frame[1], frame[2]}, matrixTranslation(handTarget), oriented ? &handTarget : nullptr, deltas))
+            continue;
+        // Bone levels on this body: 3 under the hand, 2 under the forearm, 1 under the upper arm.
+        std::vector<uint8_t> level(bones.size(), 0);
+        for (size_t b = 0; b < bones.size(); ++b) {
+            size_t node = b;
+            for (size_t hops = 0; hops <= bones.size() && node < bones.size(); ++hops) {
+                if (boneViews[node].owner != int32_t(owner)) break;
+                if (node == index[2]) { level[b] = 3; break; }
+                if (node == index[1]) { level[b] = 2; break; }
+                if (node == index[0]) { level[b] = 1; break; }
+                if (boneViews[node].parent < 0) break;
+                node = size_t(boneViews[node].parent);
+            }
+        }
+        for (size_t i = 0; i < mappings.size(); ++i) {
+            const auto &map = mappings[i];
+            if (map.bone < 0 || size_t(map.bone) >= bones.size() || map.draw < 0 || size_t(map.draw) >= drawOwners.size() ||
+                drawOwners[size_t(map.draw)] != int32_t(owner) || !level[size_t(map.bone)])
+                continue;
+            const unsigned l = level[size_t(map.bone)];
+            const Matrix34 moved = affineMultiply(l == 3 ? deltas.hand : l == 2 ? deltas.lower : deltas.upper, palette[i]);
+            if (!finiteMatrix(moved)) return false;
+            palette[i] = moved;
+            any = true;
+        }
+    }
+    return any;
+}
 static void postPaletteBody(const multiplayer::PresentationReadGuard& presentationGuard,
                             HeadPassStorage& storage) {
     if (!frozenPair || !hooksReady.load(std::memory_order_acquire) || !ready.load(std::memory_order_acquire))
@@ -551,10 +663,14 @@ static void postPaletteBody(const multiplayer::PresentationReadGuard& presentati
         return;
     }
     const auto bank = frozen; // Captured before native stereo production, once per pair.
+    // A body is posed when its head moved or a hand is tracked (arm IK).
+    const auto posed = [](const FrozenBinding &entry) {
+        const auto &pose = entry.binding.sample.pose;
+        return entry.bodyValid && (((pose.validMask & 1) && !identityTrackingDelta(pose.head)) || (pose.validMask & 6));
+    };
     bool eligible = false;
     for (const auto &entry : bank)
-        eligible |= entry.bodyValid && (entry.binding.sample.pose.validMask & 1) &&
-                    !identityTrackingDelta(entry.binding.sample.pose.head);
+        eligible |= posed(entry);
     if (!eligible)
         return;
     std::span<NativeModelRecord> records;
@@ -575,8 +691,7 @@ static void postPaletteBody(const multiplayer::PresentationReadGuard& presentati
     bool relevantBody = false;
     for (size_t i = 0; i < bank.size(); ++i) {
         const auto &entry = bank[i];
-        if (!entry.bodyValid || !(entry.binding.sample.pose.validMask & 1) ||
-            identityTrackingDelta(entry.binding.sample.pose.head))
+        if (!posed(entry))
             continue;
         bodyOwners[i] = paletteBodyOwner(instances, reinterpret_cast<uintptr_t>(entry.binding.bodyModelInstance));
         if (bodyOwners[i] == -2) { paletteFault(); return; }
@@ -632,13 +747,17 @@ static void postPaletteBody(const multiplayer::PresentationReadGuard& presentati
         const size_t owner = size_t(bodyOwners[i]);
         if (ownersUsed[owner]) { paletteFault(); return; }
         ownersUsed[owner] = 1;
-        const auto result = retargetHeadPalette(boneViews, mappings, drawOwners, worlds, int32_t(owner), headName,
-                                                entry.body, entry.binding.sample.pose.head, changed, next);
-        if (result == HeadPaletteResult::Invalid) { paletteFault(); return; }
-        if (result == HeadPaletteResult::Changed) {
-            changedHead = true;
-            changed.swap(next);
+        const auto &pose = entry.binding.sample.pose;
+        if ((pose.validMask & 1) && !identityTrackingDelta(pose.head)) {
+            const auto result = retargetHeadPalette(boneViews, mappings, drawOwners, worlds, int32_t(owner), headName,
+                                                    entry.body, pose.head, changed, next);
+            if (result == HeadPaletteResult::Invalid) { paletteFault(); return; }
+            if (result == HeadPaletteResult::Changed) {
+                changedHead = true;
+                changed.swap(next);
+            }
         }
+        changedHead |= poseArms(entry, i, owner, bones, boneViews, mappings, drawOwners, worlds, changed);
     }
     if (!changedHead)
         return; // Headless/unmapped LOD preserves native draw, even without evaluation.
@@ -1363,6 +1482,55 @@ static void __cdecl animationEnd(void *queue) {
         if(aborted) {if(entered)entered->reject(IdleWeaponTrace::Rejection::QueryAbort);producerAbort();}
     });
 }
+// Lab (SS2VR_LAB_BONE_DUMP=1): the renderer's canonical evaluated bone
+// matrices (+0x2eab68 -> +0x20) for bones named Hand/Arm/R_Hand/R_LowerArm/
+// R_UpperArm, with their owner model's world, to check what space they are in.
+static void labBoneDump() {
+    static const bool on = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_BONE_DUMP", v, 2) == 1 && v[0] == L'1'; }();
+    static unsigned lines = 0;
+    if (!on || lines >= 60 || !stringId) return;
+    static uint32_t names[5]{};
+    static const char *labels[5]{"Hand", "Arm", "R_Hand", "R_LowerArm", "R_UpperArm"};
+    if (!names[0]) for (unsigned i = 0; i < 5; ++i) stringId(&names[i], labels[i]);
+    std::span<NativeModelRecord> records;
+    std::span<NativeBone> bones;
+    if (!rendererArray(0x2eac20, MaxModelRecords, records) || !rendererArray(0x2eac60, MaxNativeBones, bones) || bones.empty())
+        return;
+    void *evaluated = nullptr;
+    Matrix34 *canonical = nullptr;
+    int32_t canonicalCount = 0;
+    std::memcpy(&evaluated, reinterpret_cast<void *>(engineBase + 0x2eab68), 4);
+    if (!readableMemory(evaluated, 0x28)) return;
+    std::memcpy(&canonical, static_cast<uint8_t *>(evaluated) + 0x20, 4);
+    std::memcpy(&canonicalCount, static_cast<uint8_t *>(evaluated) + 0x24, 4);
+    if (canonicalCount < int32_t(bones.size()) || !readableMemory(canonical, size_t(canonicalCount) * sizeof(Matrix34))) return;
+    for (size_t b = 0; b < bones.size() && lines < 60; ++b) {
+        uint32_t name = 0;
+        if (!bones[b].definition || !readableMemory(bones[b].definition, 4)) continue;
+        std::memcpy(&name, bones[b].definition, 4);
+        for (unsigned k = 0; k < 5; ++k)
+            if (name == names[k]) {
+                const auto &m = canonical[b].m;
+                const int32_t o = bones[b].owner;
+                const Matrix34 w = o >= 0 && size_t(o) < records.size() ? records[size_t(o)].world : Matrix34{};
+                ++lines;
+                log("Lab bone %s index=%zu owner=%d parent=%d canonical t=%.4f,%.4f,%.4f r=%.3f,%.3f,%.3f/%.3f,%.3f,%.3f/%.3f,%.3f,%.3f world t=%.3f,%.3f,%.3f",
+                    labels[k], b, o, bones[b].parent, m[3], m[7], m[11], m[0], m[1], m[2], m[4], m[5], m[6],
+                    m[8], m[9], m[10], w.m[3], w.m[7], w.m[11]);
+                if (lines < 12 && readableMemory(bones[b].definition, 0x80)) {
+                    float f[32];
+                    std::memcpy(f, bones[b].definition, sizeof(f));
+                    char text[600]; size_t at = 0;
+                    for (unsigned j = 0; j < 32 && at < sizeof(text) - 16; ++j)
+                        at += size_t(std::snprintf(text + at, sizeof(text) - at, " %.4g", double(f[j])));
+                    log("Lab bone %s definition:%s", labels[k], text);
+                    const uint8_t *e = reinterpret_cast<const uint8_t *>(&bones[b]) + 8;
+                    float ev[7]; std::memcpy(ev, e, sizeof(ev));
+                    log("Lab bone %s evaluated=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f", labels[k], ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6]);
+                }
+            }
+    }
+}
 static void observeIdlePalette() {
     ScopeDrawBinding binding;IdleDrawIdentity identity;IdleWeaponTrace *trace=nullptr;
     if(paletteInvalidated || !currentIdleDraw(binding,identity,trace))return;
@@ -1408,6 +1576,7 @@ static void __cdecl palettePass() {
         withFreshNativePalette(caller == engineBase + 0xe2e06, paletteReentrant, paletteInvalidated,
                                [] { originalPalettePass(); }, [] {
                                    if (headTrackingEnabled) postPalette();
+                                   labBoneDump();
                                    // Independent of remote-player presence and head option.
                                    // Unsupported observations stay native; an aborted extent
                                    // retires the pair through its native-finally cleanup.
@@ -1483,6 +1652,9 @@ bool initialize(HMODULE engine, HMODULE core, HMODULE sam, HookInstallerRva inst
         stringId(&headName, "Head");
         if (!invalidId || headName == *invalidId)
             return false;
+        static const char *const arms[2][3]{{"L_UpperArm", "L_LowerArm", "L_Hand"}, {"R_UpperArm", "R_LowerArm", "R_Hand"}};
+        for (unsigned side = 0; side < 2; ++side)
+            for (unsigned k = 0; k < 3; ++k) stringId(&armNames[side][k], arms[side][k]);
     }
     stringId(&scopeName, "Scope");
     stringId(&scopeBoneName, "Sniper");

@@ -1,5 +1,6 @@
 #include "single_pass.hpp"
 #include "common/shader_patch.hpp"
+#include "common/water_reflection.hpp"
 #include "game.hpp"
 #include <MinHook.h>
 #include <algorithm>
@@ -70,6 +71,16 @@ Stats stats;
 // so a pointer cannot be reused for a different object while mapped).
 std::unordered_map<IDirect3DVertexShader9 *, IDirect3DVertexShader9 *> shaderVariants;
 std::unordered_map<IDirect3DVertexShader9 *, uint32_t> shaderTexcoords; // oT sets the original writes.
+// Water programs whose variant reads the per-eye screen mapping (water_reflection.hpp)
+// from c30..c33, set for each half around their draws.
+constexpr unsigned WaterConstant = 30;
+std::unordered_map<IDirect3DVertexShader9 *, bool> shaderEyeClip;
+water::Reference waterReference;
+LARGE_INTEGER waterClock{};
+uint64_t waterPass = 0, waterComputedPass = ~0ull;
+replay::ViewState waterState;
+float waterK[2][16]{};
+bool waterKValid = false;
 std::unordered_map<IDirect3DVertexDeclaration9 *, IDirect3DVertexDeclaration9 *> declarationVariants;
 
 IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s) noexcept {
@@ -82,13 +93,15 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
         std::vector<uint32_t> words(bytes / 4), patched;
         UINT got = bytes;
         if (SUCCEEDED(s->GetFunction(words.data(), &got)) &&
-            sp::patchVertexShader(words.data(), words.size(), patched, &info) &&
+            sp::patchVertexShader(words.data(), words.size(), patched, &info, WaterConstant) &&
             FAILED(d->CreateVertexShader(reinterpret_cast<const DWORD *>(patched.data()), &variant)))
             variant = nullptr;
     }
     s->AddRef();
     shaderVariants.emplace(s, variant);
     shaderTexcoords.emplace(s, info.texcoordsWritten);
+    shaderEyeClip.emplace(s, variant && info.eyeClip);
+    if (variant && info.eyeClip) log("Single pass: water vertex program %p looks its reflection up per eye", static_cast<void *>(s));
     if (variant) ++stats.variants; else ++stats.failedVariants;
     static unsigned logged = 0;
     if (!variant && logged < 16) { ++logged; log("Single pass: vertex program %p not patched (%u bytes)", static_cast<void *>(s), bytes); }
@@ -585,6 +598,48 @@ template<class Call> void onMirror(IDirect3DDevice9 *d, Call body) noexcept {
     color->Release(); depth->Release();
     mirroring = false;
 }
+bool waterDraw() noexcept {
+    const auto it = engineShader ? shaderEyeClip.find(engineShader) : shaderEyeClip.end();
+    return it != shaderEyeClip.end() && it->second;
+}
+// Each eye's reference-camera map for the current view, once per pass and view
+// (the reference follows the view direction between passes).
+void waterConstants() noexcept {
+    replay::ViewState state;
+    std::memcpy(state.adjusted.data(), engineAdjusted, sizeof(state.adjusted));
+    std::memcpy(state.projection.data(), engineProjection, sizeof(state.projection));
+    std::memcpy(state.view.data(), engineView, sizeof(state.view));
+    if (waterComputedPass == waterPass && state == waterState) return;
+    LARGE_INTEGER now{}, frequency{};
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
+    const double seconds = waterClock.QuadPart ? double(now.QuadPart - waterClock.QuadPart) / double(frequency.QuadPart) : 0.;
+    if (waterComputedPass != waterPass) { water::follow(waterReference, engineView, std::min(seconds, .25)); waterClock = now; }
+    waterComputedPass = waterPass;
+    waterState = state;
+    waterKValid = true;
+    for (unsigned i = 0; i < 2; ++i) {
+        replay::M4 k;
+        if (!water::eyeClip(state, changes[i], waterReference, k)) { waterKValid = false; break; }
+        for (unsigned j = 0; j < 16; ++j) waterK[i][j] = float(k[j]);
+    }
+}
+// Saves c30..c33 around a water draw (later programs, e.g. skinned bones,
+// expect the engine's values there).
+struct WaterConstantsScope {
+    IDirect3DDevice9 *d;
+    bool active = false;
+    float saved[16]{};
+    WaterConstantsScope(IDirect3DDevice9 *device, bool stereo) noexcept : d(device) {
+        if (!stereo || !waterDraw()) return;
+        waterConstants();
+        active = SUCCEEDED(d->GetVertexShaderConstantF(WaterConstant, saved, 4));
+    }
+    void eye(unsigned i) noexcept {
+        static const float identity[16]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        if (active) d->SetVertexShaderConstantF(WaterConstant, waterKValid ? waterK[i & 1] : identity, 4);
+    }
+    ~WaterConstantsScope() { if (active) d->SetVertexShaderConstantF(WaterConstant, saved, 4); }
+};
 template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo, bool shifted = false) noexcept;
 template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool instancing) noexcept;
 // Issues a draw for both halves, then puts the engine's viewport, scissor and
@@ -635,7 +690,7 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
         });
         return result;
     }
-    if (stereo && instancing && instanced(d, call, result)) return result;
+    if (stereo && instancing && !waterDraw() && instanced(d, call, result)) return result;
     return perHalf(d, call, stereo);
 }
 template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo, bool shifted) noexcept {
@@ -709,11 +764,13 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
             }
         }
         HRESULT hr = D3D_OK;
+        WaterConstantsScope waterScope(d, stereo);
         for (unsigned j = 0; j < layout.count; ++j) {
             const RECT r = regionRect(layout.region[j], clip.left, clip.top, clip.right, clip.bottom);
             if (r.right <= r.left || r.bottom <= r.top) continue;
             applyScissor(d, r);
             applyPlanes(d, int(2 + j));
+            waterScope.eye(layout.region[j].eye);
             d->SetStreamSource(15, ring, regionOffset + j * RecordBytes, RecordBytes);
             const HRESULT one = call(false);
             if (SUCCEEDED(hr)) hr = one;
@@ -726,9 +783,11 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
     if (!stereo) ++stats.unpatched;
     HRESULT hr = D3D_OK;
     const D3DVIEWPORT9 &v = engineViewport;
+    WaterConstantsScope waterScope(d, stereo);
     for (unsigned j = 0; j < layout.count; ++j) {
         const Region &g = layout.region[j];
         if (!g.scaled) continue;
+        waterScope.eye(g.eye);
         const RECT r = regionRect(g, LONG(v.X), LONG(v.Y), LONG(v.X + v.Width), LONG(v.Y + v.Height));
         if (r.right <= r.left || r.bottom <= r.top) continue;
         D3DVIEWPORT9 placed{DWORD(r.left), DWORD(r.top), DWORD(r.right - r.left), DWORD(r.bottom - r.top), v.MinZ, v.MaxZ};
@@ -812,6 +871,7 @@ bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, UINT width, UINT heig
     wideLayout = !regions;
     changes[0] = change[0]; changes[1] = change[1];
     recordsValid = false;
+    ++waterPass;
     eligibleIndex = 0;
     appliedWide = appliedInstances = forcedScissor = suspended = scissorApplied = false;
     appliedPixelShader = enginePixelShader;

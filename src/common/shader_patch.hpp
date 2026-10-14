@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -28,6 +29,8 @@ struct VertexInfo {
     uint32_t texcoordsWritten = 0;
     unsigned positionWrites = 0;
     unsigned instructions = 0;
+    unsigned constants = 0;      // Highest constant register read + 1 (relative reads: 256).
+    bool eyeClip = false;        // Patched with the per-eye screen mapping (water).
 };
 // The texcoord output carrying the eye test (8 when the program writes all).
 inline unsigned killSet(const VertexInfo &original) {
@@ -62,7 +65,7 @@ inline uint32_t dst(unsigned type, unsigned num, unsigned mask) {
 inline uint32_t src(unsigned type, unsigned num, uint32_t swizzle = 0xe4u) {
     return 0x80000000u | ((type & 7u) << 28) | ((type & 0x18u) << 8) | (swizzle << 16) | num;
 }
-constexpr unsigned Temp = 0, Input = 1, RastOut = 4, TexCrdOut = 6;
+constexpr unsigned Temp = 0, Input = 1, Const = 2, RastOut = 4, TexCrdOut = 6;
 } // namespace detail
 
 // Reads the program; false for anything the patcher does not understand.
@@ -85,6 +88,8 @@ inline bool inspect(const uint32_t *words, size_t count, VertexInfo &info) {
                 if (k > 0 && (op[k] & 0x2000u)) {} // Relative (a0) constant addressing: untouched.
                 const unsigned type = regType(op[k]), num = regNum(op[k]);
                 if (type == Temp) info.temps = num + 1 > info.temps ? num + 1 : info.temps;
+                if (k > 0 && type == Const)
+                    info.constants = std::max(info.constants, (op[k] & 0x2000u) ? 256u : num + 1);
                 if (k == 0 && type == RastOut && num == 0) ++info.positionWrites;
                 if (k == 0 && type == TexCrdOut && num < 8) info.texcoordsWritten |= 1u << num;
             }
@@ -95,8 +100,39 @@ inline bool inspect(const uint32_t *words, size_t count, VertexInfo &info) {
     return false; // No end token.
 }
 
+// The water program (WaterShader_VP_mainCalc) derives its reflection texcoords
+// from the clip-space position it also writes to oPos: `mad rX.xy, -rN.xz,
+// c3.x, rX` (ripple) followed by `mov rX.y, -rX.y`. In single pass that position
+// is the centre camera's, so both eyes looked the reflection up at the same
+// place, painted on the water. Ahead of the mad the patch replaces rX by
+// K . rX, K the per-eye screen mapping in c<eyeClip>..c<eyeClip+3>, set for each
+// half. Returns the word index of the mad, or 0.
+inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg) {
+    using namespace detail;
+    for (size_t i = 1; i + 8 < count;) {
+        const uint32_t token = words[i], opcode = token & 0xffffu;
+        if (token == 0x0000ffffu) break;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const int n = operands(opcode);
+        if (n < 0) break;
+        const uint32_t *op = words + i + 1;
+        if (opcode == 0x04 && regType(op[0]) == Temp && ((op[0] >> 16) & 0xfu) == 0x3 &&
+            regType(op[1]) == Temp && ((op[1] >> 24) & 0xfu) == 1 && regType(op[2]) == Const &&
+            regNum(op[2]) == 3 && ((op[2] >> 16) & 0xffu) == 0x00 && regType(op[3]) == Temp &&
+            regNum(op[3]) == regNum(op[0]) && words[i + 5] == 0x01u &&
+            words[i + 6] == dst(Temp, regNum(op[0]), 0x2) &&
+            words[i + 7] == (src(Temp, regNum(op[0]), 0x55u) | (1u << 24))) {
+            reg = regNum(op[0]);
+            return i;
+        }
+        i += 1 + size_t(n);
+    }
+    return 0;
+}
 // Builds the stereo variant. False (out untouched) if the program cannot be patched.
-inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, VertexInfo *infoOut = nullptr) {
+// `eyeClip` (a free constant register, 0 = off) enables the water texcoord fix.
+inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, VertexInfo *infoOut = nullptr,
+                              unsigned eyeClip = 0) {
     using namespace detail;
     VertexInfo info;
     if (!inspect(words, count, info) || !info.positionWrites) return false;
@@ -104,6 +140,10 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
     if (info.inputsDeclared & stereoInputs) return false;
     if (info.temps > 11) return false; // vs_1_1 has r0..r11; r11 holds the original position.
     const unsigned position = 11;
+    unsigned clipReg = 0;
+    size_t clipAt = eyeClip ? eyeClipSite(words, count, clipReg) : 0;
+    if (clipAt && (info.temps > 10 || info.constants > eyeClip || eyeClip + 4 > 96)) clipAt = 0; // r10 and c<eyeClip..+3> must be free.
+    info.eyeClip = clipAt != 0;
     std::vector<uint32_t> result;
     result.reserve(count + 64);
     result.push_back(words[0]);
@@ -123,6 +163,17 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
             continue;
         }
         const int n = operands(opcode);
+        if (clipAt && i == clipAt) {
+            for (unsigned row = 0; row < 4; ++row) { // dp4 r10.<row>, rX, c<eyeClip+row>
+                result.push_back(0x09u);
+                result.push_back(dst(Temp, 10, 1u << row));
+                result.push_back(src(Temp, clipReg));
+                result.push_back(src(Const, eyeClip + row));
+            }
+            result.push_back(0x01u); // mov rX, r10
+            result.push_back(dst(Temp, clipReg, 0xf));
+            result.push_back(src(Temp, 10));
+        }
         result.push_back(token);
         for (int k = 0; k < n; ++k) {
             uint32_t operand = words[i + 1 + k];
