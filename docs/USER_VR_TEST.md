@@ -23,6 +23,26 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the fourth headset test (2026-10-14, evening)
+
+- Riding (dinosaur and every other ride): the view no longer bobs or pitches
+  with the ride; it keeps the ride's heading only (aircraft still pitch and
+  roll). Pushing the left stick forward goes straight; the right stick turns
+  the ride while you push it and your right hand aims up and down. Turrets
+  are unchanged (stick only).
+- Menus: the game's cursor is now under your pointer everywhere (it drifted
+  away from the centre up and down).
+- Grabbing boxes: squeeze the grip (Index: a firm squeeze, the light trackpad
+  press is the wheel) with your hand on or near the box, or point that hand at
+  a box up to 3 m away and squeeze: it comes to your hand. Release to throw.
+- Colt: the laser now runs from its emitter along the game's own beam (it sat
+  to the left).
+- Tilted view (e.g. after taking the headset off while paused): hold both
+  grips and click the left stick, keep holding about 2 s while looking
+  straight ahead; the view is levelled to your head.
+- Water: the reflection is looked up by the reflected view direction from each
+  eye, so it stays fixed in the world and no longer follows your head.
+
 ## Changed after the third headset test (2026-10-14)
 
 - Colours: the picture should no longer look pale or washed out (the eye
@@ -194,4 +214,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `137b755`, version `0.2.11-dev.d2c958f8bd26` (2026-10-14).
+Installed candidate: commit `566cf54` (see install-receipt.json for the version) (2026-10-14).
