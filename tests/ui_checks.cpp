@@ -222,6 +222,26 @@ int main() {
     frame.requestSequence = 0;
     frame.body.p.x = .04f;
     check(!laserEligible(samples[0], frame, 0), "Body movement beyond the cache tolerance hides the beam");
+    {
+        // A grip-relative handheld beam is rebuilt from each frame's grip pose:
+        // a newer request or moved body keeps it; age and identity still apply.
+        LaserAim relative = samples[0];
+        relative.relative = true;
+        relative.distance = 12;
+        LaserFrame later = frame;
+        later.requestSequence = 7;
+        later.sequence = frame.sequence + 3;
+        later.body.p.x = 2;
+        check(laserEligible(relative, later, 0), "A grip-relative beam survives a late-latched request");
+        later.now = relative.tickMs + 101;
+        check(!laserEligible(relative, later, 0), "A grip-relative beam still expires after 100 ms");
+        later.now = frame.now;
+        later.weapon[0]++;
+        check(!laserEligible(relative, later, 0), "A grip-relative beam never moves to another weapon");
+        later.weapon[0]--;
+        relative.distance = std::numeric_limits<float>::quiet_NaN();
+        check(!laserEligible(relative, later, 0), "A grip-relative beam needs a finite hit distance");
+    }
     Request leanRequest;
     leanRequest.sequence = 81;
     leanRequest.input.sequence = 42;

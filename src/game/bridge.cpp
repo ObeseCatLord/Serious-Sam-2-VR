@@ -592,6 +592,7 @@ struct NativeUiFrame {
     bool restore = false, ui = false, fault = false, world = false, zeroCopy = false, published = false;
     bool overlay = false, overlaySeen = false, complete = false, fade = false;
     bool hudLayerDirty = false, hudLayerCleared = false; // HUD layer content this frame / cleared this frame.
+    bool panelHidden[2]{}; // The HUD panel is behind this eye: the HUD is drawn in neither eye.
     uintptr_t faultOrigin = 0;
     const char *faultReason = "none";
     D3DVERTEXELEMENT9 diagnosticElements[8]{};
@@ -984,13 +985,17 @@ static DrawUp originalDrawUp = nullptr;
 static IDirect3DTexture9 *hudLayer = nullptr;
 static IDirect3DSurface9 *hudLayerSurface = nullptr;
 static IDirect3DDevice9 *hudLayerDevice = nullptr;
-static bool hudLayerDisabled = false; // Composition failed once: keep the per-eye path.
+static bool hudLayerDisabled = false; // Composition failed: keep the per-eye path until resources change.
+static uint64_t hudLayerDisabledGeneration = 0;
+static IDirect3DStateBlock9 *hudState = nullptr; // Reused per flush (Capture/Apply), like foveaState.
 static void releaseHudLayer() noexcept {
     if (hudLayerSurface) hudLayerSurface->Release();
     if (hudLayer) hudLayer->Release();
-    hudLayerSurface = nullptr; hudLayer = nullptr; hudLayerDevice = nullptr;
+    if (hudState) hudState->Release();
+    hudLayerSurface = nullptr; hudLayer = nullptr; hudLayerDevice = nullptr; hudState = nullptr;
 }
 static bool hudLayerReady(IDirect3DDevice9 *d) noexcept {
+    if (hudLayerDisabled && hudLayerDisabledGeneration != resourceGeneration.load()) hudLayerDisabled = false; // Retry after a reset.
     if (hudLayerDisabled || uiFrame.fade || !uiFrame.color) return false;
     const UINT w = uiFrame.request.width, h = uiFrame.request.height;
     D3DSURFACE_DESC desc{};
@@ -1011,7 +1016,7 @@ static bool hudLayerReady(IDirect3DDevice9 *d) noexcept {
         if (!autoMips || FAILED(d->CreateTexture(w,h,0,D3DUSAGE_RENDERTARGET|D3DUSAGE_AUTOGENMIPMAP,D3DFMT_A8R8G8B8,
                                                 D3DPOOL_DEFAULT,&hudLayer,nullptr)) || !hudLayer ||
             FAILED(hudLayer->GetSurfaceLevel(0,&hudLayerSurface)) || !hudLayerSurface) {
-            releaseHudLayer(); hudLayerDisabled = true;
+            releaseHudLayer(); hudLayerDisabled = true; hudLayerDisabledGeneration = resourceGeneration.load();
             log("HUD layer unavailable (mips=%u); HUD stays per eye", unsigned(autoMips));
             return false;
         }
@@ -1047,9 +1052,10 @@ static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
     const LARGE_INTEGER start = PerfClock::now();
     ++perf.hudFlushes;
     hudLayer->GenerateMipSubLevels();
-    IDirect3DStateBlock9 *saved = nullptr;
+    if (!hudState && FAILED(d->CreateStateBlock(D3DSBT_ALL,&hudState))) hudState = nullptr;
+    IDirect3DStateBlock9 *saved = hudState;
     IDirect3DSurface9 *bound = nullptr;
-    bool ok = SUCCEEDED(d->CreateStateBlock(D3DSBT_ALL,&saved)) && saved &&
+    bool ok = saved && SUCCEEDED(saved->Capture()) &&
         SUCCEEDED(d->GetRenderTarget(0,&bound)) && bound;
     uiBypass = true;
     if (ok) {
@@ -1091,14 +1097,17 @@ static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
         const HudVertex desktop[4]{{-.5f,-.5f,.5f,1,0,0},{W-.5f,-.5f,.5f,1,1,0},
                                    {W-.5f,H-.5f,.5f,1,1,1},{-.5f,H-.5f,.5f,1,0,1}};
         ok = ok && draw(uiFrame.color,desktop,false);
-        for (unsigned i=0;i<2 && ok;++i) {
+        // Both eyes or neither: a panel partly behind one eye is hidden in both
+        // (one eye only showed the HUD to the other eye during fast turns).
+        HudVertex quad[2][4]{};
+        bool visible = true;
+        for (unsigned i=0;i<2 && visible;++i) {
             // Panel-local corners (top of the canvas is +Y) through this eye's projection.
             const Matrix34 panel = matrix(uiFrame.panel[i]);
             const Matrix44 &eye = uiFrame.projection[i];
             const float hw = uiFrame.request.uiWidth*.5f, hh = uiFrame.request.uiHeight*.5f;
             const float corner[4][4]{{-hw,hh,0,0},{hw,hh,1,0},{hw,-hh,1,1},{-hw,-hh,0,1}};
-            HudVertex v[4]{};
-            bool visible = true;
+            HudVertex *v = quad[i];
             for (unsigned k=0;k<4 && visible;++k) {
                 double local[3]{};
                 for (unsigned r=0;r<3;++r)
@@ -1113,17 +1122,18 @@ static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
                 v[k] = {float((clip[0]/clip[3]+1)*.5*W), float((1-clip[1]/clip[3])*.5*H), .5f,
                         float(1/clip[3]), corner[k][2], corner[k][3]};
             }
-            if (visible) ok = draw(uiFrame.target[i],v,true);
         }
+        for (unsigned i=0;i<2 && ok && visible;++i)
+            ok = draw(uiFrame.target[i],quad[i],true);
     }
     bool restored = bound && SUCCEEDED(originalSetRT(d,0,bound));
     restored = saved && SUCCEEDED(saved->Apply()) && restored;
     uiBypass = false;
     if (bound) bound->Release();
-    if (saved) saved->Release();
     perf.hudFlushCpu += PerfClock::seconds(start,PerfClock::now());
     if (!ok || !restored) {
         hudLayerDisabled = true;
+        hudLayerDisabledGeneration = resourceGeneration.load();
         log("HUD layer composite failed (ok=%u restored=%u); HUD stays per eye", unsigned(ok), unsigned(restored));
         nativeUiFault("hud-layer-composite");
         return false;
@@ -1224,7 +1234,8 @@ template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVET
         uiDraw.changed = true; // Any partial mutation must attempt every restore.
         for (unsigned i=0;i<2;++i) {
             if (!uiCurrent()) { nativeUiFault(); break; }
-            if (projected[i].empty) continue;
+            // A panel behind either eye is drawn in neither (one-eyed HUD otherwise).
+            if (projected[i].empty || uiFrame.panelHidden[0] || uiFrame.panelHidden[1]) continue;
             bool ok = SUCCEEDED(originalSetRT(d,0,uiFrame.target[i]));
             const D3DVIEWPORT9 full{0,0,uiFrame.request.width,uiFrame.request.height,0,1};
             ok = SUCCEEDED(d->SetViewport(&full)) && ok;
@@ -2993,6 +3004,7 @@ static void releaseUiFrame() noexcept {
     admittedUiFrame=nullptr;
     uiFrame.ui=uiFrame.fault=uiFrame.world=uiFrame.restore=uiFrame.zeroCopy=uiFrame.published=false;
     uiFrame.overlay=uiFrame.overlaySeen=uiFrame.complete=uiFrame.fade=false;
+    uiFrame.panelHidden[0]=uiFrame.panelHidden[1]=false;
     uiFrame.faultOrigin=0;
     uiFrame.faultReason="none";
     uiFrame.diagnosticElementCount=0;
@@ -3729,14 +3741,21 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             zeroCopy=sharedGeneration && images.generation==sharedGeneration && images.opened==sharedGeneration &&
                 images.width==width && images.height==height && (!images.pixelRequestTick || sinceCapture>3000);
         }
-        if(l) for(int i=0;i<2;++i) {
-            auto &slot=channel.shared->slot[i];
-            const auto now=GetTickCount64();
-            if(slot.state==SlotState::Requested && !slot.cancelled && slot.request.width==width &&
-                slot.request.height==height && slot.request.input.focused && slot.request.input.headValid &&
-                now>=slot.request.input.tickMs && now-slot.request.input.tickMs<200 &&
-                headFramePrepared(puppet,slot.request)) {
-                chosen=i; request=slot.request; slot.state=SlotState::Rendering; break;
+        if(l) {
+            // Newest request first: with two waiting, the older one holds the
+            // older prediction (the host late-latches the other).
+            const auto &slots=channel.shared->slot;
+            const int order[2]{slots[1].request.sequence>slots[0].request.sequence ? 1 : 0,
+                               slots[1].request.sequence>slots[0].request.sequence ? 0 : 1};
+            for(int i : order) {
+                auto &slot=channel.shared->slot[i];
+                const auto now=GetTickCount64();
+                if(slot.state==SlotState::Requested && !slot.cancelled && slot.request.width==width &&
+                    slot.request.height==height && slot.request.input.focused && slot.request.input.headValid &&
+                    now>=slot.request.input.tickMs && now-slot.request.input.tickMs<200 &&
+                    headFramePrepared(puppet,slot.request)) {
+                    chosen=i; request=slot.request; slot.state=SlotState::Rendering; break;
+                }
             }
         }
     };
@@ -3776,6 +3795,10 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         uiFrame.read[i]=readback[i]; readback[i]->AddRef();
     }
     bool retained=false;
+    // The single-pass target swapped into eye 0 for the centre render; swapped
+    // back by the cleanup if native code unwinds before the normal swap-back
+    // (else the frame release and releaseTargets released the wrong surfaces).
+    IDirect3DSurface9 **swappedColor=nullptr, **swappedDepth=nullptr;
     withNativeFinally([&] {
         auto *d=uiFrame.device;
         bool ok=SUCCEEDED(d->GetRenderTarget(0,&uiFrame.color)) &&
@@ -3858,6 +3881,19 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         ss2vr::replay::EyeChange singlePassChange[2];
         const bool singlePassFrame=singlePassEnabled && !alternateEyes && wideColor && wideDepth &&
             single_pass::installed() && singlePassChanges(request,centre,singlePassChange);
+        {
+            // Mode flips change culling/LOD and the overlay path: say when and why.
+            static int previousMode=-1;
+            const int mode=singlePassFrame ? 1 : 0;
+            if(singlePassEnabled && mode!=previousMode) {
+                static unsigned flips=0;
+                if(++flips<=40 || flips%200==0)
+                    log("Stereo mode %s (wide=%u installed=%u alternate=%u changes=%u) flips=%u",
+                        mode ? "single pass" : "two pass",unsigned(wideColor && wideDepth),unsigned(single_pass::installed()),
+                        unsigned(alternateEyes),unsigned(mode ? 1u : unsigned(singlePassChanges(request,centre,singlePassChange))),flips);
+                previousMode=mode;
+            }
+        }
         bool centreReady=false;
         // Foveated: the pass draws into the atlas instead of the double-wide target.
         FoveaFrame fovea;
@@ -3879,6 +3915,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                 if(pass==0) {
                     // The engine's target redirection (setRT/setDepth) follows uiFrame eye 0.
                     std::swap(uiFrame.target[0],passColor); std::swap(uiFrame.z[0],passDepth);
+                    swappedColor=&passColor; swappedDepth=&passDepth;
                     beginEye(puppet,centre,0);
                     const RECT wideScissor{0,0,LONG(passWidth),LONG(passHeight)};
                     D3DVIEWPORT9 wv{0,0,passWidth,passHeight,0,1};
@@ -3980,6 +4017,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                     if(generation==graphicsResourceGeneration()) noteScopeViews(puppet,centre);
                     centreReady=ok && generation==graphicsResourceGeneration() && singlePassCaptureCentre(centre);
                     std::swap(uiFrame.target[0],passColor); std::swap(uiFrame.z[0],passDepth);
+                    swappedColor=swappedDepth=nullptr;
                     for(unsigned k=0;k<2 && centreReady;++k) {
                         const RECT half{LONG(k*width),0,LONG((k+1)*width),LONG(height)};
                         centreReady=foveated ? composeFovea(d,fovea,k,uiFrame.target[k],width,height) :
@@ -4087,6 +4125,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                 ok=ok && nativeUiProjection(identity,uiFrame.projection[i],uiFrame.panel[i],
                     request.uiWidth,request.uiHeight,request.width,request.height,
                     {0,0,request.width,request.height,0,1},false,{},admission);
+                uiFrame.panelHidden[i]=ok && admission.empty;
                 if(traceEye) log("Native eye UI projection eye=%d admitted=%u empty=%u",i,ok,admission.empty);
                 noteStage(4);
             }
@@ -4153,6 +4192,10 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             publishUiFrame(0);
         }
     },[&](bool aborted) noexcept {
+        if(swappedColor && swappedDepth) {
+            std::swap(uiFrame.target[0],*swappedColor); std::swap(uiFrame.z[0],*swappedDepth);
+            swappedColor=swappedDepth=nullptr;
+        }
         if(aborted || !retained) nativeUiEndOwner(aborted && generation == graphicsResourceGeneration());
     });
 }

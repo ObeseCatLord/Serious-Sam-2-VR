@@ -1,5 +1,37 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-14 (later) — review fixes (performance, blackouts, lasers)
+
+From a read-only code review (Fable), confirmed findings fixed:
+- Lasers: LaserAim keeps the muzzle relative to the weapon grip and the hit
+  distance; freezeLasers rebuilds each beam from the frame's own weaponGrip
+  pose (the pose weaponAbs places the model with), so beam and barrel agree in
+  every frame and handheld beams no longer need the sample's exact request
+  (host late-latching made them flicker). Transient sample rejections keep the
+  previous beam (still age-bounded at 100 ms); hand validity at freeze is the
+  frame's own input. Tests in ui_checks.
+- Emitter offsets (measuredEmitter, uzi tube) scale with [Weapons] Scale too.
+- Calibration admission window 100 -> 500 ms; a non-admitted calibration
+  falls back to the hand pose (plus emitter) instead of the native flat-camera
+  pose (the first shot after a hitch used to leave from the wrong place).
+- The weapon render and scope binding check the controller holding the weapon
+  (mountHand); the network grip uses the mounted slot's weapon; server
+  authority shots use the measured emitters.
+- Single pass: the eye-0 / pass target swap is undone on native unwind; the
+  bloom screen lock is released on unwind and reset each pass; default-pool
+  buffers/surfaces are released on device loss (Reset would fail otherwise).
+- Host: zero-copy pairs no longer drain the GPU (1-2 ms per pair under Wine):
+  each slot's eye copy ends an event query and the slot is not requested again
+  until it completes (copy_waits counts deferrals); a drain timeout drops the
+  pair instead of killing the host.
+- HUD: a panel behind either eye is hidden in both (no one-eyed HUD); the HUD
+  layer retries after a device reset instead of staying off; its state block
+  is reused (Capture/Apply) instead of created per flush.
+- The render and the laser query take the newest waiting request.
+- "Stereo mode single pass/two pass" is logged when frames switch.
+Not changed: unwind-bracketing the laser/wheel state restores (cleanup may not
+call native setters on abort); lazy single-pass state restore (higher risk).
+
 ## 2026-10-14 — two-handed hold of a weapon held alone
 
 - Dual wielding: with the stock USE COMBO WEAPONS option on, each hand can hold

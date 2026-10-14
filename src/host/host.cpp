@@ -1157,6 +1157,10 @@ struct Host {
     Com<ID3D11Device> device;
     Com<ID3D11DeviceContext> context;
     Com<ID3D11Query> drainQuery;
+    // Zero-copy: the eye copy out of a slot's shared images, ended after the copy
+    // instead of draining the GPU; the slot is not requested again until it is done.
+    Com<ID3D11Query> copyQuery[2];
+    bool copyPending[2]{};
     // Zero-copy eye images opened from the game's shared handles (slot x eye).
     Com<ID3D11Texture2D> sharedEye[2][2];
     uint32_t sharedOpened = 0, sharedTried = 0, sharedWidth = 0, sharedHeight = 0;
@@ -1210,7 +1214,7 @@ struct Host {
     uint64_t inputSequence = 0, requestSequence = 0;
     uint64_t xrEndSuccess = 0, xrLayerSuccess = 0, xrMenuSuccess = 0, xrWorldSuccess = 0;
     uint64_t uiPairs = 0, clearedPairs = 0; // Pairs with the native HUD composited; head-clearance opaque pairs.
-    uint64_t completed = 0, timeouts = 0, fullSlots = 0, discarded = 0, imageTimeouts = 0, invalidViews = 0;
+    uint64_t completed = 0, timeouts = 0, fullSlots = 0, discarded = 0, imageTimeouts = 0, invalidViews = 0, copyWaits = 0;
     uint64_t retired = 0, submissions = 0, reused = 0, lastSubmittedSequence = 0;
     ULONGLONG lastDiagnostics = 0, lastMutexDiagnostic = 0;
     // Host cost accounting for the 5 s diagnostics line (milliseconds sums).
@@ -1242,6 +1246,8 @@ struct Host {
             for (auto &chain : inset)
                 chain.abandon();
             drainQuery.abandon();
+            for (auto &query : copyQuery)
+                query.abandon();
             for (auto &row : sharedEye)
                 for (auto &image : row)
                     image.abandon();
@@ -1273,6 +1279,8 @@ struct Host {
                 image.reset();
         context.reset();
         drainQuery.reset();
+        for (auto &query : copyQuery)
+            query.reset();
         device.reset();
         if (instance && api.DestroyInstance)
             api.cleanup(api.DestroyInstance(instance), "xrDestroyInstance");
@@ -1582,6 +1590,19 @@ struct Host {
         D3D11_QUERY_DESC query{};
         query.Query = D3D11_QUERY_EVENT;
         hresult(device->CreateQuery(&query, drainQuery.put()), "CreateQuery GPU drain", log);
+        for (auto &copy : copyQuery)
+            hresult(device->CreateQuery(&query, copy.put()), "CreateQuery eye copy", log);
+    }
+    // Whether slot `index`'s shared images may be rendered again (its last eye
+    // copy executed). Never blocks.
+    bool copyDone(unsigned index) noexcept {
+        if (index >= 2 || !copyPending[index])
+            return true;
+        if (!context.p || !copyQuery[index].p ||
+            context->GetData(copyQuery[index].p, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK ||
+            FAILED(device->GetDeviceRemovedReason()))
+            copyPending[index] = false;
+        return !copyPending[index];
     }
     void cancelRequests() {
         for (auto &entry : outstanding)
@@ -2250,8 +2271,18 @@ struct Host {
             // must have executed before the game can render into the image again.
             eye[0].copyWaited(context.p, sharedEye[candidate][0].p);
             eye[1].copyWaited(context.p, sharedEye[candidate][1].p);
-            if (!drainGpu())
-                throw std::runtime_error("Zero-copy eye copy did not complete");
+            // The slot is requested again only once this copy has executed
+            // (copyDone, in requestEyes): no GPU drain stalls this loop.
+            if (copyQuery[candidate].p) {
+                context->End(copyQuery[candidate].p);
+                context->Flush();
+                copyPending[candidate] = true;
+            } else if (!drainGpu()) {
+                log.write("Zero-copy eye copy did not complete; pair dropped");
+                eye[0].releaseWaited();
+                eye[1].releaseWaited();
+                return;
+            }
             eye[0].releaseWaited();
             eye[1].releaseWaited();
             perfPairAge += double(GetTickCount64() - (deadline - FrameAgeMs));
@@ -2331,11 +2362,20 @@ struct Host {
             return;
         }
         int index = -1;
+        bool copying = false;
         for (int i = 0; i < 2; i++)
             if (shared.slot[i].state == SlotState::Empty) {
+                if (!copyDone(unsigned(i))) {
+                    copying = true; // Its eye copy has not executed yet: not this loop.
+                    continue;
+                }
                 index = i;
                 break;
             }
+        if (index < 0 && copying) {
+            ++copyWaits;
+            return;
+        }
         if (index < 0)
             throw std::runtime_error("Admission found no owned empty slot");
         auto &slot = shared.slot[index];
@@ -2805,7 +2845,7 @@ struct Host {
         std::snprintf(line, sizeof(line),
                       "Frame totals: ipc_complete=%llu deadline=%llu slots_full=%llu discarded=%llu "
                       "image_wait=%llu invalid_views=%llu retired=%llu submitted=%llu reused=%llu "
-                      "xr_end_success=%llu xr_layers=%llu xr_menu=%llu xr_world=%llu ui_pairs=%llu opaque_pairs=%llu",
+                      "xr_end_success=%llu xr_layers=%llu xr_menu=%llu xr_world=%llu ui_pairs=%llu opaque_pairs=%llu copy_waits=%llu",
                       static_cast<unsigned long long>(completed), static_cast<unsigned long long>(timeouts),
                       static_cast<unsigned long long>(fullSlots), static_cast<unsigned long long>(discarded),
                       static_cast<unsigned long long>(imageTimeouts),
@@ -2813,7 +2853,8 @@ struct Host {
                       static_cast<unsigned long long>(submissions), static_cast<unsigned long long>(reused),
                       static_cast<unsigned long long>(xrEndSuccess), static_cast<unsigned long long>(xrLayerSuccess),
                       static_cast<unsigned long long>(xrMenuSuccess), static_cast<unsigned long long>(xrWorldSuccess),
-                      static_cast<unsigned long long>(uiPairs), static_cast<unsigned long long>(clearedPairs));
+                      static_cast<unsigned long long>(uiPairs), static_cast<unsigned long long>(clearedPairs),
+                      static_cast<unsigned long long>(copyWaits));
         log.write(line);
         if (perfLoops) {
             std::snprintf(line, sizeof(line),

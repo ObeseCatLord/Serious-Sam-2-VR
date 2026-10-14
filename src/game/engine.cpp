@@ -4983,8 +4983,12 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
     Request queryRequest;
     {
         Lock lock(channel, 1);
-        if (lock)
-            for (const auto &slot : channel.shared->slot)
+        if (lock) {
+            // The newest request, as the render picks it (bridge acquireRequest).
+            const auto &slots = channel.shared->slot;
+            const unsigned first = slots[1].request.sequence > slots[0].request.sequence ? 1u : 0u;
+            for (unsigned i : {first, 1u - first}) {
+                const auto &slot = slots[i];
                 if (slot.state == SlotState::Requested && !slot.cancelled &&
                     nativeFrameIdentity(slot.request, s.input, s.generation, s.initialized, s.ui.gameplay,
                                         true) &&
@@ -4994,6 +4998,8 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
                     requested = true;
                     break;
                 }
+            }
+        }
     }
     if (!requested) {
         laserTraceValue(LaserTraceStage::Query,"request-missing",s,2,0,3);return;
