@@ -90,6 +90,18 @@ int main() {
           "Early atomic invalidation defeats matching but stale mutex-protected UI");
     context.uiEpoch = context.epoch;
     check(!eligibleFrame(reply, 150, context), "Prior cached pair cannot survive a calibration epoch change");
+    check(holdableFrame(reply, 150, context), "A shown pair stays up across an epoch change until the next one");
+    {
+        FrameContext late = context;
+        late.now = 150 + FrameHoldMs;
+        check(!holdableFrame(reply, 150, late), "The hold ends after FrameHoldMs past the deadline");
+        late = context;
+        late.session = context.session + 1;
+        check(!holdableFrame(reply, 150, late), "A new session never shows the held pair");
+        late = context;
+        late.focused = false;
+        check(!holdableFrame(reply, 150, late), "Focus loss ends the hold");
+    }
     context.epoch = context.uiEpoch = respawn;
     pending = {true, false, false, Expiry::None, 150, request};
     slot.state = SlotState::Rendering;

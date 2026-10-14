@@ -182,11 +182,13 @@ struct Mutex {
                         X(StopHapticFeedback) X(SyncActions) X(GetActionStatePose) X(GetActionStateBoolean)  \
                             X(GetActionStateFloat) X(GetActionStateVector2f) X(GetCurrentInteractionProfile)
 
+// 8-bit BGRA swapchain formats (copies from the game's BGRA images need that byte order).
+inline bool bgraFormat(DXGI_FORMAT f) { return f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB; }
 struct Api {
     Library loader;
     Log &log;
     bool lossPending = false;
-    DXGI_FORMAT colorFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    DXGI_FORMAT colorFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
     PFN_xrGetInstanceProcAddr GetInstanceProcAddr = nullptr;
     PFN_xrEnumerateInstanceExtensionProperties EnumerateInstanceExtensionProperties = nullptr;
     PFN_xrCreateInstance CreateInstance = nullptr;
@@ -343,9 +345,8 @@ struct Swapchain {
             if (description.Width != width || description.Height != height || description.ArraySize != 1 ||
                 description.SampleDesc.Count != 1 || description.MipLevels != 1 ||
                 (description.Format != api->colorFormat &&
-                 description.Format != (api->colorFormat == DXGI_FORMAT_B8G8R8A8_UNORM
-                                            ? DXGI_FORMAT_B8G8R8A8_TYPELESS
-                                            : DXGI_FORMAT_R8G8B8A8_TYPELESS)))
+                 description.Format != (bgraFormat(api->colorFormat) ? DXGI_FORMAT_B8G8R8A8_TYPELESS
+                                                                     : DXGI_FORMAT_R8G8B8A8_TYPELESS)))
                 throw std::runtime_error("OpenXR image layout does not match packed BGRA transport");
         }
     }
@@ -374,7 +375,7 @@ struct Swapchain {
     void uploadWaited(ID3D11DeviceContext *context, const uint8_t *bytes) {
         if (!ownership.acquired || !ownership.waited)
             throw std::runtime_error("Writing an unowned OpenXR image");
-        if (api->colorFormat == DXGI_FORMAT_R8G8B8A8_UNORM) {
+        if (!bgraFormat(api->colorFormat)) {
             converted.resize(size_t(width) * height * 4);
             bgraToRgba(converted.data(), bytes, size_t(width) * height);
             bytes = converted.data();
@@ -1513,14 +1514,23 @@ struct Host {
         std::vector<int64_t> formats(count);
         api.check(api.EnumerateSwapchainFormats(session, count, &count, formats.data()),
                   "xrEnumerateSwapchainFormats");
-        if (std::find(formats.begin(), formats.end(), int64_t(DXGI_FORMAT_B8G8R8A8_UNORM)) != formats.end())
-            api.colorFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
-        else if (std::find(formats.begin(), formats.end(), int64_t(DXGI_FORMAT_R8G8B8A8_UNORM)) !=
-                 formats.end())
-            api.colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // The game's pixels are display-encoded (sRGB). An _SRGB swapchain says so;
+        // in a UNORM one the runtime takes them for linear light and encodes them
+        // again (the picture looked pale and washed out). Copies stay raw bytes.
+        const auto offered = [&](DXGI_FORMAT f) { return std::find(formats.begin(), formats.end(), int64_t(f)) != formats.end(); };
+        if (offered(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) api.colorFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        else if (offered(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) api.colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        else if (offered(DXGI_FORMAT_B8G8R8A8_UNORM)) api.colorFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+        else if (offered(DXGI_FORMAT_R8G8B8A8_UNORM)) api.colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
         else
-            throw std::runtime_error(
-                "Runtime offers neither BGRA8 nor RGBA8 UNORM; sRGB encoding is not assumed");
+            throw std::runtime_error("Runtime offers no 8-bit BGRA/RGBA swapchain format");
+        {
+            char line[96];
+            std::snprintf(line, sizeof line, "Swapchain color format %d (%s)", int(api.colorFormat),
+                          api.colorFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || api.colorFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                              ? "sRGB" : "UNORM, runtime may re-encode");
+            log.write(line);
+        }
         const auto &g = systemProperties.graphicsProperties;
         const uint32_t wheelSize = std::min({1024u, g.maxSwapchainImageWidth, g.maxSwapchainImageHeight});
         if (wheelSize < 512)
@@ -1878,7 +1888,7 @@ struct Host {
         if (!images.generation)
             return;
         // Copies need the swapchain's byte layout (BGRA); RGBA swapchains keep pixels.
-        bool ok = api.colorFormat == DXGI_FORMAT_B8G8R8A8_UNORM && images.width && images.height &&
+        bool ok = bgraFormat(api.colorFormat) && images.width && images.height &&
             images.width <= MaxDimension && images.height <= MaxDimension;
         HRESULT failure = S_OK;
         for (unsigned slot = 0; slot != 2 && ok; ++slot)
@@ -2391,15 +2401,11 @@ struct Host {
     bool projection(XrCompositionLayerProjection &layer,
                     std::array<XrCompositionLayerProjectionView, 2> &views,
                     XrCompositionLayerProjection &insetLayer, std::array<XrCompositionLayerProjectionView, 2> &insetViews) {
-        if (!cachedValid || !eye[0].ownership.previousImageAvailable() ||
-            !eye[1].ownership.previousImageAvailable() ||
+        if (!cachedValid) { ++missing[0]; return false; }
+        if (!eye[0].ownership.previousImageAvailable() || !eye[1].ownership.previousImageAvailable() ||
             (cachedFoveated && (!inset[0].ownership.previousImageAvailable() || !inset[1].ownership.previousImageAvailable())))
-            return false;
-        {
-            Mutex lock(channel, 0);
-            if (!lock || !eligibleFrame(cachedRequest, cachedDeadline, frameContext()))
-                return false;
-        }
+            { ++missing[1]; return false; }
+        if (!cachedPairEligible()) { ++missing[cachedPairBusy ? 3 : 2]; return false; }
         layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         layer.space = local;
         for (unsigned h = 0; h != 2; ++h) {
@@ -2439,13 +2445,52 @@ struct Host {
             invalidateCachedPair();
             return false;
         }
-        Mutex lock(channel, 0);
-        if (!lock)
-            return false;
-        if (!eligibleFrame(cachedRequest, cachedDeadline, frameContext())) {
-            invalidateCachedPair();
+        if (!cachedPairEligible(true)) {
+            if (!cachedPairBusy) invalidateCachedPair();
+            else ++dropped[4];
             return false;
         }
+        return true;
+    }
+    // Whether the cached pair may still be shown. The check reads the shared
+    // channel without waiting; when the game holds it at that instant, the last
+    // verdict for this same pair stands for up to 100 ms (a busy lock used to
+    // drop the world layer for that XR frame, which the compositor showed black).
+    uint64_t eligibleSequence = 0, eligibleTick = 0;
+    bool cachedPairBusy = false;
+    unsigned busyHolds = 0, heldPairs = 0;
+    // World layers dropped at the final check: pair too old, game UI stale, not
+    // gameplay, other identity; and (4) busy lock with no fresh verdict.
+    unsigned dropped[5]{};
+    // No world layer offered: no cached pair, images not written, ineligible, busy.
+    unsigned missing[4]{};
+    bool cachedPairEligible(bool final = false) {
+        cachedPairBusy = false;
+        Mutex lock(channel, 0);
+        const uint64_t now = GetTickCount64();
+        if (!lock) {
+            cachedPairBusy = true;
+            const bool held = eligibleSequence == cachedRequest.sequence && eligibleTick && now - eligibleTick < 100;
+            if (held && final) ++busyHolds;
+            return held;
+        }
+        const FrameContext context = frameContext();
+        if (!eligibleFrame(cachedRequest, cachedDeadline, context)) {
+            // A pair already shown stays up briefly rather than the frame going black.
+            if (eligibleSequence == cachedRequest.sequence && holdableFrame(cachedRequest, cachedDeadline, context)) {
+                if (final) ++heldPairs;
+                return true;
+            }
+            if (final) {
+                if (context.now >= cachedDeadline) ++dropped[0];
+                else if (context.now < context.uiTick || context.now - context.uiTick > UiAgeMs) ++dropped[1];
+                else if (!context.gameplay) ++dropped[2];
+                else ++dropped[3];
+            }
+            return false;
+        }
+        eligibleSequence = cachedRequest.sequence;
+        eligibleTick = now;
         return true;
     }
     bool admitFinalWorld(std::vector<const XrCompositionLayerBaseHeader *> &layers,
@@ -2864,11 +2909,11 @@ struct Host {
         if (now - lastDiagnostics < 5000)
             return;
         lastDiagnostics = now;
-        char line[512];
+        char line[768];
         std::snprintf(line, sizeof(line),
                       "Frame totals: ipc_complete=%llu deadline=%llu slots_full=%llu discarded=%llu "
                       "image_wait=%llu invalid_views=%llu retired=%llu submitted=%llu reused=%llu "
-                      "xr_end_success=%llu xr_layers=%llu xr_menu=%llu xr_world=%llu ui_pairs=%llu opaque_pairs=%llu copy_waits=%llu",
+                      "xr_end_success=%llu xr_layers=%llu xr_menu=%llu xr_world=%llu ui_pairs=%llu opaque_pairs=%llu copy_waits=%llu busy_holds=%u held=%u dropped=%u,%u,%u,%u,%u missing=%u,%u,%u,%u",
                       static_cast<unsigned long long>(completed), static_cast<unsigned long long>(timeouts),
                       static_cast<unsigned long long>(fullSlots), static_cast<unsigned long long>(discarded),
                       static_cast<unsigned long long>(imageTimeouts),
@@ -2877,7 +2922,8 @@ struct Host {
                       static_cast<unsigned long long>(xrEndSuccess), static_cast<unsigned long long>(xrLayerSuccess),
                       static_cast<unsigned long long>(xrMenuSuccess), static_cast<unsigned long long>(xrWorldSuccess),
                       static_cast<unsigned long long>(uiPairs), static_cast<unsigned long long>(clearedPairs),
-                      static_cast<unsigned long long>(copyWaits));
+                      static_cast<unsigned long long>(copyWaits), busyHolds, heldPairs, dropped[0], dropped[1], dropped[2],
+                      dropped[3], dropped[4], missing[0], missing[1], missing[2], missing[3]);
         log.write(line);
         if (perfLoops) {
             std::snprintf(line, sizeof(line),

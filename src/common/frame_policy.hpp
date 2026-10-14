@@ -91,6 +91,18 @@ inline bool eligibleFrame(const Request &r, uint64_t deadline, const FrameContex
            r.width == c.width && r.height == c.height && r.input.session == r.session &&
            r.input.reference == r.reference && r.input.focused && r.input.headValid;
 }
+// Display only: a pair that was shown may stay up a little past its age limit
+// and across a tracking-epoch change (weapon switch, snap turn, recentre) until
+// the next pair arrives, instead of the frame going black. Session, reference,
+// focus, head tracking, gameplay and size still have to hold.
+constexpr uint64_t FrameHoldMs = 250;
+inline bool holdableFrame(const Request &r, uint64_t deadline, const FrameContext &c) {
+    return r.sequence && r.session && r.reference && validTrackingEpoch(r.trackingGeneration) && r.reserved == 0 &&
+           c.renderer && c.gameplay && c.focused && c.headValid && c.now < deadline + FrameHoldMs &&
+           c.now >= c.uiTick && c.now - c.uiTick <= UiAgeMs && r.session == c.session && r.reference == c.reference &&
+           validTrackingEpoch(c.epoch) && r.width == c.width && r.height == c.height && r.input.session == r.session &&
+           r.input.reference == r.reference && r.input.focused && r.input.headValid;
+}
 inline bool nativeFrameIdentity(const Request &r, const Input &nativeInput, uint32_t epoch, bool initialized,
                                 bool gameplay, bool samePlayer) {
     return initialized && gameplay && samePlayer && validTrackingEpoch(epoch) &&
