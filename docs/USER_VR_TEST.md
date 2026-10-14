@@ -23,6 +23,31 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the third headset test (2026-10-14)
+
+- Colours: the picture should no longer look pale or washed out (the eye
+  images are now handed to the runtime as sRGB).
+- No black flashes: switching weapons, snap turning or recentring keeps the
+  last image up instead of a black frame; level fade-ins no longer flicker.
+- Hand grenades: right stick click puts a grenade in your other hand (that
+  hand's gun is put away); throw it with a throwing motion of that hand. It
+  flies toward where your gun hand's laser points, with the game's own arc.
+  Click again to put it away.
+- Turrets: only the right stick aims them, and they stop when you let go of
+  the stick (no more turning on their own, no hand aiming).
+- Circular saw: no laser; your hand is on its rear loop handle.
+- Colt: its laser starts at the emitter under the barrel, along the game's
+  own beam.
+- All weapons are 15% smaller.
+- Hit-direction arrows and blood marks are no longer drawn.
+- Menus: the game's selection sits exactly under the pointer dot (it used to
+  drift outward toward the edges).
+- Water: the reflection is looked up per eye from a steady camera, so it sits
+  at a distance instead of looking painted on the water and swimming with your
+  head. Say whether it looks right.
+- Multiplayer: other players see your arms reach to your tracked hands (and
+  your head turn) on your character.
+
 ## New: VR options and foveated rendering (2026-10-13, late)
 
 - Open a weapon wheel (light trackpad press) and release on the new bubble with
@@ -160,6 +185,8 @@ movement. Note anything that jumps, sticks or steers wrongly.
 Every player needs the same mod build. Try a listen host with a VR client, a VR
 host with a desktop client, and a dedicated server. Players must see each other's
 head, hands and weapons move coherently, and shots must come from the right hand.
+A VR player's character reaches with both arms to that player's hands (arm IK);
+watch for twisted elbows or hands that do not meet the weapon.
 
 ## Reporting
 

@@ -1,5 +1,43 @@
 # Implementation status — 2026-10-10
 
+## 2026-10-14 (evening) — third headset test feedback
+
+- Colour: host swapchains are B8G8R8A8_UNORM_SRGB (the game's pixels are
+  display-encoded; a UNORM swapchain made the runtime encode them again, pale).
+- Black flashes: a shown pair stays up (frame_policy holdableFrame, 250 ms
+  past its age) across tracking-epoch changes (weapon handle change, snap
+  turn, recentre, gameplay toggle) and a busy IPC lock at the final check;
+  both submitted frames without a world layer. Lab V479: 27 weapon switches,
+  0 empty frames after startup (was ~40). Fades drawn in a sub-viewport or
+  scissor are drawn full-field instead of faulting the pair (level fade-ins).
+- Grenades (common/grenade_throw.hpp): right stick click holds a grenade in the
+  off hand (HandGrenade.mdl drawn at the grip, that hand's weapon hidden and
+  not firing); a hand speed >= 1.6 m/s away from the body launches the native
+  throw (plcmdTertFire), whose GetViewOrigin(0) query (Sam2Game return
+  0x1020cf) gets the grenade hand's position aimed at the other hand's laser
+  end; the native throw then adds its pitch and speed. Lab V471: thrown, 30 -> 29.
+- Turrets: seatedInTurret matches the turret GetShootDirection (vtable+0x5A4,
+  0x155ce0): CTurretPuppetEntity, CTurretCharacterEntity, CAutoTurretPuppetEntity.
+  The other classes fell into hand aim, measured in a frame that turned with
+  the turret (it kept spinning).
+- Weapons 15% smaller (WeaponSizeFactor; emitters scale with it). Saw: no laser,
+  grip on the rear loop handle {0,.035,.18} (V470/V472). Colt: laser from its
+  emitter lens (ColtLaserEmitter {0,-.0965,.1435}, V470/V472).
+- CDamageHudElement (0x176dc0) is not drawn while VR input is live.
+- Menu cursor: menuCursor() maps the pointer into the 4:3 box the menu draws
+  in (CDrawPort::ForceAspectRatio 4/3); the lab cannot move the menu aim pose
+  (simulated controller aim stays at Monado's default in menus).
+- Water (common/water_reflection.hpp): the water vertex program (ripple/flip
+  texcoord signature) reads K . clip from c30..c33; K maps the centre clip to a
+  per-eye reference camera (centre projection, the eye's position, smoothed
+  level view direction, tau 1 s). Water draws are not instanced.
+- Networked VRIK (common/arm_ik.hpp, remote_render poseArms): two-bone arm IK
+  on remote VR players' L_/R_ UpperArm/LowerArm/Hand; posed bone = canonical
+  skinning matrix x inverse(definition +0x48) (V477: joint spacing equals bone
+  lengths). A hand with a weapon follows the model pass's weapon delta, an
+  empty hand reaches its grip. Not run in a live multiplayer session (no
+  two-instance lab).
+
 ## 2026-10-14 (later) — review fixes (performance, blackouts, lasers)
 
 From a read-only code review (Fable), confirmed findings fixed:
