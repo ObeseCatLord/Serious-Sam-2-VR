@@ -852,6 +852,24 @@ bool nativeRiderCurrent(void *player, const RiderIdentity &expected,void **rideT
     if(current && rideToken)*rideToken=ride;
     return current;
 }
+// Riding: the view must not bob with the ride. The input poll low-passes the
+// seated anchor's height and publishes the correction for that player and ride;
+// every anchor read applies it, so head, hands, weapons and lasers move together.
+// Except in aircraft (which must pitch and roll) the anchor also keeps only the
+// ride's heading: a walking dinosaur pitched and rolled the whole view.
+static std::atomic<uint32_t> steadyPlayer{0}, steadyRide{0};
+static std::atomic<float> steadyOffset{0};
+static std::atomic<bool> steadyLevel{false};
+static thread_local bool steadyBypass = false;
+static uintptr_t aircraftVtables[3]{};
+static bool aircraftRide(const RiderIdentity &rider) {
+    void *ride = rider.ride && resolve ? resolve(rider.ride) : nullptr;
+    uintptr_t table = 0;
+    if (!ride || !readableMemory(ride, 4)) return false;
+    std::memcpy(&table, ride, 4);
+    for (uintptr_t t : aircraftVtables) if (t && table == t) return true;
+    return false;
+}
 bool nativeTrackingAnchor(void *player, Pose &out, const RiderIdentity *expected) {
     RiderIdentity identity;
     if (!baseViewOrigin || !nativeBodyPlacement || !readNativeRider(player, identity) ||
@@ -890,8 +908,40 @@ bool nativeTrackingAnchor(void *player, Pose &out, const RiderIdentity *expected
     if (!nativeRiderAnchor(identity, view, heightBits, body, result) ||
         !nativeRiderCurrent(player, identity))
         return false;
+    if (identity.seated() && !steadyBypass && identity.player == steadyPlayer.load(std::memory_order_relaxed) &&
+        identity.ride == steadyRide.load(std::memory_order_relaxed)) {
+        const float offset = steadyOffset.load(std::memory_order_relaxed);
+        if (std::isfinite(offset)) result.p.y += offset;
+        if (steadyLevel.load(std::memory_order_relaxed)) result.q = yaw(horizontalHeading(result.q));
+    }
     out = result;
     return true;
+}
+// Per poll: the seated anchor height follows the ride's with a 0.35 s low-pass
+// (gait bob removed, hills and jumps kept); at most 0.6 m apart.
+static void updateRideSteadying(void *player, const RiderIdentity &rider) {
+    static LARGE_INTEGER last{};
+    static float filtered = 0;
+    static uint32_t ride = 0;
+    LARGE_INTEGER now{}, frequency{};
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
+    const float dt = last.QuadPart ? std::clamp(float(double(now.QuadPart - last.QuadPart) / double(frequency.QuadPart)), 0.f, .1f) : 0.f;
+    last = now;
+    Pose raw;
+    steadyBypass = true;
+    const bool ok = rider.seated() && nativeTrackingAnchor(player, raw, &rider);
+    steadyBypass = false;
+    if (!ok || !std::isfinite(raw.p.y)) {
+        steadyRide = 0; ride = 0;
+        return;
+    }
+    if (ride != rider.ride || std::abs(filtered - raw.p.y) > .6f) filtered = raw.p.y;
+    else filtered += (raw.p.y - filtered) * (1 - std::exp(-dt / .35f));
+    ride = rider.ride;
+    steadyOffset = filtered - raw.p.y;
+    steadyLevel = !aircraftRide(rider);
+    steadyPlayer = rider.player;
+    steadyRide = rider.ride;
 }
 static uint32_t nativeHandle(void *p, int hand) {
     return *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(p) + (hand == 1 ? 0x800 : 0x804));
@@ -1361,7 +1411,11 @@ struct GripCarry {
 };
 static GripCarry gripCarry; // Game thread only.
 static std::atomic<bool> gripCarrying{false};
-static constexpr float GripReach = .2f, ThrowBoost = 1.25f;
+// Grab: objects within GripReach of the hand, else the first one along the
+// hand's pointing ray out to GripPointReach (it then comes to the hand).
+// 0.2 m alone missed nearly every box: the reach was tighter than a box's own
+// size and boxes on the floor sit below a relaxed hand.
+static constexpr float GripReach = .35f, GripPointReach = 3.f, ThrowBoost = 1.25f;
 static bool gripCarryAuthority(void *player) {
     return hooksReady.load(std::memory_order_acquire) && hullsInRange && hullOwner && hullBody && jointPlacements &&
         deleteArray && preDeleteArray && postDeleteArray && player && local(player) &&
@@ -1554,6 +1608,7 @@ static void update(void *p) {
         advanceGeneration(s);
     }
     enabled = enabled && validTrackingEpoch(s.generation);
+    updateRideSteadying(p, rider);
     validateLabOnlineIsolation(enabled);
     s.input = input;
     const int previousHealth = s.ui.health;
@@ -1592,8 +1647,10 @@ static void update(void *p) {
             w.cancel();
     }
     float ax = input.axis[1][0];
+    // Seated, the ride turns you (its heading is the anchor's); the right stick
+    // steers or aims the ride instead (mountedLookClamp).
     bool turningAllowed = enabled && !resettingControls && !wheels[1].open &&
-        !(input.buttons[1] & Button::WheelOpen) && std::isfinite(ax) && !seatedInTurret(rider);
+        !(input.buttons[1] & Button::WheelOpen) && std::isfinite(ax) && !rider.seated();
     static LARGE_INTEGER lastTurnClock{};
     LARGE_INTEGER turnClock{}, turnFrequency{};
     QueryPerformanceCounter(&turnClock);
@@ -1694,7 +1751,30 @@ static void update(void *p) {
             reach.input = input;
             Pose hand;
             if (handWorldPose(reach, p, unsigned(h), hand)) {
-                if (const uint32_t hull = nearestCarryable(p, hand.p, GripReach)) {
+                uint32_t hull = nearestCarryable(p, hand.p, GripReach);
+                bool pointed = false;
+                if (!hull) {
+                    // Pointing: along the controller's aim ray, nearest first.
+                    Pose body;
+                    if (trackingAnchor(p, body)) {
+                        const Pose aim = worldHandTracking(body, s.origin, s.turn, input.head, input.hand[h]);
+                        const Vec3 dir = rotate(normalize(aim.q), Vec3{0, 0, -1});
+                        for (float d = GripReach; !hull && d <= GripPointReach && finite(aim); d += .25f)
+                            hull = nearestCarryable(p, aim.p + dir * d, .3f);
+                        pointed = hull != 0;
+                    }
+                }
+                if (hull && pointed) {
+                    // Grab it at its centre so it comes into the hand, not held where it lay.
+                    void *native = resolve(hull);
+                    void *body = native ? hullBody(native) : nullptr;
+                    Pose placement{};
+                    if (body) memcpy(&placement, static_cast<uint8_t *>(body) + 0x2c, sizeof(placement));
+                    const Vec3 gap = placement.p - hand.p;
+                    if (body && finite(placement)) hand.p = placement.p;
+                    log("Grip carry pointed hand=%d at %.2f m", h, std::sqrt(dot(gap, gap)));
+                }
+                if (hull) {
                     gripCarry.requestHand = h;
                     gripCarry.requestHull = hull;
                     gripCarry.requestPose = hand;
@@ -5033,8 +5113,9 @@ static bool vehicleLaserCurrent(const Snapshot &s, const Request &request,
 constexpr Vec3 UziLaserEmitter{0, -.118f, .021f};
 // Colt laser emitter (the tube under its barrel, whose lens the game's own Colt
 // laser starts from) from its shot origin, at scale 1 (V470 side view: lens
-// 12 cm behind and 8 cm below the shot origin at the 0.85 size).
-constexpr Vec3 ColtLaserEmitter{0, -.0965f, .1435f};
+// 12 cm behind and 8 cm below the shot origin at the 0.85 size; V484 rolled
+// views: 3.3 cm to the right of it). Mirrored for the left hand's Colt.
+constexpr Vec3 ColtLaserEmitter{.039f, -.0965f, .1435f};
 // Lab (SS2VR_LAB_MUZZLE_MARK=1): the shot origin of each hand's weapon, drawn as
 // a green cross through any geometry.
 static Vec3 labShotMuzzle[2];
@@ -5173,7 +5254,9 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
                 };
                 static const Vec3 uzi = labEmitter("SS2VR_LAB_UZI_EMITTER", UziLaserEmitter),
                                   colt = labEmitter("SS2VR_LAB_COLT_EMITTER", ColtLaserEmitter);
-                muzzle.p = muzzle.p + rotate(normalize(muzzle.q), (weapon == 4 ? uzi : colt) * emitterScale(uint32_t(weapon)));
+                Vec3 emitter = weapon == 4 ? uzi : colt;
+                if (weapon == 12 && h == 0) emitter.x = -emitter.x; // The left Colt is the mirrored model.
+                muzzle.p = muzzle.p + rotate(normalize(muzzle.q), emitter * emitterScale(uint32_t(weapon)));
             }
             // The same grip pose shooting() and the model placement use.
             const Pose grip = worldHandTracking(body, s.origin, s.turn, s.input.head, weaponGrip(s.input, m, weapon));
@@ -8215,13 +8298,26 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (steeringWheelHeading(look)) {
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
-            } else if (trackedHandCurrent(captured.input,snapshot.input,1) && validNativeBodyPose(aim)) {
-                quaternionEuler(&desired, aim.q);
-                desired.z = 0; // Native vehicle control look has heading/pitch, zero bank.
+            } else if (fresh(captured.input)) {
+                // Other rides (dinosaurs, hovercraft, cars without the wheel): the
+                // right stick turns the ride's look while pushed, the right hand's
+                // aim sets its pitch. Hand heading used to drive the look, and the
+                // view (the ride's heading) turned with it: forward kept turning.
+                static Vec3 rideLook{};
+                static uint32_t lookRide = 0;
+                static uint64_t lookClock = 0;
+                const uint64_t now = GetTickCount64();
+                if (lookRide != captured.rider.ride || now - lookClock > 500) { rideLook = look; lookRide = captured.rider.ride; }
+                const float dt = lookClock && now > lookClock ? std::min(.1f, float(now - lookClock) / 1000.f) : 0.f;
+                lookClock = now;
+                rideLook = advanceTurretLook(rideLook, captured.input.axis[1][0], 0, settings.smoothTurnRate, dt);
+                if (trackedHandCurrent(captured.input,snapshot.input,1) && validNativeBodyPose(aim) &&
+                    quaternionEuler(&desired, aim.q) == &desired && std::isfinite(desired.y))
+                    rideLook.y = std::clamp(desired.y, -1.4f, 1.4f);
                 void *candidateRideToken=nullptr;
-                if (std::isfinite(desired.x) && std::isfinite(desired.y) &&
+                if (std::isfinite(rideLook.x) && std::isfinite(rideLook.y) &&
                     nativeRiderCurrent(snapshot.player, captured.rider,&candidateRideToken) && resolve(brainHandle) == brain) {
-                    look = desired;
+                    look = rideLook;
                     rideToken=candidateRideToken;
                 }
             }
@@ -9586,6 +9682,9 @@ bool attach(bool headless) {
     laserEngineBase = reinterpret_cast<uintptr_t>(e);
     laserTurretVtable = reinterpret_cast<uintptr_t>(g) + 0x2b39e8;
     turretShootDirection = reinterpret_cast<uintptr_t>(g) + 0x155ce0; // CTurretPuppetEntity::GetShootDirection
+    aircraftVtables[0] = reinterpret_cast<uintptr_t>(g) + 0x2b79b0; // CAircraftPuppetEntity
+    aircraftVtables[1] = reinterpret_cast<uintptr_t>(g) + 0x2b7348; // CAircraftCharacterEntity
+    aircraftVtables[2] = reinterpret_cast<uintptr_t>(g) + 0x2b0760; // CAirBikePuppetEntity
     weaponFrustumReturn = reinterpret_cast<uintptr_t>(g) + 0x4c8e9;
     weaponInverseReturn = reinterpret_cast<uintptr_t>(g) + 0x4c915;
     weaponDepthReturn = reinterpret_cast<uintptr_t>(g) + 0x4c9a6;

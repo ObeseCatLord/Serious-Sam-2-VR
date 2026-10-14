@@ -71,16 +71,11 @@ Stats stats;
 // so a pointer cannot be reused for a different object while mapped).
 std::unordered_map<IDirect3DVertexShader9 *, IDirect3DVertexShader9 *> shaderVariants;
 std::unordered_map<IDirect3DVertexShader9 *, uint32_t> shaderTexcoords; // oT sets the original writes.
-// Water programs whose variant reads the per-eye screen mapping (water_reflection.hpp)
-// from c30..c33, set for each half around their draws.
+// Water programs whose variant looks the reflection up by each eye's reflected
+// view direction (water_reflection.hpp): eye position in c30, dome scale in c31,
+// set for each half around their draws.
 constexpr unsigned WaterConstant = 30;
 std::unordered_map<IDirect3DVertexShader9 *, bool> shaderEyeClip;
-water::Reference waterReference;
-LARGE_INTEGER waterClock{};
-uint64_t waterPass = 0, waterComputedPass = ~0ull;
-replay::ViewState waterState;
-float waterK[2][16]{};
-bool waterKValid = false;
 std::unordered_map<IDirect3DVertexDeclaration9 *, IDirect3DVertexDeclaration9 *> declarationVariants;
 
 IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s) noexcept {
@@ -602,43 +597,28 @@ bool waterDraw() noexcept {
     const auto it = engineShader ? shaderEyeClip.find(engineShader) : shaderEyeClip.end();
     return it != shaderEyeClip.end() && it->second;
 }
-// Each eye's reference-camera map for the current view, once per pass and view
-// (the reference follows the view direction between passes).
-void waterConstants() noexcept {
-    replay::ViewState state;
-    std::memcpy(state.adjusted.data(), engineAdjusted, sizeof(state.adjusted));
-    std::memcpy(state.projection.data(), engineProjection, sizeof(state.projection));
-    std::memcpy(state.view.data(), engineView, sizeof(state.view));
-    if (waterComputedPass == waterPass && state == waterState) return;
-    LARGE_INTEGER now{}, frequency{};
-    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
-    const double seconds = waterClock.QuadPart ? double(now.QuadPart - waterClock.QuadPart) / double(frequency.QuadPart) : 0.;
-    if (waterComputedPass != waterPass) { water::follow(waterReference, engineView, std::min(seconds, .25)); waterClock = now; }
-    waterComputedPass = waterPass;
-    waterState = state;
-    waterKValid = true;
-    for (unsigned i = 0; i < 2; ++i) {
-        replay::M4 k;
-        if (!water::eyeClip(state, changes[i], waterReference, k)) { waterKValid = false; break; }
-        for (unsigned j = 0; j < 16; ++j) waterK[i][j] = float(k[j]);
-    }
-}
-// Saves c30..c33 around a water draw (later programs, e.g. skinned bones,
-// expect the engine's values there).
+// Saves c30..c31 around a water draw (later programs, e.g. skinned bones,
+// expect the engine's values there) and sets each eye's position: the water
+// program's view position (c4, in its model space) plus the eye's offset.
 struct WaterConstantsScope {
     IDirect3DDevice9 *d;
-    bool active = false;
-    float saved[16]{};
+    bool active = false, eyes = false;
+    float saved[8]{}, view[4]{}, offset[2][3]{};
     WaterConstantsScope(IDirect3DDevice9 *device, bool stereo) noexcept : d(device) {
         if (!stereo || !waterDraw()) return;
-        waterConstants();
-        active = SUCCEEDED(d->GetVertexShaderConstantF(WaterConstant, saved, 4));
+        active = SUCCEEDED(d->GetVertexShaderConstantF(WaterConstant, saved, 2)) &&
+                 SUCCEEDED(d->GetVertexShaderConstantF(4, view, 1));
+        eyes = active && water::eyeOffset(engineView, changes[0], offset[0]) &&
+               water::eyeOffset(engineView, changes[1], offset[1]);
     }
     void eye(unsigned i) noexcept {
-        static const float identity[16]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-        if (active) d->SetVertexShaderConstantF(WaterConstant, waterKValid ? waterK[i & 1] : identity, 4);
+        if (!active) return;
+        const unsigned e = i & 1;
+        const float c[8]{view[0] + (eyes ? offset[e][0] : 0.f), view[1] + (eyes ? offset[e][1] : 0.f),
+                         view[2] + (eyes ? offset[e][2] : 0.f), 0, water::DomeScale, 1, 0, 0};
+        d->SetVertexShaderConstantF(WaterConstant, c, 2);
     }
-    ~WaterConstantsScope() { if (active) d->SetVertexShaderConstantF(WaterConstant, saved, 4); }
+    ~WaterConstantsScope() { if (active) d->SetVertexShaderConstantF(WaterConstant, saved, 2); }
 };
 template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo, bool shifted = false) noexcept;
 template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool instancing) noexcept;
@@ -871,7 +851,6 @@ bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, UINT width, UINT heig
     wideLayout = !regions;
     changes[0] = change[0]; changes[1] = change[1];
     recordsValid = false;
-    ++waterPass;
     eligibleIndex = 0;
     appliedWide = appliedInstances = forcedScissor = suspended = scissorApplied = false;
     appliedPixelShader = enginePixelShader;

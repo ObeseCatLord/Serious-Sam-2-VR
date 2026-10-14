@@ -347,19 +347,20 @@ int main() {
     dimOpaquePixels(rightColors, 2, makeOpaqueDimming(std::numeric_limits<float>::quiet_NaN()));
     check(rightColors[0] == 100 && rightColors[3] == 255,
           "Invalid visibility cannot blacken an unqueried world");
-    // Menu cursor: a 16:9 image pillarboxes the 4:3 menu, so the hit maps into
-    // the box (centre stays, box edges reach the menu edges, bars clamp).
+    // Menu cursor: a 16:9 band of a taller canvas maps v into the canvas (V482:
+    // 1344x754 band of 1344x1512); a band as wide as the canvas keeps u.
     {
-        const auto centre = menuCursor(.5f, .5f, 1344, 756), edge = menuCursor(.5f + .375f, .5f, 1344, 756);
+        const auto centre = menuCursor(.5f, .5f, 1344, 754, 1344, 1512);
         check(near(centre.x, 320) && near(centre.y, 240), "Menu cursor centre is the menu centre");
-        check(near(edge.x, 640) && near(edge.y, 240), "The 4:3 box edge of a 16:9 image is the menu edge");
-        const auto bar = menuCursor(.02f, 1, 1344, 756);
-        check(near(bar.x, 0) && near(bar.y, 480), "Pillarbox bars clamp to the menu edge");
-        const auto tall = menuCursor(.5f, .6f, 900, 1600); // 9:16: the box is 0.421875 of the height.
-        check(near(tall.x, 320) && near(tall.y, 240 + 480 * .1f / .421875f, .01f), "A taller image letterboxes the menu");
-        const auto same = menuCursor(.25f, .75f, 640, 480), unknown = menuCursor(.25f, .75f, 0, 0);
-        check(near(same.x, 160) && near(same.y, 360) && near(unknown.x, 160) && near(unknown.y, 360),
-              "A 4:3 or unknown image maps proportionally");
+        const auto high = menuCursor(.88f, .3f, 1344, 754, 1344, 1512);
+        check(near(high.x, 640 * .88f, .01f) && near(high.y, 480 * (.5f - .2f * (1344.f / 1512) / (1344.f / 754)), .01f),
+              "A letterboxed band maps v toward the centre");
+        const auto wide = menuCursor(.25f, .5f, 754, 1344, 1512, 1344); // Pillarboxed band.
+        check(near(wide.x, 640 * (.5f - .25f * (754.f / 1344) / (1512.f / 1344)), .01f) && near(wide.y, 240),
+              "A pillarboxed band maps u toward the centre");
+        const auto plain = menuCursor(.25f, .75f), clamped = menuCursor(-.1f, 1.2f);
+        check(near(plain.x, 160) && near(plain.y, 360) && near(clamped.x, 0) && near(clamped.y, 480),
+              "Unknown sizes map proportionally and clamp");
     }
     std::cout
         << "UI comfort, lifecycle, menu recovery, grip, laser and head fade checks passed\n";

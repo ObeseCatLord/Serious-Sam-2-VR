@@ -1152,6 +1152,45 @@ struct Host {
     XrSystemId system = XR_NULL_SYSTEM_ID;
     XrSession session = XR_NULL_HANDLE;
     XrSpace local = XR_NULL_HANDLE, viewSpace = XR_NULL_HANDLE;
+    // Levelling: holding the recentre chord (both grips + left stick click) for
+    // 2 s makes the current head orientation level. LOCAL is recreated turned by
+    // the head's pitch and roll, so a tracking frame that came back tilted
+    // (e.g. after the headset was taken off) can be put right; everything
+    // (head, hands, layers) uses that one space.
+    Quat levelCorrection{0, 0, 0, 1};
+    uint64_t recenterHeldSince = 0;
+    bool levelledThisHold = false;
+    void levelOnHeldRecenter(const Input &input) {
+        const uint64_t now = GetTickCount64();
+        if (!recenterHeld(input) || !input.focused || !input.headValid || !finite(input.head)) {
+            recenterHeldSince = 0;
+            levelledThisHold = false;
+            return;
+        }
+        if (!recenterHeldSince) recenterHeldSince = now;
+        if (levelledThisHold || now - recenterHeldSince < 2000) return;
+        levelledThisHold = true;
+        const Quat q = normalize(input.head.q);
+        const Quat tilt = normalize(multiply(q, yaw(-horizontalHeading(q)))); // head = tilt * yaw(h)
+        const Quat corrected = normalize(multiply(levelCorrection, tilt));
+        XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        info.poseInReferenceSpace.orientation = {corrected.x, corrected.y, corrected.z, corrected.w};
+        XrSpace replacement = XR_NULL_HANDLE;
+        if (XR_FAILED(api.CreateReferenceSpace(session, &info, &replacement)) || !replacement) {
+            log.write("Levelling failed: LOCAL space not recreated");
+            return;
+        }
+        api.cleanup(api.DestroySpace(local), "xrDestroySpace LOCAL (levelling)");
+        local = replacement;
+        levelCorrection = corrected;
+        if (++referenceGeneration == 0) throw std::runtime_error("Reference generation overflow");
+        invalidate();
+        char line[128];
+        std::snprintf(line, sizeof line, "View levelled: tilt %.1f degrees removed",
+                      2 * std::acos(std::fmin(1.f, std::abs(tilt.w))) * 180 / 3.14159265f);
+        log.write(line);
+    }
     XrSessionState state = XR_SESSION_STATE_UNKNOWN;
     XrSystemProperties systemProperties{XR_TYPE_SYSTEM_PROPERTIES};
     std::array<XrViewConfigurationView, 2> viewConfiguration{};
@@ -2982,6 +3021,7 @@ struct Host {
             viewsTracked = validViews;
             Input input = sample(frameState.predictedDisplayTime, views, validViews);
             if (options.open) optionsInput(input);
+            levelOnHeldRecenter(input);
             const bool recenterHeldNow = recenterHeld(input);
             recenterUi = recenterHeldNow && !recenterWasHeld;
             recenterWasHeld = recenterHeldNow;

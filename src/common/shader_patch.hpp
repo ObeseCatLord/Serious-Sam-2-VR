@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <iterator>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -30,7 +31,7 @@ struct VertexInfo {
     unsigned positionWrites = 0;
     unsigned instructions = 0;
     unsigned constants = 0;      // Highest constant register read + 1 (relative reads: 256).
-    bool eyeClip = false;        // Patched with the per-eye screen mapping (water).
+    bool eyeClip = false;        // Patched with the per-eye world-fixed reflection lookup (water).
 };
 // The texcoord output carrying the eye test (8 when the program writes all).
 inline unsigned killSet(const VertexInfo &original) {
@@ -102,13 +103,19 @@ inline bool inspect(const uint32_t *words, size_t count, VertexInfo &info) {
 
 // The water program (WaterShader_VP_mainCalc) derives its reflection texcoords
 // from the clip-space position it also writes to oPos: `mad rX.xy, -rN.xz,
-// c3.x, rX` (ripple) followed by `mov rX.y, -rX.y`. In single pass that position
-// is the centre camera's, so both eyes looked the reflection up at the same
-// place, painted on the water. Ahead of the mad the patch replaces rX by
-// K . rX, K the per-eye screen mapping in c<eyeClip>..c<eyeClip+3>, set for each
-// half. Returns the word index of the mad, or 0.
-inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg) {
+// c3.x, rX` (ripple) followed by `mov rX.y, -rX.y`. That screen mapping cannot
+// work for two eyes (in single pass it was the centre camera's: the image lay
+// on the water and turned with the head). Ahead of the mad the patch puts a
+// world-fixed lookup in rX instead: the view ray from the eye (c<eyeClip>.xyz,
+// set for each half) to the vertex (rP, the position the m4x4 projected),
+// reflected about the water normal rN, mapped like a sky dome:
+// (R.x, R.z) / (1 + |R.y|) * c<eyeClip+1>.x, with z = w = 1. The game's own
+// ripple, flip and bias then apply as before. Returns the word index of the
+// mad (and its registers), or 0.
+inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg, unsigned *normal = nullptr,
+                          unsigned *position = nullptr) {
     using namespace detail;
+    int lastProjection = -1;
     for (size_t i = 1; i + 8 < count;) {
         const uint32_t token = words[i], opcode = token & 0xffffu;
         if (token == 0x0000ffffu) break;
@@ -116,13 +123,18 @@ inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg) {
         const int n = operands(opcode);
         if (n < 0) break;
         const uint32_t *op = words + i + 1;
+        if (opcode == 0x14 && regType(op[0]) == Temp && regType(op[1]) == Temp) // m4x4 rX, rP, c#
+            lastProjection = int(i);
         if (opcode == 0x04 && regType(op[0]) == Temp && ((op[0] >> 16) & 0xfu) == 0x3 &&
             regType(op[1]) == Temp && ((op[1] >> 24) & 0xfu) == 1 && regType(op[2]) == Const &&
             regNum(op[2]) == 3 && ((op[2] >> 16) & 0xffu) == 0x00 && regType(op[3]) == Temp &&
             regNum(op[3]) == regNum(op[0]) && words[i + 5] == 0x01u &&
             words[i + 6] == dst(Temp, regNum(op[0]), 0x2) &&
             words[i + 7] == (src(Temp, regNum(op[0]), 0x55u) | (1u << 24))) {
+            if (lastProjection < 0 || regNum(words[size_t(lastProjection) + 1]) != regNum(op[0])) return 0;
             reg = regNum(op[0]);
+            if (normal) *normal = regNum(op[1]);
+            if (position) *position = regNum(words[size_t(lastProjection) + 2]);
             return i;
         }
         i += 1 + size_t(n);
@@ -140,9 +152,9 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
     if (info.inputsDeclared & stereoInputs) return false;
     if (info.temps > 11) return false; // vs_1_1 has r0..r11; r11 holds the original position.
     const unsigned position = 11;
-    unsigned clipReg = 0;
-    size_t clipAt = eyeClip ? eyeClipSite(words, count, clipReg) : 0;
-    if (clipAt && (info.temps > 10 || info.constants > eyeClip || eyeClip + 4 > 96)) clipAt = 0; // r10 and c<eyeClip..+3> must be free.
+    unsigned clipReg = 0, normalReg = 0, positionReg = 0;
+    size_t clipAt = eyeClip ? eyeClipSite(words, count, clipReg, &normalReg, &positionReg) : 0;
+    if (clipAt && (info.temps > 9 || info.constants > eyeClip || eyeClip + 2 > 96)) clipAt = 0; // r9, r10 and c<eyeClip..+1> must be free.
     info.eyeClip = clipAt != 0;
     std::vector<uint32_t> result;
     result.reserve(count + 64);
@@ -164,15 +176,23 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
         }
         const int n = operands(opcode);
         if (clipAt && i == clipAt) {
-            for (unsigned row = 0; row < 4; ++row) { // dp4 r10.<row>, rX, c<eyeClip+row>
-                result.push_back(0x09u);
-                result.push_back(dst(Temp, 10, 1u << row));
-                result.push_back(src(Temp, clipReg));
-                result.push_back(src(Const, eyeClip + row));
-            }
-            result.push_back(0x01u); // mov rX, r10
-            result.push_back(dst(Temp, clipReg, 0xf));
-            result.push_back(src(Temp, 10));
+            const uint32_t neg = 1u << 24, e = eyeClip, k = eyeClip + 1;
+            const uint32_t dome[] = {
+                0x03u, dst(Temp, 9, 0x7), src(Temp, positionReg), src(Const, e),              // sub r9.xyz, rP, cE
+                0x08u, dst(Temp, 9, 0x8), src(Temp, 9), src(Temp, 9),                        // dp3 r9.w, r9, r9
+                0x07u, dst(Temp, 9, 0x8), src(Temp, 9, 0xffu),                                // rsq r9.w, r9.w
+                0x05u, dst(Temp, 9, 0x7), src(Temp, 9), src(Temp, 9, 0xffu),                  // mul r9.xyz, r9, r9.w  (V)
+                0x08u, dst(Temp, 10, 0x1), src(Temp, 9), src(Temp, normalReg),                // dp3 r10.x, V, N
+                0x02u, dst(Temp, 10, 0x1), src(Temp, 10, 0x00u), src(Temp, 10, 0x00u),        // add r10.x, r10.x, r10.x
+                0x04u, dst(Temp, 9, 0x7), src(Temp, 10, 0x00u) | neg, src(Temp, normalReg), src(Temp, 9), // R = V - 2(V.N)N
+                0x0bu, dst(Temp, 10, 0x2), src(Temp, 9, 0x55u), src(Temp, 9, 0x55u) | neg,    // max r10.y, R.y, -R.y
+                0x02u, dst(Temp, 10, 0x2), src(Temp, 10, 0x55u), src(Const, k, 0x55u),        // add r10.y, |R.y|, 1
+                0x06u, dst(Temp, 10, 0x2), src(Temp, 10, 0x55u),                              // rcp r10.y
+                0x05u, dst(Temp, clipReg, 0x3), src(Temp, 9, 0xa8u), src(Temp, 10, 0x55u),    // mul rX.xy, R.xz, r10.y
+                0x05u, dst(Temp, clipReg, 0x3), src(Temp, clipReg), src(Const, k, 0x00u),     // mul rX.xy, rX, cK.x
+                0x01u, dst(Temp, clipReg, 0xc), src(Const, k, 0x55u),                         // mov rX.zw, cK.y (1)
+            };
+            result.insert(result.end(), std::begin(dome), std::end(dome));
         }
         result.push_back(token);
         for (int k = 0; k < n; ++k) {

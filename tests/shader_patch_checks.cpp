@@ -41,46 +41,49 @@ int main() {
     std::vector<uint32_t> temps = program;
     temps.insert(temps.end() - 1, {0x01, dst(Temp, 11, 0xf), src(Input, 0)});
     assert(!patchVertexShader(temps.data(), temps.size(), out));
-    // Water-like program: m4x4 r2, v0, c7; mov oPos, r2; mad r2.xy, -r5.xz, c3.x, r2;
-    // mov r2.y, -r2.y; mov oT2, r2. With eyeClip the clip position the texcoords are
-    // derived from becomes K . r2 (K in c30..c33) ahead of the mad, after oPos took r2.
+    // Water-like program: mov r4, v0; mov r5, v0; m4x4 r2, r4, c7; mov oPos, r2;
+    // mad r2.xy, -r5.xz, c3.x, r2; mov r2.y, -r2.y; mov oT2, r2. With eyeClip the
+    // reflection lookup in r2 is replaced ahead of the mad by the world-fixed
+    // dome lookup (eye in c30, scale/1 in c31), after oPos took r2.
     {
         const std::vector<uint32_t> water{
             VsVersion11,
             0x1f, 0x80000000u | 0u, dst(Input, 0, 0xf),
-            0x14, dst(Temp, 2, 0xf), src(Input, 0), src(Const, 7),
+            0x01, dst(Temp, 4, 0xf), src(Input, 0),
+            0x01, dst(Temp, 5, 0xf), src(Input, 0),
+            0x14, dst(Temp, 2, 0xf), src(Temp, 4), src(Const, 7),
             0x01, dst(RastOut, 0, 0xf), src(Temp, 2),
             0x04, dst(Temp, 2, 0x3), src(Temp, 5, 0x08u) | (1u << 24), src(Const, 3, 0x00u), src(Temp, 2),
             0x01, dst(Temp, 2, 0x2), src(Temp, 2, 0x55u) | (1u << 24),
             0x01, dst(TexCrdOut, 2, 0xf), src(Temp, 2),
             0x0000ffffu};
-        unsigned reg = 0;
-        assert(eyeClipSite(water.data(), water.size(), reg) == 11 && reg == 2);
+        unsigned reg = 0, normal = 0, position = 0;
+        assert(eyeClipSite(water.data(), water.size(), reg, &normal, &position) == 17 && reg == 2 && normal == 5 &&
+               position == 4);
         VertexInfo w;
         assert(patchVertexShader(water.data(), water.size(), out, &w, 30) && w.eyeClip);
         size_t first = 0, mad = 0;
         for (size_t i = 0; i + 3 < out.size(); ++i) {
-            if (!first && out[i] == 0x09 && out[i + 1] == dst(Temp, 10, 0x1)) {
-                assert(out[i + 2] == src(Temp, 2) && out[i + 3] == src(Const, 30));
+            if (!first && out[i] == 0x03 && out[i + 1] == dst(Temp, 9, 0x7)) {
+                assert(out[i + 2] == src(Temp, 4) && out[i + 3] == src(Const, 30));
                 first = i;
             }
             if (!mad && out[i] == 0x04 && out[i + 1] == dst(Temp, 2, 0x3)) mad = i;
         }
-        assert(first && mad == first + 16 + 3 && out[mad - 3] == 0x01 && out[mad - 2] == dst(Temp, 2, 0xf) &&
-               out[mad - 1] == src(Temp, 10));
-        // Before the mad, oPos already took r2 (now r11): the eye's position is unchanged.
+        assert(first && mad > first && out[mad - 3] == 0x01 && out[mad - 2] == dst(Temp, 2, 0xc) &&
+               out[mad - 1] == src(Const, 31, 0x55u));
         bool redirected = false;
         for (size_t i = 0; i + 2 < first; ++i)
             if (out[i] == 0x01 && out[i + 1] == dst(Temp, 11, 0xf) && out[i + 2] == src(Temp, 2)) redirected = true;
         assert(redirected);
+        VertexInfo patched2;
+        assert(inspect(out.data(), out.size(), patched2) && patched2.temps == 12);
         VertexInfo plain;
         assert(patchVertexShader(water.data(), water.size(), out, &plain) && !plain.eyeClip);
-        for (size_t i = 0; i + 1 < out.size(); ++i) assert(!(out[i] == 0x09 && out[i + 1] == dst(Temp, 10, 0x1)));
         // A program reading c30 or above keeps the plain variant.
         std::vector<uint32_t> busyConstants = water;
         busyConstants.insert(busyConstants.end() - 1, {0x01, dst(TexCrdOut, 3, 0xf), src(Const, 31)});
         assert(patchVertexShader(busyConstants.data(), busyConstants.size(), out, &w, 30) && !w.eyeClip);
-        // An ordinary program has no water site.
         assert(!eyeClipSite(program.data(), program.size(), reg));
     }
     // Optional private check: every dumped engine vertex program patches.

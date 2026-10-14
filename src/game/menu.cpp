@@ -3,6 +3,8 @@
 #include "game.hpp"
 #include <cstring>
 #include <limits>
+#include <vector>
+#include <cstdio>
 
 namespace ss2vr::game::menus {
 namespace {
@@ -105,7 +107,7 @@ static void __cdecl poll() {
     bool sourceEligible = false;
     uint32_t publishedGeneration = 0;
     uint64_t menuSequence = 0;
-    uint32_t imageWidth = 0, imageHeight = 0;
+    uint32_t imageWidth = 0, imageHeight = 0, canvasWidth = 0, canvasHeight = 0;
     {
         Lock lock(channel);
         if (!lock) {
@@ -122,6 +124,8 @@ static void __cdecl poll() {
         menuSequence = channel.shared->menu.sequence;
         imageWidth = channel.shared->menu.width;
         imageHeight = channel.shared->menu.height;
+        canvasWidth = channel.shared->width;
+        canvasHeight = channel.shared->height;
         sourceEligible = menuPointerEligible(pointer, input, menuSequence, publishedGeneration, GetTickCount64());
     }
     uintptr_t menu = current();
@@ -138,6 +142,32 @@ static void __cdecl poll() {
         reference = input.reference;
         pointerGeneration = pointer.interactionGeneration;
         actionGeneration = pointer.primaryInputGeneration;
+    }
+    // Lab (SS2VR_LAB_MENU_CURSOR=u,v;u,v;...): the pointer at each listed hit of
+    // the menu image in turn (3 s each), whatever the controllers do, to see
+    // where the game draws its cursor for a known hit (with SS2VR_LAB_MENU_DUMP).
+    static const std::vector<std::pair<float, float>> labPoints = [] {
+        std::vector<std::pair<float, float>> points;
+        char v[256]{};
+        if (GetEnvironmentVariableA("SS2VR_LAB_MENU_CURSOR", v, sizeof v))
+            for (char *at = v; *at;) {
+                float u = 0, w = 0;
+                if (std::sscanf(at, "%f,%f", &u, &w) == 2) points.push_back({u, w});
+                char *next = std::strchr(at, ';');
+                if (!next) break;
+                at = next + 1;
+            }
+        return points;
+    }();
+    if (!labPoints.empty() && menu && nativeReady) {
+        const auto &point = labPoints[(GetTickCount64() / 3000) % labPoints.size()];
+        pointer.u = point.first; pointer.v = point.second;
+        allowed = true;
+        static uint64_t logged = 0;
+        if (GetTickCount64() - logged > 1000) {
+            logged = GetTickCount64();
+            log("Lab menu cursor u=%.3f v=%.3f image=%ux%u", point.first, point.second, imageWidth, imageHeight);
+        }
     }
     float sensitivity = readFloat(base + 0x3fe200);
     float x = readFloat(base + 0x3fe20c), y = readFloat(base + 0x3fe210);
@@ -165,11 +195,7 @@ static void __cdecl poll() {
         return;
     // Native Sam2Game cursor motion integrates deltas in a 640x480 menu space.
     // Supply the delta to its own dispatcher, not direct cursor/global writes.
-    // That space is the 4:3 box the menu draws in (CDrawPort::ForceAspectRatio
-    // 4/3, pillarboxed on a wider image, letterboxed on a taller one), not the
-    // whole image the pointer hits: map the hit into the box so the native
-    // cursor sits exactly under the pointer.
-    const MenuCursor target = menuCursor(pointer.u, pointer.v, imageWidth, imageHeight);
+    const MenuCursor target = menuCursor(pointer.u, pointer.v, imageWidth, imageHeight, canvasWidth, canvasHeight);
     motion((target.x - x) / sensitivity, (target.y - y) / sensitivity);
     if (held && !down) {
         press(0x1f, 0);
