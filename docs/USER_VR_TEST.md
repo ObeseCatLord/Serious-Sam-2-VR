@@ -23,6 +23,17 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the fifth headset test (2026-10-14, night)
+
+- Sideways or tilted world: the mod now uses the headset system's fixed play
+  space (STAGE) instead of a space the runtime may set from wherever the
+  headset was lying when the game started or tracking came back.
+- Recentre: click both sticks together (or both grips + left stick click);
+  keep holding 2 s while looking straight ahead to also level the view. The
+  grenade is now taken when you release the right stick click.
+- Fewer stutters: a frame with one bad layer pose is no longer thrown away
+  whole, and a newly arrived frame is not hidden while the channel is busy.
+
 ## Changed after the fourth headset test (2026-10-14, evening)
 
 - Riding (dinosaur and every other ride): the view no longer bobs or pitches
@@ -214,4 +225,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `566cf54`, version `0.2.11-dev.6cf5df095aad` (2026-10-14).
+Installed candidate: commit `9d76858`, version `0.2.11-dev.adeb00516073` (2026-10-14).
