@@ -23,7 +23,7 @@ struct WeaponGrip {
     Vec3 reference;
 };
 inline constexpr WeaponGrip WeaponGrips[] = {
-    {0, {0.f, .11f, .02f}},          // Circular saw: top trigger handle (V111 side view)
+    {0, {0.f, .035f, .18f}},         // Circular saw: rear loop handle (V470 side view)
     {1, Id1ModelHandleReference},     // Zap gun
     {2, {0.f, -.030f, .097f}},       // Auto shotgun: rear pistol grip (V212 side view)
     {3, {-.0379f, .025f, -.035f}},   // Double shotgun: stock wrist behind the hammers (V212)
@@ -50,10 +50,14 @@ inline constexpr WeaponGrip WeaponGrips[] = {
 // length and depth against the revolver grip). Saw, double shotgun, cannon and
 // flamer have no comparable grip and take the handless average (x1.26).
 inline constexpr float RevolverDisplayScale = 1.49f;
+// Every weapon shown 15% smaller than the matched sizes above (user, after the
+// third headset test: guns looked too big). Offsets measured at the matched
+// size (muzzle and laser emitters) scale by the same factor.
+inline constexpr float WeaponSizeFactor = .85f;
 inline constexpr float WeaponScalePercentOfRevolver[WeaponCount] = {
     83, 262, 112, 128, 268, 89, 86, 93, 141, 87, 74, 130, 100, 83, 67, 102, 101};
 inline constexpr float WeaponDisplayScales[WeaponCount] = {
-#define SS2VR_SCALE(i) RevolverDisplayScale * WeaponScalePercentOfRevolver[i] / 100
+#define SS2VR_SCALE(i) RevolverDisplayScale * WeaponSizeFactor * WeaponScalePercentOfRevolver[i] / 100
     SS2VR_SCALE(0), SS2VR_SCALE(1), SS2VR_SCALE(2), SS2VR_SCALE(3), SS2VR_SCALE(4), SS2VR_SCALE(5),
     SS2VR_SCALE(6), SS2VR_SCALE(7), SS2VR_SCALE(8), SS2VR_SCALE(9), SS2VR_SCALE(10), SS2VR_SCALE(11),
     SS2VR_SCALE(12), SS2VR_SCALE(13), SS2VR_SCALE(14), SS2VR_SCALE(15), SS2VR_SCALE(16)};

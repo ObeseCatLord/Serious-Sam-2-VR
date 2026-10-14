@@ -1215,9 +1215,18 @@ template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVET
         NativeUiProjection projected[2];
         for (unsigned i=0;i<2;++i) {
             if (uiFrame.fade) {
+                // A fade fills its whole viewport; in each eye it covers the whole
+                // view (full viewport, no scissor, no depth below). A fade drawn in
+                // a smaller viewport or with a scissor (the game's own drawport)
+                // dropped every pair it touched, which showed as flicker.
                 const auto &v=uiDraw.viewport;
-                if (v.X || v.Y || v.Width!=uiFrame.request.width || v.Height!=uiFrame.request.height ||
-                    v.MinZ!=0 || v.MaxZ!=1 || uiDraw.state[2]) { nativeUiFault(); return; }
+                if (i==0 && (v.X || v.Y || v.Width!=uiFrame.request.width || v.Height!=uiFrame.request.height ||
+                             uiDraw.state[2])) {
+                    static unsigned logged=0;
+                    if (logged++<8)
+                        log("Native UI fade viewport=%lu,%lu %lux%lu scissor=%lu eye=%ux%u drawn full-field",
+                            v.X,v.Y,v.Width,v.Height,uiDraw.state[2],uiFrame.request.width,uiFrame.request.height);
+                }
                 projected[i].constants = uiDraw.constants;
             } else {
                 const auto &v=uiDraw.viewport;
@@ -1226,7 +1235,7 @@ template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVET
                 if (!nativeUiProjection(uiDraw.constants,uiFrame.projection[i],uiFrame.panel[i],
                     uiFrame.request.uiWidth,uiFrame.request.uiHeight,uiFrame.request.width,
                     uiFrame.request.height,vp,uiDraw.state[2]!=0,{r.left,r.top,r.right,r.bottom},projected[i])) {
-                    nativeUiFault(); return;
+                    nativeUiFault("ui-projection"); return;
                 }
             }
         }
@@ -1246,7 +1255,7 @@ template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVET
             if (!uiFrame.fade)
                 for (unsigned j=0;j<6;++j) ok = SUCCEEDED(d->SetClipPlane(j,projected[i].planes[j].data())) && ok;
             ok = SUCCEEDED(d->SetRenderState(D3DRS_CLIPPLANEENABLE,uiFrame.fade ? 0 : 0x3f)) && ok;
-            if (!ok || FAILED(call()) || generation != graphicsResourceGeneration()) { nativeUiFault(); break; }
+            if (!ok || FAILED(call()) || generation != graphicsResourceGeneration()) { nativeUiFault("ui-eye-draw"); break; }
         }
         uiBypass = false;
     }, [&](bool aborted) noexcept {

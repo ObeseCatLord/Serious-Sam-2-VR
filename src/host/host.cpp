@@ -2772,6 +2772,29 @@ struct Host {
             if (!menuChain.upload(context.p, menuSourcePixels.data()))
                 return;
             menuSequence = sequence;
+            // Lab (SS2VR_LAB_MENU_DUMP=1): the menu image and where the pointer hits
+            // it, once a second, to compare the game's own cursor with the hit.
+            static const bool dump = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_MENU_DUMP", v, 2) == 1 && v[0] == L'1'; }();
+            static unsigned dumps = 0;
+            static uint64_t lastDump = 0;
+            if (dump && hit.valid && dumps < 16 && GetTickCount64() - lastDump > 1000) {
+                lastDump = GetTickCount64();
+                wchar_t name[64];
+                std::swprintf(name, 64, L"menu-%u-u%03d-v%03d.ppm", dumps++, int(hit.u * 1000), int(hit.v * 1000));
+                if (FILE *f = _wfopen((settingsFile.substr(0, settingsFile.find_last_of(L"\\/") + 1) + name).c_str(), L"wb")) {
+                    std::fprintf(f, "P6\n%u %u\n255\n", width, height);
+                    for (size_t i = 0; i < size_t(width) * height; ++i) {
+                        const uint8_t rgb[3]{menuSourcePixels[i * 4 + 2], menuSourcePixels[i * 4 + 1], menuSourcePixels[i * 4]};
+                        std::fwrite(rgb, 1, 3, f);
+                    }
+                    std::fclose(f);
+                }
+                char line[256];
+                const Pose &a = input.hand[hand < 2 ? hand : 1];
+                std::snprintf(line, sizeof line, "Lab menu dump %u size=%ux%u u=%.4f v=%.4f hand=%u aim=%.3f,%.3f,%.3f q=%.3f,%.3f,%.3f,%.3f",
+                              dumps - 1, width, height, hit.u, hit.v, hand, a.p.x, a.p.y, a.p.z, a.q.x, a.q.y, a.q.z, a.q.w);
+                log.write(line);
+            }
         }
         cursorX = x;
         cursorY = y;

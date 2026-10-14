@@ -128,6 +128,21 @@ inline bool menuPointerEligible(const MenuPointer &pointer, const Input &input, 
            pointer.trigger <= 1 && std::isfinite(pointer.u) && std::isfinite(pointer.v) && pointer.u >= 0 &&
            pointer.u <= 1 && pointer.v >= 0 && pointer.v <= 1;
 }
+// The native menu cursor position (640x480 menu space) under a pointer hit at
+// (u, v) of the published menu image. Menus draw in a centred 4:3 box of that
+// image (CDrawPort::ForceAspectRatio), so the hit is mapped into the box and
+// clamped to it; an unknown image size keeps the plain proportional mapping.
+struct MenuCursor { float x, y; };
+inline MenuCursor menuCursor(float u, float v, uint32_t width, uint32_t height) {
+    float sx = 1, sy = 1;
+    if (width && height) {
+        const float aspect = float(width) / float(height), box = 4.f / 3.f;
+        if (aspect > box) sx = aspect / box;
+        else sy = box / aspect;
+    }
+    const auto clamp01 = [](float t) { return t < 0 ? 0.f : t > 1 ? 1.f : t; };
+    return {640.f * clamp01(.5f + (u - .5f) * sx), 480.f * clamp01(.5f + (v - .5f) * sy)};
+}
 inline void applyRecenterChord(Input &input, bool clicked) {
     if (input.focused && (input.buttons[0] & Wheel) && (input.buttons[1] & Wheel) && clicked) {
         input.buttons[0] = (input.buttons[0] & ~Sprint) | Recenter;

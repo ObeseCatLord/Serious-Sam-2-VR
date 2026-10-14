@@ -347,6 +347,20 @@ int main() {
     dimOpaquePixels(rightColors, 2, makeOpaqueDimming(std::numeric_limits<float>::quiet_NaN()));
     check(rightColors[0] == 100 && rightColors[3] == 255,
           "Invalid visibility cannot blacken an unqueried world");
+    // Menu cursor: a 16:9 image pillarboxes the 4:3 menu, so the hit maps into
+    // the box (centre stays, box edges reach the menu edges, bars clamp).
+    {
+        const auto centre = menuCursor(.5f, .5f, 1344, 756), edge = menuCursor(.5f + .375f, .5f, 1344, 756);
+        check(near(centre.x, 320) && near(centre.y, 240), "Menu cursor centre is the menu centre");
+        check(near(edge.x, 640) && near(edge.y, 240), "The 4:3 box edge of a 16:9 image is the menu edge");
+        const auto bar = menuCursor(.02f, 1, 1344, 756);
+        check(near(bar.x, 0) && near(bar.y, 480), "Pillarbox bars clamp to the menu edge");
+        const auto tall = menuCursor(.5f, .6f, 900, 1600); // 9:16: the box is 0.421875 of the height.
+        check(near(tall.x, 320) && near(tall.y, 240 + 480 * .1f / .421875f, .01f), "A taller image letterboxes the menu");
+        const auto same = menuCursor(.25f, .75f, 640, 480), unknown = menuCursor(.25f, .75f, 0, 0);
+        check(near(same.x, 160) && near(same.y, 360) && near(unknown.x, 160) && near(unknown.y, 360),
+              "A 4:3 or unknown image maps proportionally");
+    }
     std::cout
         << "UI comfort, lifecycle, menu recovery, grip, laser and head fade checks passed\n";
 }

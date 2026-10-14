@@ -2,6 +2,7 @@
 #include "single_pass.hpp"
 #include "common/turret_look.hpp"
 #include "common/two_hand.hpp"
+#include "common/grenade_throw.hpp"
 #include "common/controls.hpp"
 #include "common/lab_preparation.hpp"
 #include "common/ride_control_observation.hpp"
@@ -192,7 +193,7 @@ static GfxBindArray *bindVertexArray = nullptr;
 static GfxDrawVertices *drawVertices = nullptr;
 static void **currentCanvas = nullptr;
 static uintptr_t allowedRayReturn = 0;
-static uintptr_t laserEngineBase = 0, laserTurretVtable = 0;
+static uintptr_t laserEngineBase = 0, laserTurretVtable = 0, turretShootDirection = 0;
 using ModelInstanceGet = void *(__thiscall *)(void *);
 using AttachmentGet = int(__cdecl *)(void *, uint32_t, Matrix34 &);
 using AttachmentIdent = uint32_t *(__thiscall *)(void *, uint32_t *);
@@ -336,13 +337,20 @@ static uintptr_t weaponFrustumReturn = 0, weaponInverseReturn = 0, weaponDepthRe
 static DepthRange expectedDepthRange = nullptr;
 static ProjectionSet expectedProjectionSet = nullptr;
 static HandlePointer resolve = nullptr;
-// Seated in a turret (CTurretPuppetEntity): the right stick aims it as the
-// mouse does on the desktop, instead of turning the view.
+// Seated in a turret: the right stick aims it as the mouse does on the
+// desktop, instead of turning the view. Turrets are CTurretPuppetEntity,
+// CTurretCharacterEntity and CAutoTurretPuppetEntity; they share the turret
+// GetShootDirection (vtable+0x5A4), which no other ride class uses. Matching
+// only the first class left the others on hand aim, which turned the turret
+// and with it the frame the hand is measured in: it spun on by itself.
 static bool seatedInTurret(const RiderIdentity &rider) {
-    if (!rider.seated() || !laserTurretVtable) return false;
+    if (!rider.seated() || !turretShootDirection) return false;
     void *ride = resolve(rider.ride);
-    uint32_t table = 0;
-    return ride && readableMemory(ride, 4) && (std::memcpy(&table, ride, 4), table == laserTurretVtable);
+    uint32_t table = 0, shoot = 0;
+    if (!ride || !readableMemory(ride, 4)) return false;
+    std::memcpy(&table, ride, 4);
+    const auto *slot = reinterpret_cast<const void *>(uintptr_t(table) + 0x5a4);
+    return table && readableMemory(slot, 4) && (std::memcpy(&shoot, slot, 4), shoot == turretShootDirection);
 }
 static PointerHandle pointerHandle = nullptr;
 static IntThis isLocal = nullptr, isDual = nullptr, isNetricsa = nullptr, health = nullptr, armor = nullptr;
@@ -1223,6 +1231,16 @@ static Pose weaponGrip(const Input &input, unsigned hand, int weapon) {
     if (hold.holder != int(hand) || !input.handValid[freeHand] || !finite(input.hand[freeHand])) return grip;
     return twoHandAim(grip, hold.grabbed, weaponTracking(input, freeHand).p);
 }
+// Immersive hand grenade (common/grenade_throw.hpp). The input poll owns the
+// state; the eye render reads which controller shows a grenade, and the throw's
+// view-origin query (sim thread) takes the launch and reports it back.
+static GrenadeThrow grenadeThrow;
+static std::atomic<int> grenadeShownHand{-1};
+static std::atomic<unsigned> grenadeLaunchHand{0};
+static std::atomic<bool> grenadeLaunching{false}, grenadeTaken{false};
+using AmmoQuantity = int32_t(__thiscall *)(void *, int);
+static AmmoQuantity grenadeAmmoQuantity = nullptr; // CPlayerInventory::GetAmmoQuantity
+constexpr int HandGrenadeAmmo = 4;                 // AmmoIndex the native throw drains
 static int handOf(void *weapon, const Snapshot &s) {
     if (!s.rider.handheld() || !nativeRiderCurrent(s.player, s.rider))
         return -1;
@@ -1614,7 +1632,8 @@ static void update(void *p) {
         TwoHandHold next;
         bool grip[2]{};
         for (unsigned h = 0; h < 2; ++h)
-            grip[h] = enabled && input.handValid[h] && finite(input.hand[h]) && (input.buttons[h] & Wheel) && !wheels[h].open;
+            grip[h] = enabled && input.handValid[h] && finite(input.hand[h]) && (input.buttons[h] & Wheel) && !wheels[h].open &&
+                !(grenadeThrow.holding() && grenadeThrow.hand == h);
         if (holder >= 0 && controllerTracked(input, unsigned(holder))) {
             const unsigned freeHand = 1u - unsigned(holder);
             if (grip[freeHand] && current.holder == holder && current.handle == s.handle[slot])
@@ -1667,7 +1686,8 @@ static void update(void *p) {
         orderWheelWeapons(ui);
         bool valid = enabled && !resettingControls && input.handValid[h] && finite(input.hand[h]);
         bool wheelAllowed = valid && rider.handheld() && !(input.blockedWheels & (1u << h));
-        const bool gripDown = valid && (input.buttons[h] & Wheel) && !twoHandGrip[h];
+        const bool gripDown = valid && (input.buttons[h] & Wheel) && !twoHandGrip[h] &&
+            !(grenadeThrow.holding() && grenadeThrow.hand == unsigned(h)); // A hand holding a grenade does not grab.
         if (gripDown && !gripCarry.gripDown[h] && rider.handheld() && gripCarry.hand < 0 &&
             gripCarry.requestHand < 0 && !wheels[h].open && gripCarryAuthority(p)) {
             Snapshot reach = s;
@@ -1794,6 +1814,9 @@ static void update(void *p) {
             s.fire[n] = s.fire[m];
             s.fire[m] = false;
         }
+    // The hand holding a grenade has put its weapon away: it does not fire.
+    for (unsigned n = 0; n < 2 && grenadeThrow.holding(); ++n)
+        if (mountHand(s, n) == grenadeThrow.hand) s.fire[n] = false;
     // Use existing dual-wield policy. Retry while native weapons cannot yet transition.
     static const char *lastWeaponAction = "start";
     // Dual wielding is switched on once per player (each hand its own weapon).
@@ -1874,7 +1897,41 @@ static void update(void *p) {
     // Left stick click sprints; the right one zooms a sniper (above) and
     // otherwise throws a hand grenade.
     s.sprint = enabled && !resettingControls && (leftContextual & Button::Sprint);
-    s.grenade = enabled && !resettingControls && rider.handheld() && (rightContextual & Button::Sprint);
+    {
+        // The right stick click takes a grenade into the off hand (the hand
+        // without the lone weapon, else the left) or puts it away; a throwing
+        // motion of that hand throws it (the native throw, plcmdTertFire, aimed
+        // in playerViewOrigin).
+        static bool previousButton = false;
+        const bool button = enabled && !resettingControls && rider.handheld() && (rightContextual & Button::Sprint);
+        const bool pressed = button && !previousButton;
+        previousButton = button;
+        unsigned offHand = 0;
+        if (rider.handheld() && !aliased(s) && (s.handle[0] != 0) != (s.handle[1] != 0))
+            offHand = 1u - mountHand(s, s.handle[0] ? 0u : 1u);
+        const int32_t grenades = grenadeAmmoQuantity ? grenadeAmmoQuantity(static_cast<uint8_t *>(p) + 0x8f8,
+                                                                               HandGrenadeAmmo) : 1;
+        if (!enabled || resettingControls || !rider.handheld() || wheels[0].open || wheels[1].open)
+            grenadeThrow.clear();
+        else if (pressed && (grenades > 0 || grenadeThrow.holding()))
+            grenadeThrow.press(offHand);
+        if (grenadeTaken.exchange(false)) grenadeThrow.thrown();
+        const unsigned g = grenadeThrow.hand;
+        const Vec3 forward = rotate(normalize(input.head.q), Vec3{0, 0, -1});
+        if (grenadeThrow.update(controllerTracked(input, g), weaponTracking(input, g).p, input.tickMs, forward))
+            log("Grenade throw motion hand=%u grenades=%d", g, grenades);
+        const bool launching = grenadeThrow.state == GrenadeThrow::State::Launching;
+        grenadeLaunchHand = g;
+        grenadeLaunching = launching;
+        grenadeShownHand = grenadeThrow.state == GrenadeThrow::State::Held ? int(g) : -1;
+        s.grenade = launching;
+        static GrenadeThrow::State previousState = GrenadeThrow::State::Idle;
+        if (grenadeThrow.state != previousState) {
+            static unsigned traced = 0;
+            if (traced++ < 120) log("Grenade state=%u hand=%u grenades=%d", unsigned(grenadeThrow.state), g, grenades);
+            previousState = grenadeThrow.state;
+        }
+    }
     lastButtons[0] = input.buttons[0];
     lastButtons[1] = input.buttons[1];
     if (!singlePlayer()) {
@@ -3793,6 +3850,7 @@ static void freezeLasers(const Request &request);
 static void drawLasers();
 static void drawSteeringWheel();
 static void drawWeaponWheels();
+static void drawHeldGrenade();
 // Diagnostic: time spent executing the root view's collected commands, per eye
 // (the rest of an eye render is scene collection, sorting and setup).
 static double rootExecuteSeconds[2]{};
@@ -3830,6 +3888,7 @@ static void __fastcall viewExecute(void *command, void *) {
             drawSteeringWheel();
             QueryPerformanceCounter(&sectionStart);
             drawWeaponWheels();
+            drawHeldGrenade();
             notePerfSection(2, sectionStart);
         }
     }, [&](bool aborted) noexcept {
@@ -4107,7 +4166,7 @@ static Pose *__fastcall camera(void *p, void *, Pose *out) {
 // Use near a turret found no seat. Those two callers see the tracked head.
 using ViewOrigin = Pose *(__thiscall *)(void *, Pose *, int);
 static ViewOrigin originalViewOrigin = nullptr;
-static uintptr_t boardingSeatReturn = 0, useSeatReturn = 0;
+static uintptr_t boardingSeatReturn = 0, useSeatReturn = 0, grenadeViewReturn = 0;
 // Lab (SS2VR_LAB_TURRET=1): boarding sees a view origin just in front of the
 // world's first turret, looking back at it, so Use boards it from anywhere
 // (the lab cannot walk to one). The turret is found in the world info's puppet
@@ -4175,6 +4234,43 @@ static Pose *__fastcall playerViewOrigin(void *p, void *, Pose *out, int purpose
     const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 #endif
     originalViewOrigin(p, out, purpose);
+    if (caller == grenadeViewReturn) {
+        // The hand-grenade throw (after its cooldown and ammo checks) takes its
+        // start and direction from here: start at the grenade in the off hand,
+        // aimed at the end of the other hand's laser (its aim if it has none).
+        // The game then adds its throw pitch and picks the speed from the pitch.
+        if (!grenadeLaunching.load() || !nativeMainThread || !nativeMainThread()) return out;
+        const auto s = copySnapshot();
+        Pose body;
+        const unsigned g = grenadeLaunchHand.load() & 1u, aim = 1u - g;
+        if (p != s.player || !s.rider.handheld() || !vrSession(s) || !fresh(s.input) || !trackingAnchor(p, body) ||
+            !controllerTracked(s.input, g))
+            return out;
+        const Vec3 from = worldHandTracking(body, s.origin, s.turn, s.input.head, weaponTracking(s.input, g)).p;
+        Vec3 target{};
+        bool targetValid = false;
+        for (unsigned n = 0; n < 2; ++n)
+            if (s.handle[n] && mountHand(s, n) == aim) {
+                AcquireSRWLockShared(&laserLock);
+                const LaserAim beam = laserAim[n];
+                ReleaseSRWLockShared(&laserLock);
+                const uint64_t now = GetTickCount64();
+                if (beam.valid && beam.owner == s.playerHandle && now >= beam.tickMs && now - beam.tickMs < 250) {
+                    target = beam.end;
+                    targetValid = true;
+                }
+            }
+        const Pose aimPose = worldHandTracking(body, s.origin, s.turn, s.input.head, s.input.hand[aim]);
+        const Vec3 fallback = controllerTracked(s.input, aim) ? rotate(normalize(aimPose.q), Vec3{0, 0, -1})
+                                                              : rotate(normalize(out->q), Vec3{0, 0, -1});
+        const Pose launch = grenadeLaunchPose(from, target, targetValid, fallback);
+        if (finite(launch)) *out = launch;
+        grenadeTaken = true;
+        const Vec3 d = rotate(launch.q, Vec3{0, 0, -1});
+        log("Grenade thrown from %.2f,%.2f,%.2f dir=%.2f,%.2f,%.2f target=%d", from.x, from.y, from.z, d.x, d.y, d.z,
+            int(targetValid));
+        return out;
+    }
     if (caller != boardingSeatReturn && caller != useSeatReturn) return out;
     if (labTurretMode() && nativeMainThread && nativeMainThread() && labTurretView(*out)) return out;
     const auto s = copySnapshot();
@@ -4556,7 +4652,7 @@ static const Vec3 *measuredEmitter(uint32_t nativeId) {
 // Emitter offsets were measured at the matched display size; they scale with the
 // model whenever [Weapons] Scale or a per-weapon Scale changes it.
 static float emitterScale(uint32_t nativeId) {
-    return (settings.weaponScale > 0 ? settings.weaponScale : 1.f) *
+    return WeaponSizeFactor * (settings.weaponScale > 0 ? settings.weaponScale : 1.f) *
            (nativeId < WeaponCount ? settings.weaponScaleById[nativeId] : 1.f);
 }
 static Pose *shooting(void *w, Pose *out, PoseGet original, const Snapshot *snapshot = nullptr,
@@ -4935,6 +5031,10 @@ static bool vehicleLaserCurrent(const Snapshot &s, const Request &request,
 // 1 cm inside the tube's front face, where the game's own uzi laser starts
 // (V428-V429: 12 cm below the nub, its front 3.5 cm behind it).
 constexpr Vec3 UziLaserEmitter{0, -.118f, .021f};
+// Colt laser emitter (the tube under its barrel, whose lens the game's own Colt
+// laser starts from) from its shot origin, at scale 1 (V470 side view: lens
+// 12 cm behind and 8 cm below the shot origin at the 0.85 size).
+constexpr Vec3 ColtLaserEmitter{0, -.0965f, .1435f};
 // Lab (SS2VR_LAB_MUZZLE_MARK=1): the shot origin of each hand's weapon, drawn as
 // a green cross through any geometry.
 static Vec3 labShotMuzzle[2];
@@ -5040,12 +5140,16 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
             sourceHandle = s.rider.ride;
             mechanism = resolve(vehicle.mechanism);
         } else {
-            if (!s.rider.handheld() || aliased(s) || s.ui.wheel[m].open || !s.handle[h] || s.selecting[h])
+            if (!s.rider.handheld() || aliased(s) || s.ui.wheel[m].open || !s.handle[h] || s.selecting[h] ||
+                grenadeShownHand.load(std::memory_order_relaxed) == int(m))
                 { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,3);continue; }
             void *w = resolve(s.handle[h]);
             if (!w || nativeHandle(s.player, h) != s.handle[h] || !laserModelScratchIdle())
                 { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,4);continue; }
             const int weapon = *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4);
+            // The circular saw cuts what it touches; it has no use for a laser.
+            if (weapon == 0)
+                { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,5);continue; }
             bool calibrated = false;
             shooting(w, &muzzle, weapon == 13 ? originalSniperShot : originalShot, &s, &calibrated);
             const bool usable = calibrated || measuredEmitter(uint32_t(weapon)); // An emitter needs no model calibration.
@@ -5058,17 +5162,18 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
             direction = rotate(normalize(muzzle.q), {0, 0, -1});
             labShotMuzzle[h] = muzzle.p; // Where shots start (before the uzi laser's tube offset).
             labShotMuzzleValid[h] = true;
-            // The uzi's beam starts at the laser emitter tube under its barrel,
-            // where the game's own laser starts (V420/V421 side views).
-            if (weapon == 4) {
-                // Lab: SS2VR_LAB_UZI_EMITTER=x,y,z overrides the offset.
-                static const Vec3 emitter = [] {
+            // The uzi's and the Colt's beams start at the laser emitter tube under
+            // their barrels, where the game's own lasers start (V420/V421, V470).
+            if (weapon == 4 || weapon == 12) {
+                // Lab: SS2VR_LAB_UZI_EMITTER / SS2VR_LAB_COLT_EMITTER=x,y,z override the offsets.
+                static const auto labEmitter = [](const char *name, Vec3 e) {
                     char v[64]{};
-                    Vec3 e = UziLaserEmitter;
-                    if (GetEnvironmentVariableA("SS2VR_LAB_UZI_EMITTER", v, sizeof v)) std::sscanf(v, "%f,%f,%f", &e.x, &e.y, &e.z);
+                    if (GetEnvironmentVariableA(name, v, sizeof v)) std::sscanf(v, "%f,%f,%f", &e.x, &e.y, &e.z);
                     return e;
-                }();
-                muzzle.p = muzzle.p + rotate(normalize(muzzle.q), emitter * emitterScale(4));
+                };
+                static const Vec3 uzi = labEmitter("SS2VR_LAB_UZI_EMITTER", UziLaserEmitter),
+                                  colt = labEmitter("SS2VR_LAB_COLT_EMITTER", ColtLaserEmitter);
+                muzzle.p = muzzle.p + rotate(normalize(muzzle.q), (weapon == 4 ? uzi : colt) * emitterScale(uint32_t(weapon)));
             }
             // The same grip pose shooting() and the model placement use.
             const Pose grip = worldHandTracking(body, s.origin, s.turn, s.input.head, weaponGrip(s.input, m, weapon));
@@ -6460,7 +6565,9 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
 static bool heldUnderOpenWheel(void *w) {
     if (eyeIndex < 0) return false;
     const int h = handOf(w, eyeSnapshot);
-    return h >= 0 && eyeSnapshot.ui.wheel[mountHand(eyeSnapshot, unsigned(h))].open;
+    if (h < 0) return false;
+    const unsigned m = mountHand(eyeSnapshot, unsigned(h));
+    return eyeSnapshot.ui.wheel[m].open || grenadeShownHand.load(std::memory_order_relaxed) == int(m);
 }
 static void renderTrackedWeapon(void *w, Matrix34 m, bool sniper, uintptr_t caller) {
     // A hand with its weapon wheel open shows the wheel, not the held gun.
@@ -7648,6 +7755,44 @@ static bool wheelModelConfigurationReady(void *configuration) {
     uintptr_t table=0;std::memcpy(&table,configuration,4);
     return table==modelConfigurationVtable && !(static_cast<const uint8_t*>(configuration)[4]&1u);
 }
+static WheelModel grenadeModel;
+// Loads one display model (process-lifetime instance) and normalises its size.
+static void loadDisplayModel(WheelModel &m,const char *path,const char *name) {
+    m.tried=true;
+    constexpr uint32_t MaximumMeshes=16;
+    WheelBox configured{},meshes[MaximumMeshes]{};
+    uint32_t meshCount=0;
+    bool boxed=false;
+    if(obtainNativeResource(m.configuration,*modelDataType,path) &&
+       wheelModelConfigurationReady(m.configuration))
+        withNativeFinally([&] {
+            m.instance=createModelInstance();
+            if(!m.instance)return;
+            configureModelInstance(m.instance,m.configuration);
+            boxed=modelInstanceBox(&configured,m.instance)==&configured; // Unit stretch: the stored box.
+            // A render mesh without LODs yields the native +-0.5 default box; skip it.
+            const int32_t count=modelMeshCount(m.configuration);
+            for(int32_t i=0;i<count && meshCount<MaximumMeshes;++i) {
+                void *mesh=modelMesh(m.configuration,i);
+                void *render=mesh ? meshRenderMesh(mesh) : nullptr;
+                if(render && renderMeshLodCount(render)>0 && renderMeshBox(&meshes[meshCount],render)==&meshes[meshCount])
+                    ++meshCount;
+            }
+        },[](bool) noexcept {});
+    const auto bounds=wheelModelBounds(meshes,meshCount,boxed ? configured : WheelBox{});
+    m.extent=bounds.extent;
+    m.centre=bounds.centre;
+    m.ready=m.instance && m.extent>0;
+    if(m.instance && !m.ready) {
+        void *instance=m.instance;
+        m.instance=nullptr;
+        withNativeFinally([&] {deleteModelInstance(instance);},[](bool) noexcept {});
+    }
+    const Vec3 stored=configured.max-configured.min;
+    log("%s %s extent=%.3f source=%s meshes=%u configurationExtent=%.3f",name,
+        m.ready ? "loaded" : "unavailable; using its icon",m.extent,bounds.fromMeshes ? "meshes" : "configuration",
+        meshCount,std::max({stored.x,stored.y,stored.z}));
+}
 // One model per input poll once gameplay runs, so loading never stalls one frame
 // for long; a weapon keeps its icon until (or unless) its mesh is ready.
 static void loadWeaponWheelModels(const Snapshot &s) {
@@ -7658,42 +7803,14 @@ static void loadWeaponWheelModels(const Snapshot &s) {
     for(uint32_t id=0;id!=WeaponCount;++id) {
         auto &m=wheelModels[id];
         if(m.tried || !wheelModelPaths[id])continue;
-        m.tried=true;
-        constexpr uint32_t MaximumMeshes=16;
-        WheelBox configured{},meshes[MaximumMeshes]{};
-        uint32_t meshCount=0;
-        bool boxed=false;
-        if(obtainNativeResource(m.configuration,*modelDataType,wheelModelPaths[id]) &&
-           wheelModelConfigurationReady(m.configuration))
-            withNativeFinally([&] {
-                m.instance=createModelInstance();
-                if(!m.instance)return;
-                configureModelInstance(m.instance,m.configuration);
-                boxed=modelInstanceBox(&configured,m.instance)==&configured; // Unit stretch: the stored box.
-                // A render mesh without LODs yields the native +-0.5 default box; skip it.
-                const int32_t count=modelMeshCount(m.configuration);
-                for(int32_t i=0;i<count && meshCount<MaximumMeshes;++i) {
-                    void *mesh=modelMesh(m.configuration,i);
-                    void *render=mesh ? meshRenderMesh(mesh) : nullptr;
-                    if(render && renderMeshLodCount(render)>0 && renderMeshBox(&meshes[meshCount],render)==&meshes[meshCount])
-                        ++meshCount;
-                }
-            },[](bool) noexcept {});
-        const auto bounds=wheelModelBounds(meshes,meshCount,boxed ? configured : WheelBox{});
-        m.extent=bounds.extent;
-        m.centre=bounds.centre;
-        m.ready=m.instance && m.extent>0;
-        if(m.instance && !m.ready) {
-            void *instance=m.instance;
-            m.instance=nullptr;
-            withNativeFinally([&] {deleteModelInstance(instance);},[](bool) noexcept {});
-        }
-        const Vec3 stored=configured.max-configured.min;
-        log("Weapon wheel model %u %s extent=%.3f source=%s meshes=%u configurationExtent=%.3f",id,
-            m.ready ? "loaded" : "unavailable; using its icon",m.extent,bounds.fromMeshes ? "meshes" : "configuration",
-            meshCount,std::max({stored.x,stored.y,stored.z}));
+        char name[24];
+        std::snprintf(name,sizeof name,"Weapon wheel model %u",id);
+        loadDisplayModel(m,wheelModelPaths[id],name);
         return;
     }
+    // The hand grenade held before a throw (after the wheel meshes).
+    if(!grenadeModel.tried)
+        loadDisplayModel(grenadeModel,"Content/SeriousSam2/Models/Projectiles/HandGrenade/HandGrenade.mdl","Hand grenade model");
 }
 struct WheelBillboard {
     Vec3 centre,right,up;
@@ -7956,8 +8073,59 @@ static void drawWeaponWheels() {
         else (*disableFog)();
     }
 }
+// The grenade waiting in the off hand: 9 cm across, its centre 4 cm in front of
+// the grip point (in the palm), drawn like the wheel meshes.
+static void drawHeldGrenade() {
+    const int hand=grenadeShownHand.load(std::memory_order_relaxed);
+    if(hand<0 || hand>1 || !grenadeModel.ready || !eyeAnchorReady || !nativeMainThread || !nativeMainThread() ||
+       !eyeSnapshot.ui.gameplay || !eyeSnapshot.rider.handheld() || !rootView || !renderModelInstance ||
+       !stretchModelInstance || !unbindVertexBuffers || !*unbindVertexBuffers || !useSimpleShader ||
+       !controllerTracked(eyeRequest.input,unsigned(hand)))return;
+    const Pose grip=worldHandTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head,
+                                      weaponTracking(eyeRequest.input,unsigned(hand)));
+    if(!finite(grip))return;
+    const float scale=.09f/grenadeModel.extent;
+    if(!std::isfinite(scale) || !(scale>0))return;
+    const Quat q=normalize(grip.q);
+    const Vec3 centre=grip.p+rotate(q,Vec3{0,-.01f,-.04f});
+    const Pose placed{q,centre-rotate(q,grenadeModel.centre*scale)};
+    ortho();
+    activateView(rootView);
+    const bool wasDepth=*depthEnabled!=0,wasWrite=*depthWriting!=0,wasBlend=*blending!=0;
+    const bool fogControl=fogging && enableFog && disableFog && *enableFog && *disableFog, wasFog=fogControl && *fogging!=0;
+    const int priorComparison=*depthComparison;
+    (*enableDepth)();(*enableDepthWrite)();(*disableBlend)();
+    (*setDepthComparison)(42); // LESSEQUAL, as for the lasers.
+    stretchModelInstance(grenadeModel.instance,Vec3{scale,scale,scale});
+    renderModelInstance(grenadeModel.instance,matrix(placed),0.f,0);
+    (*unbindVertexBuffers)();
+    useSimpleShader(0);
+    ortho();
+    activateView(rootView);
+    if(wasBlend)(*enableBlend)();
+    else (*disableBlend)();
+    if(wasDepth)(*enableDepth)();
+    else (*disableDepth)();
+    if(wasWrite)(*enableDepthWrite)();
+    else (*disableDepthWrite)();
+    (*setDepthComparison)(priorComparison);
+    if(fogControl) {
+        if(wasFog)(*enableFog)();
+        else (*disableFog)();
+    }
+}
 // Core's activity test selects the inactive frame cap and input routing. A live
 // VR session owns the game regardless of which desktop window has focus.
+// CDamageHudElement's draw (Sam2Game 0x176dc0, its vtable slot after
+// Initialize): the red hit-direction arrows and blood around the screen edge.
+// The HUD is a small floating panel in VR, where those marks only clutter it;
+// while VR input is live they are not drawn at all (user request).
+using DamageHudRender = void(__thiscall *)(void *, void *, void *);
+static DamageHudRender originalDamageHudRender = nullptr;
+static void __fastcall damageHudRender(void *element, void *, void *a, void *b) {
+    if (vrInputLive()) return;
+    originalDamageHudRender(element, a, b);
+}
 static int(__cdecl *originalAppForeground)() = nullptr;
 static int __cdecl appForeground() {
     if (vrInputLive())
@@ -9417,6 +9585,7 @@ bool attach(bool headless) {
     nativeShotAttachmentReturn = reinterpret_cast<uintptr_t>(g) + 0x4a824;
     laserEngineBase = reinterpret_cast<uintptr_t>(e);
     laserTurretVtable = reinterpret_cast<uintptr_t>(g) + 0x2b39e8;
+    turretShootDirection = reinterpret_cast<uintptr_t>(g) + 0x155ce0; // CTurretPuppetEntity::GetShootDirection
     weaponFrustumReturn = reinterpret_cast<uintptr_t>(g) + 0x4c8e9;
     weaponInverseReturn = reinterpret_cast<uintptr_t>(g) + 0x4c915;
     weaponDepthReturn = reinterpret_cast<uintptr_t>(g) + 0x4c9a6;
@@ -9441,6 +9610,7 @@ bool attach(bool headless) {
     mountedClampReturn = reinterpret_cast<uintptr_t>(g) + 0xf3255;
     boardingSeatReturn = reinterpret_cast<uintptr_t>(g) + 0xea4fe;
     useSeatReturn = reinterpret_cast<uintptr_t>(g) + 0xea465;
+    grenadeViewReturn = reinterpret_cast<uintptr_t>(g) + 0x1020cf; // Hand-grenade throw's GetViewOrigin(0)
     playerControlsReturn = reinterpret_cast<uintptr_t>(g) + 0xf35d3;
     inactivePlayerControlsReturn = reinterpret_cast<uintptr_t>(g) + 0xf2ddc;
     controlsGameBase = reinterpret_cast<uintptr_t>(g);
@@ -9530,6 +9700,7 @@ bool attach(bool headless) {
         symbol(e, "?mdlGetBonesAbsPlacement@SeriousEngine@@YAXPAVCModelInstance@1@AAV?$CStaticStackArray@UBonePlacement@SeriousEngine@@@1@@Z", bonesAbsolute);
         symbol(c, "?strConvertIDToString@SeriousEngine@@YAPBDVIDENT@1@@Z", identToString);
         symbol(g, "?OnGiveAll@CPlayerPuppetEntity@SeriousEngine@@QAEXH@Z", giveAllWeapons);
+        symbol(g, "?GetAmmoQuantity@CPlayerInventory@SeriousEngine@@QAEJW4AmmoIndex@2@@Z", grenadeAmmoQuantity);
         symbol(c, "?memPreDeleteArrayRC_internal@SeriousEngine@@YAXPBXPAVCDataType@1@@Z", preDeleteArray);
         symbol(c, "?memDeleteArray_internal@SeriousEngine@@YAXPAX@Z", deleteArray);
         symbol(c, "?memPostDeleteArrayRC_internal@SeriousEngine@@YAXPAVCDataType@1@@Z", postDeleteArray);
@@ -9822,6 +9993,9 @@ bool attach(bool headless) {
     }
     H(e, "?Step@CSimulation@SeriousEngine@@QAEXXZ", simulationStep, originalSimulationStep);
 #undef H
+    if (!headless)
+        ok = internalHook(g, 0x176dc0, reinterpret_cast<void *>(damageHudRender),
+                          reinterpret_cast<void **>(&originalDamageHudRender)) && ok;
     ok = internalHook(g, 0x8e5bb, reinterpret_cast<void *>(primaryDownPredicate), &primaryDownPredicate_original) && ok;
     ok = internalHook(g, 0x8e5e0, reinterpret_cast<void *>(primaryPressPredicate), &primaryPressPredicate_original) && ok;
     ok = internalHook(g, 0x8e610, reinterpret_cast<void *>(primaryReleasePredicate), &primaryReleasePredicate_original) && ok;
