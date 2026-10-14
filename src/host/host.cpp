@@ -174,7 +174,7 @@ struct Mutex {
     X(BeginSession)                                                                                          \
     X(EndSession)                                                                                            \
     X(PollEvent)                                                                                             \
-    X(CreateReferenceSpace) X(DestroySpace) X(LocateSpace) X(EnumerateSwapchainFormats) X(CreateSwapchain)   \
+    X(CreateReferenceSpace) X(EnumerateReferenceSpaces) X(DestroySpace) X(LocateSpace) X(EnumerateSwapchainFormats) X(CreateSwapchain)   \
         X(DestroySwapchain) X(EnumerateSwapchainImages) X(AcquireSwapchainImage) X(WaitSwapchainImage)       \
             X(ReleaseSwapchainImage) X(WaitFrame) X(BeginFrame) X(EndFrame) X(LocateViews) X(StringToPath)   \
                 X(CreateActionSet) X(DestroyActionSet) X(CreateAction) X(SuggestInteractionProfileBindings)  \
@@ -421,9 +421,11 @@ struct Frame {
     XrSession session;
     XrTime time;
     bool active = true;
+    static inline unsigned rejectedFrames = 0, droppedLayers = 0; // Process totals (Frame totals line).
     Frame(Api &a, XrSession s, XrTime t) : api(a), session(s), time(t) {}
     void rejected(XrResult result, const std::vector<const XrCompositionLayerBaseHeader *> &layers) {
         static unsigned reports = 0;
+        ++rejectedFrames;
         if (reports >= 8) return;
         ++reports;
         char line[256];
@@ -437,7 +439,17 @@ struct Frame {
                 pose = reinterpret_cast<const XrCompositionLayerQuad *>(layer)->pose;
             else if (layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
                 const auto *projection = reinterpret_cast<const XrCompositionLayerProjection *>(layer);
-                if (projection->viewCount && projection->views) pose = projection->views[0].pose;
+                for (uint32_t v = 0; v < projection->viewCount && projection->views; ++v) {
+                    const auto &view = projection->views[v];
+                    const auto &q = view.pose.orientation;
+                    const auto &r = view.subImage.imageRect;
+                    std::snprintf(line, sizeof line, "  projection view %u q=%.6g,%.6g,%.6g,%.6g p=%.6g,%.6g,%.6g fov=%.3f,%.3f,%.3f,%.3f rect=%d,%d %dx%d layer=%u",
+                                  v, q.x, q.y, q.z, q.w, view.pose.position.x, view.pose.position.y, view.pose.position.z,
+                                  view.fov.angleLeft, view.fov.angleRight, view.fov.angleUp, view.fov.angleDown,
+                                  r.offset.x, r.offset.y, r.extent.width, r.extent.height, view.subImage.imageArrayIndex);
+                    api.log.write(line);
+                }
+                continue;
             }
             const auto &q = pose.orientation;
             std::snprintf(line, sizeof line, "  layer type=%d q=%.6g,%.6g,%.6g,%.6g p=%.6g,%.6g,%.6g", int(layer->type),
@@ -453,7 +465,38 @@ struct Frame {
             api.cleanup(api.EndFrame(session, &end), "xrEndFrame zero layers during unwind");
         }
     }
-    XrResult submit(const std::vector<const XrCompositionLayerBaseHeader *> &layers) {
+    // A pose the runtime would reject (non-finite, or a quaternion far from
+    // unit length) loses only its own layer; near-unit quaternions are
+    // renormalised. One bad pose used to drop the whole frame (POSE_INVALID).
+    static bool sanePose(XrPosef &pose) {
+        auto &q = pose.orientation;
+        const auto &p = pose.position;
+        const float n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        if (!std::isfinite(n) || n < .5f || n > 1.5f || !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+            return false;
+        q = {q.x / n, q.y / n, q.z / n, q.w / n};
+        return true;
+    }
+    std::vector<const XrCompositionLayerBaseHeader *> sanitized;
+    const std::vector<const XrCompositionLayerBaseHeader *> &sanitize(const std::vector<const XrCompositionLayerBaseHeader *> &layers) {
+        sanitized.clear();
+        for (const auto *layer : layers) {
+            if (!layer) continue;
+            bool ok = true;
+            if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD)
+                ok = sanePose(const_cast<XrCompositionLayerQuad *>(reinterpret_cast<const XrCompositionLayerQuad *>(layer))->pose);
+            else if (layer->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                const auto *projection = reinterpret_cast<const XrCompositionLayerProjection *>(layer);
+                for (uint32_t v = 0; v < projection->viewCount && projection->views && ok; ++v)
+                    ok = sanePose(const_cast<XrCompositionLayerProjectionView &>(projection->views[v]).pose);
+            }
+            if (ok) sanitized.push_back(layer);
+            else ++droppedLayers;
+        }
+        return sanitized;
+    }
+    XrResult submit(const std::vector<const XrCompositionLayerBaseHeader *> &submitted) {
+        const auto &layers = sanitize(submitted);
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
         end.displayTime = time;
         end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1151,7 +1194,8 @@ struct Host {
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId system = XR_NULL_SYSTEM_ID;
     XrSession session = XR_NULL_HANDLE;
-    XrSpace local = XR_NULL_HANDLE, viewSpace = XR_NULL_HANDLE;
+    XrSpace local = XR_NULL_HANDLE, viewSpace = XR_NULL_HANDLE; // `local`: the world space (STAGE or LOCAL)
+    XrReferenceSpaceType worldSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
     // Levelling: holding the recentre chord (both grips + left stick click) for
     // 2 s makes the current head orientation level. LOCAL is recreated turned by
     // the head's pitch and roll, so a tracking frame that came back tilted
@@ -1174,7 +1218,7 @@ struct Host {
         const Quat tilt = normalize(multiply(q, yaw(-horizontalHeading(q)))); // head = tilt * yaw(h)
         const Quat corrected = normalize(multiply(levelCorrection, tilt));
         XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-        info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        info.referenceSpaceType = worldSpaceType;
         info.poseInReferenceSpace.orientation = {corrected.x, corrected.y, corrected.z, corrected.w};
         XrSpace replacement = XR_NULL_HANDLE;
         if (XR_FAILED(api.CreateReferenceSpace(session, &info, &replacement)) || !replacement) {
@@ -1527,8 +1571,28 @@ struct Host {
         api.check(sessionResult,"xrCreateSession D3D11");
         XrReferenceSpaceCreateInfo space{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         space.poseInReferenceSpace.orientation.w = 1;
-        space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
-        api.check(api.CreateReferenceSpace(session, &space, &local), "xrCreateReferenceSpace LOCAL");
+        // The world space: STAGE when offered (the tracking system's level, fixed
+        // play area), else LOCAL. A runtime may set LOCAL from the headset's pose
+        // when the session starts or tracking returns; with the headset lying on
+        // its side that turned the whole game sideways.
+        {
+            uint32_t count = 0;
+            std::vector<XrReferenceSpaceType> types;
+            if (XR_SUCCEEDED(api.EnumerateReferenceSpaces(session, 0, &count, nullptr)) && count) {
+                types.resize(count);
+                if (XR_FAILED(api.EnumerateReferenceSpaces(session, count, &count, types.data()))) types.clear();
+            }
+            const bool stage = std::find(types.begin(), types.end(), XR_REFERENCE_SPACE_TYPE_STAGE) != types.end();
+            wchar_t lab[2]{}; // Lab: SS2VR_LAB_SPACE=L forces LOCAL.
+            worldSpaceType = stage && !(GetEnvironmentVariableW(L"SS2VR_LAB_SPACE", lab, 2) == 1 && lab[0] == L'L')
+                                 ? XR_REFERENCE_SPACE_TYPE_STAGE : XR_REFERENCE_SPACE_TYPE_LOCAL;
+        }
+        space.referenceSpaceType = worldSpaceType;
+        if (XR_FAILED(api.CreateReferenceSpace(session, &space, &local))) {
+            worldSpaceType = space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+            api.check(api.CreateReferenceSpace(session, &space, &local), "xrCreateReferenceSpace LOCAL");
+        }
+        log.write(worldSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE ? "World space: STAGE" : "World space: LOCAL");
         space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
         api.check(api.CreateReferenceSpace(session, &space, &viewSpace), "xrCreateReferenceSpace VIEW");
         actions.create(api, instance, session, frameController, eyeGazeSupported);
@@ -1731,7 +1795,7 @@ struct Host {
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
                 const auto &change =
                     *reinterpret_cast<const XrEventDataReferenceSpaceChangePending *>(&event);
-                if (change.session == session && change.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+                if (change.session == session && change.referenceSpaceType == worldSpaceType) {
                     if (referenceChanges.size() >= 32)
                         throw std::runtime_error("Too many pending LOCAL space changes");
                     referenceChanges.push_back(change.changeTime);
@@ -2509,7 +2573,8 @@ struct Host {
         const uint64_t now = GetTickCount64();
         if (!lock) {
             cachedPairBusy = true;
-            const bool held = eligibleSequence == cachedRequest.sequence && eligibleTick && now - eligibleTick < 100;
+            // A pair that arrived since the last check was made in the same state.
+            const bool held = eligibleTick && now - eligibleTick < 100;
             if (held && final) ++busyHolds;
             return held;
         }
@@ -2952,7 +3017,7 @@ struct Host {
         std::snprintf(line, sizeof(line),
                       "Frame totals: ipc_complete=%llu deadline=%llu slots_full=%llu discarded=%llu "
                       "image_wait=%llu invalid_views=%llu retired=%llu submitted=%llu reused=%llu "
-                      "xr_end_success=%llu xr_layers=%llu xr_menu=%llu xr_world=%llu ui_pairs=%llu opaque_pairs=%llu copy_waits=%llu busy_holds=%u held=%u dropped=%u,%u,%u,%u,%u missing=%u,%u,%u,%u",
+                      "xr_end_success=%llu xr_layers=%llu xr_menu=%llu xr_world=%llu ui_pairs=%llu opaque_pairs=%llu copy_waits=%llu busy_holds=%u held=%u rejected=%u bad_layers=%u dropped=%u,%u,%u,%u,%u missing=%u,%u,%u,%u",
                       static_cast<unsigned long long>(completed), static_cast<unsigned long long>(timeouts),
                       static_cast<unsigned long long>(fullSlots), static_cast<unsigned long long>(discarded),
                       static_cast<unsigned long long>(imageTimeouts),
@@ -2961,7 +3026,7 @@ struct Host {
                       static_cast<unsigned long long>(xrEndSuccess), static_cast<unsigned long long>(xrLayerSuccess),
                       static_cast<unsigned long long>(xrMenuSuccess), static_cast<unsigned long long>(xrWorldSuccess),
                       static_cast<unsigned long long>(uiPairs), static_cast<unsigned long long>(clearedPairs),
-                      static_cast<unsigned long long>(copyWaits), busyHolds, heldPairs, dropped[0], dropped[1], dropped[2],
+                      static_cast<unsigned long long>(copyWaits), busyHolds, heldPairs, Frame::rejectedFrames, Frame::droppedLayers, dropped[0], dropped[1], dropped[2],
                       dropped[3], dropped[4], missing[0], missing[1], missing[2], missing[3]);
         log.write(line);
         if (perfLoops) {

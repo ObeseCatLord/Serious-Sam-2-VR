@@ -146,8 +146,12 @@ inline MenuCursor menuCursor(float u, float v, uint32_t imageWidth = 0, uint32_t
     const auto clamp01 = [](float t) { return t < 0 ? 0.f : t > 1 ? 1.f : t; };
     return {640.f * clamp01(.5f + (u - .5f) * sx), 480.f * clamp01(.5f + (v - .5f) * sy)};
 }
+// Recentre: both grips plus the left stick click, or both stick clicks
+// together. Holding either chord 2 s also levels the view (host).
 inline void applyRecenterChord(Input &input, bool clicked) {
-    if (input.focused && (input.buttons[0] & Wheel) && (input.buttons[1] & Wheel) && clicked) {
+    const bool grips = (input.buttons[0] & Wheel) && (input.buttons[1] & Wheel) && clicked;
+    const bool sticks = (input.buttons[0] & Sprint) && (input.buttons[1] & Sprint);
+    if (input.focused && (grips || sticks)) {
         input.buttons[0] = (input.buttons[0] & ~Sprint) | Recenter;
         input.buttons[1] &= ~Sprint;
         // Keep physical trigger and grip state: neither a fake trigger release

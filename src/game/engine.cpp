@@ -1982,9 +1982,14 @@ static void update(void *p) {
         // without the lone weapon, else the left) or puts it away; a throwing
         // motion of that hand throws it (the native throw, plcmdTertFire, aimed
         // in playerViewOrigin).
-        static bool previousButton = false;
+        // On release of the click, so that clicking both sticks (recentre) does
+        // not also take a grenade.
+        static bool previousButton = false, armed = false;
         const bool button = enabled && !resettingControls && rider.handheld() && (rightContextual & Button::Sprint);
-        const bool pressed = button && !previousButton;
+        if (button && !previousButton) armed = true;
+        if (recenterHeld(input) || !enabled) armed = false;
+        const bool pressed = !button && previousButton && armed;
+        if (!button) armed = false;
         previousButton = button;
         unsigned offHand = 0;
         if (rider.handheld() && !aliased(s) && (s.handle[0] != 0) != (s.handle[1] != 0))

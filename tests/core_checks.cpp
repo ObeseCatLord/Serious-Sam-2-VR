@@ -359,6 +359,19 @@ int main() {
               (chord.buttons[0] & Wheel) && (chord.buttons[1] & Wheel) &&
               !((chord.buttons[0] | chord.buttons[1]) & Sprint),
           "Recenter preserves physical grips/triggers and suppresses sprint");
+    {
+        Input sticks{};
+        sticks.focused = 1;
+        sticks.buttons[0] = sticks.buttons[1] = Sprint;
+        applyRecenterChord(sticks, false);
+        check(recenterHeld(sticks) && !((sticks.buttons[0] | sticks.buttons[1]) & Sprint),
+              "Both stick clicks recenter and suppress sprint and grenade");
+        Input one{};
+        one.focused = 1;
+        one.buttons[1] = Sprint;
+        applyRecenterChord(one, false);
+        check(!recenterHeld(one) && (one.buttons[1] & Sprint), "One stick click alone stays a stick click");
+    }
     TriggerGate chordGate;
     chordGate.update(0, true);
     chordGate.update(chord.trigger[0], !recenterHeld(chord));
