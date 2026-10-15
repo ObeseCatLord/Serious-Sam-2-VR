@@ -5144,14 +5144,34 @@ static uint32_t laserFindIdent(const void *object, size_t pointerOffset, uint32_
     }
     return 0;
 }
+// Any other ride (other turret classes, vehicles with guns): a generic source,
+// marked by attachment 0, whose beam follows the ride's own aim (its view
+// origin and GetShootDirection) instead of a model attachment.
+static bool genericVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out) {
+    void *ride = resolve(s.rider.ride);
+    VehicleLaserSource source;
+    source.rider = s.rider;
+    if (!ride || !laserRead32(ride, 0x114, source.mechanism) || !source.mechanism || !resolve(source.mechanism))
+        return false;
+    source.model = s.rider.ride; source.instance = ~0u; source.resource = 1; source.config = 1;
+    source.attachment = 0;
+    if (!source.usable() || !nativeRiderCurrent(s.player, s.rider) || resolve(s.rider.ride) != ride) return false;
+    out = source;
+    return true;
+}
+static bool auditedVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out);
 static bool readVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out) {
     if (!s.rider.seated() || !nativeMainThread() || !nativeRiderCurrent(s.player, s.rider))
         return false;
+    // The audited turret with its laser attachment; any other ride (or that
+    // turret without the attachment) is generic.
+    return auditedVehicleLaserSource(s, out) || genericVehicleLaserSource(s, out);
+}
+static bool auditedVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out) {
     void *ride = resolve(s.rider.ride);
     uint32_t table = 0;
     VehicleLaserSource source;
     source.rider = s.rider;
-    // Gate the actual implementation audited, not every entity that is rideable.
     if (!laserRead32(ride, 0, table) || table != laserTurretVtable ||
         !laserRead32(ride, 0x120, source.model) || !laserRead32(ride, 0x47c, source.resource) ||
         !laserRead32(ride, 0x1bc, source.action) || !laserRead32(ride, 0x1c4, source.blast) ||
@@ -5222,6 +5242,17 @@ static bool vehicleLaserMuzzle(const Snapshot &s, const Request &request, Vehicl
         return false;
     void *ride = resolve(source.rider.ride);
     auto *table = *reinterpret_cast<uintptr_t **>(ride);
+    if (!source.attachment) {
+        // Generic ride: from just below and ahead of the ride's eye along its aim.
+        Pose origin;
+        reinterpret_cast<ViewOrigin>(table[0xac / 4])(ride, &origin, 1);
+        Vec3 direction;
+        reinterpret_cast<ShootDirection>(table[0x5a4 / 4])(ride, &direction);
+        if (!vehicleLaserCurrent(s, request, source) || !nativeLaserPose(origin, direction, muzzle, &rayDirection))
+            return false;
+        muzzle.p = muzzle.p + rayDirection * .5f + Vec3{0, -.25f, 0};
+        return finite(muzzle);
+    }
     uint32_t attachment = *invalidSeatIdent;
     reinterpret_cast<AttachmentIdent>(table[0x550 / 4])(ride, &attachment);
     if (attachment != source.attachment || !vehicleLaserCurrent(s, request, source))
@@ -8341,6 +8372,45 @@ static float __fastcall mouseControlValue(void *device, void *, long control) {
     if (control >= 0x78 && control <= 0x7b && vrInputLive()) return 0.f; // Mouse X+, X-, Y+, Y-
     return originalMouseControl(device, control);
 }
+// Mounted guns by hand: while a grip is held in a turret (or a ride steered by
+// stick), the gun pivots about a point 0.5 m beyond the gripping hands (fixed
+// in the body frame at the grab), like handles behind a real mount's pivot:
+// hands right, muzzle left. Returns this step's heading and pitch change, added
+// to the native look as the mouse's deltas are.
+static Vec3 rideHandAimDelta(const ControlSample &c) {
+    static bool active = false;
+    static Vec3 pivot{}, previous{};
+    Vec3 mid{};
+    unsigned count = 0;
+    for (unsigned h = 0; h < 2; ++h)
+        if ((c.input.buttons[h] & Wheel) && controllerTracked(c.input, h)) {
+            mid = mid + bodyHandTracking(c.origin, c.turn, c.input.head, weaponTracking(c.input, h)).p;
+            ++count;
+        }
+    if (!count || !fresh(c.input)) { active = false; return {}; }
+    mid = mid * (1.f / float(count));
+    const auto angles = [](Vec3 d, float &heading, float &pitch) {
+        const float n = std::sqrt(dot(d, d));
+        if (!(n > 1e-4f)) return false;
+        heading = std::atan2(-d.x, -d.z);
+        pitch = std::asin(std::clamp(d.y / n, -1.f, 1.f));
+        return std::isfinite(heading) && std::isfinite(pitch);
+    };
+    if (!active) {
+        const Vec3 f = rotate(bodyHeadTracking(c.origin, c.turn, c.input.head).q, Vec3{0, 0, -1});
+        const float n = std::sqrt(f.x * f.x + f.z * f.z);
+        if (!(n > 1e-3f)) return {};
+        pivot = mid + Vec3{f.x / n, 0, f.z / n} * .5f;
+        previous = pivot - mid;
+        active = true;
+        return {};
+    }
+    const Vec3 now = pivot - mid;
+    float h0, p0, h1, p1;
+    if (!angles(previous, h0, p0) || !angles(now, h1, p1)) return {};
+    previous = now;
+    return {std::remainder(h1 - h0, 2 * Pi), p1 - p0, 0};
+}
 static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -8380,8 +8450,11 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 const uint64_t now = GetTickCount64();
                 const float dt = turretClock && now > turretClock ? std::min(.1f, float(now - turretClock) / 1000.f) : 0.f;
                 turretClock = now;
-                const Vec3 turned = advanceTurretLook(look, captured.input.axis[1][0], captured.input.axis[1][1],
-                                                      settings.smoothTurnRate, dt);
+                Vec3 turned = advanceTurretLook(look, captured.input.axis[1][0], captured.input.axis[1][1],
+                                                settings.smoothTurnRate, dt);
+                const Vec3 byHand = rideHandAimDelta(captured);
+                turned.x += byHand.x;
+                turned.y = std::clamp(turned.y + byHand.y, -1.4f, 1.4f);
                 if (labTurretMode()) {
                     static unsigned calls = 0;
                     if (calls++ % 25 == 0)
@@ -8405,6 +8478,9 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 lookClock = now;
                 Vec3 rideLook = advanceTurretLook(look, captured.input.axis[1][0], captured.input.axis[1][1],
                                                   settings.smoothTurnRate, dt);
+                const Vec3 byHand = rideHandAimDelta(captured);
+                rideLook.x += byHand.x;
+                rideLook.y = std::clamp(rideLook.y + byHand.y, -1.4f, 1.4f);
                 rideLook.z = look.z;
                 void *candidateRideToken=nullptr;
                 if (std::isfinite(rideLook.x) && std::isfinite(rideLook.y) &&
