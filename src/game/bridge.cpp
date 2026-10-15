@@ -2658,9 +2658,14 @@ static void presentBody(IDirect3DDevice9 *d) {
     // Its menus are drawn over the whole canvas (a 4:3 box filling the square
     // eye canvas): the band cut off their top and bottom, so a native menu shows
     // the whole canvas (the pointer maps image -> canvas either way).
+    // Native menus lay out a 640x480 (4:3) space stretched over the whole canvas
+    // (V481/V482: the cursor spans its full width and height), so on the square
+    // eye canvas they looked squeezed: their image is the canvas scaled to 4:3.
     const UiBand source = nativeMenu ? UiBand{0, 0, copyWidth, copyHeight} : uiBand(copyWidth, copyHeight);
-    const float fit = std::min({1.f, 1920.f / float(std::max(1u, source.width)), 1080.f / float(std::max(1u, source.height))});
-    const uint32_t outWidth = std::max(2u, uint32_t(float(source.width) * fit)) & ~1u,
+    float sourceWidth = nativeMenu ? float(source.height) * 4.f / 3.f : float(source.width);
+    if (sourceWidth * float(source.height) > float(copyWidth) * float(copyHeight)) sourceWidth = float(source.width); // Buffer bound.
+    const float fit = std::min({1.f, 1920.f / std::max(1.f, sourceWidth), 1080.f / float(std::max(1u, source.height))});
+    const uint32_t outWidth = std::max(2u, uint32_t(sourceWidth * fit)) & ~1u,
                    outHeight = std::max(2u, uint32_t(float(source.height) * fit)) & ~1u;
     withNativeFinally([&] {
         if (FAILED(sourceBackbuffer(&backbuffer))) return;

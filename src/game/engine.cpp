@@ -3,6 +3,7 @@
 #include "common/turret_look.hpp"
 #include "common/two_hand.hpp"
 #include "common/grenade_throw.hpp"
+#include "common/bomb_fuse.hpp"
 #include "common/controls.hpp"
 #include "common/lab_preparation.hpp"
 #include "common/ride_control_observation.hpp"
@@ -1285,6 +1286,28 @@ static bool aliased(const Snapshot &s) {
 // hand whose wheel chose it, whichever native slot the game put it in, unless
 // only the other controller is tracked (one controller off): then it goes there.
 static std::atomic<unsigned> soloMountHand{1};
+// Native dual wielding (CPlayerPuppetEntity::ToggleDualWielding): the flag at
+// +0x9bc, set only while each held weapon is one-handed (weapon class 1 or 7,
+// never the bomb); IsDualWielding also needs both hand slots filled.
+static bool dualIntent(void *p) { return isDual(p) || primaryField(p, 0x9bc) != 0; }
+static bool pairable(void *p) {
+    unsigned held = 0;
+    for (const int hand : {0, 1})
+        if (void *w = nativeHandle(p, hand) ? resolve(nativeHandle(p, hand)) : nullptr) {
+            // A handle that no longer resolves is an empty hand, as for the game.
+            const uint32_t type = primaryField(w, 0xb0), id = primaryField(w, 0xb4);
+            if ((type != 1 && type != 7) || id == 11) return false;
+            ++held;
+        }
+    return held != 0;
+}
+// Single mode's weapon slot: the one holding the lone weapon, else the right.
+static bool slotHeld(void *p, int hand) { return nativeHandle(p, hand) && resolve(nativeHandle(p, hand)); }
+static int soloSlot(void *p) { return slotHeld(p, 1) || !slotHeld(p, 0) ? 1 : 0; }
+// A pick that replaced the lone weapon from the other hand's wheel, given to
+// the choosing hand once dual mode is back.
+struct PairPick { int id = -1, hand = -1; };
+static PairPick pairPick;
 static bool controllerTracked(const Input &input, unsigned hand) {
     return hand < 2 && input.handValid[hand] && finite(input.hand[hand]);
 }
@@ -1943,6 +1966,18 @@ static void update(void *p) {
                 selectionTick[h] = GetTickCount64();
                 log("Weapon audit hold id=%d hand=%d", settings.labHoldWeapon, h);
             }
+            // Lab (SS2VR_LAB_DUAL_DROP=<id>|-1): 4 s after the hold, drop dual mode
+            // as a ride or cutscene does, and (id >= 0) pick id on the left wheel.
+            static const int labDualDrop = [] {
+                wchar_t v[8]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_DUAL_DROP", v, 8) ? _wtoi(v) : -2; }();
+            static uint64_t dropAt = 0;
+            if (held && labDualDrop >= -1 && !dropAt) dropAt = GetTickCount64() + 4000;
+            if (dropAt && dropAt != ~0ull && GetTickCount64() >= dropAt && isDual(p) && canChange(p, 0) && canChange(p, 1)) {
+                dropAt = ~0ull;
+                toggleDual(p, 0);
+                log("Lab dual dropped dual=%d", isDual(p));
+                if (labDualDrop >= 0) { pendingSelection[0] = labDualDrop; selectionTick[0] = GetTickCount64(); }
+            }
             if (given && settings.labHoldWeapon < 0 && GetTickCount64() >= next && pendingSelection[h] < 0) {
                 next = GetTickCount64() + 1000ull * settings.labAuditSeconds;
                 for (int step = 0; step < int(WeaponCount); ++step) {
@@ -1956,20 +1991,27 @@ static void update(void *p) {
                 }
             }
         }
-        if (pendingSelection[h] >= 0 && !multiplayer::remoteClient() && canChange(p, h) &&
+        // Single mode holds one weapon: one put in the other slot was dropped by
+        // the game a moment later (the wheel seemed to unequip it). The pick
+        // replaces the lone weapon, mounted on the hand that chose it; dual mode
+        // is switched on again below and then gives the choosing hand its pick.
+        const int pickSlot = dualIntent(p) ? int(h) : soloSlot(p);
+        if (pendingSelection[h] >= 0 && !multiplayer::remoteClient() && canChange(p, pickSlot) &&
             nativeRiderCurrent(p, rider)) {
             soloMountHand = unsigned(h);
             static char selectionAction[48];
-            std::snprintf(selectionAction, sizeof(selectionAction), "selection id=%d hand=%d", pendingSelection[h], h);
+            std::snprintf(selectionAction, sizeof(selectionAction), "selection id=%d hand=%d slot=%d", pendingSelection[h], int(h), pickSlot);
             lastWeaponSelection = selectionAction;
-            setWeapon(p, pendingSelection[h], h, 1);
+            setWeapon(p, pendingSelection[h], pickSlot, 1);
             if (!nativeRiderCurrent(p, rider))
                 return; // A native lifecycle callback superseded this transaction.
+            pairPick = pickSlot != int(h) ? PairPick{pendingSelection[h], int(h)} : PairPick{};
             pendingSelection[h] = -1;
-            s.handle[h] = nativeHandle(p, h);
-
-            gates[h] = TriggerGate{};
-            s.fire[h] = false;
+            for (const int n : {int(h), pickSlot}) {
+                s.handle[n] = nativeHandle(p, n);
+                gates[n] = TriggerGate{};
+                s.fire[n] = false;
+            }
             clearCalibration(h);
             advanceGeneration(s);
         }
@@ -1986,27 +2028,100 @@ static void update(void *p) {
     // The hand holding a grenade has put its weapon away: it does not fire.
     for (unsigned n = 0; n < 2 && grenadeThrow.holding(); ++n)
         if (mountHand(s, n) == grenadeThrow.hand) s.fire[n] = false;
+    {
+        // The serious bomb is lit by hand (common/bomb_fuse.hpp): the other
+        // hand's trigger strikes the lighter, its flame at the fuse fires it.
+        // The bomb hand's own trigger still fires it too.
+        static BombFuse fuse;
+        int bombSlot = -1;
+        for (unsigned n = 0; n < 2; ++n)
+            if (void *w = s.handle[n] && rider.handheld() && !aliased(s) ? resolve(s.handle[n]) : nullptr)
+                if (primaryField(w, 0xb4) == 11) bombSlot = int(n);
+        if (bombSlot < 0 || !enabled || resettingControls || grenadeThrow.holding()) fuse.clear();
+        else {
+            const unsigned bombHand = mountHand(s, unsigned(bombSlot)), lighter = 1 - bombHand;
+            const bool tracked = controllerTracked(input, 0) && controllerTracked(input, 1) && input.handValid[lighter];
+            const bool wasFiring = fuse.firing;
+            if (fuse.update(tracked, input.trigger[lighter], weaponTracking(input, lighter), weaponTracking(input, bombHand),
+                            GetTickCount64()))
+                s.fire[bombSlot] = true;
+            if (fuse.firing && !wasFiring) log("Bomb fuse lit by hand=%u", lighter);
+        }
+    }
     // Use existing dual-wield policy. Retry while native weapons cannot yet transition.
     static const char *lastWeaponAction = "start";
-    // Dual wielding is switched on once per player (each hand its own weapon).
-    // After that a weapon chosen on a wheel that the game will not pair (it
-    // drops dual mode) must stay: toggling back restored the previous pair.
-    static uint32_t dualPlayer = 0;
-    static uint64_t lastSelection = 0;
+    // Dual wielding. The game pairs only one-handed weapons and drops dual mode
+    // on its own around rides, destroyed turrets, cutscenes and loads, and for
+    // a two-handed pick; switching it on once per player left the player with a
+    // lone weapon for the rest of the run. It is switched on again whenever the
+    // held weapons can pair, with no wheel pick or trigger in the last second;
+    // a refused toggle (still seated, mid-transition) is retried a second later.
+    static uint64_t lastSelection = 0, lastToggle = 0;
     if (lastWeaponSelection) {
         lastWeaponAction = lastWeaponSelection; lastWeaponSelection = nullptr;
         lastSelection = GetTickCount64();
     }
-    if (s.playerHandle != dualPlayer && isDual(p)) dualPlayer = s.playerHandle;
     // Lab (SS2VR_LAB_NO_DUAL=1): leave dual wielding off, so weapons are held alone.
     static const bool labNoDual = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_NO_DUAL", v, 2) == 1 && v[0] == L'1'; }();
-    if (enabled && !labNoDual && rider.handheld() && !multiplayer::remoteClient() && s.playerHandle != dualPlayer && !isDual(p) &&
-        !s.fire[0] && !s.fire[1] && GetTickCount64() - lastSelection > 2000 &&
-        canChange(p, 0) && canChange(p, 1) && nativeRiderCurrent(p, rider)) {
+    const uint64_t now = GetTickCount64();
+    const bool pairReady = enabled && !labNoDual && rider.handheld() && !multiplayer::remoteClient() && !s.fire[0] &&
+        !s.fire[1] && now - lastSelection > 1000 && canChange(p, 0) && canChange(p, 1) && nativeRiderCurrent(p, rider);
+    // A pair the game drops again at once is not retried: twice per lone
+    // weapon, until dual mode has held for a few seconds.
+    static uint32_t triedKey = 0;
+    static unsigned tries = 0;
+    static uint64_t dualSince = 0;
+    void *lone = nativeHandle(p, soloSlot(p)) ? resolve(nativeHandle(p, soloSlot(p))) : nullptr;
+    const uint32_t weaponKey = lone ? primaryField(lone, 0xb4) + 1 : 0;
+    if (!isDual(p)) dualSince = 0;
+    else if (!dualSince) dualSince = now;
+    if ((weaponKey != triedKey && !isDual(p)) || (dualSince && now - dualSince > 3000)) { triedKey = weaponKey; tries = 0; }
+    {
+        // Bounded trace while unpaired on foot: why dual mode is not switched on.
+        static uint64_t lastTrace = 0;
+        static unsigned traced = 0;
+        if (!isDual(p) && rider.handheld() && now - lastTrace > 3000 && traced < 40) {
+            lastTrace = now; ++traced;
+            uint32_t state[2]{~0u, ~0u}, ids[2]{~0u, ~0u};
+            for (const int hand : {0, 1})
+                if (void *w = nativeHandle(p, hand) ? resolve(nativeHandle(p, hand)) : nullptr) {
+                    state[hand] = primaryField(w, 0xb0); ids[hand] = primaryField(w, 0xb4);
+                }
+            log("Dual unpaired ready=%u flag=%u pairable=%u tries=%u change=%u,%u fire=%u,%u sinceSelection=%llu ids=%d,%d states=%d,%d",
+                pairReady, primaryField(p, 0x9bc), pairable(p), tries, canChange(p, 0), canChange(p, 1), s.fire[0], s.fire[1],
+                static_cast<unsigned long long>(now - lastSelection), int(ids[0]), int(ids[1]), int(state[0]), int(state[1]));
+        }
+    }
+    if (pairReady && !dualIntent(p) && pairable(p) && now - lastToggle > 1000 && tries < 2) {
         toggleDual(p, 0);
-        dualPlayer = s.playerHandle;
+        ++tries;
+        lastToggle = now;
         lastWeaponAction = "dual toggle";
     }
+    // Dual mode with one slot empty (the game brings up the left weapon it last
+    // paired, which may be gone): the choosing hand's pick, else the same weapon.
+    if (pairReady && dualIntent(p) && !isDual(p) && pairable(p) && now - lastToggle > 500 && tries < 4) {
+        const int empty = slotHeld(p, 1) ? 0 : 1;
+        void *other = resolve(nativeHandle(p, 1 - empty));
+        const int id = pairPick.id >= 0 && pairPick.hand == empty ? pairPick.id : other ? int(primaryField(other, 0xb4)) : -1;
+        if (id >= 0 && id != 11 && inInventory(static_cast<uint8_t *>(p) + 0x8f8, id)) {
+            setWeapon(p, id, empty, 1);
+            ++tries;
+            lastToggle = now;
+            lastWeaponAction = "dual fill";
+        }
+    }
+    // Paired after a pick that replaced the lone weapon: the choosing hand gets it.
+    if (pairReady && isDual(p) && pairPick.id >= 0) {
+        const PairPick pick = pairPick;
+        pairPick = {};
+        void *w = resolve(nativeHandle(p, pick.hand));
+        if ((!w || int(primaryField(w, 0xb4)) != pick.id) && inInventory(static_cast<uint8_t *>(p) + 0x8f8, pick.id)) {
+            setWeapon(p, pick.id, pick.hand, 1);
+            lastWeaponAction = "dual pick";
+        }
+    }
+    if (!rider.handheld() || now - lastSelection > 10000) pairPick = {};
     {
         // Bounded trace of every native weapon change per hand and what preceded it.
         static int previousIds[2]{-2, -2};
@@ -3184,7 +3299,10 @@ static void prepareMeleeStep(void *weapon, MeleeStepFrame &frame) {
 static bool unheldWeaponFiring(void *player, uint32_t weapon) {
     if (!weapon) return false;
     const auto s = copySnapshot();
-    if (!vrSession(s) || !s.rider.handheld() || player != livePlayer(s) ||
+    // Only while dual wielding (the ghost: a replaced hand's weapon kept firing).
+    // Single-weapon mode fires its own current weapon; refusing it there (after
+    // leaving a turret, which drops dual mode) left the right hand unable to fire.
+    if (!vrSession(s) || !s.rider.handheld() || player != livePlayer(s) || !isDual(player) ||
         weapon == nativeHandle(player, 0) || weapon == nativeHandle(player, 1))
         return false;
     static unsigned refused = 0;
@@ -4111,8 +4229,30 @@ static void __fastcall viewPrepare(void *command, void *, const Matrix34 &view, 
         const Matrix34 expectedView = matrix(inverse(eye));
         preparedWeaponWorld = {view, projection, depthRange.min, depthRange.max,
             finiteMatrix(view) && finiteProjection(projection) &&
-            validDepthRange(depthRange.min, depthRange.max) && sameWeaponView(view, expectedView) &&
+            validDepthRange(depthRange.min, depthRange.max) && shakenWeaponView(view, expectedView) &&
             sameProjectionXY(projection, ss2vr::projection(eyeRequest.fov[eyeIndex]))};
+        {
+            // Bounded trace of shaken root views the pair now keeps.
+            static unsigned shaken = 0;
+            if (preparedWeaponWorld.valid && !sameWeaponView(view, expectedView) && (++shaken <= 8 || shaken % 2000 == 0))
+                log("Native root view shaken eye=%d (%u) dt=%.4f,%.4f,%.4f", eyeIndex, shaken, view.m[3] - expectedView.m[3],
+                    view.m[7] - expectedView.m[7], view.m[11] - expectedView.m[11]);
+        }
+        {
+            // Bounded trace of rejected root views: what differed from the eye.
+            static unsigned rejected = 0;
+            if (!preparedWeaponWorld.valid && (++rejected <= 24 || rejected % 500 == 0)) {
+                const auto &a = view.m, &b = expectedView.m;
+                float rotation = 0;
+                for (unsigned i : {0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u}) rotation = std::max(rotation, std::abs(a[i] - b[i]));
+                const auto expectedProjection = ss2vr::projection(eyeRequest.fov[eyeIndex]);
+                log("Native root view rejected eye=%d (%u) view=%u xy=%u depth=%u dt=%.4f,%.4f,%.4f rot=%.4f P %.5f/%.5f %.5f/%.5f %.5f/%.5f",
+                    eyeIndex, rejected, sameWeaponView(view, expectedView), sameProjectionXY(projection, expectedProjection),
+                    validDepthRange(depthRange.min, depthRange.max), a[3] - b[3], a[7] - b[7], a[11] - b[11], rotation,
+                    projection.m[0], expectedProjection.m[0], projection.m[5], expectedProjection.m[5], projection.m[2],
+                    expectedProjection.m[2]);
+            }
+        }
         static unsigned prepareDiagnostics=0;
         if(prepareDiagnostics<4) {
             ++prepareDiagnostics;
@@ -5235,6 +5375,7 @@ constexpr Vec3 ColtLaserEmitter{.039f, -.0965f, .1435f};
 // a green cross through any geometry.
 static Vec3 labShotMuzzle[2];
 static bool labShotMuzzleValid[2];
+static Vec3 genericBeamOffset{};
 static bool vehicleLaserMuzzle(const Snapshot &s, const Request &request, VehicleLaserSource &source,
                                Pose &muzzle, Vec3 &rayDirection) {
     if (!laserModelScratchIdle() || !readVehicleLaserSource(s, source) ||
@@ -5250,7 +5391,10 @@ static bool vehicleLaserMuzzle(const Snapshot &s, const Request &request, Vehicl
         reinterpret_cast<ShootDirection>(table[0x5a4 / 4])(ride, &direction);
         if (!vehicleLaserCurrent(s, request, source) || !nativeLaserPose(origin, direction, muzzle, &rayDirection))
             return false;
-        muzzle.p = muzzle.p + rayDirection * .5f + Vec3{0, -.25f, 0};
+        // The ray is cast from the eye along the aim (where shots go); the beam
+        // is drawn from just below and ahead of it to that hit (sampling applies
+        // genericBeamOffset), so it converges on the target.
+        genericBeamOffset = rayDirection * .5f + Vec3{0, -.25f, 0};
         return finite(muzzle);
     }
     uint32_t attachment = *invalidSeatIdent;
@@ -5354,8 +5498,9 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
             if (!w || nativeHandle(s.player, h) != s.handle[h] || !laserModelScratchIdle())
                 { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,4);continue; }
             const int weapon = *reinterpret_cast<int *>(static_cast<uint8_t *>(w) + 0xb4);
-            // The circular saw cuts what it touches; it has no use for a laser.
-            if (weapon == 0)
+            // The circular saw cuts what it touches and the serious bomb clears
+            // everything around regardless of aim: neither has use for a laser.
+            if (weapon == 0 || weapon == 11)
                 { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,5);continue; }
             bool calibrated = false;
             shooting(w, &muzzle, weapon == 13 ? originalSniperShot : originalShot, &s, &calibrated);
@@ -5426,6 +5571,7 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
                       s.generation, s.input.sequence, GetTickCount64(), true, hit};
         sampled[h].kind = mounted ? LaserSourceKind::Vehicle : LaserSourceKind::Handheld;
         sampled[h].vehicle = vehicle;
+        if (mounted && !vehicle.attachment) sampled[h].muzzle.p = sampled[h].muzzle.p + genericBeamOffset; // Converging beam.
         sampled[h].requestSequence = queryRequest.sequence;
         sampled[h].local = local;
         sampled[h].distance = distance;
@@ -6762,6 +6908,12 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
             trace.references(identity,rawGrip,gripValid,rawAim);
         }
         out = staged;
+        // The Serious Bomb model is both arms: its left arm follows the left controller.
+        if (nativeId == 11 && controllerTracked(tracking, 0) && mountHand(s, unsigned(h)) == 1)
+            remote_render::setSplitModel(uintptr_t(modelAfter.instance),
+                worldHandTracking(body, s.origin, s.turn, tracking.head, weaponTracking(tracking, 0)), hand.q, true);
+        else if (nativeId == 11 || mountHand(s, unsigned(h)) == 1)
+            remote_render::setSplitModel(0, {}, {0, 0, 0, 1}, false);
     }
     const auto published=calibration[h];
     ReleaseSRWLockExclusive(&snapshotLock);
@@ -8446,15 +8598,35 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 // the native look each control step, as the mouse's deltas are on
                 // the desktop: it turns only while pushed, whatever frame the look
                 // is kept in.
+                // The native look a turret reports is its actual aim, which only
+                // lerps toward the commanded look: per-step deltas on it mostly
+                // vanished (turning was very slow). A commanded look accumulates
+                // instead, kept within 0.6 rad heading / 0.4 rad pitch of the
+                // actual aim so the turret stops soon after the stick is released.
+                static Vec3 commanded{};
+                static uint32_t commandedRide = 0;
                 static uint64_t turretClock = 0;
                 const uint64_t now = GetTickCount64();
+                if (commandedRide != captured.rider.ride || now - turretClock > 500) {
+                    commanded = look;
+                    commandedRide = captured.rider.ride;
+                }
                 const float dt = turretClock && now > turretClock ? std::min(.1f, float(now - turretClock) / 1000.f) : 0.f;
                 turretClock = now;
-                Vec3 turned = advanceTurretLook(look, captured.input.axis[1][0], captured.input.axis[1][1],
+                Vec3 turned = advanceTurretLook(commanded, captured.input.axis[1][0], captured.input.axis[1][1],
                                                 settings.smoothTurnRate, dt);
                 const Vec3 byHand = rideHandAimDelta(captured);
                 turned.x += byHand.x;
                 turned.y = std::clamp(turned.y + byHand.y, -1.4f, 1.4f);
+                const float lead = std::remainder(turned.x - look.x, 2 * Pi);
+                turned.x = look.x + std::clamp(lead, -.6f, .6f);
+                turned.y = std::clamp(turned.y, look.y - .4f, look.y + .4f);
+                // Idle (no stick, no hand motion): hold the actual aim, so nothing
+                // can keep it turning.
+                const bool idle = !turretStickRate(captured.input.axis[1][0]) && !turretStickRate(captured.input.axis[1][1]) &&
+                                  byHand.x == 0 && byHand.y == 0;
+                if (idle) turned = look;
+                commanded = turned;
                 if (labTurretMode()) {
                     static unsigned calls = 0;
                     if (calls++ % 25 == 0)

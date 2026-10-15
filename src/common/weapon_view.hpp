@@ -25,6 +25,18 @@ inline bool sameWeaponView(const Matrix34 &a, const Matrix34 &b) {
             std::abs(a.m[i] - b.m[i]) > .001f) return false;
     return true;
 }
+// The game's own camera motion on top of the eye (view bob on landing, damage
+// and explosion shake) moves the root view a few centimetres and degrees from
+// the eye: the world was still drawn for this eye. Another camera altogether
+// (more than ShakeReach metres or ShakeTurn in any rotation element) is not.
+constexpr float ShakeReach = .3f, ShakeTurn = .2f;
+inline bool shakenWeaponView(const Matrix34 &a, const Matrix34 &b) {
+    for (unsigned i = 0; i != 12; ++i) {
+        if (!std::isfinite(a.m[i]) || !std::isfinite(b.m[i])) return false;
+        if (std::abs(a.m[i] - b.m[i]) > (i % 4 == 3 ? ShakeReach : ShakeTurn)) return false;
+    }
+    return true;
+}
 inline bool sameProjectionXY(const Matrix44 &a, const Matrix44 &b) {
     // Native execution may revise Z clipping. Every other coefficient must
     // retain this exact prepared asymmetric eye's projection provenance.

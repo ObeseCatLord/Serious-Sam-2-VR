@@ -1531,6 +1531,97 @@ static void labBoneDump() {
             }
     }
 }
+// The Serious Bomb split (setSplitModel): the left arm's bones of that model
+// move so its Palm_Left sits at the left controller, turned by the rotation
+// between the two controllers.
+static struct { uintptr_t instance = 0; Pose left{}; Quat right{0, 0, 0, 1}; bool valid = false; } splitModel;
+static uint32_t splitArmName = 0, splitPalmName = 0;
+static void applySplitModel() {
+    if (!splitModel.valid || !splitModel.instance || !splitArmName || !finite(splitModel.left)) return;
+    std::span<NativeModelRecord> records;
+    std::span<NativeMeshRecord> meshes;
+    std::span<NativeDrawEntry> draws;
+    std::span<NativeBone> bones;
+    std::span<PaletteMap> mappings;
+    std::span<Matrix34> palette;
+    if (!rendererArray(0x2eac20, MaxModelRecords, records) || records.empty() ||
+        !rendererArray(0x2eac70, MaxPaletteMatrices, mappings) || mappings.empty() ||
+        !rendererArray(0x2eac30, MaxNativeEntries, meshes) || !rendererArray(0x2eac50, MaxNativeEntries, draws) ||
+        !rendererArray(0x2eac60, MaxNativeBones, bones) ||
+        !rendererArray(0x2eac90, MaxPaletteMatrices, palette, true) || palette.size() < mappings.size())
+        return;
+    size_t owner = records.size();
+    for (size_t i = 0; i < records.size(); ++i)
+        if (reinterpret_cast<uintptr_t>(records[i].instance) == splitModel.instance) { owner = i; break; }
+    if (owner == records.size()) return;
+    void *evaluated = nullptr;
+    Matrix34 *canonical = nullptr;
+    int32_t canonicalCount = 0;
+    std::memcpy(&evaluated, reinterpret_cast<void *>(engineBase + 0x2eab68), 4);
+    if (!readableMemory(evaluated, 0x28)) return;
+    std::memcpy(&canonical, static_cast<uint8_t *>(evaluated) + 0x20, 4);
+    std::memcpy(&canonicalCount, static_cast<uint8_t *>(evaluated) + 0x24, 4);
+    if (canonicalCount < int32_t(bones.size()) || !readableMemory(canonical, size_t(canonicalCount) * sizeof(Matrix34))) return;
+    size_t arm = bones.size(), palm = bones.size();
+    std::vector<uint32_t> names(bones.size(), 0);
+    for (size_t b = 0; b < bones.size(); ++b) {
+        if (!bones[b].definition || !readableMemory(bones[b].definition, 4)) continue;
+        std::memcpy(&names[b], bones[b].definition, 4);
+        if (bones[b].owner == int32_t(owner) && names[b] == splitArmName) arm = b;
+        if (bones[b].owner == int32_t(owner) && names[b] == splitPalmName) palm = b;
+    }
+    if (arm == bones.size() || palm == bones.size() ||
+        !readableMemory(static_cast<const uint8_t *>(bones[palm].definition) + 0x48, sizeof(Matrix34)))
+        return;
+    Matrix34 inverseBind, bind;
+    std::memcpy(&inverseBind, static_cast<const uint8_t *>(bones[palm].definition) + 0x48, sizeof(Matrix34));
+    if (!affineInverse(inverseBind, bind)) return;
+    const Matrix34 &world = records[owner].world;
+    Matrix34 inverseWorld;
+    if (!affineInverse(world, inverseWorld)) return;
+    const Vec3 palmModel = matrixTranslation(affineMultiply(canonical[palm], bind));
+    const Vec3 palmWorld = matrixApply(world, palmModel);
+    // World delta: turn about the palm by the controllers' relative rotation,
+    // then move the palm to the left controller.
+    const Quat turn = normalize(multiply(normalize(splitModel.left.q), inverse(normalize(splitModel.right))));
+    const Matrix34 delta = affineMultiply(matrix(Pose{{0, 0, 0, 1}, splitModel.left.p - palmWorld}),
+                                          rotationAbout(turn, palmWorld));
+    const Matrix34 modelDelta = affineMultiply(inverseWorld, affineMultiply(delta, world));
+    if (!finiteMatrix(modelDelta)) return;
+    // Bones under Arm_Left on this model.
+    std::vector<uint8_t> moved(bones.size(), 0);
+    for (size_t b = 0; b < bones.size(); ++b) {
+        size_t node = b;
+        for (size_t hops = 0; hops <= bones.size() && node < bones.size(); ++hops) {
+            if (bones[node].owner != int32_t(owner)) break;
+            if (node == arm) { moved[b] = 1; break; }
+            if (bones[node].parent < 0) break;
+            node = size_t(bones[node].parent);
+        }
+    }
+    std::vector<PaletteModelRange> models;
+    std::vector<PaletteMeshRange> meshRanges;
+    std::vector<PaletteDrawRange> drawRanges;
+    std::vector<int32_t> drawOwners;
+    for (const auto &record : records) {
+        int32_t first = 0, count = 0;
+        std::memcpy(&first, reinterpret_cast<const uint8_t *>(&record) + 8, 4);
+        std::memcpy(&count, reinterpret_cast<const uint8_t *>(&record) + 0xc, 4);
+        models.push_back({first, count});
+    }
+    for (const auto &mesh : meshes) meshRanges.push_back({mesh.owner, mesh.first, mesh.count});
+    for (const auto &draw : draws) drawRanges.push_back({draw.mesh, draw.first, draw.count});
+    if (!paletteDrawOwners(models, meshRanges, drawRanges, mappings, drawOwners)) return;
+    if (paletteInvalidated) return;
+    for (size_t i = 0; i < mappings.size(); ++i) {
+        const auto &map = mappings[i];
+        if (map.bone < 0 || size_t(map.bone) >= bones.size() || map.draw < 0 || size_t(map.draw) >= drawOwners.size() ||
+            drawOwners[size_t(map.draw)] != int32_t(owner) || !moved[size_t(map.bone)])
+            continue;
+        const Matrix34 next = affineMultiply(modelDelta, palette[i]);
+        if (finiteMatrix(next)) palette[i] = next;
+    }
+}
 static void observeIdlePalette() {
     ScopeDrawBinding binding;IdleDrawIdentity identity;IdleWeaponTrace *trace=nullptr;
     if(paletteInvalidated || !currentIdleDraw(binding,identity,trace))return;
@@ -1577,6 +1668,7 @@ static void __cdecl palettePass() {
                                [] { originalPalettePass(); }, [] {
                                    if (headTrackingEnabled) postPalette();
                                    labBoneDump();
+                                   applySplitModel();
                                    // Independent of remote-player presence and head option.
                                    // Unsupported observations stay native; an aborted extent
                                    // retires the pair through its native-finally cleanup.
@@ -1619,6 +1711,12 @@ static void clearBinding(uint32_t handle) {
 
 } // namespace
 
+void setSplitModel(uintptr_t instance, const Pose &left, Quat right, bool valid) noexcept {
+    splitModel.instance = instance;
+    splitModel.left = left;
+    splitModel.right = right;
+    splitModel.valid = valid && instance;
+}
 bool initialize(HMODULE engine, HMODULE core, HMODULE sam, HookInstallerRva install, bool enableHeadTracking,
                 bool observeRideControl,bool produceGrips) {
     if (ready.load(std::memory_order_acquire))
@@ -1657,6 +1755,8 @@ bool initialize(HMODULE engine, HMODULE core, HMODULE sam, HookInstallerRva inst
             for (unsigned k = 0; k < 3; ++k) stringId(&armNames[side][k], arms[side][k]);
     }
     stringId(&scopeName, "Scope");
+    stringId(&splitArmName, "Arm_Left");
+    stringId(&splitPalmName, "Palm_Left");
     stringId(&scopeBoneName, "Sniper");
     if(observeRideControl) {
         stringId(&mainName,"Main");stringId(&seatName,"Seat");

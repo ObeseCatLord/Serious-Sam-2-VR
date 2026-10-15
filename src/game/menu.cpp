@@ -107,7 +107,7 @@ static void __cdecl poll() {
     bool sourceEligible = false;
     uint32_t publishedGeneration = 0;
     uint64_t menuSequence = 0;
-    uint32_t imageWidth = 0, imageHeight = 0, canvasWidth = 0, canvasHeight = 0;
+    uint32_t imageWidth = 0, imageHeight = 0;
     {
         Lock lock(channel);
         if (!lock) {
@@ -124,8 +124,6 @@ static void __cdecl poll() {
         menuSequence = channel.shared->menu.sequence;
         imageWidth = channel.shared->menu.width;
         imageHeight = channel.shared->menu.height;
-        canvasWidth = channel.shared->width;
-        canvasHeight = channel.shared->height;
         sourceEligible = menuPointerEligible(pointer, input, menuSequence, publishedGeneration, GetTickCount64());
     }
     uintptr_t menu = current();
@@ -195,7 +193,9 @@ static void __cdecl poll() {
         return;
     // Native Sam2Game cursor motion integrates deltas in a 640x480 menu space.
     // Supply the delta to its own dispatcher, not direct cursor/global writes.
-    const MenuCursor target = menuCursor(pointer.u, pointer.v, imageWidth, imageHeight, canvasWidth, canvasHeight);
+    // The menu image is the whole canvas (scaled to 4:3, bridge), as is the
+    // cursor's space: the mapping is proportional.
+    const MenuCursor target = menuCursor(pointer.u, pointer.v);
     motion((target.x - x) / sensitivity, (target.y - y) / sensitivity);
     if (held && !down) {
         press(0x1f, 0);

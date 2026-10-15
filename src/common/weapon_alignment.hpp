@@ -32,9 +32,9 @@ inline constexpr WeaponGrip WeaponGrips[] = {
     {6, {0.f, -.118f, -.058f}},      // Rocket launcher: rear grip
     {7, {0.f, .058f, .008f}},        // Grenade launcher: rear grip
     {8, {0.f, .041f, 0.f}},          // Plasma rifle
-    {9, {0.f, -.08f, .226f}},        // Klodovik
+    {9, {0.f, -.02f, -.12f}},        // Klodovik: the fist holding the bomb (V472 side view)
     {10, {0.f, -.065f, .117f}},      // Cannon: rear handle
-    {11, {0.f, -.118f, -.531f}},     // Serious bomb
+    {11, {.165f, -.14f, -.6475f}},   // Serious bomb: right palm (Palm_Right); the left arm follows the left hand
     {12, {.0114f, -.0016f, -.3308f}},// Colt revolvers: Hand bone
     {13, Id13ModelHandleReference},   // Sniper
     {15, {0.f, .003f, -.113f}},      // Beam gun: rear grip

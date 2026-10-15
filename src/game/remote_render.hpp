@@ -16,6 +16,12 @@ bool initialize(HMODULE engine, HMODULE core, HMODULE sam, HookInstallerRva inst
                 bool observeRideControl=false,bool produceGrips=false);
 
 // Pin before native simulation; check lifecycle entries before native mutation.
+// A two-handed first-person model held by the right hand (the Serious Bomb):
+// its left arm (the bone subtree `leftArm`) follows the left controller. `left`
+// is the left controller's world pose and `right` the holding hand's rotation,
+// in the world the model is placed in; set before the model renders, cleared
+// with instance 0.
+void setSplitModel(uintptr_t instance, const Pose &left, Quat right, bool valid) noexcept;
 void noteSimulationThread();
 bool checkNativeThread();
 // Passive observers decline foreign/unknown ownership without poisoning it.

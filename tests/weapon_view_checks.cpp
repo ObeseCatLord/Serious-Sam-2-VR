@@ -119,5 +119,12 @@ int main() {
     invalid.m[0]=std::numeric_limits<float>::quiet_NaN();
     check(!finiteProjection(invalid) && !validDepthRange(0,0) && !validDepthRange(-.1f,1),
           "Nonfinite projection and invalid native depth ranges cannot be admitted");
+    {
+        Matrix34 eyeView{}; eyeView.m[0] = eyeView.m[5] = eyeView.m[10] = 1;
+        Matrix34 bob = eyeView; bob.m[7] += .04f; bob.m[1] = .03f;
+        Matrix34 other = eyeView; other.m[11] += 2;
+        check(shakenWeaponView(bob, eyeView) && !sameWeaponView(bob, eyeView) && !shakenWeaponView(other, eyeView),
+              "Camera shake on the eye view is kept; another camera is not");
+    }
     std::cout << "Physical weapon view/depth checks passed; no native runtime executed\n";
 }

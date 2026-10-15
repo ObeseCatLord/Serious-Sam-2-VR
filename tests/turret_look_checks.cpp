@@ -13,6 +13,8 @@ int main() {
     assert(advanceTurretLook(start, 0, -1, 2, .1f).y < start.y);
     // Full deflection moves at the rate; the dead zone holds still; bank is zero.
     assert(std::abs(advanceTurretLook(start, 1, 0, 2, .1f).x - (start.x - .2f)) < 1e-6f);
+    // Half way past the dead zone moves at a quarter of the rate (squared response).
+    assert(std::abs(advanceTurretLook(start, .575f, 0, 2, .1f).x - (start.x - .05f)) < 1e-5f);
     const Vec3 held = advanceTurretLook(start, .1f, -.1f, 2, .1f);
     assert(held.x == start.x && held.y == start.y && held.z == 0);
     // Pitch stays within +-1.4 rad; bad input does nothing.
