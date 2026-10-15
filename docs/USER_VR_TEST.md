@@ -240,4 +240,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `02bbf53`, version `0.2.11-dev.055d0a7ad895` (2026-10-14).
+Installed candidate: commit `1bafc35`, version `0.2.11-dev.9f0dfd98c720` (2026-10-15).
