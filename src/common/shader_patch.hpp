@@ -3,6 +3,7 @@
 #include <iterator>
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <vector>
 
 // Single-pass stereo vertex shader patch (vs_1_1, the only vertex program
@@ -32,6 +33,7 @@ struct VertexInfo {
     unsigned instructions = 0;
     unsigned constants = 0;      // Highest constant register read + 1 (relative reads: 256).
     bool eyeClip = false;        // Patched with the per-eye world-fixed reflection lookup (water).
+    unsigned clipMatrix = 0;     // With eyeClip: first of the model -> clip rows (c#..c#+3).
 };
 // The texcoord output carrying the eye test (8 when the program writes all).
 inline unsigned killSet(const VertexInfo &original) {
@@ -113,7 +115,7 @@ inline bool inspect(const uint32_t *words, size_t count, VertexInfo &info) {
 // ripple, flip and bias then apply as before. Returns the word index of the
 // mad (and its registers), or 0.
 inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg, unsigned *normal = nullptr,
-                          unsigned *position = nullptr) {
+                          unsigned *position = nullptr, unsigned *matrix = nullptr) {
     using namespace detail;
     int lastProjection = -1;
     for (size_t i = 1; i + 8 < count;) {
@@ -135,6 +137,7 @@ inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg, un
             reg = regNum(op[0]);
             if (normal) *normal = regNum(op[1]);
             if (position) *position = regNum(words[size_t(lastProjection) + 2]);
+            if (matrix) *matrix = regNum(words[size_t(lastProjection) + 3]);
             return i;
         }
         i += 1 + size_t(n);
@@ -143,8 +146,12 @@ inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg, un
 }
 // Builds the stereo variant. False (out untouched) if the program cannot be patched.
 // `eyeClip` (a free constant register, 0 = off) enables the water texcoord fix.
+// With `probe` the water variant instead writes the world-space reflection
+// direction (model-space R turned by the rows in c<eyeClip+2..+4>) to the
+// texcoord set the reflection lookup wrote, for a cube map of the surroundings
+// (env_probe.cpp, and patchWaterPixelShader below).
 inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, VertexInfo *infoOut = nullptr,
-                              unsigned eyeClip = 0) {
+                              unsigned eyeClip = 0, bool probe = false) {
     using namespace detail;
     VertexInfo info;
     if (!inspect(words, count, info) || !info.positionWrites) return false;
@@ -153,8 +160,9 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
     if (info.temps > 11) return false; // vs_1_1 has r0..r11; r11 holds the original position.
     const unsigned position = 11;
     unsigned clipReg = 0, normalReg = 0, positionReg = 0;
-    size_t clipAt = eyeClip ? eyeClipSite(words, count, clipReg, &normalReg, &positionReg) : 0;
-    if (clipAt && (info.temps > 9 || info.constants > eyeClip || eyeClip + 2 > 96)) clipAt = 0; // r9, r10 and c<eyeClip..+1> must be free.
+    size_t clipAt = eyeClip ? eyeClipSite(words, count, clipReg, &normalReg, &positionReg, &info.clipMatrix) : 0;
+    if (clipAt && (info.temps > 9 || info.constants > eyeClip || eyeClip + (probe ? 5 : 2) > 96)) clipAt = 0; // r9, r10 and c<eyeClip..> must be free.
+    bool reflectionWritten = !probe || !clipAt;
     info.eyeClip = clipAt != 0;
     std::vector<uint32_t> result;
     result.reserve(count + 64);
@@ -192,7 +200,32 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
                 0x05u, dst(Temp, clipReg, 0x3), src(Temp, clipReg), src(Const, k, 0x00u),     // mul rX.xy, rX, cK.x
                 0x01u, dst(Temp, clipReg, 0xc), src(Const, k, 0x55u),                         // mov rX.zw, cK.y (1)
             };
-            result.insert(result.end(), std::begin(dome), std::end(dome));
+            // The view ray and its reflection (the first seven instructions), then
+            // either the dome mapping or the world direction for the probe.
+            result.insert(result.end(), std::begin(dome), probe ? std::begin(dome) + 28 : std::end(dome));
+            if (probe) {
+                const uint32_t world[] = {
+                    0x08u, dst(Temp, 10, 0x1), src(Temp, 9), src(Const, e + 2), // dp3 r10.x, R, cE+2
+                    0x08u, dst(Temp, 10, 0x2), src(Temp, 9), src(Const, e + 3), // dp3 r10.y, R, cE+3
+                    0x08u, dst(Temp, 10, 0x4), src(Temp, 9), src(Const, e + 4), // dp3 r10.z, R, cE+4
+                    0x01u, dst(Temp, 10, 0x8), src(Const, k, 0x55u),            // mov r10.w, 1
+                };
+                result.insert(result.end(), std::begin(world), std::end(world));
+            }
+        }
+        // Probe: the texcoord the reflection lookup wrote (from rX) takes the direction.
+        if (clipAt && probe && !reflectionWritten && i > clipAt && n >= 2 && regType(words[i + 1]) == TexCrdOut) {
+            bool fromLookup = false;
+            for (int k = 1; k < n; ++k)
+                if (regType(words[i + 1 + k]) == Temp && regNum(words[i + 1 + k]) == clipReg) fromLookup = true;
+            if (fromLookup) {
+                result.push_back(0x01u);
+                result.push_back(dst(TexCrdOut, regNum(words[i + 1]), 0xf));
+                result.push_back(src(Temp, 10));
+                reflectionWritten = true;
+                i += 1 + size_t(n);
+                continue;
+            }
         }
         result.push_back(token);
         for (int k = 0; k < n; ++k) {
@@ -223,6 +256,7 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
         result.push_back(dst(TexCrdOut, k, test ? 0xe : 0xf));
         result.push_back(src(Input, FirstStereoInput));
     }
+    if (!reflectionWritten) return false; // Probe mode needs the lookup's texcoord.
     result.push_back(0x0000ffffu);
     out = std::move(result);
     if (infoOut) *infoOut = info;
@@ -313,6 +347,92 @@ inline bool patchPixelShader(const uint32_t *words, size_t count, unsigned k, st
     }
     if (!inserted) insert();
     result.push_back(0x0000ffffu);
+    out = std::move(result);
+    return true;
+}
+
+// The water pixel program (WaterShader_PP20_bump) looks the reflection image up
+// projectively: `mad rA.xy, rB, tC.z, tC` (ripple offset scaled by w), `mov
+// rA.w, tC.w`, `texldp rA, rA, sN`. For the environment cube (the vertex
+// variant writes the world reflection direction to tC) the ripple turns the
+// direction instead: `mad rA.xyz, rB.x, c30, tC`, `mad rA.xyz, rB.y, c31, rA`
+// with c30 = (Ripple,0,0,0), c31 = (0,0,Ripple,0), then `texld rA, rA, sN`
+// from sN declared as a cube and `mul rA.xyz, rA, c29` (c29 = `gain`: the
+// program scales the painted image's dark values up, the cube holds the real
+// scene). `sampler` returns N. False if no such sequence, or the program
+// already uses c29..c31.
+constexpr float WaterRipple = .15f; // Direction change for the ripple's texture offset.
+inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, unsigned &sampler,
+                                  float gain = 1) {
+    using namespace detail;
+    constexpr unsigned Sampler = 10;
+    if (!words || count < 2 || words[0] != PsVersion20) return false;
+    size_t site = 0, dclAt = 0;
+    unsigned a = 0, b = 0, c = 0, n = 0;
+    for (size_t i = 1; i < count && words[i] != 0x0000ffffu;) {
+        const uint32_t token = words[i], opcode = token & 0xffffu;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const size_t len = (token >> 24) & 0xfu;
+        if (i + 1 + len > count) return false;
+        for (size_t k = 1; k <= len && opcode != 0x51 && opcode != 0x1f; ++k)
+            if (regType(words[i + k]) == Const && regNum(words[i + k]) >= 29 && regNum(words[i + k]) <= 31) return false;
+        const uint32_t *op = words + i + 1;
+        if (!site && opcode == 0x04 && len == 4 && regType(op[0]) == Temp && ((op[0] >> 16) & 0xfu) == 0x3 &&
+            regType(op[1]) == Temp && regType(op[2]) == Texture && ((op[2] >> 16) & 0xffu) == 0xaa &&
+            regType(op[3]) == Texture && regNum(op[3]) == regNum(op[2]) && ((op[3] >> 16) & 0xffu) == 0xe4 &&
+            !(op[1] >> 24 & 0xf) && !(op[2] >> 24 & 0xf) && !(op[3] >> 24 & 0xf)) {
+            const size_t mov = i + 5, tex = i + 8;
+            a = regNum(op[0]); b = regNum(op[1]); c = regNum(op[2]);
+            if (tex + 3 < count && (words[mov] & 0xffffu) == 0x01 && ((words[mov] >> 24) & 0xfu) == 2 &&
+                regType(words[mov + 1]) == Temp && regNum(words[mov + 1]) == a && ((words[mov + 1] >> 16) & 0xfu) == 0x8 &&
+                words[mov + 2] == src(Texture, c, 0xffu) && (words[tex] & 0xffffu) == 0x42 && ((words[tex] >> 24) & 0xfu) == 3 &&
+                regType(words[tex + 1]) == Temp && regNum(words[tex + 1]) == a && regType(words[tex + 2]) == Temp &&
+                regNum(words[tex + 2]) == a && regType(words[tex + 3]) == Sampler) {
+                site = i; n = regNum(words[tex + 3]);
+            }
+        }
+        i += 1 + len;
+    }
+    if (!site) return false;
+    // The sampler's declaration (D3DSTT_2D) becomes a cube (D3DSTT_CUBE).
+    for (size_t i = 1; i < count && words[i] != 0x0000ffffu;) {
+        const uint32_t token = words[i], opcode = token & 0xffffu;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const size_t len = (token >> 24) & 0xfu;
+        if (opcode == 0x1f && len == 2 && regType(words[i + 2]) == Sampler && regNum(words[i + 2]) == n) {
+            if ((words[i + 1] & 0x78000000u) != 0x10000000u) return false;
+            dclAt = i;
+        }
+        i += 1 + len;
+    }
+    if (!dclAt) return false;
+    const auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    std::vector<uint32_t> result;
+    result.reserve(count + 16);
+    result.push_back(words[0]);
+    result.insert(result.end(), {0x05000051u, dst(Const, 29, 0xf), bits(gain), bits(gain), bits(gain), bits(1),
+                                 0x05000051u, dst(Const, 30, 0xf), bits(WaterRipple), 0u, 0u, 0u,
+                                 0x05000051u, dst(Const, 31, 0xf), 0u, 0u, bits(WaterRipple), 0u});
+    const uint32_t pp = words[site + 1] & 0x00200000u; // Keep partial precision.
+    for (size_t i = 1; i < count && words[i] != 0x0000ffffu;) {
+        const uint32_t token = words[i], opcode = token & 0xffffu;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const size_t len = (token >> 24) & 0xfu;
+        if (i == dclAt) {
+            result.insert(result.end(), {token, (words[i + 1] & ~0x78000000u) | 0x18000000u, words[i + 2]});
+        } else if (i == site) {
+            result.insert(result.end(), {
+                0x04000004u, dst(Temp, a, 0x7) | pp, src(Temp, b, 0x00u), src(Const, 30), src(Texture, c),
+                0x04000004u, dst(Temp, a, 0x7) | pp, src(Temp, b, 0x55u), src(Const, 31), src(Temp, a),
+                0x03000042u, words[site + 9], words[site + 10], words[site + 11],
+                0x03000005u, dst(Temp, a, 0x7) | pp, src(Temp, a), src(Const, 29)});
+            i = site + 12; // mad, mov and texldp replaced.
+            continue;
+        } else result.insert(result.end(), words + i, words + i + 1 + len);
+        i += 1 + len;
+    }
+    result.push_back(0x0000ffffu);
+    sampler = n;
     out = std::move(result);
     return true;
 }

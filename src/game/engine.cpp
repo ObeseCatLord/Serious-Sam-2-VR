@@ -95,6 +95,8 @@ static uintptr_t rootProjectionReturn = 0, nativeFrustumReturn = 0, playerFovGet
 static PoseGet originalCamera = nullptr, originalShot = nullptr, originalSniperShot = nullptr;
 static ViewOrigin baseViewOrigin = nullptr;
 static PoseGet nativeBodyPlacement = nullptr;
+using TeleportFn = int(__thiscall *)(void *, Pose);
+static TeleportFn nativeTeleport = nullptr; // Lab only (SS2VR_LAB_TELEPORT).
 static const uint32_t *invalidSeatIdent = nullptr;
 static ProjGet originalProjection = nullptr;
 static VoidThis originalRender = nullptr, originalStep = nullptr, originalDelete = nullptr,
@@ -2130,6 +2132,27 @@ static void update(void *p) {
     }
     // Use existing dual-wield policy. Retry while native weapons cannot yet transition.
     static const char *lastWeaponAction = "start";
+    {
+        // Lab (SS2VR_LAB_TELEPORT=x,y,z[,heading]): put the player there once,
+        // 3 s into play (CPuppetEntity::Teleport), to reach a scene by position.
+        static float target[4]{};
+        static int parts = [] {
+            wchar_t v[96]{};
+            if (!GetEnvironmentVariableW(L"SS2VR_LAB_TELEPORT", v, 96)) return 0;
+            return swscanf(v, L"%f,%f,%f,%f", &target[0], &target[1], &target[2], &target[3]);
+        }();
+        static uint64_t playingSince = 0;
+        if (parts >= 3 && rider.handheld() && singlePlayer() && nativeTeleport) {
+            if (!playingSince) playingSince = GetTickCount64();
+            if (GetTickCount64() - playingSince > 3000) {
+                const float half = target[3] * .5f;
+                const Pose placement{{0, std::sin(half), 0, std::cos(half)}, {target[0], target[1], target[2]}};
+                const int done = nativeTeleport(p, placement);
+                log("Lab teleport to %.2f,%.2f,%.2f heading %.2f result=%d", target[0], target[1], target[2], target[3], done);
+                parts = 0;
+            }
+        }
+    }
     // Dual wielding. The game pairs only one-handed weapons and drops dual mode
     // on its own around rides, destroyed turrets, cutscenes and loads, and for
     // a two-handed pick; switching it on once per player left the player with a
@@ -9796,6 +9819,19 @@ bool singlePassAdoptEye(void *p, const Request &real, int i) noexcept {
     }
     return true;
 }
+// The view and projection the single pass drew eye `i` of `real` with (the
+// water environment cube is filled from that image).
+bool singlePassEyeView(const Request &real, int i, float (&view)[12], float (&projection)[16]) noexcept {
+    ss2vr::replay::EyeChange change;
+    if (!singlePassRootWorld.valid || !singlePassEyeChange(real, singlePassCentre, i, change)) return false;
+    const auto r = ss2vr::replay::rewrite(singlePassRoot, change);
+    if (!r.valid) return false;
+    for (unsigned k = 0; k < 12; ++k) view[k] = float(r.view[k]);
+    for (unsigned k = 0; k < 16; ++k) projection[k] = float(r.projection[k]);
+    for (float v : view) if (!std::isfinite(v)) return false;
+    for (float v : projection) if (!std::isfinite(v)) return false;
+    return true;
+}
 // Lab check (SS2VR_LAB_REPLAY_VERIFY=1): after a native right eye, compare its
 // root capture with what the replay derivation would have produced.
 void replayVerifyEye(const ss2vr::replay::EyeChange &change) noexcept {
@@ -10210,6 +10246,7 @@ bool attach(bool headless) {
     S(g, "?OnAlternativeFirePressed@CBaseWeaponEntity@SeriousEngine@@UAEHXZ", nativeBaseAlternativePress);
     S(g, "?OnAlternativeFireReleased@CBaseWeaponEntity@SeriousEngine@@UAEXXZ", nativeBaseAlternativeRelease);
     S(g, "?CanFireFromOwnWeapons@CPuppetEntity@SeriousEngine@@QAEHXZ", nativeOwnWeapons);
+    nativeTeleport = loadProc<TeleportFn>(g, "?Teleport@CPuppetEntity@SeriousEngine@@UAEHVQuatVect@2@@Z");
     S(g, "?IsLocal@CPuppetEntity@SeriousEngine@@QAEHXZ", isLocal);
     S(g, "?IsAlive@CPuppetEntity@SeriousEngine@@UAEHXZ", isAlive);
     S(g, "?RendersIn3rdPerson@CPuppetEntity@SeriousEngine@@UAEHXZ", thirdPerson);

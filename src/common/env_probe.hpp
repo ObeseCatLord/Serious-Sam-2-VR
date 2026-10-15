@@ -1,0 +1,120 @@
+#pragma once
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+// Water reflections from the surroundings (env_probe.cpp). The engine's water
+// looks a painted image up by screen position, so in VR the reflection lay on
+// the water and turned or slid with the head. Instead each frame's left-eye
+// world image (before HUD) is projected into a world-aligned cube map around
+// the viewer: only the upper half of the view and directions above the
+// horizon, where the guns and the water itself are not. The patched water
+// programs sample the cube by the world reflection direction, so reflections
+// show the real sky, trees and cliffs, fixed in the world and alike for both
+// eyes. Matrices are row-major: view is world -> view 3x4, projection 4x4 with
+// clip = P * view (w = -z).
+namespace ss2vr::env_probe {
+constexpr unsigned FaceSize = 128;
+// D3D cube face order +X, -X, +Y, -Y, +Z, -Z; s, t in [-1, 1] across the face
+// (t grows down the face image). The direction the hardware samples there.
+inline void faceDirection(unsigned face, float s, float t, float (&out)[3]) {
+    switch (face) {
+    case 0: out[0] = 1; out[1] = -t; out[2] = -s; break;
+    case 1: out[0] = -1; out[1] = -t; out[2] = s; break;
+    case 2: out[0] = s; out[1] = 1; out[2] = t; break;
+    case 3: out[0] = s; out[1] = -1; out[2] = -t; break;
+    case 4: out[0] = s; out[1] = -t; out[2] = 1; break;
+    default: out[0] = -s; out[1] = -t; out[2] = -1; break;
+    }
+}
+// Capture constants c0..c3: clip x, y, (unused), w of a world direction seen
+// from the camera (rotation only: the cube is centred on the viewer).
+inline void captureRows(const float *view, const float *projection, float (&out)[16]) {
+    for (unsigned r = 0; r < 4; ++r)
+        for (unsigned j = 0; j < 4; ++j) {
+            double v = 0;
+            if (j < 3)
+                for (unsigned k = 0; k < 3; ++k) v += double(projection[4 * r + k]) * view[4 * k + j];
+            out[4 * r + j] = float(v);
+        }
+}
+// Model -> world rotation (rows) of a draw from its model -> clip matrix
+// (`wvp`, rows) and the camera's view and projection: the x, y and w rows of
+// the projection are inverted (its last column is 0 for a perspective), the
+// view's rotation transposed. False for a degenerate projection.
+inline bool modelRotation(const float *wvp, const float *view, const float *projection, float (&out)[12]) {
+    const unsigned rows[3]{0, 1, 3};
+    double p[3][3], a[3][4];
+    for (unsigned i = 0; i < 3; ++i) {
+        for (unsigned k = 0; k < 3; ++k) p[i][k] = projection[4 * rows[i] + k];
+        for (unsigned k = 0; k < 4; ++k) a[i][k] = wvp[4 * rows[i] + k];
+        if (projection[4 * rows[i] + 3] != 0) return false;
+    }
+    const double det = p[0][0] * (p[1][1] * p[2][2] - p[1][2] * p[2][1]) - p[0][1] * (p[1][0] * p[2][2] - p[1][2] * p[2][0]) +
+                       p[0][2] * (p[1][0] * p[2][1] - p[1][1] * p[2][0]);
+    if (!std::isfinite(det) || std::abs(det) < 1e-12) return false;
+    double inv[3][3];
+    for (unsigned i = 0; i < 3; ++i)
+        for (unsigned j = 0; j < 3; ++j) {
+            const unsigned i1 = (j + 1) % 3, i2 = (j + 2) % 3, j1 = (i + 1) % 3, j2 = (i + 2) % 3;
+            inv[i][j] = (p[i1][j1] * p[i2][j2] - p[i1][j2] * p[i2][j1]) / det;
+        }
+    double c[3][3]; // Model -> view rotation (rows).
+    for (unsigned i = 0; i < 3; ++i)
+        for (unsigned j = 0; j < 3; ++j) {
+            c[i][j] = 0;
+            for (unsigned k = 0; k < 3; ++k) c[i][j] += inv[i][k] * a[k][j];
+        }
+    for (unsigned i = 0; i < 3; ++i) {
+        for (unsigned j = 0; j < 3; ++j) {
+            double w = 0;
+            for (unsigned k = 0; k < 3; ++k) w += double(view[4 * k + i]) * c[k][j]; // V^T C
+            if (!std::isfinite(w)) return false;
+            out[4 * i + j] = float(w);
+        }
+        out[4 * i + 3] = 0;
+    }
+    return true;
+}
+// Below the horizon (unnormalized direction y) and below this clip height the
+// view is not captured: the guns, hands and the water itself are there.
+constexpr float HorizonY = -.08f, ViewFloor = .05f;
+// ps_2_0 capture program: t0.xyz = the texel's direction, s0 = the eye image,
+// c0..c3 = captureRows. Texels the eye does not see (behind, outside, too low)
+// are discarded, so the cube keeps what earlier views put there.
+inline std::vector<uint32_t> captureProgram() {
+    const auto f = [](float v) { uint32_t u; std::memcpy(&u, &v, 4); return u; };
+    const auto reg = [](unsigned type, unsigned num) { return 0x80000000u | ((type & 7u) << 28) | ((type & 0x18u) << 8) | num; };
+    constexpr unsigned R = 0, C = 2, T = 3, Out = 8, S = 10;
+    const auto d = [&](unsigned type, unsigned num, unsigned mask) { return reg(type, num) | (mask << 16); };
+    const auto s = [&](unsigned type, unsigned num, unsigned swizzle = 0xe4, bool negate = false) {
+        return reg(type, num) | (swizzle << 16) | (negate ? 1u << 24 : 0u);
+    };
+    return {
+        0xffff0200u,
+        0x05000051u, d(C, 4, 0xf), f(.5f), f(-.5f), f(1), f(0),
+        0x05000051u, d(C, 5, 0xf), f(ViewFloor), f(HorizonY), f(0), f(0),
+        0x0200001fu, 0x80000000u, d(T, 0, 0x7),
+        0x0200001fu, 0x90000000u, d(S, 0, 0xf),
+        0x03000008u, d(R, 0, 0x1), s(T, 0), s(C, 0),                          // dp3 r0.x, t0, c0
+        0x03000008u, d(R, 0, 0x2), s(T, 0), s(C, 1),                          // dp3 r0.y, t0, c1
+        0x03000008u, d(R, 0, 0x8), s(T, 0), s(C, 3),                          // dp3 r0.w, t0, c3
+        0x02000006u, d(R, 1, 0x8), s(R, 0, 0xff),                             // rcp r1.w, r0.w
+        0x03000005u, d(R, 1, 0x3), s(R, 0), s(R, 1, 0xff),                    // mul r1.xy, r0, r1.w (ndc)
+        0x02000023u, d(R, 2, 0x3), s(R, 1),                                   // abs r2.xy, r1
+        0x03000002u, d(R, 2, 0x3), s(C, 4, 0xaa), s(R, 2, 0xe4, true),        // add r2.xy, 1, -|ndc|
+        0x03000002u, d(R, 2, 0x4), s(R, 1, 0x55), s(C, 5, 0x00, true),        // add r2.z, ndc.y, -floor
+        0x02000001u, d(R, 2, 0x8), s(C, 4, 0xaa),                             // mov r2.w, 1
+        0x01000041u, d(R, 2, 0xf),                                            // texkill r2
+        0x03000002u, d(R, 3, 0x1), s(T, 0, 0x55), s(C, 5, 0x55, true),        // add r3.x, dir.y, -horizon
+        0x02000001u, d(R, 3, 0x2), s(R, 0, 0xff),                             // mov r3.y, w (in front)
+        0x02000001u, d(R, 3, 0xc), s(C, 4, 0xaa),                             // mov r3.zw, 1
+        0x01000041u, d(R, 3, 0xf),                                            // texkill r3
+        0x04000004u, d(R, 4, 0x3), s(R, 1), s(C, 4), s(C, 4, 0x00),           // mad r4.xy, ndc, (.5,-.5), .5
+        0x03000042u, d(R, 5, 0xf), s(R, 4), s(S, 0),                          // texld r5, r4, s0
+        0x02000001u, d(R, 5, 0x8), s(C, 4, 0xaa),                             // mov r5.w, 1
+        0x02000001u, d(Out, 0, 0xf), s(R, 5),                                 // mov oC0, r5
+        0x0000ffffu};
+}
+} // namespace ss2vr::env_probe

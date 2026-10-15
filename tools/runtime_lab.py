@@ -1033,10 +1033,15 @@ def interactive_hold(cfg,env,token,deadline,run_dir,owned_game):
                 # of the next eye pair at the commanded baseline head pose.
                 for request in sorted(run_dir.glob('capture-request-*')):
                     name=request.name[len('capture-request-'):]
+                    # Optional request text "px,py,pz,qx,qy,qz,qw": the head pose the
+                    # driver commanded (default: the baseline head pose).
+                    try:custom=[float(v) for v in request.read_text().split(',')]
+                    except (OSError,ValueError):custom=[]
                     request.unlink()
                     if not name.replace('-','').isalnum():continue
                     baseline=cfg['expected_baseline_head']
-                    try:observer(cfg,env,'capture',token,(run_dir/name,state['input_sequence'],*baseline['p'],*baseline['q']),
+                    pose=custom if len(custom)==7 and all(math.isfinite(v) for v in custom) else [*baseline['p'],*baseline['q']]
+                    try:observer(cfg,env,'capture',token,(run_dir/name,state['input_sequence'],*pose),
                                  timeout=remaining(end,20),deadline=end)
                     except (ObserverError,TimeoutError,subprocess.TimeoutExpired) as error:
                         (run_dir/(name+'-error.txt')).write_text(str(error))

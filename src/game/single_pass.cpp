@@ -1,6 +1,8 @@
 #include "single_pass.hpp"
 #include "common/shader_patch.hpp"
 #include "common/water_reflection.hpp"
+#include "common/env_probe.hpp"
+#include "env_probe.hpp"
 #include "game.hpp"
 #include <MinHook.h>
 #include <algorithm>
@@ -13,6 +15,7 @@
 namespace ss2vr::game::single_pass {
 using namespace ss2vr::replay;
 namespace sp = ss2vr::shader_patch;
+namespace env_probe_math = ss2vr::env_probe;
 namespace {
 using SetVertexShaderF = HRESULT(WINAPI *)(IDirect3DDevice9 *, IDirect3DVertexShader9 *);
 using SetDeclarationF = HRESULT(WINAPI *)(IDirect3DDevice9 *, IDirect3DVertexDeclaration9 *);
@@ -75,7 +78,44 @@ std::unordered_map<IDirect3DVertexShader9 *, uint32_t> shaderTexcoords; // oT se
 // view direction (water_reflection.hpp): eye position in c30, dome scale in c31,
 // set for each half around their draws.
 constexpr unsigned WaterConstant = 30;
+// Lab (SS2VR_LAB_WATER_NOPATCH=1): water keeps the engine's screen-mapped reflection.
+bool labWaterUnpatched() {
+    static const bool off = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_WATER_NOPATCH", v, 2) == 1 && v[0] == L'1'; }();
+    return off;
+}
 std::unordered_map<IDirect3DVertexShader9 *, bool> shaderEyeClip;
+// Water programs' environment-cube variants (common/env_probe.hpp): the vertex
+// variant writing the world reflection direction (model -> world rows in
+// c32..c34, from the program's model -> clip rows), the pixel variant sampling
+// the cube on the reflection image's sampler.
+struct ProbeVertex { IDirect3DVertexShader9 *variant = nullptr; unsigned clipMatrix = 0; };
+std::unordered_map<IDirect3DVertexShader9 *, ProbeVertex> shaderProbe;
+struct ProbePixel { IDirect3DPixelShader9 *variant = nullptr; unsigned sampler = 0; };
+std::unordered_map<IDirect3DPixelShader9 *, ProbePixel> pixelProbe;
+// The cube holds the scene's own brightness; the water program scales its
+// painted image (dark) up by 8.
+float waterGain() {
+    static const float gain = [] { wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_WATER_GAIN", v, 16) ? float(_wtof(v)) : .45f; }();
+    return gain;
+}
+ProbePixel probePixelOf(IDirect3DDevice9 *d, IDirect3DPixelShader9 *s) noexcept {
+    if (!s) return {};
+    if (const auto it = pixelProbe.find(s); it != pixelProbe.end()) return it->second;
+    ProbePixel probe;
+    UINT bytes = 0;
+    if (SUCCEEDED(s->GetFunction(nullptr, &bytes)) && bytes >= 8 && bytes % 4 == 0) {
+        std::vector<uint32_t> words(bytes / 4), patched;
+        UINT got = bytes;
+        if (SUCCEEDED(s->GetFunction(words.data(), &got)) &&
+            sp::patchWaterPixelShader(words.data(), words.size(), patched, probe.sampler, waterGain()) &&
+            FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.variant)))
+            probe.variant = nullptr;
+    }
+    s->AddRef();
+    pixelProbe.emplace(s, probe);
+    log("Single pass: water pixel program %p %s", static_cast<void *>(s), probe.variant ? "samples the environment cube" : "keeps its image");
+    return probe;
+}
 std::unordered_map<IDirect3DVertexDeclaration9 *, IDirect3DVertexDeclaration9 *> declarationVariants;
 
 IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s) noexcept {
@@ -88,7 +128,7 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
         std::vector<uint32_t> words(bytes / 4), patched;
         UINT got = bytes;
         if (SUCCEEDED(s->GetFunction(words.data(), &got)) &&
-            sp::patchVertexShader(words.data(), words.size(), patched, &info, WaterConstant) &&
+            sp::patchVertexShader(words.data(), words.size(), patched, &info, labWaterUnpatched() ? 0 : WaterConstant) &&
             FAILED(d->CreateVertexShader(reinterpret_cast<const DWORD *>(patched.data()), &variant)))
             variant = nullptr;
     }
@@ -96,6 +136,17 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
     shaderVariants.emplace(s, variant);
     shaderTexcoords.emplace(s, info.texcoordsWritten);
     shaderEyeClip.emplace(s, variant && info.eyeClip);
+    if (variant && info.eyeClip) {
+        ProbeVertex probe{nullptr, info.clipMatrix};
+        std::vector<uint32_t> words(bytes / 4), patched;
+        UINT got = bytes;
+        sp::VertexInfo probeInfo;
+        if (SUCCEEDED(s->GetFunction(words.data(), &got)) &&
+            sp::patchVertexShader(words.data(), words.size(), patched, &probeInfo, WaterConstant, true) && probeInfo.eyeClip &&
+            FAILED(d->CreateVertexShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.variant)))
+            probe.variant = nullptr;
+        shaderProbe.emplace(s, probe);
+    }
     if (variant && info.eyeClip) log("Single pass: water vertex program %p looks its reflection up per eye", static_cast<void *>(s));
     if (variant) ++stats.variants; else ++stats.failedVariants;
     static unsigned logged = 0;
@@ -632,14 +683,38 @@ bool waterDraw() noexcept {
 // program's view position (c4, in its model space) plus the eye's offset.
 struct WaterConstantsScope {
     IDirect3DDevice9 *d;
-    bool active = false, eyes = false;
-    float saved[8]{}, view[4]{}, offset[2][3]{};
+    bool active = false, eyes = false, cube = false;
+    float saved[20]{}, view[4]{}, offset[2][3]{};
+    ProbePixel pixel;
+    IDirect3DBaseTexture9 *image = nullptr;
+    DWORD sampling[4]{};
     WaterConstantsScope(IDirect3DDevice9 *device, bool stereo) noexcept : d(device) {
         if (!stereo || !waterDraw()) return;
-        active = SUCCEEDED(d->GetVertexShaderConstantF(WaterConstant, saved, 2)) &&
+        env_probe::noteWater();
+        active = SUCCEEDED(d->GetVertexShaderConstantF(WaterConstant, saved, 5)) &&
                  SUCCEEDED(d->GetVertexShaderConstantF(4, view, 1));
         eyes = active && water::eyeOffset(engineView, changes[0], offset[0]) &&
                water::eyeOffset(engineView, changes[1], offset[1]);
+        // The environment cube once it holds something, with both programs' variants.
+        IDirect3DCubeTexture9 *environment = active ? env_probe::cube(d) : nullptr;
+        const auto vertex = shaderProbe.find(engineShader);
+        if (!environment || labWaterUnpatched() || vertex == shaderProbe.end() || !vertex->second.variant) return;
+        pixel = probePixelOf(d, enginePixelShader);
+        float wvp[16], rows[12];
+        if (!pixel.variant || FAILED(d->GetVertexShaderConstantF(vertex->second.clipMatrix, wvp, 4)) ||
+            !env_probe_math::modelRotation(wvp, engineView, engineProjection, rows) ||
+            FAILED(d->GetTexture(pixel.sampler, &image)))
+            return;
+        const D3DSAMPLERSTATETYPE kinds[4]{D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_SRGBTEXTURE};
+        for (unsigned k = 0; k < 4; ++k) d->GetSamplerState(pixel.sampler, kinds[k], &sampling[k]);
+        cube = true;
+        d->SetVertexShaderConstantF(WaterConstant + 2, rows, 3);
+        oSetVertexShader(d, vertex->second.variant);
+        oSetPixelShader(d, pixel.variant);
+        appliedPixelShader = pixel.variant;
+        d->SetTexture(pixel.sampler, environment);
+        for (unsigned k = 0; k < 3; ++k) d->SetSamplerState(pixel.sampler, kinds[k], D3DTADDRESS_CLAMP);
+        d->SetSamplerState(pixel.sampler, D3DSAMP_SRGBTEXTURE, FALSE);
     }
     void eye(unsigned i) noexcept {
         if (!active) return;
@@ -648,7 +723,18 @@ struct WaterConstantsScope {
                          view[2] + (eyes ? offset[e][2] : 0.f), 0, water::DomeScale, 1, 0, 0};
         d->SetVertexShaderConstantF(WaterConstant, c, 2);
     }
-    ~WaterConstantsScope() { if (active) d->SetVertexShaderConstantF(WaterConstant, saved, 2); }
+    ~WaterConstantsScope() {
+        if (cube) {
+            const D3DSAMPLERSTATETYPE kinds[4]{D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_SRGBTEXTURE};
+            for (unsigned k = 0; k < 4; ++k) d->SetSamplerState(pixel.sampler, kinds[k], sampling[k]);
+            d->SetTexture(pixel.sampler, image);
+            oSetVertexShader(d, variantOf(d, engineShader));
+            oSetPixelShader(d, enginePixelShader);
+            appliedPixelShader = enginePixelShader;
+        }
+        if (image) image->Release();
+        if (active) d->SetVertexShaderConstantF(WaterConstant, saved, 5);
+    }
 };
 template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo, bool shifted = false) noexcept;
 template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool instancing) noexcept;
@@ -685,6 +771,70 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
             log("Single pass water draw %u stereo=%u", waterDraws, unsigned(stereoBound()));
         }
         if (skipWater && water) return D3D_OK;
+        // Lab (SS2VR_LAB_WATER_DUMP=1): the first draws of each water program
+        // pair: both programs' bytecode, their constants and the bound textures.
+        static const bool dumpWater = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_WATER_DUMP", v, 2) == 1 && v[0] == L'1'; }();
+        static unsigned probes = 0;
+        if (dumpWater && water && waterDraws % 300 == 1 && probes < 60 && engineView) {
+            ++probes;
+            float c4[4]{};
+            d->GetVertexShaderConstantF(4, c4, 1);
+            const float *v = engineView;
+            const float cam[3]{-(v[0] * v[3] + v[4] * v[7] + v[8] * v[11]), -(v[1] * v[3] + v[5] * v[7] + v[9] * v[11]),
+                               -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11])};
+            log("Lab water probe eye=%.2f,%.2f,%.2f c4=%.2f,%.2f,%.2f origin=%.2f,%.2f,%.2f", cam[0], cam[1], cam[2], c4[0], c4[1], c4[2],
+                cam[0] - c4[0], cam[1] - c4[1], cam[2] - c4[2]);
+        }
+        static std::vector<std::pair<void *, void *>> dumped;
+        if (dumpWater && water && dumped.size() < 6 &&
+            std::find(dumped.begin(), dumped.end(), std::pair<void *, void *>{engineShader, enginePixelShader}) == dumped.end()) {
+            dumped.push_back({engineShader, enginePixelShader});
+            const auto hex = [](const char *what, const void *object, auto *shader) {
+                UINT size = 0;
+                if (!shader || FAILED(shader->GetFunction(nullptr, &size)) || !size || size > 16384) return;
+                std::vector<uint8_t> bytes(size);
+                if (FAILED(shader->GetFunction(bytes.data(), &size))) return;
+                for (UINT at = 0; at < size; at += 256) {
+                    char line[600]; int k = 0;
+                    for (UINT b = at; b < std::min(size, at + 256); ++b) k += std::snprintf(line + k, sizeof(line) - k, "%02x", bytes[b]);
+                    log("Lab water %s %p bytes=%u at=%u %s", what, object, size, at, line);
+                }
+            };
+            hex("vs", engineShader, engineShader);
+            hex("ps", enginePixelShader, enginePixelShader);
+            float vc[16 * 4]{}, pc[8 * 4]{};
+            d->GetVertexShaderConstantF(0, vc, 16);
+            d->GetPixelShaderConstantF(0, pc, 8);
+            for (unsigned r = 0; r < 16; ++r) log("Lab water vc%u %.4f %.4f %.4f %.4f", r, vc[4*r], vc[4*r+1], vc[4*r+2], vc[4*r+3]);
+            for (unsigned r = 0; r < 8; ++r) log("Lab water pc%u %.4f %.4f %.4f %.4f", r, pc[4*r], pc[4*r+1], pc[4*r+2], pc[4*r+3]);
+            if (engineView) log("Lab water view %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f", engineView[0], engineView[1],
+                engineView[2], engineView[3], engineView[4], engineView[5], engineView[6], engineView[7], engineView[8], engineView[9],
+                engineView[10], engineView[11]);
+            for (DWORD stage = 0; stage < 8; ++stage) {
+                IDirect3DBaseTexture9 *t = nullptr;
+                if (FAILED(d->GetTexture(stage, &t)) || !t) continue;
+                D3DSURFACE_DESC desc{};
+                const auto type = t->GetType();
+                if (type == D3DRTYPE_TEXTURE) static_cast<IDirect3DTexture9 *>(t)->GetLevelDesc(0, &desc);
+                else if (type == D3DRTYPE_CUBETEXTURE) static_cast<IDirect3DCubeTexture9 *>(t)->GetLevelDesc(0, &desc);
+                DWORD addressU = 0, addressV = 0, minFilter = 0, flags = 0, transform = 0;
+                d->GetSamplerState(stage, D3DSAMP_ADDRESSU, &addressU); d->GetSamplerState(stage, D3DSAMP_ADDRESSV, &addressV);
+                d->GetSamplerState(stage, D3DSAMP_MINFILTER, &minFilter);
+                d->GetTextureStageState(stage, D3DTSS_TEXTURETRANSFORMFLAGS, &flags);
+                d->GetTextureStageState(stage, D3DTSS_TEXCOORDINDEX, &transform);
+                log("Lab water texture stage=%lu %p type=%d %ux%u format=%d usage=%lx pool=%d levels=%lu address=%lu,%lu filter=%lu ttf=%lu tci=%lx",
+                    stage, static_cast<void *>(t), int(type), desc.Width, desc.Height, int(desc.Format), desc.Usage, int(desc.Pool),
+                    t->GetLevelCount(), addressU, addressV, minFilter, flags, transform);
+                t->Release();
+            }
+            IDirect3DSurface9 *rt = nullptr;
+            if (SUCCEEDED(d->GetRenderTarget(0, &rt)) && rt) {
+                D3DSURFACE_DESC desc{}; rt->GetDesc(&desc);
+                log("Lab water target %p %ux%u viewport=%lu,%lu %lux%lu", static_cast<void *>(rt), desc.Width, desc.Height,
+                    engineViewport.X, engineViewport.Y, engineViewport.Width, engineViewport.Height);
+                rt->Release();
+            }
+        }
     }
     const bool stereo = stereoBound();
     if (stereo && !writeRecords(d)) return call(false);

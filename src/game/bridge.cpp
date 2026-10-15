@@ -13,6 +13,7 @@
 #include "native_memory.hpp"
 #include "eye_replay.hpp"
 #include "single_pass.hpp"
+#include "env_probe.hpp"
 #include "scope_gpu.hpp"
 #include "scope_source_gpu.hpp"
 #include "common/scope_capture_command.hpp"
@@ -1708,6 +1709,7 @@ static bool composeFovea(IDirect3DDevice9 *d, const FoveaFrame &f, unsigned k, I
 }
 static void releaseTargets() {
     ++resourceGeneration;
+    env_probe::release();
     releaseScopeCache();
     releaseHudLayer();
     releaseMenuScaled();
@@ -4047,6 +4049,14 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                             SUCCEEDED(originalStretch(d,wideColor,&half,uiFrame.target[k],nullptr,D3DTEXF_NONE));
                     }
                     if(foveated) ++perf.foveatedPairs;
+                    if(centreReady && env_probe::wanted()) {
+                        // Water reflections: this frame's left eye (world only) into the environment cube.
+                        float eyeView[12], eyeProjection[16];
+                        if(singlePassEyeView(request,0,eyeView,eyeProjection)) {
+                            const env_probe::Device device{originalSetRT,originalDrawUp,originalStretch};
+                            env_probe::capture(d,device,uiFrame.target[0],width,height,eyeView,eyeProjection);
+                        }
+                    }
                     ++labStagePair;
                     labStageDump(d,uiFrame.target[1],L"stage-a-pass.ppm");
                     {

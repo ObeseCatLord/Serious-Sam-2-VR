@@ -34,6 +34,7 @@ void setSinglePassWorld(bool on) noexcept;
 bool singlePassChanges(const Request &real, const Request &centre, ss2vr::replay::EyeChange (&out)[2]) noexcept;
 bool singlePassCaptureCentre(const Request &centre) noexcept;
 bool singlePassAdoptEye(void *player, const Request &real, int i) noexcept;
+bool singlePassEyeView(const Request &real, int i, float (&view)[12], float (&projection)[16]) noexcept;
 bool replayCaptureEyeGeometry(ss2vr::replay::EyeChange &out) noexcept;
 const ss2vr::replay::ViewState &replayRootState() noexcept;
 bool replayAdoptEye(const ss2vr::replay::EyeChange &change) noexcept;

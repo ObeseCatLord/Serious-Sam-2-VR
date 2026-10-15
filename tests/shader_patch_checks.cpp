@@ -85,6 +85,61 @@ int main() {
         busyConstants.insert(busyConstants.end() - 1, {0x01, dst(TexCrdOut, 3, 0xf), src(Const, 31)});
         assert(patchVertexShader(busyConstants.data(), busyConstants.size(), out, &w, 30) && !w.eyeClip);
         assert(!eyeClipSite(program.data(), program.size(), reg));
+        // Probe mode: the world reflection direction (R turned by c32..c34) in r10
+        // replaces the texcoord the lookup wrote.
+        VertexInfo probe;
+        assert(patchVertexShader(water.data(), water.size(), out, &probe, 30, true) && probe.eyeClip);
+        bool turned = false, written = false, lookupLeft = false;
+        for (size_t i = 0; i + 3 < out.size(); ++i) {
+            if (out[i] == 0x08 && out[i + 1] == dst(Temp, 10, 0x1) && out[i + 2] == src(Temp, 9) && out[i + 3] == src(Const, 32))
+                turned = true;
+            if (out[i] == 0x01 && out[i + 1] == dst(TexCrdOut, 2, 0xf) && out[i + 2] == src(Temp, 10)) written = true;
+            if (out[i] == 0x01 && out[i + 1] == dst(TexCrdOut, 2, 0xf) && out[i + 2] == src(Temp, 2)) lookupLeft = true;
+        }
+        assert(turned && written && !lookupLeft);
+        // Probe mode needs constants up to c34 free and a texcoord fed by the lookup.
+        assert(patchVertexShader(busyConstants.data(), busyConstants.size(), out, &w, 30, true) && !w.eyeClip);
+    }
+    // Water pixel program: ripple offset + projective reflection lookup becomes a
+    // cube lookup turned by the ripple.
+    {
+        constexpr uint32_t Ps20 = 0xffff0200u, Tex = 3, Smp = 10, Out = 8;
+        const auto reg = [](unsigned type, unsigned num) { return ((type & 7u) << 28) | ((type & 0x18u) << 8) | num; };
+        const std::vector<uint32_t> ps{
+            Ps20,
+            0x0200001fu, 0x80000000u, 0x80000000u | reg(Tex, 0) | (0x3u << 16),
+            0x0200001fu, 0x80000000u, 0x80000000u | reg(Tex, 2) | (0xfu << 16),
+            0x0200001fu, 0x90000000u, 0x80000000u | reg(Smp, 0) | (0xfu << 16),
+            0x0200001fu, 0x90000000u, 0x80000000u | reg(Smp, 2) | (0xfu << 16),
+            0x03000042u, dst(Temp, 0, 0xf), 0x80000000u | reg(Tex, 0) | (0xe4u << 16), 0x80000000u | reg(Smp, 0) | (0xe4u << 16),
+            0x04000004u, dst(Temp, 2, 0x3), src(Temp, 0), 0x80000000u | reg(Tex, 2) | (0xaau << 16), 0x80000000u | reg(Tex, 2) | (0xe4u << 16),
+            0x02000001u, dst(Temp, 2, 0x8), 0x80000000u | reg(Tex, 2) | (0xffu << 16),
+            0x03010042u, dst(Temp, 2, 0xf), src(Temp, 2), 0x80000000u | reg(Smp, 2) | (0xe4u << 16),
+            0x02000001u, 0x80000000u | reg(Out, 0) | (0xfu << 16), src(Temp, 2),
+            0x0000ffffu};
+        std::vector<uint32_t> cube;
+        unsigned sampler = 99;
+        assert(patchWaterPixelShader(ps.data(), ps.size(), cube, sampler) && sampler == 2);
+        assert(cube[1] == 0x05000051u && cube[2] == dst(Const, 29, 0xf) && cube[8] == dst(Const, 30, 0xf) && cube[13] == 0x05000051u);
+        bool cubeDcl = false, plainLookup = false, projective = false, turnedX = false, turnedZ = false;
+        for (size_t i = 0; i + 4 < cube.size(); ++i) {
+            if (cube[i] == 0x0200001fu && cube[i + 1] == 0x98000000u && cube[i + 2] == (0x80000000u | reg(Smp, 2) | (0xfu << 16))) cubeDcl = true;
+            if (cube[i] == 0x03000042u && cube[i + 1] == dst(Temp, 2, 0xf)) plainLookup = true;
+            if (cube[i] == 0x03010042u) projective = true;
+            if (cube[i] == 0x04000004u && cube[i + 1] == dst(Temp, 2, 0x7) && cube[i + 2] == src(Temp, 0, 0x00u) &&
+                cube[i + 3] == src(Const, 30)) turnedX = true;
+            if (cube[i] == 0x04000004u && cube[i + 1] == dst(Temp, 2, 0x7) && cube[i + 2] == src(Temp, 0, 0x55u) &&
+                cube[i + 3] == src(Const, 31) && cube[i + 4] == src(Temp, 2)) turnedZ = true;
+        }
+        assert(cubeDcl && plainLookup && !projective && turnedX && turnedZ && cube.back() == 0x0000ffffu);
+        assert(cube.size() == ps.size() + 18 + 6); // Three defs; mad+mov+texldp (12 words) -> mad+mad+texld+mul (18).
+        // Programs already using c30 are left alone; so are programs without the sequence.
+        std::vector<uint32_t> busy = ps;
+        busy.insert(busy.end() - 1, {0x02000001u, dst(Temp, 3, 0xf), src(Const, 30)});
+        assert(!patchWaterPixelShader(busy.data(), busy.size(), cube, sampler));
+        std::vector<uint32_t> other(ps.begin(), ps.begin() + 17);
+        other.push_back(0x0000ffffu);
+        assert(!patchWaterPixelShader(other.data(), other.size(), cube, sampler));
     }
     // Optional private check: every dumped engine vertex program patches.
     if (const char *dir = std::getenv("SS2VR_SHADER_DUMPS")) {
