@@ -23,6 +23,21 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the sixth headset test (2026-10-14, late night)
+
+- No more tilt after a judder: on foot the view takes only the game's heading
+  (its camera shake or swimming pitch tilted the whole world).
+- Sky and clouds sit at infinity in stereo (they had a few pixels of parallax).
+- Menus show completely (top and bottom were cut off); the cursor stays under
+  the pointer.
+- Boxes come into your hand and stay there (they ended above your head).
+- Index: right A jumps, right B is Use.
+- Riding: the camera is smoothed (bob and sway removed, no lag on steady
+  movement or turns); the ride turns only while you push the right stick.
+- Turrets and other rides: a laser shows where the gun aims; hold a grip (or
+  both) and move your hands to swing the gun like a real mount (hands right,
+  muzzle left); the stick still works.
+
 ## Changed after the fifth headset test (2026-10-14, night)
 
 - Sideways or tilted world: the mod now uses the headset system's fixed play
@@ -225,4 +240,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `9d76858`, version `0.2.11-dev.adeb00516073` (2026-10-14).
+Installed candidate: commit `5df6c70`, version `0.2.11-dev.892178bd8f5f` (2026-10-14).
