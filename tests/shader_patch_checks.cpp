@@ -85,6 +85,10 @@ int main() {
         busyConstants.insert(busyConstants.end() - 1, {0x01, dst(TexCrdOut, 3, 0xf), src(Const, 31)});
         assert(patchVertexShader(busyConstants.data(), busyConstants.size(), out, &w, 30) && !w.eyeClip);
         assert(!eyeClipSite(program.data(), program.size(), reg));
+        // A matrix read ending in c30 (m4x4 from c27 reads c27..c30) keeps the plain variant too.
+        std::vector<uint32_t> matrixRead = water;
+        matrixRead.insert(matrixRead.end() - 1, {0x14, dst(Temp, 6, 0xf), src(Temp, 4), src(Const, 27)});
+        assert(patchVertexShader(matrixRead.data(), matrixRead.size(), out, &w, 30) && !w.eyeClip);
         // Probe mode: the world reflection direction (R turned by c32..c34) in r10
         // replaces the texcoord the lookup wrote.
         VertexInfo probe;

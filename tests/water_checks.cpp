@@ -17,5 +17,17 @@ int main() {
     assert(near(offset[0], -.032f * c) && near(offset[1], 0) && near(offset[2], .032f * s));
     replay::EyeChange invalid;
     assert(!water::eyeOffset(view, invalid, offset));
+    // The inverse of a turned, scaled model rotation.
+    const float rows[12]{2 * c, 0, 2 * s, 9, 0, 2, 0, 9, -2 * s, 0, 2 * c, 9};
+    float inv[9];
+    assert(water::invert3(rows, inv));
+    for (unsigned r = 0; r < 3; ++r)
+        for (unsigned k = 0; k < 3; ++k) {
+            float v = 0;
+            for (unsigned j = 0; j < 3; ++j) v += rows[4 * r + j] * inv[3 * j + k];
+            assert(near(v, r == k ? 1.f : 0.f));
+        }
+    const float flat[12]{};
+    assert(!water::invert3(flat, inv));
     std::puts("Water reflection checks passed");
 }

@@ -91,8 +91,11 @@ inline bool inspect(const uint32_t *words, size_t count, VertexInfo &info) {
                 if (k > 0 && (op[k] & 0x2000u)) {} // Relative (a0) constant addressing: untouched.
                 const unsigned type = regType(op[k]), num = regNum(op[k]);
                 if (type == Temp) info.temps = num + 1 > info.temps ? num + 1 : info.temps;
+                // Matrix opcodes read consecutive rows: m4x4/m3x4 four, m4x3/m3x3 three, m3x2 two.
+                const unsigned rows = k != 2 ? 1u : opcode == 0x14 || opcode == 0x16 ? 4u :
+                                      opcode == 0x15 || opcode == 0x17 ? 3u : opcode == 0x18 ? 2u : 1u;
                 if (k > 0 && type == Const)
-                    info.constants = std::max(info.constants, (op[k] & 0x2000u) ? 256u : num + 1);
+                    info.constants = std::max(info.constants, (op[k] & 0x2000u) ? 256u : num + rows);
                 if (k == 0 && type == RastOut && num == 0) ++info.positionWrites;
                 if (k == 0 && type == TexCrdOut && num < 8) info.texcoordsWritten |= 1u << num;
             }

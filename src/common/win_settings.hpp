@@ -47,6 +47,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.shadowReuse = number(L"Render", L"ShadowReuse", 1, 0, 1) >= .5f;
     settings.eyeReplay = number(L"Render", L"EyeReplay", 0, 0, 1) >= .5f;
     settings.singlePass = number(L"Render", L"SinglePass", 1, 0, 1) >= .5f;
+    settings.instantRides = number(L"Rides", L"InstantTransitions", 1, 0, 1) >= .5f;
     settings.singlePassInstancing = number(L"Render", L"SinglePassInstancing", 0, 0, 1) >= .5f;
     settings.uiAspect = number(L"Render", L"UiAspect", 16.f / 9, 1.f, 2.5f);
     settings.snapTurn = number(L"Comfort", L"SnapTurn", 0, 0, 1) >= .5f;

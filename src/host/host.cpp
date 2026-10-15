@@ -2313,7 +2313,9 @@ struct Host {
         bool zeroCopy = false;
         Fov insetFov[2];
         {
-            Mutex lock(channel, 0);
+            // A brief wait: a lock the game holds for a moment (publishing the next
+            // request) otherwise showed the previous pair again this frame.
+            Mutex lock(channel, 2);
             if (lock) {
                 reapLocked();
                 auto &slot = channel.shared->slot[candidate];

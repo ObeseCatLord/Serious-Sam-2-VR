@@ -992,7 +992,15 @@ struct Authority {
     RiderIdentity rider;
     multiplayer::Sample sample;
     bool observer = false; // Client replica storage; never server intent authority.
+    // Dual mode for this remote player (as for the local one): retries per lone weapon.
+    uint32_t dualKey = 0;
+    unsigned dualTries = 0;
+    uint64_t dualToggle = 0;
 };
+static bool dualIntent(void *p);
+static bool pairable(void *p);
+static int soloSlot(void *p);
+static uint32_t heldHandle(void *p, int hand);
 // Pose rows remain copyable. Native consumption belongs to the existing row's
 // stationary owner and must never disappear when a new pose is published.
 struct AuthorityOwner {
@@ -1209,18 +1217,31 @@ static void authorityStepBody(void *player) {
             if (requested >= 0 && requested != actual &&
                 inInventory(static_cast<uint8_t *>(player) + 0x8f8, requested)) {
                 pending = true;
-                if (canChange(player, hand) && nativeRiderCurrent(player, rider) &&
+                // Single mode holds one weapon: the pick replaces it (in the other
+                // slot the game dropped it again), as for the local player.
+                const int slot = dualIntent(player) ? int(hand) : soloSlot(player);
+                if (canChange(player, slot) && nativeRiderCurrent(player, rider) &&
                     currentWeaponSample(value.sample, multiplayer::authority(player), hand)) {
-                    setWeapon(player, requested, hand, 1);
-                    equipped |= uint8_t(1u << hand);
+                    setWeapon(player, requested, slot, 1);
+                    equipped |= uint8_t(1u << hand) | uint8_t(1u << slot);
                 }
             }
         }
-        if (value.sample.valid && nativeRiderCurrent(player, rider) && !isDual(player) &&
+        // Dual mode again when the held weapons can pair, at most twice per lone
+        // weapon and a second apart: a pair the game refuses (two-handed weapon,
+        // carrying) no longer flipped the flag and re-sent the weapons every tick.
+        const uint64_t tick = GetTickCount64();
+        void *lone = heldHandle(player, soloSlot(player)) ? resolve(heldHandle(player, soloSlot(player))) : nullptr;
+        const uint32_t key = lone ? primaryField(lone, 0xb4) + 1 : 0;
+        if (key != value.dualKey || isDual(player)) { value.dualKey = key; value.dualTries = 0; }
+        if (value.sample.valid && nativeRiderCurrent(player, rider) && !dualIntent(player) && pairable(player) &&
+            value.dualTries < 2 && tick - value.dualToggle > 1000 &&
             !value.sample.pose.physicalDownMask && !pending && canChange(player, 0) &&
             canChange(player, 1) && nativeRiderCurrent(player, rider)) {
             toggleDual(player, 0);
-            equipped = 3;
+            ++value.dualTries;
+            value.dualToggle = tick;
+            if (isDual(player)) equipped = 3;
         }
         if (equipped) {
             multiplayer::invalidateWeapons(player, ++value.weaponGeneration, equipped);
@@ -1289,6 +1310,7 @@ static bool aliased(const Snapshot &s) {
 // only the other controller is tracked (one controller off): then it goes there.
 // A lone weapon the game left by itself (dual mode dropped) keeps its own hand.
 static std::atomic<unsigned> soloMountHand{1};
+static std::atomic<bool> rideTransitionHold{false}; // See the input poll.
 static int lastPickId = -1; // The weapon of the latest wheel pick (input poll).
 // A hand slot's handle when its weapon still exists. The game leaves the handle
 // of a weapon it put away and deleted (after dropping dual mode) in the slot:
@@ -1458,6 +1480,7 @@ static void publishSnapshot(const Snapshot &s) {
     Lock l(channel);
     if (l && trackingEpoch(*channel.shared) == s.generation) {
         channel.shared->ui = s.ui;
+        if (!s.ui.gameplay && rideTransitionHold) channel.shared->ui.gameplay = 2; // Host: hold the world.
         for (int h = 0; h < 2; ++h)
             channel.shared->ui.fireSequence[h] = fireFeedback[h].load(std::memory_order_relaxed);
         channel.shared->ui.damageSequence = damageFeedback.load(std::memory_order_relaxed);
@@ -1761,6 +1784,19 @@ static void update(void *p) {
         advanceGeneration(s);
     }
     enabled = enabled && validTrackingEpoch(s.generation);
+    {
+        // Entering or leaving a ride the rider is neither seated nor on foot for a
+        // few ticks (the instant transitions above): the headset keeps the last
+        // stereo frame (gameplay 2 to the host) instead of the flat view's flash.
+        static uint64_t transitionSince = 0, lastEnabled = 0;
+        const uint64_t tick = GetTickCount64();
+        const bool transition = riderValid && rider.player && !rider.seated() && !rider.handheld();
+        if (enabled) lastEnabled = tick;
+        if (!transition) transitionSince = 0;
+        else if (!transitionSince) transitionSince = tick;
+        rideTransitionHold = transition && !enabled && settings.instantRides && tick - transitionSince < 800 &&
+                             tick - lastEnabled < 1500;
+    }
     updateRideSteadying(p, rider);
     validateLabOnlineIsolation(enabled);
     s.input = input;
@@ -1917,6 +1953,27 @@ static void update(void *p) {
                         const Vec3 dir = rotate(normalize(aim.q), Vec3{0, 0, -1});
                         for (float d = GripReach; !hull && d <= GripPointReach && finite(aim); d += .25f)
                             hull = nearestCarryable(p, aim.p + dir * d, .3f);
+                        // Not through walls: this hand's laser (the world hit along nearly
+                        // the same ray) must not stop well short of the object.
+                        if (void *native = hull ? resolve(hull) : nullptr) {
+                            void *nativeBody = hullBody(native);
+                            Pose centre{};
+                            if (nativeBody) memcpy(&centre, static_cast<uint8_t *>(nativeBody) + 0x2c, sizeof(centre));
+                            for (unsigned n = 0; n < 2 && nativeBody && finite(centre); ++n) {
+                                if (!s.handle[n] || mountHand(s, n) != unsigned(h)) continue;
+                                AcquireSRWLockShared(&laserLock);
+                                const LaserAim beam = laserAim[n];
+                                ReleaseSRWLockShared(&laserLock);
+                                const Vec3 toObject = centre.p - aim.p, toHit = beam.end - aim.p, past = beam.end - centre.p;
+                                if (beam.valid && beam.hit && GetTickCount64() - beam.tickMs < 250 &&
+                                    dot(toHit, toHit) < (std::sqrt(dot(toObject, toObject)) - .6f) * (std::sqrt(dot(toObject, toObject)) - .6f) &&
+                                    dot(past, past) > .8f * .8f && dot(toObject, toObject) > .36f) {
+                                    log("Grip carry pointed object behind something at %.2f m (hit %.2f m)",
+                                        std::sqrt(dot(toObject, toObject)), std::sqrt(dot(toHit, toHit)));
+                                    hull = 0;
+                                }
+                            }
+                        }
                         pointed = hull != 0;
                     }
                 }
@@ -2046,7 +2103,10 @@ static void update(void *p) {
         // replaces the lone weapon, mounted on the hand that chose it; dual mode
         // is switched on again below and then gives the choosing hand its pick
         // and the other hand back the weapon the pick replaced.
-        const int pickSlot = dualIntent(p) ? int(h) : soloSlot(p);
+        // The serious bomb goes to the right slot from either wheel (its lighter
+        // hand is the left; a left-slot bomb had no lighter arm).
+        const bool bombPick = pendingSelection[h] == 11;
+        const int pickSlot = bombPick && dualIntent(p) ? 1 : dualIntent(p) ? int(h) : soloSlot(p);
         if (pendingSelection[h] >= 0 && !multiplayer::remoteClient() && canChange(p, pickSlot) &&
             nativeRiderCurrent(p, rider)) {
             // The serious bomb's model holds the bomb in its right hand and the
@@ -2062,7 +2122,7 @@ static void update(void *p) {
             replaceWeapon(p, pendingSelection[h], pickSlot);
             if (!nativeRiderCurrent(p, rider))
                 return; // A native lifecycle callback superseded this transaction.
-            pairPick = pickSlot != int(h) ? PairPick{pendingSelection[h], int(h), restore} : PairPick{};
+            pairPick = pickSlot != int(h) && !bombPick ? PairPick{pendingSelection[h], int(h), restore} : PairPick{};
             pendingSelection[h] = -1;
             for (const int n : {int(h), pickSlot}) {
                 s.handle[n] = heldHandle(p, n);
@@ -4635,7 +4695,8 @@ static void *labFindTurret() {
         std::memcpy(&table, candidate, 4);
         if (listed++ < 24) log("Lab turret puppet %u/%u entry=%08x vtable rva=%lx", i, count, entry,
                                static_cast<unsigned long>(table - laserTurretVtable + 0x2b39e8));
-        if (table == laserTurretVtable && !turret) turret = candidate;
+        // CTurretPuppetEntity or CTurretCharacterEntity (Sam2Game 0x2b9fe0).
+        if ((table == laserTurretVtable || table == laserTurretVtable - 0x2b39e8 + 0x2b9fe0) && !turret) turret = candidate;
     }
     static unsigned found = 0;
     if (turret && found++ < 2) log("Lab turret found at %p", turret);
@@ -8603,6 +8664,52 @@ static void __fastcall damageHudRender(void *element, void *, void *a, void *b) 
     if (vrInputLive()) return;
     originalDamageHudRender(element, a, b);
 }
+// Mounting and dismounting rides (turrets, vehicles, creatures) without the
+// enter/exit animation. The rider (the player puppet) plays a ride-and-rider
+// sequence (CLeggedPuppetEntity::PlayRideAndRiderSequenceState, Sam2Game
+// 0x64360): animation steps while the body lerps onto or off the seat and the
+// camera flies between the eye and the ride's camera, shown flat in VR like a
+// cutscene. For the local VR player the first step is skipped to the end
+// (step index past the list), so the game's own completion runs at once: the
+// seat snap and DoStartRiding on entry; on exit the rider is first put at the
+// ride's enter point, where the native lerp ends. Only where the game is the
+// authority (single player, host).
+using RideSequenceState = void(__thiscall *)(void *);
+using RideEnterPoint = Pose *(__thiscall *)(void *ride, Pose *out, uint32_t seat, int32_t way); // ride vt+0x220
+using RiderDetach = void(__thiscall *)(void *rider, Pose placement);                            // rider vt+0x648
+using RideRiderNote = void(__thiscall *)(void *ride, uint32_t seat);                             // ride vt+0x254/0x258
+static RideSequenceState originalRideSequence = nullptr;
+static void __fastcall rideSequence(void *p, void *) {
+    const auto field = [p](unsigned offset) { uint32_t v; std::memcpy(&v, static_cast<uint8_t *>(p) + offset, 4); return v; };
+    const auto s = copySnapshot();
+    if (!settings.instantRides || !vrInputLive() || p != s.player || !(singlePlayer() || multiplayer::server()) ||
+        field(0x7d0) != 2 || field(0x7d4) != 0) {
+        originalRideSequence(p);
+        return;
+    }
+    void *ride = field(0x204) ? resolve(field(0x204)) : nullptr;
+    if (!ride || !field(0x544) || !resolve(field(0x544)) || !field(0x114) || !resolve(field(0x114))) {
+        originalRideSequence(p); // It finishes by itself without them.
+        return;
+    }
+    const uint32_t seat = field(0x208);
+    const int32_t way = int32_t(field(0x20c));
+    const bool exiting = field(0x728) == 1;
+    const auto *rideTable = *reinterpret_cast<uintptr_t *const *>(ride);
+    if (field(0x54c) == seat) // The ride's own enter/exit notice (native: on lerp steps).
+        reinterpret_cast<RideRiderNote>(rideTable[(exiting ? 0x258 : 0x254) / 4])(ride, seat);
+    if (exiting) {
+        Pose out{};
+        reinterpret_cast<RideEnterPoint>(rideTable[0x220 / 4])(ride, &out, seat, way);
+        if (finite(out) && validNativeBodyPose(out))
+            reinterpret_cast<RiderDetach>((*reinterpret_cast<uintptr_t *const *>(p))[0x648 / 4])(p, out);
+    }
+    const int32_t done = INT32_MAX; // Native: index >= count -> SetState(1), the sequence's end.
+    std::memcpy(static_cast<uint8_t *>(p) + 0x7d4, &done, 4);
+    static unsigned logged = 0;
+    if (logged++ < 32) log("Ride %s without its animation seat=%u way=%d", exiting ? "exit" : "entry", seat, way);
+    originalRideSequence(p);
+}
 static int(__cdecl *originalAppForeground)() = nullptr;
 static int __cdecl appForeground() {
     if (vrInputLive())
@@ -8736,6 +8843,13 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 }
                 const float dt = turretClock && now > turretClock ? std::min(.1f, float(now - turretClock) / 1000.f) : 0.f;
                 turretClock = now;
+                // Reversing the stick (the commanded look ahead of the aim the other
+                // way, e.g. held against a turret's limit): start from the actual
+                // aim, so the turret turns back at once instead of unwinding the lead.
+                const Vec3 fromAim = advanceTurretLook(look, captured.input.axis[1][0], captured.input.axis[1][1],
+                                                       settings.smoothTurnRate, dt);
+                if (std::remainder(fromAim.x - look.x, 2 * Pi) * std::remainder(commanded.x - look.x, 2 * Pi) < 0) commanded.x = look.x;
+                if ((fromAim.y - look.y) * (commanded.y - look.y) < 0) commanded.y = look.y;
                 Vec3 turned = advanceTurretLook(commanded, captured.input.axis[1][0], captured.input.axis[1][1],
                                                 settings.smoothTurnRate, dt);
                 const Vec3 byHand = rideHandAimDelta(captured);
@@ -10569,6 +10683,7 @@ bool attach(bool headless) {
           originalRepeated);
     }
     H(e, "?Step@CSimulation@SeriousEngine@@QAEXXZ", simulationStep, originalSimulationStep);
+    H(g, "?PlayRideAndRiderSequenceState@CLeggedPuppetEntity@SeriousEngine@@UAEXXZ", rideSequence, originalRideSequence);
 #undef H
     if (!headless)
         ok = internalHook(g, 0x176dc0, reinterpret_cast<void *>(damageHudRender),

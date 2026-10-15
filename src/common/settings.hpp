@@ -29,6 +29,7 @@ struct VrSettings {
     float scopeEyeRelief = .1f; // Optical presentation parameter, not native zoom timing.
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;
+    bool instantRides = true; // [Rides] InstantTransitions: mount and dismount without the animation.
     SteeringWheelSettings steeringWheel;
     bool roomscale = false; // Development gate until controller/replication completion.
     bool physicalMelee = false; // Unique-saw single-player integration gate.

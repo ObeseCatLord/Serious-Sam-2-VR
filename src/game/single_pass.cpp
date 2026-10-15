@@ -695,16 +695,26 @@ struct WaterConstantsScope {
                  SUCCEEDED(d->GetVertexShaderConstantF(4, view, 1));
         eyes = active && water::eyeOffset(engineView, changes[0], offset[0]) &&
                water::eyeOffset(engineView, changes[1], offset[1]);
+        // The program's view position (c4) is in its model space: the eyes' world
+        // offsets are turned (and scaled) into it by the inverse model rotation.
+        const auto vertex = shaderProbe.find(engineShader);
+        float wvp[16], rows[12];
+        const bool turned = active && vertex != shaderProbe.end() &&
+            SUCCEEDED(d->GetVertexShaderConstantF(vertex->second.clipMatrix, wvp, 4)) &&
+            env_probe_math::modelRotation(wvp, engineView, engineProjection, rows);
+        if (eyes && turned) {
+            float inverse[9];
+            if (water::invert3(rows, inverse))
+                for (auto &o : offset) {
+                    const float w[3]{o[0], o[1], o[2]};
+                    for (unsigned r = 0; r < 3; ++r) o[r] = inverse[3 * r] * w[0] + inverse[3 * r + 1] * w[1] + inverse[3 * r + 2] * w[2];
+                }
+        }
         // The environment cube once it holds something, with both programs' variants.
         IDirect3DCubeTexture9 *environment = active ? env_probe::cube(d) : nullptr;
-        const auto vertex = shaderProbe.find(engineShader);
-        if (!environment || labWaterUnpatched() || vertex == shaderProbe.end() || !vertex->second.variant) return;
+        if (!environment || !turned || labWaterUnpatched() || !vertex->second.variant) return;
         pixel = probePixelOf(d, enginePixelShader);
-        float wvp[16], rows[12];
-        if (!pixel.variant || FAILED(d->GetVertexShaderConstantF(vertex->second.clipMatrix, wvp, 4)) ||
-            !env_probe_math::modelRotation(wvp, engineView, engineProjection, rows) ||
-            FAILED(d->GetTexture(pixel.sampler, &image)))
-            return;
+        if (!pixel.variant || FAILED(d->GetTexture(pixel.sampler, &image))) return;
         const D3DSAMPLERSTATETYPE kinds[4]{D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_SRGBTEXTURE};
         for (unsigned k = 0; k < 4; ++k) d->GetSamplerState(pixel.sampler, kinds[k], &sampling[k]);
         cube = true;
@@ -723,6 +733,9 @@ struct WaterConstantsScope {
                          view[2] + (eyes ? offset[e][2] : 0.f), 0, water::DomeScale, 1, 0, 0};
         d->SetVertexShaderConstantF(WaterConstant, c, 2);
     }
+    // A water draw whose constants could not be read: its stereo variant would
+    // look the reflection up from whatever c30.. hold, so it is not drawn.
+    bool unusable() const noexcept { return waterDraw() && !active; }
     ~WaterConstantsScope() {
         if (cube) {
             const D3DSAMPLERSTATETYPE kinds[4]{D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_SRGBTEXTURE};
@@ -936,6 +949,7 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
         }
         HRESULT hr = D3D_OK;
         WaterConstantsScope waterScope(d, stereo);
+        if (stereo && waterScope.unusable()) return D3D_OK;
         for (unsigned j = 0; j < layout.count; ++j) {
             const RECT r = regionRect(layout.region[j], clip.left, clip.top, clip.right, clip.bottom);
             if (r.right <= r.left || r.bottom <= r.top) continue;
@@ -955,6 +969,7 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
     HRESULT hr = D3D_OK;
     const D3DVIEWPORT9 &v = engineViewport;
     WaterConstantsScope waterScope(d, stereo);
+    if (stereo && waterScope.unusable()) return D3D_OK;
     for (unsigned j = 0; j < layout.count; ++j) {
         const Region &g = layout.region[j];
         if (!g.scaled) continue;

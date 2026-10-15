@@ -28,4 +28,14 @@ inline bool eyeOffset(const float *view, const replay::EyeChange &change, float 
     }
     return true;
 }
+// Inverse of a 3x3 (rows of a 3x4: `m`, stride 4), into `out` (3x3, stride 3).
+inline bool invert3(const float *m, float (&out)[9]) noexcept {
+    const double a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+    const double det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if (!std::isfinite(det) || std::abs(det) < 1e-12) return false;
+    const double r[9]{e * i - f * h, c * h - b * i, b * f - c * e, f * g - d * i, a * i - c * g,
+                      c * d - a * f, d * h - e * g, b * g - a * h, a * e - b * d};
+    for (unsigned k = 0; k < 9; ++k) out[k] = float(r[k] / det);
+    return true;
+}
 } // namespace ss2vr::water
