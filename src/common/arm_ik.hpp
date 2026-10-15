@@ -48,8 +48,9 @@ inline bool solveArm(const ArmPose &arm, Vec3 target, const Matrix34 *handTarget
     dl = std::clamp(dl, std::abs(a - b) + 1e-4f, a + b - 1e-4f);
     const Vec3 reach = s + d * dl;
     // Bend plane: the animation's elbow, else down.
+    // (Each fallback is that direction less its part along d.)
     Vec3 pole = (e - s) - d * dot(d, e - s);
-    if (length(pole) < 1e-4f) pole = Vec3{0, -1, 0} - d * d.y;
+    if (length(pole) < 1e-4f) pole = Vec3{0, -1, 0} + d * d.y;
     if (length(pole) < 1e-4f) pole = Vec3{1, 0, 0} - d * d.x;
     pole = pole * (1 / length(pole));
     const float cosA = std::clamp((a * a + dl * dl - b * b) / (2 * a * dl), -1.f, 1.f);
@@ -74,6 +75,11 @@ inline bool solveArm(const ArmPose &arm, Vec3 target, const Matrix34 *handTarget
         about.m[3] = shifted.x; about.m[7] = shifted.y; about.m[11] = shifted.z;
         out.hand = affineMultiply(about, out.lower);
     }
+    // A turn rotationBetween cannot make (about half a turn: it gives none) left
+    // the upper arm unturned while the forearm turned about the computed elbow,
+    // up to half a metre from the real joint: such a pose stays native instead.
+    if (length(matrixApply(out.upper, e) - elbow) > 1e-3f || length(matrixApply(out.lower, w) - reach) > 1e-3f)
+        return false;
     return finiteMatrix(out.upper) && finiteMatrix(out.lower) && finiteMatrix(out.hand);
 }
 } // namespace ss2vr

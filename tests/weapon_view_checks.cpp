@@ -125,6 +125,18 @@ int main() {
         Matrix34 other = eyeView; other.m[11] += 2;
         check(shakenWeaponView(bob, eyeView) && !sameWeaponView(bob, eyeView) && !shakenWeaponView(other, eyeView),
               "Camera shake on the eye view is kept; another camera is not");
+        // Hundreds of metres from the world origin, as levels are played: a
+        // degree of tilt plus 3 cm of bob moves the view's translation by metres,
+        // still the same eye; a camera 2 m away or turned 15 degrees is not.
+        const Pose eye{normalize(Quat{0, .38f, 0, .92f}), {263.2f, .74f, -241.9f}};
+        const Matrix34 far = matrix(inverse(eye));
+        const float tilt = std::sin(.0087f) * .7071f; // A degree about the view's x and z (pitch and roll).
+        const Pose tilted{normalize(multiply(eye.q, Quat{tilt, 0, tilt, std::cos(.0087f)})), eye.p + Vec3{0, .03f, 0}};
+        const Pose moved{eye.q, eye.p + Vec3{2, 0, 0}};
+        const Pose turned{normalize(multiply(eye.q, Quat{0, std::sin(.13f), 0, std::cos(.13f)})), eye.p};
+        check(shakenWeaponView(matrix(inverse(tilted)), far) && !sameWeaponView(matrix(inverse(tilted)), far) &&
+                  !shakenWeaponView(matrix(inverse(moved)), far) && !shakenWeaponView(matrix(inverse(turned)), far),
+              "Shake is judged by camera position and turn, not the view's translation");
     }
     std::cout << "Physical weapon view/depth checks passed; no native runtime executed\n";
 }

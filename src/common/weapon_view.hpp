@@ -25,17 +25,28 @@ inline bool sameWeaponView(const Matrix34 &a, const Matrix34 &b) {
             std::abs(a.m[i] - b.m[i]) > .001f) return false;
     return true;
 }
+// A view's camera position: -R^T t for the view [R | t] (world -> view, row-major).
+inline Vec3 viewCamera(const Matrix34 &v) {
+    return {-(v.m[0] * v.m[3] + v.m[4] * v.m[7] + v.m[8] * v.m[11]),
+            -(v.m[1] * v.m[3] + v.m[5] * v.m[7] + v.m[9] * v.m[11]),
+            -(v.m[2] * v.m[3] + v.m[6] * v.m[7] + v.m[10] * v.m[11])};
+}
 // The game's own camera motion on top of the eye (view bob on landing, damage
 // and explosion shake) moves the root view a few centimetres and degrees from
 // the eye: the world was still drawn for this eye. Another camera altogether
-// (more than ShakeReach metres or ShakeTurn in any rotation element) is not.
+// (its camera more than ShakeReach metres away, or more than ShakeTurn in any
+// rotation element) is not. The cameras are compared, not the views'
+// translations: a translation is the camera position turned by the view's
+// rotation, so hundreds of metres from the world origin (where levels are
+// played) a tenth of a degree of shake already moved it more than ShakeReach.
 constexpr float ShakeReach = .3f, ShakeTurn = .2f;
 inline bool shakenWeaponView(const Matrix34 &a, const Matrix34 &b) {
     for (unsigned i = 0; i != 12; ++i) {
         if (!std::isfinite(a.m[i]) || !std::isfinite(b.m[i])) return false;
-        if (std::abs(a.m[i] - b.m[i]) > (i % 4 == 3 ? ShakeReach : ShakeTurn)) return false;
+        if (i % 4 != 3 && std::abs(a.m[i] - b.m[i]) > ShakeTurn) return false;
     }
-    return true;
+    const Vec3 d = viewCamera(a) - viewCamera(b);
+    return std::isfinite(d.x + d.y + d.z) && dot(d, d) <= ShakeReach * ShakeReach;
 }
 inline bool sameProjectionXY(const Matrix44 &a, const Matrix44 &b) {
     // Native execution may revise Z clipping. Every other coefficient must

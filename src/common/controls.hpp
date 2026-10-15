@@ -146,17 +146,42 @@ inline MenuCursor menuCursor(float u, float v, uint32_t imageWidth = 0, uint32_t
     const auto clamp01 = [](float t) { return t < 0 ? 0.f : t > 1 ? 1.f : t; };
     return {640.f * clamp01(.5f + (u - .5f) * sx), 480.f * clamp01(.5f + (v - .5f) * sy)};
 }
+// Both stick clicks are a chord only when pressed together (the second within
+// WindowMs of the first): the left click is held to sprint, and a right click
+// meanwhile (grenade, sniper zoom) recentred the view. A stick that was part of
+// a chord stays a plain stick until released: letting go of the left first
+// left the right's click to take a grenade on its release.
+struct StickChord {
+    static constexpr uint64_t WindowMs = 200;
+    uint64_t pressedAt[2]{};
+    bool down[2]{}, held = false, spent[2]{};
+    bool update(bool left, bool right, uint64_t now) {
+        const bool clicks[2]{left, right};
+        for (unsigned h = 0; h < 2; ++h) {
+            if (clicks[h] && !down[h]) pressedAt[h] = now;
+            down[h] = clicks[h];
+            if (!clicks[h]) spent[h] = false;
+        }
+        if (!left || !right) held = false;
+        else if (!held && !spent[0] && !spent[1])
+            held = (pressedAt[0] > pressedAt[1] ? pressedAt[0] - pressedAt[1] : pressedAt[1] - pressedAt[0]) <= WindowMs;
+        return held;
+    }
+};
 // Recentre: both grips plus the left stick click, or both stick clicks
 // together. Holding either chord 2 s also levels the view (host).
-inline void applyRecenterChord(Input &input, bool clicked) {
+inline void applyRecenterChord(Input &input, bool clicked, StickChord &sticks, uint64_t now) {
     const bool grips = (input.buttons[0] & Wheel) && (input.buttons[1] & Wheel) && clicked;
-    const bool sticks = (input.buttons[0] & Sprint) && (input.buttons[1] & Sprint);
-    if (input.focused && (grips || sticks)) {
+    const bool both = sticks.update((input.buttons[0] & Sprint) != 0, (input.buttons[1] & Sprint) != 0, now);
+    if (input.focused && (grips || both)) {
+        for (unsigned h = 0; h < 2; ++h) sticks.spent[h] = sticks.spent[h] || (input.buttons[h] & Sprint) != 0;
         input.buttons[0] = (input.buttons[0] & ~Sprint) | Recenter;
         input.buttons[1] &= ~Sprint;
         // Keep physical trigger and grip state: neither a fake trigger release
         // nor a fake new grip press may be synthesized when the chord ends.
     }
+    for (unsigned h = 0; h < 2; ++h)
+        if (sticks.spent[h]) input.buttons[h] &= ~Sprint;
 }
 // Observe raw input independently of gated intent. Hysteresis in [.2,.65]
 // preserves the latch, but is never evidence of a new physical release.

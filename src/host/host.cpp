@@ -532,6 +532,7 @@ struct Actions {
     ActionStream primaryStream[2], zoomStream[2], gripPoseStream[2];
     SqueezeAdmission squeeze[2];
     WheelOpenGate wheelGate[2];
+    StickChord stickChord;
     void invalidateStreams() {
         for (unsigned h = 0; h != 2; ++h) {
             wheelGate[h].sample(false, false, false);
@@ -890,7 +891,7 @@ struct Actions {
                     input.zoomDownMask |= 1u << h;
             }
         }
-        applyRecenterChord(input, boolean(api, session, recenter, 0));
+        applyRecenterChord(input, boolean(api, session, recenter, 0), stickChord, GetTickCount64());
         for (unsigned h = 0; h != 2; ++h) {
             const bool admitted = squeeze[h].sample(squeezeSources[h], squeezeValuesValid[h],
                 (input.buttons[h] & Wheel) != 0,
@@ -2583,6 +2584,9 @@ struct Host {
             // A pair already shown stays up briefly rather than the frame going black.
             if (eligibleSequence == cachedRequest.sequence && holdableFrame(cachedRequest, cachedDeadline, context)) {
                 if (final) ++heldPairs;
+                // A busy lock during a hold keeps it too (the hold itself is bounded):
+                // left at the last eligible verdict, a hold over 100 ms went black.
+                eligibleTick = now;
                 return true;
             }
             if (final) {

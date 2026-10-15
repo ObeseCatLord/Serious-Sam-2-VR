@@ -2662,11 +2662,17 @@ static void presentBody(IDirect3DDevice9 *d) {
     // (V481/V482: the cursor spans its full width and height), so on the square
     // eye canvas they looked squeezed: their image is the canvas scaled to 4:3.
     const UiBand source = nativeMenu ? UiBand{0, 0, copyWidth, copyHeight} : uiBand(copyWidth, copyHeight);
-    float sourceWidth = nativeMenu ? float(source.height) * 4.f / 3.f : float(source.width);
-    if (sourceWidth * float(source.height) > float(copyWidth) * float(copyHeight)) sourceWidth = float(source.width); // Buffer bound.
-    const float fit = std::min({1.f, 1920.f / std::max(1.f, sourceWidth), 1080.f / float(std::max(1u, source.height))});
-    const uint32_t outWidth = std::max(2u, uint32_t(sourceWidth * fit)) & ~1u,
-                   outHeight = std::max(2u, uint32_t(float(source.height) * fit)) & ~1u;
+    const auto scaled = [&](float sourceWidth, uint32_t &w, uint32_t &h) {
+        const float fit = std::min({1.f, 1920.f / std::max(1.f, sourceWidth), 1080.f / float(std::max(1u, source.height))});
+        w = std::max(2u, uint32_t(sourceWidth * fit)) & ~1u;
+        h = std::max(2u, uint32_t(float(source.height) * fit)) & ~1u;
+    };
+    uint32_t outWidth = 0, outHeight = 0;
+    scaled(nativeMenu ? float(source.height) * 4.f / 3.f : float(source.width), outWidth, outHeight);
+    // The scaled image must fit the canvas-sized pixel buffer. (Bounding the
+    // unscaled 4:3 width instead left every eye canvas, all narrower than 4:3,
+    // at the canvas aspect: 1344x1512 was still published as 960x1080.)
+    if (uint64_t(outWidth) * outHeight > uint64_t(copyWidth) * copyHeight) scaled(float(source.width), outWidth, outHeight);
     withNativeFinally([&] {
         if (FAILED(sourceBackbuffer(&backbuffer))) return;
         if (menuScaledWidth != outWidth || menuScaledHeight != outHeight || !menuScaled || !menuScaledRead) {

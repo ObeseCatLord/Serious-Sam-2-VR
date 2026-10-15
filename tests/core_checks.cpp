@@ -354,23 +354,42 @@ int main() {
     chord.focused = 1;
     chord.buttons[0] = chord.buttons[1] = Wheel | Sprint;
     chord.trigger[0] = chord.trigger[1] = .9f;
-    applyRecenterChord(chord, true);
+    StickChord chordSticks;
+    applyRecenterChord(chord, true, chordSticks, 1000);
     check(recenterHeld(chord) && chord.trigger[0] == .9f && chord.trigger[1] == .9f &&
               (chord.buttons[0] & Wheel) && (chord.buttons[1] & Wheel) &&
               !((chord.buttons[0] | chord.buttons[1]) & Sprint),
           "Recenter preserves physical grips/triggers and suppresses sprint");
     {
-        Input sticks{};
-        sticks.focused = 1;
-        sticks.buttons[0] = sticks.buttons[1] = Sprint;
-        applyRecenterChord(sticks, false);
+        // The chord as the host samples it each frame: `l`/`r` stick clicks at `t` ms.
+        StickChord chordState;
+        const auto sample = [&](bool l, bool r, uint64_t t) {
+            Input in{};
+            in.focused = 1;
+            in.buttons[0] = l ? Sprint : 0u;
+            in.buttons[1] = r ? Sprint : 0u;
+            applyRecenterChord(in, false, chordState, t);
+            return in;
+        };
+        Input sticks = sample(true, false, 0);
+        check(!recenterHeld(sticks) && (sticks.buttons[0] & Sprint), "One stick click alone stays a stick click");
+        sticks = sample(true, true, 120);
         check(recenterHeld(sticks) && !((sticks.buttons[0] | sticks.buttons[1]) & Sprint),
-              "Both stick clicks recenter and suppress sprint and grenade");
-        Input one{};
-        one.focused = 1;
-        one.buttons[1] = Sprint;
-        applyRecenterChord(one, false);
-        check(!recenterHeld(one) && (one.buttons[1] & Sprint), "One stick click alone stays a stick click");
+              "Both stick clicks together recenter and suppress sprint and grenade");
+        // Left let go first: the still-held right click is no grenade or sprint.
+        sticks = sample(false, true, 400);
+        check(!recenterHeld(sticks) && !(sticks.buttons[1] & Sprint), "A stick left held after the chord stays quiet");
+        sticks = sample(false, false, 450);
+        sticks = sample(false, true, 600);
+        check(!recenterHeld(sticks) && (sticks.buttons[1] & Sprint), "Released, the stick clicks normally again");
+        sample(false, false, 650);
+        // Sprinting (left held) and then the right click: a grenade, not a recentre.
+        sample(true, false, 1000);
+        sticks = sample(true, true, 1600);
+        check(!recenterHeld(sticks) && (sticks.buttons[0] & Sprint) && (sticks.buttons[1] & Sprint),
+              "The right click while sprinting is no recentre");
+        sticks = sample(true, true, 3000);
+        check(!recenterHeld(sticks), "Holding both after a late click never becomes a recentre (or levelling)");
     }
     TriggerGate chordGate;
     chordGate.update(0, true);

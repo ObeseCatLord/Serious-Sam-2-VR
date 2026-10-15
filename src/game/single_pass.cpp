@@ -678,9 +678,13 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
     {
         // Lab (SS2VR_LAB_WATER_SKIP=1): water draws are left out, to find water by difference.
         static const bool skipWater = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_WATER_SKIP", v, 2) == 1 && v[0] == L'1'; }();
-        static unsigned waterDraws = 0;
-        if (waterDraw() && waterDraws++ % 600 == 0) log("Single pass water draw %u stereo=%u", waterDraws, unsigned(stereoBound()));
-        if (skipWater && waterDraw()) return D3D_OK;
+        static unsigned waterDraws = 0, waterLogged = 0;
+        const bool water = waterDraw();
+        if (water && waterDraws++ % 600 == 0 && waterLogged < 16) { // Bounded: water is drawn every frame.
+            ++waterLogged;
+            log("Single pass water draw %u stereo=%u", waterDraws, unsigned(stereoBound()));
+        }
+        if (skipWater && water) return D3D_OK;
     }
     const bool stereo = stereoBound();
     if (stereo && !writeRecords(d)) return call(false);

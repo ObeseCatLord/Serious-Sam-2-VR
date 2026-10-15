@@ -37,6 +37,20 @@ int main() {
     const Matrix34 posed = affineMultiply(d.hand, arm.hand);
     for (unsigned i : {0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u}) assert(std::abs(posed.m[i] - handTarget.m[i]) < 1e-3f);
     assert(near(matrixTranslation(posed), target));
+    // A straight arm hanging down reaching straight down: the bend plane falls
+    // back to a direction across the arm; the bones stay rigid, the wrist reaches.
+    {
+        const Vec3 se{.2f, 1.12f, 0}, sw{.2f, .86f, 0};
+        ArmPose straight{matrix(Pose{{0, 0, 0, 1}, s}), matrix(Pose{{0, 0, 0, 1}, se}), matrix(Pose{{0, 0, 0, 1}, sw})};
+        const Vec3 below{.2f, 1.f, 0};
+        assert(solveArm(straight, below, nullptr, d));
+        const Vec3 bentElbow = matrixApply(d.upper, se), reached = matrixApply(d.lower, sw);
+        assert(near(reached, below) && std::abs(len(bentElbow - s) - .28f) < 1e-3f &&
+               std::abs(len(reached - bentElbow) - .26f) < 1e-3f);
+        // Straight up at full reach needs half a turn of the upper arm, which
+        // rotationBetween does not make: refused (bones stay native), not detached.
+        assert(!solveArm(straight, {.2f, 1.94f, 0}, nullptr, d));
+    }
     // Degenerate input is refused.
     ArmPose folded = arm;
     folded.lower = folded.upper;

@@ -1533,11 +1533,15 @@ static void labBoneDump() {
 }
 // The Serious Bomb split (setSplitModel): the left arm's bones of that model
 // move so its Palm_Left sits at the left controller, turned by the rotation
-// between the two controllers.
-static struct { uintptr_t instance = 0; Pose left{}; Quat right{0, 0, 0, 1}; bool valid = false; } splitModel;
+// between the two controllers. Set by the bomb's own placement each render: a
+// stale one (the bomb gone, nothing placed in the right hand since) whose
+// freed instance address another model reused must not move that model's arm.
+static struct { uintptr_t instance = 0; Pose left{}; Quat right{0, 0, 0, 1}; bool valid = false; uint64_t tick = 0; } splitModel;
 static uint32_t splitArmName = 0, splitPalmName = 0;
 static void applySplitModel() {
-    if (!splitModel.valid || !splitModel.instance || !splitArmName || !finite(splitModel.left)) return;
+    if (!splitModel.valid || !splitModel.instance || !splitArmName || !finite(splitModel.left) ||
+        GetTickCount64() - splitModel.tick > 250)
+        return;
     std::span<NativeModelRecord> records;
     std::span<NativeMeshRecord> meshes;
     std::span<NativeDrawEntry> draws;
@@ -1561,7 +1565,9 @@ static void applySplitModel() {
     if (!readableMemory(evaluated, 0x28)) return;
     std::memcpy(&canonical, static_cast<uint8_t *>(evaluated) + 0x20, 4);
     std::memcpy(&canonicalCount, static_cast<uint8_t *>(evaluated) + 0x24, 4);
-    if (canonicalCount < int32_t(bones.size()) || !readableMemory(canonical, size_t(canonicalCount) * sizeof(Matrix34))) return;
+    if (canonicalCount < int32_t(bones.size()) || size_t(canonicalCount) > MaxNativeBones ||
+        !readableMemory(canonical, size_t(canonicalCount) * sizeof(Matrix34)))
+        return;
     size_t arm = bones.size(), palm = bones.size();
     std::vector<uint32_t> names(bones.size(), 0);
     for (size_t b = 0; b < bones.size(); ++b) {
@@ -1716,6 +1722,7 @@ void setSplitModel(uintptr_t instance, const Pose &left, Quat right, bool valid)
     splitModel.left = left;
     splitModel.right = right;
     splitModel.valid = valid && instance;
+    splitModel.tick = GetTickCount64();
 }
 bool initialize(HMODULE engine, HMODULE core, HMODULE sam, HookInstallerRva install, bool enableHeadTracking,
                 bool observeRideControl,bool produceGrips) {

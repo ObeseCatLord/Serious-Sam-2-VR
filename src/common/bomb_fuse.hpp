@@ -25,14 +25,16 @@ struct BombFuse {
 
     static Vec3 flame(const Pose &lighter) { return lighter.p + rotate(normalize(lighter.q), Flame); }
     static Vec3 fuse(const Pose &bomb) { return bomb.p + rotate(normalize(bomb.q), Fuse); }
-    void clear() { lit = spent = firing = false; }
-    // Returns whether the native fire is pressed this frame.
+    // A spent lighter stays spent: only releasing its trigger re-arms it.
+    void clear() { lit = firing = false; }
+    // Returns whether the native fire is pressed this frame. Lost tracking lights
+    // nothing, but neither re-arms a spent lighter (its trigger still held, the
+    // flame lit a second bomb when tracking came back) nor cuts a fire short.
     bool update(bool tracked, float lighterTrigger, const Pose &lighter, const Pose &bomb, uint64_t now) {
-        if (!tracked) { clear(); return false; }
         lit = lighterTrigger > Strike;
         if (!lit) spent = false;
         if (firing && now - firedAt >= Hold) firing = false;
-        if (lit && !spent && !firing) {
+        if (tracked && lit && !spent && !firing) {
             const Vec3 d = flame(lighter) - fuse(bomb);
             if (std::isfinite(d.x + d.y + d.z) && dot(d, d) < Reach * Reach) {
                 firing = spent = true;
