@@ -2655,7 +2655,10 @@ static void presentBody(IDirect3DDevice9 *d) {
     bool locked = false, lockAttempted = false, lockReturned = false, held = false;
     // The game letterboxes its 2D view to gfx_fAspectRatio inside the (eye-
     // sized) canvas; the flat screen shows only that band, at its own aspect.
-    const UiBand source = uiBand(copyWidth, copyHeight);
+    // Its menus are drawn over the whole canvas (a 4:3 box filling the square
+    // eye canvas): the band cut off their top and bottom, so a native menu shows
+    // the whole canvas (the pointer maps image -> canvas either way).
+    const UiBand source = nativeMenu ? UiBand{0, 0, copyWidth, copyHeight} : uiBand(copyWidth, copyHeight);
     const float fit = std::min({1.f, 1920.f / float(std::max(1u, source.width)), 1080.f / float(std::max(1u, source.height))});
     const uint32_t outWidth = std::max(2u, uint32_t(float(source.width) * fit)) & ~1u,
                    outHeight = std::max(2u, uint32_t(float(source.height) * fit)) & ~1u;

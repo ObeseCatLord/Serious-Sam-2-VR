@@ -26,6 +26,10 @@ void setInstancing(bool enabled) noexcept; // [Render] SinglePassInstancing
 // reprojection): camera-attached effects, which two-pass renders draw in front
 // of each eye's own camera.
 void setScreenLocked(bool locked) noexcept;
+// The root view (world -> view, row-major 3x4) the pass renders the world with.
+// Views with their camera elsewhere (the sky's background viewer) get eye
+// rotation only, as each eye's own camera would render them.
+void setMainView(const float *view) noexcept;
 // Releases the pass's default-pool resources (before a device Reset).
 void releaseDeviceResources() noexcept;
 // Engine globals: adjusted projection, projection, view (read at draw time).

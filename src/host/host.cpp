@@ -687,8 +687,8 @@ struct Actions {
             case 1:
                 bind(sprint, 1, click);
                 bind(reload, 0, "a/click");
-                bind(use, 1, "a/click");
-                bind(jump, 1, "b/click");
+                bind(jump, 1, "a/click"); // Right A jumps, right B uses (user's choice).
+                bind(use, 1, "b/click");
                 bind(menu, 0, "b/click");
                 // A float, thresholded here: the runtime's boolean conversion of
                 // trackpad force needs a hard press.

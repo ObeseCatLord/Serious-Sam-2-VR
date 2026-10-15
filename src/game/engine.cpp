@@ -858,7 +858,7 @@ bool nativeRiderCurrent(void *player, const RiderIdentity &expected,void **rideT
 // Except in aircraft (which must pitch and roll) the anchor also keeps only the
 // ride's heading: a walking dinosaur pitched and rolled the whole view.
 static std::atomic<uint32_t> steadyPlayer{0}, steadyRide{0};
-static std::atomic<float> steadyOffset{0};
+static std::atomic<float> steadyOffset{0}, steadyOffsetX{0}, steadyOffsetZ{0}, steadyYaw{0};
 static std::atomic<bool> steadyLevel{false};
 static thread_local bool steadyBypass = false;
 static uintptr_t aircraftVtables[3]{};
@@ -910,18 +910,43 @@ bool nativeTrackingAnchor(void *player, Pose &out, const RiderIdentity *expected
         return false;
     if (identity.seated() && !steadyBypass && identity.player == steadyPlayer.load(std::memory_order_relaxed) &&
         identity.ride == steadyRide.load(std::memory_order_relaxed)) {
-        const float offset = steadyOffset.load(std::memory_order_relaxed);
-        if (std::isfinite(offset)) result.p.y += offset;
-        if (steadyLevel.load(std::memory_order_relaxed)) result.q = yaw(horizontalHeading(result.q));
+        const Vec3 offset{steadyOffsetX.load(std::memory_order_relaxed), steadyOffset.load(std::memory_order_relaxed),
+                          steadyOffsetZ.load(std::memory_order_relaxed)};
+        if (std::isfinite(offset.x + offset.y + offset.z)) result.p = result.p + offset;
+        if (steadyLevel.load(std::memory_order_relaxed)) {
+            const float turn = steadyYaw.load(std::memory_order_relaxed);
+            result.q = yaw(horizontalHeading(result.q) + (std::isfinite(turn) ? turn : 0.f));
+        }
     }
+    // On foot the anchor is the game's view, whose pitch and roll the game can
+    // change by itself (camera shake from explosions and damage, swimming):
+    // that tilted the whole VR world until the game's view came back. Only its
+    // heading is used; the headset gives all pitch and roll.
+    if (!identity.seated()) result.q = yaw(horizontalHeading(result.q));
     out = result;
     return true;
 }
-// Per poll: the seated anchor height follows the ride's with a 0.35 s low-pass
-// (gait bob removed, hills and jumps kept); at most 0.6 m apart.
+// Per poll while riding: the anchor's position and heading follow the ride's
+// through an alpha-beta tracker (position and velocity), which follows steady
+// motion and turns without lag but lets through little above ~1 Hz: the gait
+// bob and sway of a walking ride are smoothed away, hills, jumps and turns kept.
+// Jumps over 1.5 m (teleports, boarding) are taken at once.
+struct RideTracker {
+    float x = 0, v = 0;
+    bool seeded = false;
+    float step(float z, float dt, float omega) {
+        if (!seeded || !(dt > 0)) { x = z; v = 0; seeded = true; return x; }
+        const float predicted = x + v * dt, residual = z - predicted;
+        const float alpha = std::min(1.f, 2 * .7f * omega * dt), beta = std::min(1.f, omega * omega * dt * dt);
+        x = predicted + alpha * residual;
+        v += beta / dt * residual;
+        return x;
+    }
+};
 static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     static LARGE_INTEGER last{};
-    static float filtered = 0;
+    static RideTracker axes[3], heading;
+    static float unwrapped = 0, previousRaw = 0;
     static uint32_t ride = 0;
     LARGE_INTEGER now{}, frequency{};
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
@@ -931,14 +956,25 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     steadyBypass = true;
     const bool ok = rider.seated() && nativeTrackingAnchor(player, raw, &rider);
     steadyBypass = false;
-    if (!ok || !std::isfinite(raw.p.y)) {
+    if (!ok || !finite(raw)) {
         steadyRide = 0; ride = 0;
         return;
     }
-    if (ride != rider.ride || std::abs(filtered - raw.p.y) > .6f) filtered = raw.p.y;
-    else filtered += (raw.p.y - filtered) * (1 - std::exp(-dt / .35f));
+    const float rawHeading = horizontalHeading(raw.q);
+    const bool reseed = ride != rider.ride ||
+        std::abs(axes[0].x - raw.p.x) + std::abs(axes[1].x - raw.p.y) + std::abs(axes[2].x - raw.p.z) > 1.5f;
+    if (reseed) {
+        for (auto &a : axes) a.seeded = false;
+        heading.seeded = false;
+        unwrapped = rawHeading;
+    } else unwrapped += std::remainder(rawHeading - previousRaw, 2 * Pi);
+    previousRaw = rawHeading;
     ride = rider.ride;
-    steadyOffset = filtered - raw.p.y;
+    const float omega = 5.f, turnOmega = 9.f; // rad/s
+    steadyOffsetX = axes[0].step(raw.p.x, dt, omega) - raw.p.x;
+    steadyOffset = axes[1].step(raw.p.y, dt, omega) - raw.p.y;
+    steadyOffsetZ = axes[2].step(raw.p.z, dt, omega) - raw.p.z;
+    steadyYaw = heading.step(unwrapped, dt, turnOmega) - unwrapped;
     steadyLevel = !aircraftRide(rider);
     steadyPlayer = rider.player;
     steadyRide = rider.ride;
@@ -1389,6 +1425,16 @@ static void(__cdecl *hullsInRange)(const Vec3 &, float, NativeHulls &) = nullptr
 static void *(__thiscall *hullOwner)(void *) = nullptr;
 static void *(__thiscall *hullBody)(void *) = nullptr;
 static void(__thiscall *jointPlacements)(void *, const Pose &, const Pose &) = nullptr;
+// The carry joint's target: the hand. Native code set it again after our carry
+// step (the object reached the hand, then rose ~3 m above it, V499), so every
+// SetDesiredPlacements on that joint gets the hand target while we carry.
+static void *carryJoint = nullptr;
+static Pose carryTargetA{}, carryTargetB{};
+static bool carryTargetValid = false;
+static void __fastcall carryJointPlacements(void *joint, void *, const Pose &a, const Pose &b) {
+    if (carryTargetValid && joint && joint == carryJoint) { jointPlacements(joint, carryTargetA, carryTargetB); return; }
+    jointPlacements(joint, a, b);
+}
 static void(__thiscall *jointMaxLinVel)(void *, float) = nullptr;
 static void(__cdecl *preDeleteArray)(const void *, void *) = nullptr;
 static void(__cdecl *deleteArray)(void *) = nullptr;
@@ -1403,7 +1449,7 @@ template <class R, class... A> static R virtualCall(void *object, unsigned offse
 }
 struct GripCarry {
     int requestHand = -1, hand = -1;
-    uint32_t requestHull = 0, joint = 0;
+    uint32_t requestHull = 0, joint = 0, carriedHull = 0;
     Pose requestPose{};
     bool gripDown[2]{};
     struct Sample { double time; Vec3 p; } history[16]{};
@@ -1496,6 +1542,7 @@ static void releaseGripCarry(void *puppet, bool throwIt) {
     gripCarry.joint = 0;
     gripCarry.samples = 0;
     gripCarrying = false;
+    carryTargetValid = false;
 }
 static void __fastcall carryStep(void *puppet, void *) {
     const auto s = copySnapshot();
@@ -1508,7 +1555,8 @@ static void __fastcall carryStep(void *puppet, void *) {
     const bool live = vrSession(s) && fresh(s.input) && s.ui.gameplay && !recenterHeld(s.input);
     if (g.hand >= 0) {
         if (!primaryField(puppet, 0x564)) { // Ended natively: Use, death, object destroyed.
-            g.hand = -1; g.samples = 0; gripCarrying = false;
+            log("Grip carry ended natively hand=%d", g.hand);
+            g.hand = -1; g.samples = 0; gripCarrying = false; carryTargetValid = false;
         } else if (!live || !(s.input.buttons[g.hand] & Wheel)) {
             releaseGripCarry(puppet, live);
         }
@@ -1520,7 +1568,7 @@ static void __fastcall carryStep(void *puppet, void *) {
             resolve(g.requestHull)) {
             virtualCall<void>(puppet, 0x290, g.requestHull, g.requestPose); // TakeObject(hull, world grab pose)
             if (primaryField(puppet, 0x564)) {
-                g.hand = int(h); g.samples = 0; g.joint = 0;
+                g.hand = int(h); g.samples = 0; g.joint = 0; g.carriedHull = g.requestHull;
                 gripCarrying = true;
                 log("Grip carry taken hand=%u object=%u", h, primaryField(puppet, 0x564));
             }
@@ -1540,10 +1588,48 @@ static void __fastcall carryStep(void *puppet, void *) {
     const uint32_t jointHandle = primaryField(puppet, 0x374);
     if (jointHandle != g.joint) {
         g.joint = jointHandle;
-        if (jointMaxLinVel) jointMaxLinVel(joint, 40.f); // Keep up with a moving hand.
+        if (jointMaxLinVel) jointMaxLinVel(joint, 12.f); // Keep up with a hand without flinging the object.
     }
     // The joint holds the grab frame (object space) at the hand (player-body space).
-    jointPlacements(joint, compose(inverse(own), hand), grab);
+    // The hand is often inside the player's collision capsule; an object pulled
+    // there was pushed out over the top and ended above the head (V499/V500:
+    // 0.65 m above the hand after overshooting to 3 m). Hold it at the hand's
+    // height but at least CarryClearance out from the body's vertical axis.
+    {
+        constexpr float CarryClearance = .7f;
+        Vec3 out{hand.p.x - own.p.x, 0, hand.p.z - own.p.z};
+        float reach = std::sqrt(out.x * out.x + out.z * out.z);
+        if (reach < 1e-3f) {
+            const Vec3 forward = rotate(hand.q, Vec3{0, 0, -1});
+            out = {forward.x, 0, forward.z};
+            reach = std::sqrt(out.x * out.x + out.z * out.z);
+        }
+        if (reach > 1e-3f && reach < CarryClearance) {
+            const float k = CarryClearance / reach;
+            hand.p.x = own.p.x + out.x * k;
+            hand.p.z = own.p.z + out.z * k;
+        }
+    }
+    carryJoint = joint;
+    carryTargetA = compose(inverse(own), hand);
+    carryTargetB = grab;
+    carryTargetValid = finite(carryTargetA) && finite(carryTargetB);
+    jointPlacements(joint, carryTargetA, grab);
+    {
+        // Lab (SS2VR_LAB_SHOT_LOG=1): where the carried object is against the hand.
+        static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SHOT_LOG", v, 2) == 1 && v[0] == L'1'; }();
+        static uint64_t last = 0;
+        if (trace && GetTickCount64() - last > 100) {
+            last = GetTickCount64();
+            void *hull = g.carriedHull ? resolve(g.carriedHull) : nullptr;
+            void *objectBody = hull ? hullBody(hull) : nullptr;
+            Pose placed{};
+            if (objectBody) memcpy(&placed, static_cast<uint8_t *>(objectBody) + 0x2c, sizeof(placed));
+            log("Lab carry hand=%.2f,%.2f,%.2f body=%.2f,%.2f,%.2f object=%.2f,%.2f,%.2f grab=%.2f,%.2f,%.2f q=%.2f,%.2f,%.2f,%.2f",
+                hand.p.x, hand.p.y, hand.p.z, own.p.x, own.p.y, own.p.z, placed.p.x, placed.p.y, placed.p.z, grab.p.x, grab.p.y,
+                grab.p.z, grab.q.x, grab.q.y, grab.q.z, grab.q.w);
+        }
+    }
     g.history[g.samples % 16] = {carryClock(), hand.p};
     ++g.samples;
 }
@@ -1790,9 +1876,12 @@ static void update(void *p) {
                         Pose placement{};
                         if (body) memcpy(&placement, static_cast<uint8_t *>(body) + 0x2c, sizeof(placement));
                         const Vec3 d = placement.p - hand.p;
+                        Pose anchorPose{};
+                        trackingAnchor(p, anchorPose);
+                        const Vec3 fwd = rotate(worldHeadTracking(anchorPose, s.origin, s.turn, input.head).q, Vec3{0, 0, -1});
                         log("Grip carry none in reach hand=%d at=%.2f,%.2f,%.2f nearest40m=%u offset=%.2f,%.2f,%.2f "
-                            "hulls=%d owned=%d takeable=%d flags=%x", h, hand.p.x, hand.p.y, hand.p.z, nearby,
-                            d.x, d.y, d.z, scan.hulls, scan.owned, scan.takeable, scan.flagsSeen);
+                            "hulls=%d owned=%d takeable=%d flags=%x fwd=%.3f,%.3f", h, hand.p.x, hand.p.y, hand.p.z, nearby,
+                            d.x, d.y, d.z, scan.hulls, scan.owned, scan.takeable, scan.flagsSeen, fwd.x, fwd.z);
                     }
                 }
             }
@@ -4016,6 +4105,7 @@ static void __fastcall viewPrepare(void *command, void *, const Matrix34 &view, 
             return;
         }
         rootView = command;
+        single_pass::setMainView(view.m);
         const Pose eye = worldEyeTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn,
                                          eyeRequest.input.head, eyeRequest.eye[eyeIndex]);
         const Matrix34 expectedView = matrix(inverse(eye));
@@ -8228,10 +8318,13 @@ using SubstituteCommands = void *(__thiscall *)(void *, void *, const char *);
 static SubstituteCommands originalSubstitute = nullptr;
 static void *__fastcall substituteCommands(void *bindings, void *, void *result, const char *text) {
     if (!text || !vrInputLive() || !std::strchr(text, '{')) return originalSubstitute(bindings, result, text);
-    static const std::pair<const char *, const char *> names[] = {
-        {"{plcmdUse}", "A"}, {"{plcmdFire}", "the right trigger"}, {"{plcmdAltFire}", "the left trigger"},
+    // Profiles with a jump button (Index): right A jumps, right B uses.
+    const auto latest = copySnapshot().input;
+    const bool jumpButton = ((latest.buttons[0] | latest.buttons[1]) & Button::JumpBound) != 0;
+    const std::pair<const char *, const char *> names[] = {
+        {"{plcmdUse}", jumpButton ? "B" : "A"}, {"{plcmdFire}", "the right trigger"}, {"{plcmdAltFire}", "the left trigger"},
         {"{plcmdReloadWeapon}", "left A"}, {"{plcmdDisplayNetricsa}", "the wheel's Netricsa bubble"},
-        {"{plcmdTertFire}", "the right stick click"}, {"{plcmdY+}", "B"}};
+        {"{plcmdTertFire}", "the right stick click"}, {"{plcmdY+}", jumpButton ? "A" : "B"}};
     std::string out = text;
     for (const auto &[from, to] : names)
         for (size_t at = out.find(from); at != std::string::npos; at = out.find(from, at + std::strlen(to)))
@@ -8278,28 +8371,24 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
         Pose anchor;
         if (playerHandle == captured.rider.player && ownedBrain == brainHandle &&
             nativeTrackingAnchor(snapshot.player, anchor, &captured.rider)) {
-            const Pose aim = worldHandTracking(anchor, captured.origin, captured.turn,
-                captured.input.head, captured.input.hand[1]);
-            Vec3 desired;
-            static Vec3 turretLook{};
-            static uint32_t turretRide = 0;
-            static uint64_t turretClock = 0;
             if (seatedInTurret(captured.rider) && fresh(captured.input)) {
-                // Right stick: heading and pitch rates (smooth-turn rate), from the
-                // look the turret had when the rider sat down.
+                // Right stick: heading and pitch rates (smooth-turn rate) added to
+                // the native look each control step, as the mouse's deltas are on
+                // the desktop: it turns only while pushed, whatever frame the look
+                // is kept in.
+                static uint64_t turretClock = 0;
                 const uint64_t now = GetTickCount64();
-                if (turretRide != captured.rider.ride || now - turretClock > 500) { turretLook = look; turretRide = captured.rider.ride; }
                 const float dt = turretClock && now > turretClock ? std::min(.1f, float(now - turretClock) / 1000.f) : 0.f;
                 turretClock = now;
-                turretLook = advanceTurretLook(turretLook, captured.input.axis[1][0], captured.input.axis[1][1],
-                                               settings.smoothTurnRate, dt);
+                const Vec3 turned = advanceTurretLook(look, captured.input.axis[1][0], captured.input.axis[1][1],
+                                                      settings.smoothTurnRate, dt);
                 if (labTurretMode()) {
                     static unsigned calls = 0;
                     if (calls++ % 25 == 0)
-                        log("Lab turret look heading=%.3f pitch=%.3f stick=%.2f,%.2f", turretLook.x, turretLook.y,
+                        log("Lab turret look heading=%.3f pitch=%.3f stick=%.2f,%.2f", turned.x, turned.y,
                             captured.input.axis[1][0], captured.input.axis[1][1]);
                 }
-                if (std::isfinite(turretLook.x) && std::isfinite(turretLook.y)) look = turretLook;
+                if (std::isfinite(turned.x) && std::isfinite(turned.y)) { look.x = turned.x; look.y = turned.y; }
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (steeringWheelHeading(look)) {
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
@@ -8308,17 +8397,15 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 // right stick turns the ride's look while pushed, the right hand's
                 // aim sets its pitch. Hand heading used to drive the look, and the
                 // view (the ride's heading) turned with it: forward kept turning.
-                static Vec3 rideLook{};
-                static uint32_t lookRide = 0;
+                // Added to the native look as mouse deltas are (see turrets): the
+                // ride turns only while the stick is pushed, it never drifts.
                 static uint64_t lookClock = 0;
                 const uint64_t now = GetTickCount64();
-                if (lookRide != captured.rider.ride || now - lookClock > 500) { rideLook = look; lookRide = captured.rider.ride; }
                 const float dt = lookClock && now > lookClock ? std::min(.1f, float(now - lookClock) / 1000.f) : 0.f;
                 lookClock = now;
-                rideLook = advanceTurretLook(rideLook, captured.input.axis[1][0], 0, settings.smoothTurnRate, dt);
-                if (trackedHandCurrent(captured.input,snapshot.input,1) && validNativeBodyPose(aim) &&
-                    quaternionEuler(&desired, aim.q) == &desired && std::isfinite(desired.y))
-                    rideLook.y = std::clamp(desired.y, -1.4f, 1.4f);
+                Vec3 rideLook = advanceTurretLook(look, captured.input.axis[1][0], captured.input.axis[1][1],
+                                                  settings.smoothTurnRate, dt);
+                rideLook.z = look.z;
                 void *candidateRideToken=nullptr;
                 if (std::isfinite(rideLook.x) && std::isfinite(rideLook.y) &&
                     nativeRiderCurrent(snapshot.player, captured.rider,&candidateRideToken) && resolve(brainHandle) == brain) {
@@ -9798,7 +9885,6 @@ bool attach(bool headless) {
         symbol(e, "?cldGetHullsInRange@SeriousEngine@@YAXABVVector3f@1@MAAV?$CDynamicContainer@VCHull@SeriousEngine@@@1@@Z", hullsInRange);
         symbol(e, "?GetOwner@CAspect@SeriousEngine@@QAEPAVCEntity@2@XZ", hullOwner);
         symbol(e, "?GetBody@CHull@SeriousEngine@@QAEPAVCBody@2@XZ", hullBody);
-        symbol(e, "?SetDesiredPlacements@CManipulatorJoint@SeriousEngine@@QAEXABVQuatVect@2@0@Z", jointPlacements);
         symbol(e, "?SetMaxLinVel@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxLinVel);
         symbol(e, "?mdlGetBoneAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z", boneAbsolute);
         symbol(e, "?mdlGetBonesAbsPlacement@SeriousEngine@@YAXPAVCModelInstance@1@AAV?$CStaticStackArray@UBonePlacement@SeriousEngine@@@1@@Z", bonesAbsolute);
@@ -10074,6 +10160,8 @@ bool attach(bool headless) {
         H(g, "?ProcessPlayerControls@CPlayerBrainEntity@SeriousEngine@@UAEXEVVector3f@2@0@Z",
           waterPlayerControls, originalPlayerControls);
         H(g, "?HandleObjectCarrying@CPuppetEntity@SeriousEngine@@QAEXXZ", carryStep, originalCarrying);
+        H(e, "?SetDesiredPlacements@CManipulatorJoint@SeriousEngine@@QAEXABVQuatVect@2@0@Z", carryJointPlacements,
+          jointPlacements);
         H(g, "?IsComboWeaponsEnabled@CGameInfoEntity@SeriousEngine@@QAEHXZ", comboWeapons, originalComboWeapons);
         H(e, "?PollValues@CInputBindings@SeriousEngine@@QAEXXZ", poll, originalPoll);
         if (!headless) {

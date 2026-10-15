@@ -214,6 +214,18 @@ bool recordsValid = false;
 bool recordsOrtho = false; // The current matrices are not a perspective view (fills, 2D).
 bool screenLocked = false; // Records built for the centre view in every eye.
 bool engineScreenLock = false; // setScreenLocked: inside a camera-attached effect.
+float mainCamera[3]{};
+bool mainCameraValid = false;
+// A perspective view whose camera is more than 1 m from the root view's: the
+// sky's background viewer (V490: its camera sat 4.5 km below the world, so it
+// was treated as a world view and the sky got 1-5 px of parallax, 10-40 m).
+bool backgroundViewer(const float *v, const float *p) noexcept {
+    if (!mainCameraValid || !v || !p || p[15] != 0) return false;
+    const float c[3]{-(v[0] * v[3] + v[4] * v[7] + v[8] * v[11]), -(v[1] * v[3] + v[5] * v[7] + v[9] * v[11]),
+                     -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11])};
+    const float d[3]{c[0] - mainCamera[0], c[1] - mainCamera[1], c[2] - mainCamera[2]};
+    return d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 1.f;
+}
 bool writeRecords(IDirect3DDevice9 *d) noexcept {
     static bool lockedRecords = false;
     if (lockedRecords != screenLocked) { recordsValid = false; lockedRecords = screenLocked; }
@@ -227,6 +239,21 @@ bool writeRecords(IDirect3DDevice9 *d) noexcept {
     std::memcpy(cachedAdjusted, engineAdjusted, sizeof(cachedAdjusted));
     std::memcpy(cachedProjection, engineProjection, sizeof(cachedProjection));
     std::memcpy(cachedView, engineView, sizeof(cachedView));
+    {
+        // Lab (SS2VR_LAB_SP_VIEWS=1): every distinct view state of the first passes.
+        static const bool views = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_VIEWS", v, 2) == 1 && v[0] == L'1'; }();
+        static unsigned logged = 0;
+        if (views && logged < 120 && stats.passes > 200 && stats.passes < 204) {
+            ++logged;
+            const float *v = engineView, *p = engineProjection;
+            // Camera position: -R^T t.
+            const float cx = -(v[0] * v[3] + v[4] * v[7] + v[8] * v[11]), cy = -(v[1] * v[3] + v[5] * v[7] + v[9] * v[11]),
+                        cz = -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11]);
+            log("Lab SP view pass=%u t=%.3f,%.3f,%.3f camera=%.2f,%.2f,%.2f fwd=%.3f,%.3f,%.3f p14=%.4f p15=%.4f p0=%.3f vp=%lux%lu",
+                unsigned(stats.passes), v[3], v[7], v[11], cx, cy, cz, -v[8], -v[9], -v[10], p[14], p[15], p[0],
+                engineViewport.Width, engineViewport.Height);
+        }
+    }
     ViewState state;
     std::memcpy(state.adjusted.data(), engineAdjusted, sizeof(cachedAdjusted));
     std::memcpy(state.projection.data(), engineProjection, sizeof(cachedProjection));
@@ -236,8 +263,11 @@ bool writeRecords(IDirect3DDevice9 *d) noexcept {
     // with the kill row -x'' (left) / +x'' (right), less half a pixel, for the pixel program.
     sp::EyeRecord records[4 + MaxRegions];
     recordsOrtho = false;
+    const bool background = backgroundViewer(engineView, engineProjection);
     for (unsigned i = 0; i < 2; ++i) {
-        Rewrite r = rewrite(state, changes[i]);
+        EyeChange change = changes[i];
+        if (background) change.view = change.rotation; // Rotation only, like the sky's own child view.
+        Rewrite r = rewrite(state, change);
         if (screenLocked) r.identity = true;
         recordsOrtho = recordsOrtho || !r.valid || r.identity;
         for (unsigned row = 0; row < 4; ++row)
@@ -823,6 +853,13 @@ bool install(IDirect3DDevice9 *d, const Originals &o) noexcept {
 bool installed() noexcept { return hooked; }
 void setInstancing(bool enabled) noexcept { instancingEnabled = enabled; }
 void setScreenLocked(bool locked) noexcept { engineScreenLock = locked; }
+void setMainView(const float *v) noexcept {
+    if (!v) return;
+    mainCamera[0] = -(v[0] * v[3] + v[4] * v[7] + v[8] * v[11]);
+    mainCamera[1] = -(v[1] * v[3] + v[5] * v[7] + v[9] * v[11]);
+    mainCamera[2] = -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11]);
+    mainCameraValid = std::isfinite(mainCamera[0] + mainCamera[1] + mainCamera[2]);
+}
 void releaseDeviceResources() noexcept {
     // D3DPOOL_DEFAULT resources must be gone before IDirect3DDevice9::Reset; all
     // are recreated on first use.
