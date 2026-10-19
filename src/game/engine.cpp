@@ -44,6 +44,7 @@
 #include "menu.hpp"
 #include "scope_gpu.hpp"
 #include "multiplayer.hpp"
+#include "voice.hpp"
 #include "native_tracking.hpp"
 #include "native_memory.hpp"
 #include "native_finally.hpp"
@@ -633,6 +634,7 @@ static void pollSettingsFile() {
     settings.snapTurn = fresh.snapTurn;
     settings.smoothTurnRate = fresh.smoothTurnRate;
     settings.singlePassInstancing = fresh.singlePassInstancing;
+    settings.voice = fresh.voice;
     single_pass::setInstancing(fresh.singlePassInstancing);
     log("Settings reloaded: lasers=%d snapTurn=%d turnRate=%.0f instancing=%d", int(fresh.lasers), int(fresh.snapTurn),
         double(fresh.smoothTurnRate * 180 / Pi), int(fresh.singlePassInstancing));
@@ -1830,6 +1832,50 @@ static float moveHeading(const Snapshot &s) { return moveHeading(s.input, s.orig
 static int labRideKind();
 static void *labFindTurret();
 static bool labPlacement(void *puppet, Pose &out);
+// Voice chat (voice.hpp): the scene for positional voices and push-to-talk,
+// then the local player's queued packets onto the network.
+static void voiceTick(void *p, const Snapshot &s) {
+    voice::configure(settings.voice);
+    voice::Scene scene;
+    scene.session = !singlePlayer() && multiplayer::voiceSession();
+    scene.self = pointerHandle(p);
+    Pose body;
+    if (s.initialized && fresh(s.input) && s.input.headValid && trackingAnchor(p, body)) {
+        const Pose head = worldHeadTracking(body, s.origin, s.turn, s.input.head);
+        if (finite(head)) {
+            scene.listener = true;
+            scene.head = head.p;
+            scene.right = rotate(normalize(head.q), Vec3{1, 0, 0});
+        }
+        // Push to talk: a controller held at the mouth (tracking space, metres).
+        const Vec3 mouth = s.input.head.p + rotate(normalize(s.input.head.q), Vec3{0, -.07f, -.07f});
+        for (unsigned h = 0; h < 2; ++h) {
+            const Pose hand = s.input.gripValid[h] && finite(s.input.grip[h]) ? s.input.grip[h] : s.input.hand[h];
+            const Vec3 d = hand.p - mouth;
+            if (controllerTracked(s.input, h) && finite(hand) && dot(d, d) < .15f * .15f) scene.pushToTalk = true;
+        }
+    } else if (baseViewOrigin) {
+        Pose view{};
+        baseViewOrigin(p, &view, 0);
+        if (finite(view)) {
+            scene.listener = true;
+            scene.head = view.p;
+            scene.right = rotate(normalize(view.q), Vec3{1, 0, 0});
+        }
+    }
+    if (scene.session && baseViewOrigin) {
+        unsigned count = 0;
+        for (void *player : multiplayer::activePlayers()) {
+            if (!player || player == p || count >= 18) continue;
+            Pose view{};
+            baseViewOrigin(player, &view, 0);
+            scene.speakers[count++] = {pointerHandle(player), view.p, finite(view)};
+        }
+    }
+    voice::publish(scene);
+    network::VoicePacket packet;
+    for (unsigned i = 0; i < 8 && voice::takeOutbound(packet); ++i) multiplayer::sendVoice(p, packet);
+}
 static void update(void *p) {
     validateLabOnlineIsolation(false);
     if (rigMutationActive || !hooksReady.load(std::memory_order_acquire) || !channel.shared || !local(p))
@@ -2641,6 +2687,7 @@ static void update(void *p) {
                 s.zoom[h] = s.zoom[h] && (packet.zoomMask & (1u << h));
         }
     }
+    voiceTick(p, s);
     publishSnapshot(s);
 }
 struct PreparedPlayer {
@@ -4473,6 +4520,7 @@ float frozenWorldVisibility() {
 }
 static void freezeLasers(const Request &request);
 static void drawLasers();
+static void drawVoiceIndicators();
 static void drawSteeringWheel();
 static void drawWeaponWheels();
 static void drawHeldGrenade();
@@ -4509,6 +4557,7 @@ static void __fastcall viewExecute(void *command, void *) {
             if (!executedWeaponWorld.valid) SS2VR_PAIR_FAULT();
             LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart);
             drawLasers();
+            drawVoiceIndicators();
             notePerfSection(1, sectionStart);
             drawSteeringWheel();
             QueryPerformanceCounter(&sectionStart);
@@ -6233,6 +6282,57 @@ static void drawLasers() {
         (*disableBlend)();
     if (wasAlpha)
         (*enableAlpha)();
+    (*setDepthComparison)(priorComparison);
+}
+// Voice chat indicators: a green ring over each player who is talking, and a
+// small one at your left hand while your microphone is sending.
+static void drawVoiceIndicators() {
+    if (!settings.voice.indicators || !eyeSnapshot.ui.gameplay || !currentCanvas || !*currentCanvas) return;
+    const auto scene = voice::lastScene();
+    const bool sending = voice::sending();
+    bool any = sending;
+    for (const auto &sp : scene.speakers) any = any || (sp.avatar && sp.positioned && voice::talking(sp.avatar));
+    if (!any) return;
+    const Pose head = worldHeadTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, eyeRequest.input.head);
+    if (!finite(head)) return;
+    ortho();
+    activateView(rootView);
+    const bool wasDepth = *depthEnabled != 0, wasWrite = *depthWriting != 0;
+    const bool wasBlend = *blending != 0, wasAlpha = *alphaTesting != 0;
+    const int priorComparison = *depthComparison;
+    (*enableDepth)();
+    (*disableDepthWrite)();
+    (*disableBlend)();
+    (*disableAlpha)();
+    (*setDepthComparison)(42); // LESSEQUAL, as for the lasers.
+    const auto ring = [&](Vec3 centre, float radius, uint32_t color) {
+        Vec3 n = centre - head.p;
+        const float length = std::sqrt(dot(n, n));
+        if (!(length > 1e-3f)) return;
+        n = n * (1 / length);
+        Vec3 u = cross(n, Vec3{0, 1, 0});
+        const float ul = std::sqrt(dot(u, u));
+        u = ul > 1e-3f ? u * (1 / ul) : Vec3{1, 0, 0};
+        const Vec3 v = cross(u, n);
+        constexpr unsigned Segments = 24;
+        for (unsigned k = 0; k < Segments; ++k)
+            for (float r : {radius, radius * .9f}) {
+                const float a = 2 * Pi * k / Segments, b = 2 * Pi * (k + 1) / Segments;
+                drawLine(centre + (u * std::cos(a) + v * std::sin(a)) * r, centre + (u * std::cos(b) + v * std::sin(b)) * r,
+                         color, UINT32_MAX);
+            }
+    };
+    for (const auto &sp : scene.speakers)
+        if (sp.avatar && sp.positioned && voice::talking(sp.avatar)) ring(sp.position + Vec3{0, .35f, 0}, .12f, 0xff3cdc5au);
+    if (sending && controllerTracked(eyeRequest.input, 0)) {
+        const Pose hand = worldHandTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, eyeRequest.input.head,
+                                            eyeRequest.input.hand[0]);
+        if (finite(hand)) ring(hand.p + rotate(normalize(hand.q), Vec3{0, .03f, .04f}), .015f, 0xff3cdc5au);
+    }
+    if (!wasDepth) (*disableDepth)();
+    if (wasWrite) (*enableDepthWrite)();
+    if (wasBlend) (*enableBlend)();
+    if (wasAlpha) (*enableAlpha)();
     (*setDepthComparison)(priorComparison);
 }
 struct LabWeaponReceipt {
@@ -11145,6 +11245,7 @@ bool attach(bool headless) {
         if(ok&&settings.roomscale)ok=queueRoomscalePlacementHooks(e,hook,internalHook);
     }
     ok = multiplayer::initialize(e, c, g, hook) && ok;
+    if (!headless && voice::start()) multiplayer::setVoiceSink(&voice::receive);
     ok = internalHook(e, 0x1b3b60, reinterpret_cast<void *>(entityStep),
                       reinterpret_cast<void **>(&originalEntityStep)) &&
          ok;

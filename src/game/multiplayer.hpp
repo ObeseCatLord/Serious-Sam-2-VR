@@ -9,6 +9,17 @@ bool initialize(HMODULE engine, HMODULE core, HMODULE sam, HookInstaller install
 bool remoteClient();
 bool server();
 bool negotiatedLocal();
+// Voice chat (game/voice.hpp). The sink receives every voice packet for the
+// local player, naming the speaker's local avatar handle and the speaker's
+// capability incarnation; null (dedicated server) only relays.
+using VoiceSink = void (*)(uint32_t avatar, uint32_t incarnation, const network::VoicePacket &packet);
+void setVoiceSink(VoiceSink sink);
+// Someone to talk to: a client negotiated with its server, or a listen host
+// with at least one negotiated peer.
+bool voiceSession();
+// Game thread: the local player's packet (client: to the server, which relays
+// it; listen host: to every negotiated peer).
+bool sendVoice(void *localPlayer, network::VoicePacket packet);
 // Authoritative negotiated-peer recognition only, including invalid intent.
 // Local XR ownership comes from Snapshot.initialized, never a local nonce.
 // No native getter, transport operation, freeze or admission grant.

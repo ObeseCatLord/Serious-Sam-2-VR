@@ -31,6 +31,18 @@ struct VrSettings {
     bool immersiveVehicleGrips = true;
     bool instantRides = true; // [Rides] InstantTransitions: mount and dismount without the animation.
     bool creatureHandAim = true; // [Rides] HandAimCreatures: dinosaurs aim where the right hand points.
+    // [Voice] multiplayer voice chat with other SS2VR players (common/voice.hpp).
+    struct Voice {
+        bool receive = true;           // Receive: hear other players.
+        int microphone = 1;            // Microphone: 0 off, 1 voice activated, 2 hand to mouth (push to talk).
+        float sensitivity = 55;        // Sensitivity 0..100: how readily the voice gate opens.
+        float inputGain = 1;           // InputGain 0..4
+        float volume = 1;              // Volume 0..2
+        float radioVolume = .45f;      // RadioVolume 0..1: distant (or unseen) players, centred.
+        float spatialDistance = 24;    // SpatialDistanceMeters: beyond it a voice is all radio.
+        bool indicators = true;        // Indicators: rings over talking players, a dot at your hand while sending.
+        wchar_t device[64]{};          // InputDevice: capture device name; empty is the system default.
+    } voice;
     SteeringWheelSettings steeringWheel;
     bool roomscale = false; // Development gate until controller/replication completion.
     bool physicalMelee = false; // Unique-saw single-player integration gate.

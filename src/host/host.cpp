@@ -2618,7 +2618,7 @@ struct Host {
     // --- VR options panel ---
     enum OptionsItem : unsigned {
         OptFoveation, OptInset, OptPeriphery, OptTurning, OptTurnSpeed, OptLasers, OptFireHaptic, OptDamageHaptic,
-        OptScale, OptInstancing, OptClose, OptCount
+        OptScale, OptInstancing, OptMicrophone, OptVoiceVolume, OptClose, OptCount
     };
     bool instancingSetting() const { return loadSettings(settingsFile).singlePassInstancing; }
     std::vector<OptionsRow> optionRows() const {
@@ -2640,6 +2640,10 @@ struct Host {
         std::swprintf(scale, 24, L"%.2gx", double(settings.renderScale));
         rows[OptScale] = {L"Render scale", scale};
         rows[OptInstancing] = {L"Instanced single pass", instancingSetting() ? L"On" : L"Off", L"(experimental)"};
+        const int microphone = settings.voice.microphone;
+        rows[OptMicrophone] = {L"Voice chat microphone", microphone == 0 ? L"Off" : microphone == 1 ? L"Voice activated" : L"Hand to mouth",
+                               microphone == 2 ? L"(hold a controller to your mouth)" : L""};
+        rows[OptVoiceVolume] = {L"Voice chat volume", percent(settings.voice.volume)};
         rows[OptClose] = {L"Close", L""};
         return rows;
     }
@@ -2687,6 +2691,14 @@ struct Host {
             saveSetting(L"Render", L"Scale", settings.renderScale);
             break;
         case OptInstancing: saveSetting(L"Render", L"SinglePassInstancing", instancingSetting() ? 0 : 1); break;
+        case OptMicrophone:
+            settings.voice.microphone = (settings.voice.microphone + 3 + direction) % 3;
+            saveSetting(L"Voice", L"Microphone", settings.voice.microphone);
+            break;
+        case OptVoiceVolume:
+            settings.voice.volume = stepped(settings.voice.volume, direction, .1f, 0, 2);
+            saveSetting(L"Voice", L"Volume", settings.voice.volume);
+            break;
         default: break;
         }
         char line[96];

@@ -20,7 +20,7 @@ constexpr uint8_t HandMask = 0x03;
 constexpr uint8_t PoseValidMask = 0x07; // bit 0: head, bits 1/2: left/right grip.
 constexpr uint64_t MaxPoseAgeMs = 200;
 
-enum class Kind : uint8_t { Hello = 1, Ack = 2, Pose = 3, Relay = 4 };
+enum class Kind : uint8_t { Hello = 1, Ack = 2, Pose = 3, Relay = 4, Voice = 5, VoiceRelay = 6 };
 enum class ParseResult : uint8_t { NotMod, Malformed, Valid };
 
 struct Hello {
@@ -115,12 +115,46 @@ struct Relay {
     uint32_t subjectAvatar = 0;
     uint32_t subjectIncarnation = 0;
 };
+// Voice chat: Opus frames of one talk spurt. A client sends its own to the
+// server (Voice); the server forwards each to every other negotiated mod peer
+// (VoiceRelay, naming the speaker's avatar). Nonces bind both to the sender's
+// or recipient's negotiated capability, as for poses. Unreliable transport:
+// a lost packet is concealed by the receiver's decoder.
+constexpr unsigned MaxVoiceFrames = 4, MaxVoiceFrameBytes = 120;
+// START: the first packet of a talk spurt; END: its last (may carry no frames).
+constexpr uint8_t VoiceStart = 1, VoiceEnd = 2;
+struct VoicePacket {
+    uint64_t clientNonce = 0, serverNonce = 0;
+    uint32_t firstFrame = 0; // Sender's 20 ms frame counter of frames[0]; frame i is firstFrame + i.
+    uint8_t talkspurt = 0;   // Per talk spurt, never 0.
+    uint8_t flags = 0, frameCount = 0;
+    uint8_t frameBytes[MaxVoiceFrames]{};
+    uint8_t frames[MaxVoiceFrames][MaxVoiceFrameBytes]{};
+};
+struct VoiceRelay {
+    VoicePacket voice{};
+    uint32_t subjectAvatar = 0;
+    uint32_t subjectIncarnation = 0;
+};
+inline bool validateVoice(const VoicePacket &v) {
+    if (!v.clientNonce || !v.serverNonce || !v.talkspurt || v.frameCount > MaxVoiceFrames ||
+        (v.flags & ~(VoiceStart | VoiceEnd)))
+        return false;
+    if (!v.frameCount && !(v.flags & VoiceEnd))
+        return false;
+    for (unsigned i = 0; i < v.frameCount; ++i)
+        if (!v.frameBytes[i] || v.frameBytes[i] > MaxVoiceFrameBytes)
+            return false;
+    return true;
+}
 struct Message {
     Kind kind = Kind::Hello;
     Hello hello{};
     Ack ack{};
     PosePacket pose{};
     Relay relay{};
+    VoicePacket voice{};
+    VoiceRelay voiceRelay{};
 };
 
 inline bool validWeaponId(int16_t id) {
@@ -985,6 +1019,31 @@ inline bool unbase64(std::string_view in, std::vector<uint8_t> &out) {
     }
     return true;
 }
+inline void writeVoice(std::vector<uint8_t> &out, const VoicePacket &v) {
+    put64(out, v.clientNonce);
+    put64(out, v.serverNonce);
+    put32(out, v.firstFrame);
+    put8(out, v.talkspurt);
+    put8(out, v.flags);
+    put8(out, v.frameCount);
+    for (unsigned i = 0; i < v.frameCount; ++i) {
+        put8(out, v.frameBytes[i]);
+        out.insert(out.end(), v.frames[i], v.frames[i] + v.frameBytes[i]);
+    }
+}
+inline bool readVoice(Reader &r, VoicePacket &v) {
+    if (!r.u64(v.clientNonce) || !r.u64(v.serverNonce) || !r.u32(v.firstFrame) || !r.u8(v.talkspurt) || !r.u8(v.flags) ||
+        !r.u8(v.frameCount) || v.frameCount > MaxVoiceFrames)
+        return false;
+    for (unsigned i = 0; i < v.frameCount; ++i) {
+        if (!r.u8(v.frameBytes[i]) || !v.frameBytes[i] || v.frameBytes[i] > MaxVoiceFrameBytes)
+            return false;
+        for (unsigned b = 0; b < v.frameBytes[i]; ++b)
+            if (!r.u8(v.frames[i][b]))
+                return false;
+    }
+    return true;
+}
 } // namespace detail
 
 inline bool encode(const Message &message, std::string &carrier) {
@@ -1020,6 +1079,18 @@ inline bool encode(const Message &message, std::string &carrier) {
         detail::writePosePacket(bytes, copy.relay.pose);
         detail::put32(bytes, copy.relay.subjectAvatar);
         detail::put32(bytes, copy.relay.subjectIncarnation);
+        break;
+    case Kind::Voice:
+        if (!validateVoice(copy.voice))
+            return false;
+        detail::writeVoice(bytes, copy.voice);
+        break;
+    case Kind::VoiceRelay:
+        if (!copy.voiceRelay.subjectAvatar || !copy.voiceRelay.subjectIncarnation || !validateVoice(copy.voiceRelay.voice))
+            return false;
+        detail::writeVoice(bytes, copy.voiceRelay.voice);
+        detail::put32(bytes, copy.voiceRelay.subjectAvatar);
+        detail::put32(bytes, copy.voiceRelay.subjectIncarnation);
         break;
     default:
         return false;
@@ -1068,6 +1139,18 @@ inline ParseResult parse(std::string_view carrier, Message &message) {
         if (!detail::readPosePacket(r, parsed.relay.pose) || !r.u32(parsed.relay.subjectAvatar) ||
             !r.u32(parsed.relay.subjectIncarnation) || !parsed.relay.subjectAvatar ||
             !parsed.relay.subjectIncarnation || !validatePose(parsed.relay.pose))
+            return ParseResult::Malformed;
+        break;
+    case Kind::Voice:
+        parsed.kind = Kind::Voice;
+        if (!detail::readVoice(r, parsed.voice) || !validateVoice(parsed.voice))
+            return ParseResult::Malformed;
+        break;
+    case Kind::VoiceRelay:
+        parsed.kind = Kind::VoiceRelay;
+        if (!detail::readVoice(r, parsed.voiceRelay.voice) || !r.u32(parsed.voiceRelay.subjectAvatar) ||
+            !r.u32(parsed.voiceRelay.subjectIncarnation) || !parsed.voiceRelay.subjectAvatar ||
+            !parsed.voiceRelay.subjectIncarnation || !validateVoice(parsed.voiceRelay.voice))
             return ParseResult::Malformed;
         break;
     default:

@@ -23,6 +23,28 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Voice chat (multiplayer, 2026-10-19)
+
+Players who all run SS2VR can talk. The server must run SS2VR too: a listen
+host with the mod, or a dedicated server with `SS2VRServer.dll`. The server
+relays the voices; players without the mod hear nothing and see nothing extra.
+
+- Voices come from where each player is (left/right by direction, softer with
+  distance) and fade to a centred "radio" voice beyond 24 m, so distant
+  teammates stay audible.
+- Microphone (VR options panel on the weapon wheel, or `[Voice] Microphone` in
+  `SS2VR.ini`): Voice activated (default), Hand to mouth (hold either
+  controller at your mouth to talk), or Off. The microphone only opens while
+  you are in a multiplayer session with another SS2VR player.
+- A green ring floats over a player who is talking; a small one sits at your
+  left hand while you are sending. `[Voice] Indicators=0` hides them.
+- Voice volume is on the VR options panel too. `[Voice] InputDevice` picks a
+  microphone by name; the names are listed in `Bin/SS2VR.log` ("Voice capture
+  device"). Empty uses the system default input.
+- To check: both players talk in turn; each should hear the other from the
+  right side; with "Hand to mouth", nothing is sent until a controller is at
+  the mouth. Report with both players' `Bin/SS2VR.log` ("Voice" lines).
+
 ## Changed after the ride and weapon report (2026-10-18)
 
 - Getting on a vehicle no longer throws you off at once: Use (B) held from

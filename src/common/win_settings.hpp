@@ -49,6 +49,21 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.singlePass = number(L"Render", L"SinglePass", 1, 0, 1) >= .5f;
     settings.instantRides = number(L"Rides", L"InstantTransitions", 1, 0, 1) >= .5f;
     settings.creatureHandAim = number(L"Rides", L"HandAimCreatures", 1, 0, 1) >= .5f;
+    {
+        auto &v = settings.voice;
+        v.receive = number(L"Voice", L"Receive", 1, 0, 1) >= .5f;
+        v.microphone = int(number(L"Voice", L"Microphone", 1, 0, 2) + .5f);
+        v.sensitivity = number(L"Voice", L"Sensitivity", 55, 0, 100);
+        v.inputGain = number(L"Voice", L"InputGain", 1, 0, 4);
+        v.volume = number(L"Voice", L"Volume", 1, 0, 2);
+        v.radioVolume = number(L"Voice", L"RadioVolume", .45f, 0, 1);
+        v.spatialDistance = number(L"Voice", L"SpatialDistanceMeters", 24, 2, 200);
+        v.indicators = number(L"Voice", L"Indicators", 1, 0, 1) >= .5f;
+        wchar_t device[64]{};
+        if (!GetPrivateProfileStringW(L"Voice", L"InputDevice", L"", device, 64, user.c_str()))
+            GetPrivateProfileStringW(L"Voice", L"InputDevice", L"", device, 64, filename.c_str());
+        std::wcsncpy(v.device, device, 63);
+    }
     settings.singlePassInstancing = number(L"Render", L"SinglePassInstancing", 0, 0, 1) >= .5f;
     settings.uiAspect = number(L"Render", L"UiAspect", 16.f / 9, 1.f, 2.5f);
     settings.snapTurn = number(L"Comfort", L"SnapTurn", 0, 0, 1) >= .5f;

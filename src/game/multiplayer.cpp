@@ -2,6 +2,7 @@
 #include "common/winproc.hpp"
 #include "common/presentation_identity.hpp"
 #include "common/intent_boundary.hpp"
+#include "common/voice.hpp"
 #include "game.hpp"
 #include "native_finally.hpp"
 #include <array>
@@ -89,6 +90,7 @@ struct Peer : network::OrderedPosePolicy {
     Sample frozen;
     uint64_t rateStart = 0, lastRelay = 0;
     unsigned rateCount = 0;
+    ss2vr::voice::Admission voice; // Per-source voice budget and duplicates.
     void resetForCapability(uint32_t nextBrain, uint32_t nextAvatar) noexcept {
         const bool owned = retainGameplayOwnership(brain, avatar, nextBrain, nextAvatar);
         *this = {};
@@ -309,6 +311,32 @@ static bool sendPeerAck(void *server, int slot, uint32_t brain, uint32_t incarna
     message.ack = ack;
     return send(brain, message, true, slot); // Also verifies the native slot binding.
 }
+static VoiceSink voiceSink = nullptr;
+// The listen host's own voice names this capability incarnation (peers count up from 1).
+constexpr uint32_t HostVoiceIncarnation = 0x80000001u;
+struct VoiceRecipient { int slot; uint32_t brain; uint64_t clientNonce, serverNonce; };
+// Caller holds the peer lock: every negotiated peer but the speaker.
+static size_t voiceRecipients(uint32_t speaker, std::array<VoiceRecipient, 18> &out) {
+    size_t count = 0;
+    for (int slot = 0; slot < int(peers.size()); ++slot) {
+        const auto &peer = peers[slot];
+        if (peer.avatar && peer.avatar != speaker && peer.validation.serverNonce && peer.validation.clientNonce &&
+            bound(activeServer, slot, peer.brain))
+            out[count++] = {slot, peer.brain, peer.validation.clientNonce, peer.validation.serverNonce};
+    }
+    return count;
+}
+static void relayVoice(const network::VoicePacket &voice, uint32_t speaker, uint32_t incarnation,
+                       const std::array<VoiceRecipient, 18> &to, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        network::Message forwarded{};
+        forwarded.kind = network::Kind::VoiceRelay;
+        forwarded.voiceRelay = {voice, speaker, incarnation};
+        forwarded.voiceRelay.voice.clientNonce = to[i].clientNonce;
+        forwarded.voiceRelay.voice.serverNonce = to[i].serverNonce;
+        send(to[i].brain, forwarded, false, to[i].slot); // Unreliable: a loss is concealed.
+    }
+}
 static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
     if (!hooksReady.load(std::memory_order_acquire))
         return false;
@@ -332,6 +360,10 @@ static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
     size_t discardCount = 0;
     uint32_t incarnation = 0;
     bool reply = false;
+    std::array<VoiceRecipient, 18> voiceTo{};
+    size_t voiceCount = 0;
+    bool voiceAdmitted = false;
+    uint32_t voiceSpeaker = 0;
     if (!withPeerLock([&] {
         if (activeServer != server) {
             peers = {};
@@ -364,12 +396,26 @@ static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
             // Discard ACKs name the submitted capability, including retired ones;
             // they return credit without reviving that capability on either peer.
             reply = !receivePeer(peer, message.pose, now, ack.ack, ++peer.rateCount <= 40);
+        } else if (message.kind == network::Kind::Voice && peer.validation.serverNonce &&
+                   message.voice.clientNonce == peer.validation.clientNonce &&
+                   message.voice.serverNonce == peer.validation.serverNonce) {
+            unsigned bytes = 30;
+            for (unsigned i = 0; i < message.voice.frameCount; ++i) bytes += message.voice.frameBytes[i] + 1u;
+            voiceAdmitted = peer.voice.admit(now, bytes, message.voice);
+            if (voiceAdmitted) {
+                voiceSpeaker = peer.avatar;
+                voiceCount = voiceRecipients(peer.avatar, voiceTo);
+            }
         }
         if (message.kind == network::Kind::Hello)
             ack.ack = {peer.validation.clientNonce, peer.validation.serverNonce, 0};
         incarnation = peer.incarnation;
     }))
         return true; // Tagged mod input failed; never forward it as native chat.
+    if (voiceAdmitted) {
+        relayVoice(message.voice, voiceSpeaker, incarnation, voiceTo, voiceCount);
+        if (voiceSink) voiceSink(voiceSpeaker, incarnation, message.voice); // The listen host hears it.
+    }
     for (size_t i = 0; i < discardCount; ++i)
         sendPeerAck(server, slot, brain, incarnation, discarded[i]);
     if (reply)
@@ -469,6 +515,18 @@ static void executeClientBody(void *unusedThis, int h, uint32_t brain, int j, in
                         local.lastAck = now;
                     installIntentEpochs(message.ack.intentEpoch, now);
                 }
+            }
+            if (message.kind == network::Kind::VoiceRelay && local.serverNonce && voiceSink &&
+                message.voiceRelay.voice.clientNonce == local.clientNonce &&
+                message.voiceRelay.voice.serverNonce == local.serverNonce) {
+                // The speaker's server handle, mapped as for pose relays.
+                using MapEntity = int(__thiscall *)(void *, uint32_t, uint32_t *);
+                auto table = *reinterpret_cast<void ***>(client);
+                auto mapper = reinterpret_cast<MapEntity>(table[0xc8 / 4]);
+                uint32_t mapped[3]{};
+                if (mapper(client, message.voiceRelay.subjectAvatar, mapped) >= 0 && resolve(mapped[1]) &&
+                    mapped[1] != local.avatar)
+                    voiceSink(mapped[1], message.voiceRelay.subjectIncarnation, message.voiceRelay.voice);
             }
             if (message.kind == network::Kind::Relay && local.serverNonce &&
                 message.relay.pose.clientNonce == local.clientNonce &&
@@ -570,6 +628,55 @@ bool negotiatedLocal() {
         result = local.serverNonce && local.net == currentNet() && GetTickCount64() - local.lastAck <= 500;
     });
     return result;
+}
+void setVoiceSink(VoiceSink sink) { voiceSink = sink; }
+bool voiceSession() {
+    if (!hooksReady.load(std::memory_order_acquire) || !nativeInputHealthy() || !isServer || !isClient)
+        return false;
+    if (isClient()) return negotiatedLocal();
+    if (!isServer()) return false;
+    bool any = false;
+    withPeerLock<false>([&] {
+        std::array<VoiceRecipient, 18> to{};
+        any = activeServer == currentNet() && voiceRecipients(0, to) > 0;
+    });
+    return any;
+}
+bool sendVoice(void *localPlayer, network::VoicePacket voice) {
+    if (!hooksReady.load(std::memory_order_acquire) || !nativeInputHealthy() || !localPlayer)
+        return false;
+    bool sent = false;
+    withNativeFinally([&] {
+        if (isClient && isClient()) {
+            uint32_t brain = 0;
+            withPeerLock<false>([&] {
+                if (local.net == currentNet() && local.serverNonce && local.clientNonce && local.avatar == handleOf(localPlayer)) {
+                    brain = local.brain;
+                    voice.clientNonce = local.clientNonce;
+                    voice.serverNonce = local.serverNonce;
+                }
+            });
+            if (!brain) return;
+            network::Message message{};
+            message.kind = network::Kind::Voice;
+            message.voice = voice;
+            sent = send(brain, message, false);
+        } else if (isServer && isServer()) {
+            // The listen host: straight to every negotiated peer.
+            const uint32_t speaker = handleOf(localPlayer);
+            std::array<VoiceRecipient, 18> to{};
+            size_t count = 0;
+            withPeerLock<false>([&] {
+                if (activeServer == currentNet()) count = voiceRecipients(speaker, to);
+            });
+            voice.clientNonce = voice.serverNonce = 1; // Replaced per recipient.
+            relayVoice(voice, speaker, HostVoiceIncarnation, to, count);
+            sent = count > 0;
+        }
+    }, [](bool aborted) noexcept {
+        if (aborted) nativeInputFailed();
+    });
+    return sent;
 }
 bool knownVrAvatar(uint32_t avatar) noexcept {
     if (!avatar) return false;
