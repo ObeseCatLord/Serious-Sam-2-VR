@@ -249,6 +249,10 @@ static IntThis labCheatsEnabled=nullptr;
 static VoidThis labGiveAll=nullptr;
 static LabSelect labSelectSniper=nullptr;
 static void(__cdecl *labSaveSniper)(const char *)=nullptr;
+// Lab (SS2VR_LAB_LOAD=1): the native load of a saved game (Sam2Game 0x26980, the
+// load menu's call), of Temp/SS2VR/user.sav once Temp/SS2VR/load-request exists.
+static void(__cdecl *labLoadGame)(const char *)=nullptr;
+static std::atomic<bool> labLoadPending{false}, labLoadIssued{false};
 static uintptr_t labBrainGetter=0,labPuppetGetter=0;
 static bool labSniperConfigured=false;
 static const LabPreparationTarget *labPreparation=nullptr;
@@ -863,15 +867,36 @@ bool nativeRiderCurrent(void *player, const RiderIdentity &expected,void **rideT
 static std::atomic<uint32_t> steadyPlayer{0}, steadyRide{0};
 static std::atomic<float> steadyOffset{0}, steadyOffsetX{0}, steadyOffsetZ{0}, steadyYaw{0};
 static std::atomic<bool> steadyLevel{false};
+// The rolling ball is steered by looking (mountedLookClamp): its anchor keeps a
+// fixed heading, turned only by the right stick as on foot (the snapshot's
+// turn), never by the ball. Following the ball's own heading shook the view
+// and made looking steer the view as well as the ball.
+static std::atomic<bool> steadyFixed{false};
+static std::atomic<float> steadyFixedHeading{0};
 static thread_local bool steadyBypass = false;
-static uintptr_t aircraftVtables[3]{};
-static bool aircraftRide(const RiderIdentity &rider) {
+static uintptr_t aircraftVtables[3]{}, ballVtables[2]{};
+static bool rideOfClass(const RiderIdentity &rider, const uintptr_t *tables, unsigned count) {
     void *ride = rider.ride && resolve ? resolve(rider.ride) : nullptr;
     uintptr_t table = 0;
     if (!ride || !readableMemory(ride, 4)) return false;
     std::memcpy(&table, ride, 4);
-    for (uintptr_t t : aircraftVtables) if (t && table == t) return true;
+    for (unsigned i = 0; i < count; ++i) if (tables[i] && table == tables[i]) return true;
     return false;
+}
+static bool aircraftRide(const RiderIdentity &rider) { return rideOfClass(rider, aircraftVtables, 3); }
+static bool ballRide(const RiderIdentity &rider) { return rider.seated() && rideOfClass(rider, ballVtables, 2); }
+// The ball's centre: its placement (GetAbsPlacement, vtable +0x54; the ball's
+// override, Sam2Game 0x15aca0, reads its body entity's).
+static bool ballCentre(const RiderIdentity &rider, Vec3 &out) {
+    void *ride = rider.ride && resolve ? resolve(rider.ride) : nullptr;
+    if (!ride || !readableMemory(ride, 4)) return false;
+    using AbsPlacement = Pose *(__thiscall *)(void *, Pose *);
+    const auto table = *static_cast<uintptr_t **>(ride);
+    Pose placement{};
+    reinterpret_cast<AbsPlacement>(table[0x54 / 4])(ride, &placement);
+    if (!finite(placement) || !(std::abs(placement.p.x) + std::abs(placement.p.y) + std::abs(placement.p.z) < 1e6f)) return false;
+    out = placement.p;
+    return true;
 }
 bool nativeTrackingAnchor(void *player, Pose &out, const RiderIdentity *expected) {
     RiderIdentity identity;
@@ -916,7 +941,9 @@ bool nativeTrackingAnchor(void *player, Pose &out, const RiderIdentity *expected
         const Vec3 offset{steadyOffsetX.load(std::memory_order_relaxed), steadyOffset.load(std::memory_order_relaxed),
                           steadyOffsetZ.load(std::memory_order_relaxed)};
         if (std::isfinite(offset.x + offset.y + offset.z)) result.p = result.p + offset;
-        if (steadyLevel.load(std::memory_order_relaxed)) {
+        const float fixed = steadyFixedHeading.load(std::memory_order_relaxed);
+        if (steadyFixed.load(std::memory_order_relaxed) && std::isfinite(fixed)) result.q = yaw(fixed);
+        else if (steadyLevel.load(std::memory_order_relaxed)) {
             const float turn = steadyYaw.load(std::memory_order_relaxed);
             result.q = yaw(horizontalHeading(result.q) + (std::isfinite(turn) ? turn : 0.f));
         }
@@ -961,11 +988,29 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     steadyBypass = false;
     if (!ok || !finite(raw)) {
         steadyRide = 0; ride = 0;
+        steadyFixed = false;
         return;
     }
     const float rawHeading = horizontalHeading(raw.q);
+    // In the ball the view follows the ball's centre at the eye height it had on
+    // boarding: the rider's head inside it sways and bobs with its run.
+    static float ballLift = .5f, ballHeading = 0;
+    const bool ball = ballRide(rider);
+    Vec3 centre{}, target = raw.p;
+    if (ball && ride != rider.ride) ballHeading = rawHeading;
+    if (ball && ballCentre(rider, centre)) {
+        if (ride != rider.ride) ballLift = std::clamp(raw.p.y - centre.y, -.5f, 1.5f);
+        target = centre + Vec3{0, ballLift, 0};
+        static uint64_t lastTrace = 0;
+        static unsigned traced = 0;
+        if (GetTickCount64() - lastTrace > 1000 && traced < 120) {
+            lastTrace = GetTickCount64(); ++traced;
+            log("Ball ride centre=%.2f,%.2f,%.2f view=%.2f,%.2f,%.2f lift=%.2f heading=%.3f rideHeading=%.3f", centre.x, centre.y,
+                centre.z, raw.p.x, raw.p.y, raw.p.z, ballLift, ballHeading, rawHeading);
+        }
+    }
     const bool reseed = ride != rider.ride ||
-        std::abs(axes[0].x - raw.p.x) + std::abs(axes[1].x - raw.p.y) + std::abs(axes[2].x - raw.p.z) > 1.5f;
+        std::abs(axes[0].x - target.x) + std::abs(axes[1].x - target.y) + std::abs(axes[2].x - target.z) > 1.5f;
     if (reseed) {
         for (auto &a : axes) a.seeded = false;
         heading.seeded = false;
@@ -973,11 +1018,13 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     } else unwrapped += std::remainder(rawHeading - previousRaw, 2 * Pi);
     previousRaw = rawHeading;
     ride = rider.ride;
-    const float omega = 5.f, turnOmega = 9.f; // rad/s
-    steadyOffsetX = axes[0].step(raw.p.x, dt, omega) - raw.p.x;
-    steadyOffset = axes[1].step(raw.p.y, dt, omega) - raw.p.y;
-    steadyOffsetZ = axes[2].step(raw.p.z, dt, omega) - raw.p.z;
+    const float omega = ball ? 3.f : 5.f, turnOmega = 9.f; // rad/s
+    steadyOffsetX = axes[0].step(target.x, dt, omega) - raw.p.x;
+    steadyOffset = axes[1].step(target.y, dt, omega) - raw.p.y;
+    steadyOffsetZ = axes[2].step(target.z, dt, omega) - raw.p.z;
     steadyYaw = heading.step(unwrapped, dt, turnOmega) - unwrapped;
+    steadyFixedHeading = ballHeading;
+    steadyFixed = ball;
     steadyLevel = !aircraftRide(rider);
     steadyPlayer = rider.player;
     steadyRide = rider.ride;
@@ -1001,6 +1048,7 @@ static bool dualIntent(void *p);
 static bool pairable(void *p);
 static int soloSlot(void *p);
 static uint32_t heldHandle(void *p, int hand);
+static void syncWeaponChoices(void *p);
 // Pose rows remain copyable. Native consumption belongs to the existing row's
 // stationary owner and must never disappear when a new pose is published.
 struct AuthorityOwner {
@@ -1243,6 +1291,7 @@ static void authorityStepBody(void *player) {
             value.dualToggle = tick;
             if (isDual(player)) equipped = 3;
         }
+        if (nativeRiderCurrent(player, rider)) syncWeaponChoices(player);
         if (equipped) {
             multiplayer::invalidateWeapons(player, ++value.weaponGeneration, equipped);
             network::invalidateWeaponIntents(value.sample.pose, equipped);
@@ -1311,6 +1360,10 @@ static bool aliased(const Snapshot &s) {
 // A lone weapon the game left by itself (dual mode dropped) keeps its own hand.
 static std::atomic<unsigned> soloMountHand{1};
 static std::atomic<bool> rideTransitionHold{false}; // See the input poll.
+// Use held across boarding or leaving a ride is not Use again until released:
+// with the instant transitions the press that boarded was still held on the
+// first seated tick, and the game took it as Use to get off at once.
+static bool useAwaitsRelease = false;
 static int lastPickId = -1; // The weapon of the latest wheel pick (input poll).
 // A hand slot's handle when its weapon still exists. The game leaves the handle
 // of a weapon it put away and deleted (after dropping dual mode) in the slot:
@@ -1357,6 +1410,23 @@ static void replaceWeapon(void *p, int id, int slot) {
     setWeapon(p, id, slot, 1);
     if (before && nativeHandle(p, slot) != before)
         replacedWeapons[replacedNext.fetch_add(1, std::memory_order_relaxed) % 8].store(before, std::memory_order_relaxed);
+}
+// The game's own weapon choice per hand (+0x988 right, +0x98c left), kept equal
+// to the steady weapon in that hand. SetCurrentWeapon (our picks) leaves it,
+// and with the left choice unset (dual mode switched off, as around a ride) the
+// HUD's weapon list (GetActiveWeaponIndex, Sam2Game 0xfafa0, on each render)
+// re-equipped the old choice on the right: a pick switched straight back.
+// Only a steady weapon (state 1 or 7) with no native switch pending (+0x998,
+// +0x994) is taken, so a switch the game itself makes is never undone.
+static void syncWeaponChoices(void *p) {
+    for (const int hand : {0, 1}) {
+        void *w = heldHandle(p, hand) ? resolve(heldHandle(p, hand)) : nullptr;
+        if (!w) continue;
+        const uint32_t state = primaryField(w, 0xb0), id = primaryField(w, 0xb4);
+        auto *choice = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(p) + (hand == 1 ? 0x988 : 0x98c));
+        const auto pending = int32_t(primaryField(p, hand == 1 ? 0x998 : 0x994));
+        if ((state == 1 || state == 7) && id < WeaponCount && pending == -1 && *choice != int32_t(id)) *choice = int32_t(id);
+    }
 }
 static bool replacedWeapon(uint32_t handle) {
     for (const auto &replaced : replacedWeapons)
@@ -1729,6 +1799,9 @@ static float moveHeading(const Input &input, const Pose &origin, float turn) {
     return std::isfinite(head) && input.headValid ? turn + head : turn;
 }
 static float moveHeading(const Snapshot &s) { return moveHeading(s.input, s.origin, s.turn); }
+static int labRideKind();
+static void *labFindTurret();
+static bool labPlacement(void *puppet, Pose &out);
 static void update(void *p) {
     validateLabOnlineIsolation(false);
     if (rigMutationActive || !hooksReady.load(std::memory_order_acquire) || !channel.shared || !local(p))
@@ -1755,6 +1828,7 @@ static void update(void *p) {
     bool changed = s.player != p || s.inputProducer != inputProducer ||
                    s.input.session != input.session || s.input.reference != input.reference ||
                    s.rider != rider;
+    if (s.rider.ride != rider.ride || s.rider.state != rider.state) useAwaitsRelease = true;
     if (changed) {
         const auto interruption = s.interruption;
         if (s.player != p) lastPickId = -1; // A new player (level) made no pick yet.
@@ -1837,9 +1911,10 @@ static void update(void *p) {
     }
     float ax = input.axis[1][0];
     // Seated, the ride turns you (its heading is the anchor's); the right stick
-    // steers or aims the ride instead (mountedLookClamp).
+    // steers or aims the ride instead (mountedLookClamp). The rolling ball rolls
+    // where you look, and the stick turns you as on foot.
     bool turningAllowed = enabled && !resettingControls && !wheels[1].open &&
-        !(input.buttons[1] & Button::WheelOpen) && std::isfinite(ax) && !rider.seated();
+        !(input.buttons[1] & Button::WheelOpen) && std::isfinite(ax) && (!rider.seated() || ballRide(rider));
     static LARGE_INTEGER lastTurnClock{};
     LARGE_INTEGER turnClock{}, turnFrequency{};
     QueryPerformanceCounter(&turnClock);
@@ -2085,6 +2160,21 @@ static void update(void *p) {
                 log("Lab dual dropped dual=%d", isDual(p));
                 if (labDualDrop >= 0) { pendingSelection[0] = labDualDrop; selectionTick[0] = GetTickCount64(); }
             }
+            // Lab (SS2VR_LAB_LATE_PICK=<id>): 8 s after the drop, once paired again,
+            // pick id on the right wheel (a pick after dual mode came back).
+            static const int labLatePick = [] {
+                wchar_t v[8]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_LATE_PICK", v, 8) ? _wtoi(v) : -1; }();
+            static uint64_t latePickAt = 0;
+            if (dropAt == ~0ull && labLatePick >= 0 && !latePickAt) latePickAt = GetTickCount64() + 8000;
+            if (latePickAt && latePickAt != ~0ull && GetTickCount64() >= latePickAt && isDual(p) && pendingSelection[1] < 0) {
+                latePickAt = ~0ull;
+                // As dual mode switched off (a ride) leaves it: no left choice.
+                const int32_t none = -1;
+                std::memcpy(static_cast<uint8_t *>(p) + 0x98c, &none, 4);
+                pendingSelection[1] = labLatePick;
+                selectionTick[1] = GetTickCount64();
+                log("Lab late pick id=%d choices=%d,%d", labLatePick, int(primaryField(p, 0x98c)), int(primaryField(p, 0x988)));
+            }
             if (given && settings.labHoldWeapon < 0 && GetTickCount64() >= next && pendingSelection[h] < 0) {
                 next = GetTickCount64() + 1000ull * settings.labAuditSeconds;
                 for (int step = 0; step < int(WeaponCount); ++step) {
@@ -2190,6 +2280,9 @@ static void update(void *p) {
             if (fuse.firing && !wasFiring) log("Bomb fuse lit by hand=%u", lighter);
         }
     }
+    // Lab (SS2VR_LAB_NO_CHOICE_SYNC=1): leave the game's weapon choices stale.
+    static const bool labNoChoiceSync = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_NO_CHOICE_SYNC", v, 2) == 1 && v[0] == L'1'; }();
+    if (rider.handheld() && !multiplayer::remoteClient() && !labNoChoiceSync && nativeRiderCurrent(p, rider)) syncWeaponChoices(p);
     // Use existing dual-wield policy. Retry while native weapons cannot yet transition.
     static const char *lastWeaponAction = "start";
     {
@@ -2202,6 +2295,43 @@ static void update(void *p) {
             return swscanf(v, L"%f,%f,%f,%f", &target[0], &target[1], &target[2], &target[3]);
         }();
         static uint64_t playingSince = 0;
+        static const bool labLoadWanted = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_LOAD", v, 2) == 1 && v[0] == L'1'; }();
+        if (parts == 0 && labRideKind() >= 2 && (!labLoadWanted || labLoadIssued) && rider.handheld() && singlePlayer() && nativeTeleport) {
+            static bool once = false;
+            Pose ride{};
+            void *found = once ? nullptr : labFindTurret();
+            if (found && labPlacement(found, ride)) {
+                once = true;
+                target[0] = ride.p.x + 3.f; target[1] = ride.p.y + .5f; target[2] = ride.p.z; target[3] = Pi / 2;
+                parts = 4;
+            }
+        }
+        static const bool labLoad = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_LOAD", v, 2) == 1 && v[0] == L'1'; }();
+        static bool labLoaded = false;
+        if (labLoad && !labLoaded && labLoadGame && singlePlayer() && nativeMainThread && nativeMainThread() &&
+            GetFileAttributesA("Temp\\SS2VR\\load-request") != INVALID_FILE_ATTRIBUTES) {
+            labLoaded = true;
+            DeleteFileA("Temp\\SS2VR\\load-request");
+            log("Lab load of Temp/SS2VR/user.sav requested");
+            labLoadPending = true; // Issued between frames (appForeground), as the load menu does: not mid-step.
+        }
+        // Lab (SS2VR_LAB_PICK_AFTER_RIDE=<id>): 3 s after leaving a ride, pick id
+        // on the right wheel (a pick right after a ride switched straight back).
+        static const int labPickAfterRide = [] {
+            wchar_t v[8]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_PICK_AFTER_RIDE", v, 8) ? _wtoi(v) : -1; }();
+        static bool labWasSeated = false;
+        static uint64_t labPickAt = 0;
+        if (labPickAfterRide >= 0) {
+            if (rider.seated()) labWasSeated = true;
+            else if (labWasSeated && rider.handheld()) { labWasSeated = false; labPickAt = GetTickCount64() + 3000; }
+            if (labPickAt && GetTickCount64() >= labPickAt && rider.handheld() && pendingSelection[1] < 0) {
+                labPickAt = 0;
+                pendingSelection[1] = labPickAfterRide;
+                selectionTick[1] = GetTickCount64();
+                log("Lab pick after ride id=%d choices=%d,%d dual=%d", labPickAfterRide, int(primaryField(p, 0x98c)),
+                    int(primaryField(p, 0x988)), isDual(p));
+            }
+        }
         if (parts >= 3 && rider.handheld() && singlePlayer() && nativeTeleport) {
             if (!playingSince) playingSince = GetTickCount64();
             if (GetTickCount64() - playingSince > 3000) {
@@ -2328,7 +2458,9 @@ static void update(void *p) {
                 zoomKey&1u,(zoomKey>>1)&1u,(zoomKey>>2)&1u,(zoomKey>>3)&1u,(zoomKey>>4)&1u,input.zoomInputGeneration[physical]);
         }
     }
-    s.use = enabled && !resettingControls && ((input.buttons[0] | input.buttons[1]) & Button::Use);
+    const bool useButton = ((input.buttons[0] | input.buttons[1]) & Button::Use) != 0;
+    if (!useButton) useAwaitsRelease = false;
+    s.use = enabled && !resettingControls && useButton && !useAwaitsRelease;
     uint32_t contextualButtons = 0, leftContextual = 0, rightContextual = 0;
     for (unsigned h=0;h<2;++h)
     {
@@ -4660,11 +4792,42 @@ static uintptr_t boardingSeatReturn = 0, useSeatReturn = 0, grenadeViewReturn = 
 // world's first turret, looking back at it, so Use boards it from anywhere
 // (the lab cannot walk to one). The turret is found in the world info's puppet
 // array (+0x58) by its vtable; its camera comes from CPuppetEntity::GetCameraPlacement.
-static bool labTurretMode() {
-    static const bool on = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_TURRET", v, 2) == 1 && v[0] == L'1'; }();
-    return on;
+// Lab (SS2VR_LAB_RIDE=hover|ball): the same for the world's first hovercraft
+// or rolling ball, with the view 3 m beside it and Use aimed at it; the player
+// is teleported there 3 s into play (labRideTeleport).
+static int labRideKind() {
+    static const int kind = [] {
+        wchar_t v[8]{};
+        if (GetEnvironmentVariableW(L"SS2VR_LAB_RIDE", v, 8)) return !wcscmp(v, L"hover") ? 2 : !wcscmp(v, L"ball") ? 3 : 0;
+        return GetEnvironmentVariableW(L"SS2VR_LAB_TURRET", v, 2) == 1 && v[0] == L'1' ? 1 : 0;
+    }();
+    return kind;
 }
+static bool labTurretMode() { return labRideKind() != 0; }
+// Lab rides (hovercraft, rolling ball) are not in the world info's turret list:
+// their own native steps record the latest instance (handle) instead.
+static std::atomic<uint32_t> labSeenRide{0};
+using EntityStep = void(__thiscall *)(void *);
+using EntityCreate = void(__thiscall *)(void *, void *);
+static EntityStep originalHoverStep = nullptr, originalBallStep = nullptr, originalBallReset = nullptr;
+static EntityCreate originalHoverCreate = nullptr;
+static void labNoteRide(void *ride) {
+    if (ride && pointerHandle && !labSeenRide.load(std::memory_order_relaxed)) {
+        labSeenRide = pointerHandle(ride);
+        log("Lab ride seen at %p handle=%08x", ride, labSeenRide.load());
+    }
+}
+static void __fastcall hoverStep(void *ride, void *) { labNoteRide(ride); originalHoverStep(ride); }
+static void __fastcall ballStep(void *ride, void *) { labNoteRide(ride); originalBallStep(ride); }
+static void __fastcall ballReset(void *ride, void *) { originalBallReset(ride); labNoteRide(ride); }
+static void __fastcall hoverCreate(void *ride, void *, void *properties) { originalHoverCreate(ride, properties); labNoteRide(ride); }
 static void *labFindTurret() {
+    if (labRideKind() >= 2) {
+        const uint32_t handle = labSeenRide.load(std::memory_order_relaxed);
+        void *ride = handle && resolve ? resolve(handle) : nullptr;
+        if (handle && !ride) labSeenRide = 0; // Gone (a load): take the next one.
+        return ride;
+    }
     void *info = nativeWorldInfo ? nativeWorldInfo() : nullptr;
     if (!info || !laserTurretVtable) return nullptr;
     uint32_t raw[4]{};
@@ -4695,18 +4858,39 @@ static void *labFindTurret() {
         std::memcpy(&table, candidate, 4);
         if (listed++ < 24) log("Lab turret puppet %u/%u entry=%08x vtable rva=%lx", i, count, entry,
                                static_cast<unsigned long>(table - laserTurretVtable + 0x2b39e8));
-        // CTurretPuppetEntity or CTurretCharacterEntity (Sam2Game 0x2b9fe0).
-        if ((table == laserTurretVtable || table == laserTurretVtable - 0x2b39e8 + 0x2b9fe0) && !turret) turret = candidate;
+        // CTurretPuppetEntity or CTurretCharacterEntity (Sam2Game 0x2b9fe0); the
+        // hovercraft puppet/character (0x2a8558, 0x2b8420); the rolling ball
+        // puppet/character (0x2b9240, 0x2b98f0).
+        const uintptr_t rva = table - laserTurretVtable + 0x2b39e8;
+        const bool match = labRideKind() == 2 ? rva == 0x2a8558 || rva == 0x2b8420 :
+                           labRideKind() == 3 ? rva == 0x2b9240 || rva == 0x2b98f0 : rva == 0x2b39e8 || rva == 0x2b9fe0;
+        if (match && !turret) turret = candidate;
     }
     static unsigned found = 0;
     if (turret && found++ < 2) log("Lab turret found at %p", turret);
     return turret;
+}
+// A puppet's placement (CPuppetEntity::GetAbsPlacement, vtable +0x54).
+static bool labPlacement(void *puppet, Pose &out) {
+    using AbsPlacement = Pose *(__thiscall *)(void *, Pose *);
+    const auto table = *static_cast<uintptr_t **>(puppet);
+    reinterpret_cast<AbsPlacement>(table[0x54 / 4])(puppet, &out);
+    return finite(out);
 }
 static bool labTurretView(Pose &out) {
     void *turret = labFindTurret();
     if (!turret) return false;
     using CameraPlacement = Pose *(__thiscall *)(void *, Pose *);
     const auto table = *static_cast<uintptr_t **>(turret);
+    if (labRideKind() >= 2) {
+        Pose ride{};
+        if (!labPlacement(turret, ride)) return false;
+        out.p = ride.p + Vec3{3.f, 1.2f, 0};
+        out.q = yaw(Pi / 2); // Facing -x, at the ride.
+        static unsigned logged = 0;
+        if (logged++ < 4) log("Lab ride view ride=%.2f,%.2f,%.2f eye=%.2f,%.2f,%.2f", ride.p.x, ride.p.y, ride.p.z, out.p.x, out.p.y, out.p.z);
+        return true;
+    }
     Pose camera{};
     reinterpret_cast<CameraPlacement>(table[0x5f4 / 4])(turret, &camera);
     if (!finite(camera)) return false;
@@ -4716,6 +4900,21 @@ static bool labTurretView(Pose &out) {
     static unsigned logged = 0;
     if (logged++ < 4) log("Lab turret view camera=%.2f,%.2f,%.2f eye=%.2f,%.2f,%.2f", camera.p.x, camera.p.y, camera.p.z, out.p.x, out.p.y, out.p.z);
     return true;
+}
+// Lab (SS2VR_LAB_RIDE): Use's target (brain +0x1f4, set by
+// CPlayerBrainEntity::ProcessViewRayCasting from the view) is the found ride
+// while the player is on foot.
+using BrainStep = void(__thiscall *)(void *);
+static BrainStep originalViewRayCasting = nullptr;
+static void __fastcall viewRayCasting(void *brain, void *) {
+    originalViewRayCasting(brain);
+    if (labRideKind() < 2 || !nativeMainThread || !nativeMainThread()) return;
+    void *ride = labFindTurret();
+    const uint32_t playerHandle = primaryField(brain, 0x28);
+    void *player = playerHandle ? resolve(playerHandle) : nullptr;
+    if (!ride || !player || primaryField(player, 0x544)) return;
+    const uint32_t handle = pointerHandle(ride);
+    std::memcpy(static_cast<uint8_t *>(brain) + 0x1f4, &handle, 4);
 }
 static Pose *__fastcall playerViewOrigin(void *p, void *, Pose *out, int purpose) {
 #ifdef _MSC_VER
@@ -8053,6 +8252,16 @@ static void __fastcall waterPlayerControls(void *brain, void *, uint8_t fire, Ve
         }
     }
     if (!waterAdapted) swimmingStrokes.reset();
+    if (captured.rider.seated()) {
+        // Bounded trace of what a ride is driven with.
+        static uint64_t lastTrace = 0;
+        static unsigned traced = 0;
+        if (GetTickCount64() - lastTrace > 1000 && traced < 120) {
+            lastTrace = GetTickCount64(); ++traced;
+            log("Ride controls move=%.2f,%.2f,%.2f look=%.3f,%.3f,%.3f ball=%d", move.x, move.y, move.z, look.x, look.y, look.z,
+                ballRide(captured.rider));
+        }
+    }
     originalPlayerControls(brain, fire, look, move);
     logLocalControls(observation,caller,fire,look,move);
 }
@@ -8682,7 +8891,9 @@ static RideSequenceState originalRideSequence = nullptr;
 static void __fastcall rideSequence(void *p, void *) {
     const auto field = [p](unsigned offset) { uint32_t v; std::memcpy(&v, static_cast<uint8_t *>(p) + offset, 4); return v; };
     const auto s = copySnapshot();
-    if (!settings.instantRides || !vrInputLive() || p != s.player || !(singlePlayer() || multiplayer::server()) ||
+    // Lab (SS2VR_LAB_NO_INSTANT=1): the native animated transitions.
+    static const bool labNoInstant = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_NO_INSTANT", v, 2) == 1 && v[0] == L'1'; }();
+    if (!settings.instantRides || labNoInstant || !vrInputLive() || p != s.player || !(singlePlayer() || multiplayer::server()) ||
         field(0x7d0) != 2 || field(0x7d4) != 0) {
         originalRideSequence(p);
         return;
@@ -8710,8 +8921,81 @@ static void __fastcall rideSequence(void *p, void *) {
     if (logged++ < 32) log("Ride %s without its animation seat=%u way=%d", exiting ? "exit" : "entry", seat, way);
     originalRideSequence(p);
 }
+// Bounded traces of the game's weapon changes with their callers (Sam2Game
+// RVAs): which native path brings a weapon back after a pick.
+using WeaponSet4 = void(__thiscall *)(void *, int, int, int, int);
+using WeaponPutDownTrace = void(__thiscall *)(void *, uint32_t);
+static SetWeapon originalSetCurrentWeapon = nullptr;
+static WeaponSet4 originalSetNewWeapon = nullptr, originalSetToHand = nullptr;
+static WeaponPutDownTrace originalWeaponPutDown = nullptr;
+static uintptr_t weaponTraceBase = 0;
+static void weaponTrace(const char *what, void *p, int a, int b, int c, int d, uintptr_t caller) {
+    static std::atomic<unsigned> traced{0};
+    if (traced.fetch_add(1, std::memory_order_relaxed) >= 400) return;
+    const bool game = caller >= weaponTraceBase && caller < weaponTraceBase + 0x400000;
+    log("Weapon call %s %d,%d,%d,%d right=%d left=%d choices=%d,%d pending=%d,%d caller=%s%lx", what, a, b, c, d,
+        resolve(nativeHandle(p, 1)) ? int(primaryField(resolve(nativeHandle(p, 1)), 0xb4)) : -1,
+        resolve(nativeHandle(p, 0)) ? int(primaryField(resolve(nativeHandle(p, 0)), 0xb4)) : -1,
+        int(primaryField(p, 0x988)), int(primaryField(p, 0x98c)), int(primaryField(p, 0x998)), int(primaryField(p, 0x994)),
+        game ? "game+" : "", static_cast<unsigned long>(game ? caller - weaponTraceBase : caller));
+}
+static void __fastcall setCurrentWeaponTraced(void *p, void *, int id, int hand, int flag) {
+    weaponTrace("SetCurrentWeapon", p, id, hand, flag, 0, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    originalSetCurrentWeapon(p, id, hand, flag);
+}
+static void __fastcall setNewWeaponTraced(void *p, void *, int id, int a, int b, int c) {
+    weaponTrace("SetNewWeapon", p, id, a, b, c, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    originalSetNewWeapon(p, id, a, b, c);
+}
+static void __fastcall setToHandTraced(void *p, void *, int id, int a, int hand, int c) {
+    weaponTrace("SetNewWeaponToPlayerHand", p, id, a, hand, c, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    originalSetToHand(p, id, a, hand, c);
+}
+static void __fastcall weaponPutDownTraced(void *p, void *, uint32_t weapon) {
+    void *w = weapon ? resolve(weapon) : nullptr;
+    weaponTrace("OnWeaponPutDown", p, w ? int(primaryField(w, 0xb4)) : -1, weapon == nativeHandle(p, 1) ? 1 : weapon == nativeHandle(p, 0) ? 0 : -1,
+                0, 0, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    originalWeaponPutDown(p, weapon);
+}
+// A weapon this adapter replaced in a hand (SetCurrentWeapon leaves the old
+// entity alive, and saved games keep it) still steps. Out of ammo (state 6) it
+// reports itself unusable every tick (CBaseWeaponEntity::OnStep ->
+// CPlayerPuppetEntity::CantBeUsed, Sam2Game 0xfa900), and for a weapon in
+// neither hand the game then brings up its favorite weapon in the right hand:
+// every pick switched straight back to it. Only held weapons are heard.
+static WeaponPutDownTrace originalCantBeUsed = nullptr;
+static void __fastcall cantBeUsed(void *p, void *, uint32_t weapon) {
+    if (weapon && weapon != nativeHandle(p, 1) && weapon != nativeHandle(p, 0)) {
+        static unsigned traced = 0;
+        if (traced++ < 8) {
+            void *w = resolve(weapon);
+            log("Weapon in neither hand reported unusable id=%d state=%d (ignored)", w ? int(primaryField(w, 0xb4)) : -1,
+                w ? int(primaryField(w, 0xb0)) : -1);
+        }
+        return;
+    }
+    originalCantBeUsed(p, weapon);
+}
+// Bounded trace of leaving a ride: who unregisters the rider (Sam2Game RVA),
+// with its health, to tell Use, the exit sequence and the game's own ejections apart.
+using RiderUnregister = void(__thiscall *)(void *);
+static RiderUnregister originalUnregisterFromRide = nullptr;
+static void __fastcall unregisterFromRide(void *p, void *) {
+    static unsigned traced = 0;
+    const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    if (p == copySnapshot().player && traced++ < 32)
+        log("Ride left: unregistered by game+%lx health=%d ride=%08x", static_cast<unsigned long>(caller - weaponTraceBase),
+            health ? health(p) : -1, primaryField(p, 0x544));
+    originalUnregisterFromRide(p);
+}
 static int(__cdecl *originalAppForeground)() = nullptr;
 static int __cdecl appForeground() {
+    if (labLoadPending.exchange(false) && labLoadGame) {
+        log("Lab load of Temp/SS2VR/user.sav issued");
+        labLoadGame("Temp/SS2VR/user.sav");
+        labSeenRide = 0;
+        labLoadIssued = true;
+    }
     if (vrInputLive())
         return 1;
     return originalAppForeground ? originalAppForeground() : 0;
@@ -8874,6 +9158,20 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (steeringWheelHeading(look)) {
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
+            } else if (ballRide(captured.rider) && fresh(captured.input) && ![] {
+                           wchar_t v[2]{}; // Lab (SS2VR_LAB_BALL_NATIVE_LOOK=1): leave the ball's look alone.
+                           return GetEnvironmentVariableW(L"SS2VR_LAB_BALL_NATIVE_LOOK", v, 2) == 1 && v[0] == L'1'; }()) {
+                // The rolling ball rolls along its look (the stick's forward push is
+                // relative to it): the look is where the head faces. The view keeps
+                // its own heading (updateRideSteadying), so this never turns it.
+                const Pose head = worldHeadTracking(anchor, captured.origin, captured.turn, captured.input.head);
+                Vec3 converted;
+                if (finite(head) && quaternionEuler(&converted, yaw(horizontalHeading(head.q))) == &converted &&
+                    std::isfinite(converted.x) && nativeRiderCurrent(snapshot.player, captured.rider, &rideToken)) {
+                    look.x = converted.x;
+                    static unsigned traced = 0;
+                    if (traced++ % 200 == 0) log("Ball look heading=%.3f", look.x);
+                }
             } else if (fresh(captured.input)) {
                 // Other rides (dinosaurs, hovercraft, cars without the wheel): the
                 // right stick turns the ride's look while pushed, the right hand's
@@ -10275,6 +10573,8 @@ bool attach(bool headless) {
     aircraftVtables[0] = reinterpret_cast<uintptr_t>(g) + 0x2b79b0; // CAircraftPuppetEntity
     aircraftVtables[1] = reinterpret_cast<uintptr_t>(g) + 0x2b7348; // CAircraftCharacterEntity
     aircraftVtables[2] = reinterpret_cast<uintptr_t>(g) + 0x2b0760; // CAirBikePuppetEntity
+    ballVtables[0] = reinterpret_cast<uintptr_t>(g) + 0x2b9240; // CRollingBallPuppetEntity
+    ballVtables[1] = reinterpret_cast<uintptr_t>(g) + 0x2b98f0; // CRollingBallCharacterEntity
     weaponFrustumReturn = reinterpret_cast<uintptr_t>(g) + 0x4c8e9;
     weaponInverseReturn = reinterpret_cast<uintptr_t>(g) + 0x4c915;
     weaponDepthReturn = reinterpret_cast<uintptr_t>(g) + 0x4c9a6;
@@ -10361,6 +10661,7 @@ bool attach(bool headless) {
     S(g, "?OnAlternativeFireReleased@CBaseWeaponEntity@SeriousEngine@@UAEXXZ", nativeBaseAlternativeRelease);
     S(g, "?CanFireFromOwnWeapons@CPuppetEntity@SeriousEngine@@QAEHXZ", nativeOwnWeapons);
     nativeTeleport = loadProc<TeleportFn>(g, "?Teleport@CPuppetEntity@SeriousEngine@@UAEHVQuatVect@2@@Z");
+    labLoadGame = reinterpret_cast<decltype(labLoadGame)>(reinterpret_cast<uintptr_t>(g) + 0x26980);
     S(g, "?IsLocal@CPuppetEntity@SeriousEngine@@QAEHXZ", isLocal);
     S(g, "?IsAlive@CPuppetEntity@SeriousEngine@@UAEHXZ", isAlive);
     S(g, "?RendersIn3rdPerson@CPuppetEntity@SeriousEngine@@UAEHXZ", thirdPerson);
@@ -10684,6 +10985,27 @@ bool attach(bool headless) {
     }
     H(e, "?Step@CSimulation@SeriousEngine@@QAEXXZ", simulationStep, originalSimulationStep);
     H(g, "?PlayRideAndRiderSequenceState@CLeggedPuppetEntity@SeriousEngine@@UAEXXZ", rideSequence, originalRideSequence);
+    weaponTraceBase = reinterpret_cast<uintptr_t>(g);
+    H(g, "?UnregisterFromRide@CPuppetEntity@SeriousEngine@@UAEXXZ", unregisterFromRide, originalUnregisterFromRide);
+    H(g, "?CantBeUsed@CPlayerPuppetEntity@SeriousEngine@@UAEXV?$Handle@VCBaseWeaponEntity@SeriousEngine@@@2@@Z", cantBeUsed,
+      originalCantBeUsed);
+    H(g, "?SetCurrentWeapon@CPlayerPuppetEntity@SeriousEngine@@UAEXW4WeaponIndex@2@W4PlayerHand@2@H@Z", setCurrentWeaponTraced,
+      originalSetCurrentWeapon);
+    H(g, "?SetNewWeapon@CPlayerPuppetEntity@SeriousEngine@@UAEXW4WeaponIndex@2@HHH@Z", setNewWeaponTraced, originalSetNewWeapon);
+    H(g, "?SetNewWeaponToPlayerHand@CPlayerPuppetEntity@SeriousEngine@@UAEXW4WeaponIndex@2@HW4PlayerHand@2@H@Z", setToHandTraced,
+      originalSetToHand);
+    H(g, "?OnWeaponPutDown@CPlayerPuppetEntity@SeriousEngine@@UAEXV?$Handle@VCBaseWeaponEntity@SeriousEngine@@@2@@Z", weaponPutDownTraced,
+      originalWeaponPutDown);
+    if (labRideKind() >= 2) {
+        H(g, "?ProcessViewRayCasting@CPlayerBrainEntity@SeriousEngine@@QAEXXZ", viewRayCasting, originalViewRayCasting);
+        if (labRideKind() == 2) {
+            H(g, "?OnStep@CHovercraftPuppetEntity@SeriousEngine@@UAEXXZ", hoverStep, originalHoverStep);
+            H(g, "?OnCreate@CHovercraftPuppetEntity@SeriousEngine@@UAEXPAVCEntityProperties@2@@Z", hoverCreate, originalHoverCreate);
+        } else {
+            H(g, "?OnStep@CRollingBallPuppetEntity@SeriousEngine@@UAEXXZ", ballStep, originalBallStep);
+            H(g, "?ResetDynamicMembers@CRollingBallPuppetEntity@SeriousEngine@@UAEXXZ", ballReset, originalBallReset);
+        }
+    }
 #undef H
     if (!headless)
         ok = internalHook(g, 0x176dc0, reinterpret_cast<void *>(damageHudRender),
