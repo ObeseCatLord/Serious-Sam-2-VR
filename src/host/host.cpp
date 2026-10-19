@@ -382,13 +382,18 @@ struct Swapchain {
         }
         context->UpdateSubresource(images[ownership.index].texture, 0, nullptr, bytes, width * 4, 0);
         context->Flush();
+        lastWritten = ownership.index;
         releaseWaited();
     }
+    // The image last written (lab captures of what the headset was given).
+    size_t lastWritten = SIZE_MAX;
+    ID3D11Texture2D *lastTexture() const { return lastWritten < images.size() ? images[lastWritten].texture : nullptr; }
     // Zero-copy: the game's shared eye image goes straight into the waited image.
     void copyWaited(ID3D11DeviceContext *context, ID3D11Texture2D *source) {
         if (!ownership.acquired || !ownership.waited)
             throw std::runtime_error("Writing an unowned OpenXR image");
         context->CopySubresourceRegion(images[ownership.index].texture, 0, 0, 0, 0, source, 0, nullptr);
+        lastWritten = ownership.index;
     }
     void releaseWaited() {
         if (!ownership.acquired || !ownership.waited)
@@ -1249,7 +1254,7 @@ struct Host {
     // Zero-copy eye images opened from the game's shared handles (slot x eye).
     Com<ID3D11Texture2D> sharedEye[2][2];
     uint32_t sharedOpened = 0, sharedTried = 0, sharedWidth = 0, sharedHeight = 0;
-    uint64_t zeroCopyPairs = 0, latched = 0;
+    uint64_t zeroCopyPairs = 0, latched = 0, capturePolls = 0;
     Actions actions;
     WorldSubmissionStream worldSubmission;
     Swapchain eye[2];
@@ -1972,7 +1977,9 @@ struct Host {
                 std::fwrite(row.data(), 1, row.size(), file);
             }
             std::fclose(file);
-            log.write("Zero-copy probe written: zero-copy-probe-left.ppm");
+            char written[160];
+            std::snprintf(written, sizeof written, "Zero-copy probe written: %ls", name);
+            log.write(written);
         }
         context->Unmap(staging.p, 0);
     }
@@ -2411,6 +2418,26 @@ struct Host {
         } else {
             eye[0].uploadWaited(context.p, source[0]);
             eye[1].uploadWaited(context.p, source[1]);
+        }
+        // Lab: a driver's zc-capture-<name> file beside the host asks for the left
+        // eye image just given to the headset, as <name>-zc-left.ppm (the
+        // observer's pixel-pair captures go stale once pairs arrive zero-copy).
+        if (++capturePolls % 15 == 0) {
+            wchar_t lab[2]{};
+            if (GetEnvironmentVariableW(L"SS2VR_LAB_PRIVATE_DISPLAY", lab, 2) == 1 && lab[0] == L'1') {
+                WIN32_FIND_DATAW found{};
+                const std::wstring dir = executableDirectory();
+                HANDLE search = FindFirstFileW((dir + L"zc-capture-*").c_str(), &found);
+                if (search != INVALID_HANDLE_VALUE) {
+                    const std::wstring request = found.cFileName;
+                    FindClose(search);
+                    DeleteFileW((dir + request).c_str());
+                    const std::wstring name = request.substr(11);
+                    bool safe = !name.empty() && name.size() < 40;
+                    for (wchar_t ch : name) safe = safe && (iswalnum(ch) || ch == L'-');
+                    if (safe) probeZeroCopy(eye[0].lastTexture(), (name + L"-zc-left.ppm").c_str());
+                }
+            }
         }
         if (reply.foveated == 1)
             for (unsigned h = 0; h != 2; ++h) {

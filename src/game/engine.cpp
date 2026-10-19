@@ -62,6 +62,8 @@
 #include <vector>
 #ifdef _MSC_VER
 #include <intrin.h>
+#else
+#include <x86intrin.h>
 #endif
 extern "C" const ss2vr::BuildContract ss2vrBuildContract;
 namespace ss2vr::game {
@@ -866,15 +868,49 @@ bool nativeRiderCurrent(void *player, const RiderIdentity &expected,void **rideT
 // every anchor read applies it, so head, hands, weapons and lasers move together.
 // Except in aircraft (which must pitch and roll) the anchor also keeps only the
 // ride's heading: a walking dinosaur pitched and rolled the whole view.
-static std::atomic<uint32_t> steadyPlayer{0}, steadyRide{0};
-static std::atomic<float> steadyOffset{0}, steadyOffsetX{0}, steadyOffsetZ{0}, steadyYaw{0};
-static std::atomic<bool> steadyLevel{false};
+// The ride anchor's tracked motion, published by the input poll and predicted
+// to each rendered frame (position + velocity x elapsed time): the native
+// placement advances per simulation tick, and offsets taken against it at the
+// tick were applied to a different placement at render (the view juddered).
+struct SteadyState {
+    uint32_t player = 0, ride = 0;
+    Vec3 x{}, v{};
+    float heading = 0, headingRate = 0, fixedHeading = 0;
+    double stamp = 0; // QPC seconds of the last tracker step
+    bool valid = false, level = false, fixed = false;
+};
+static SRWLOCK steadyLock = SRWLOCK_INIT;
+static SteadyState steadyState;
+static double qpcSeconds() {
+    LARGE_INTEGER t{}, f{};
+    QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f);
+    return double(t.QuadPart) / double(f.QuadPart);
+}
+// A fine real-time clock for per-frame prediction: under this Proton the
+// performance counter advanced only every ~16-32 ms (several frames shared a
+// time), so the CPU timestamp counter, calibrated against it over seconds,
+// gives the time between frames.
+static std::atomic<double> tscPerSecond{0};
+static double fineSeconds() {
+    static const uint64_t tsc0 = __rdtsc();
+    static const double q0 = qpcSeconds();
+    const uint64_t tsc = __rdtsc();
+    const double q = qpcSeconds(), elapsed = q - q0;
+    double rate = tscPerSecond.load(std::memory_order_relaxed);
+    if (elapsed > 2 && elapsed < 60 && tsc > tsc0) { // Calibrate over the first minute, then hold.
+        rate = double(tsc - tsc0) / elapsed;
+        tscPerSecond.store(rate, std::memory_order_relaxed);
+    }
+    return rate > 0 && tsc > tsc0 ? q0 + double(tsc - tsc0) / rate : q;
+}
+// The simulation's own clock (Engine simNow, ticks); the ride tracker steps
+// on it, so a step always matches the motion simulated since the last one.
+static int64_t *(__cdecl *nativeSimNow)(int64_t *) = nullptr;
+static float(__cdecl *ticksToSeconds)(int64_t) = nullptr;
 // The rolling ball is steered by looking (mountedLookClamp): its anchor keeps a
 // fixed heading, turned only by the right stick as on foot (the snapshot's
 // turn), never by the ball. Following the ball's own heading shook the view
 // and made looking steer the view as well as the ball.
-static std::atomic<bool> steadyFixed{false};
-static std::atomic<float> steadyFixedHeading{0};
 static thread_local bool steadyBypass = false;
 static uintptr_t aircraftVtables[3]{}, ballVtables[2]{}, dinoVtables[2]{};
 static bool rideOfClass(const RiderIdentity &rider, const uintptr_t *tables, unsigned count) {
@@ -948,16 +984,19 @@ bool nativeTrackingAnchor(void *player, Pose &out, const RiderIdentity *expected
     if (!nativeRiderAnchor(identity, view, heightBits, body, result) ||
         !nativeRiderCurrent(player, identity))
         return false;
-    if (identity.seated() && !steadyBypass && identity.player == steadyPlayer.load(std::memory_order_relaxed) &&
-        identity.ride == steadyRide.load(std::memory_order_relaxed)) {
-        const Vec3 offset{steadyOffsetX.load(std::memory_order_relaxed), steadyOffset.load(std::memory_order_relaxed),
-                          steadyOffsetZ.load(std::memory_order_relaxed)};
-        if (std::isfinite(offset.x + offset.y + offset.z)) result.p = result.p + offset;
-        const float fixed = steadyFixedHeading.load(std::memory_order_relaxed);
-        if (steadyFixed.load(std::memory_order_relaxed) && std::isfinite(fixed)) result.q = yaw(fixed);
-        else if (steadyLevel.load(std::memory_order_relaxed)) {
-            const float turn = steadyYaw.load(std::memory_order_relaxed);
-            result.q = yaw(horizontalHeading(result.q) + (std::isfinite(turn) ? turn : 0.f));
+    if (identity.seated() && !steadyBypass) {
+        AcquireSRWLockShared(&steadyLock);
+        const SteadyState st = steadyState;
+        ReleaseSRWLockShared(&steadyLock);
+        if (st.valid && identity.player == st.player && identity.ride == st.ride) {
+            const float ahead = float(std::clamp(fineSeconds() - st.stamp, 0.0, .1));
+            const Vec3 p = st.x + st.v * ahead;
+            if (std::isfinite(p.x + p.y + p.z)) result.p = p;
+            if (st.fixed && std::isfinite(st.fixedHeading)) result.q = yaw(st.fixedHeading);
+            else if (st.level) {
+                const float h = st.heading + st.headingRate * ahead;
+                if (std::isfinite(h)) result.q = yaw(h);
+            }
         }
     }
     // On foot the anchor is the game's view, whose pitch and roll the game can
@@ -977,7 +1016,8 @@ struct RideTracker {
     float x = 0, v = 0;
     bool seeded = false;
     float step(float z, float dt, float omega) {
-        if (!seeded || !(dt > 0)) { x = z; v = 0; seeded = true; return x; }
+        if (!seeded) { x = z; v = 0; seeded = true; return x; }
+        if (!(dt > 0)) return x; // Several polls in one instant: no new information.
         const float predicted = x + v * dt, residual = z - predicted;
         const float alpha = std::min(1.f, 2 * .7f * omega * dt), beta = std::min(1.f, omega * omega * dt * dt);
         x = predicted + alpha * residual;
@@ -986,23 +1026,27 @@ struct RideTracker {
     }
 };
 static void updateRideSteadying(void *player, const RiderIdentity &rider) {
-    static LARGE_INTEGER last{};
+    static int64_t lastSim = 0;
     static RideTracker axes[3], heading;
     static float unwrapped = 0, previousRaw = 0;
     static uint32_t ride = 0;
-    LARGE_INTEGER now{}, frequency{};
-    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
-    const float dt = last.QuadPart ? std::clamp(float(double(now.QuadPart - last.QuadPart) / double(frequency.QuadPart)), 0.f, .1f) : 0.f;
-    last = now;
+    const double now = fineSeconds();
+    int64_t sim = 0;
+    if (nativeSimNow) nativeSimNow(&sim);
     Pose raw;
     steadyBypass = true;
     const bool ok = rider.seated() && nativeTrackingAnchor(player, raw, &rider);
     steadyBypass = false;
     if (!ok || !finite(raw)) {
-        steadyRide = 0; ride = 0;
-        steadyFixed = false;
+        // A missed poll keeps the motion (prediction carries it); a lasting one ends it.
+        AcquireSRWLockExclusive(&steadyLock);
+        if (!rider.seated() || now - steadyState.stamp > .25) { steadyState.valid = false; ride = 0; }
+        ReleaseSRWLockExclusive(&steadyLock);
         return;
     }
+    if (ride == rider.ride && sim == lastSim && nativeSimNow) return; // No simulation since: nothing new.
+    const float dt = lastSim && nativeSimNow && ticksToSeconds ? std::clamp(ticksToSeconds(sim - lastSim), 0.f, .1f) : 0.f;
+    lastSim = sim;
     const float rawHeading = horizontalHeading(raw.q);
     // In the ball the view follows the ball's centre at the eye height it had on
     // boarding: the rider's head inside it sways and bobs with its run.
@@ -1032,10 +1076,8 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     previousRaw = rawHeading;
     ride = rider.ride;
     const float omega = ball ? 3.f : 5.f, turnOmega = 9.f; // rad/s
-    steadyOffsetX = axes[0].step(target.x, dt, omega) - raw.p.x;
-    steadyOffset = axes[1].step(target.y, dt, omega) - raw.p.y;
-    steadyOffsetZ = axes[2].step(target.z, dt, omega) - raw.p.z;
-    steadyYaw = heading.step(unwrapped, dt, turnOmega) - unwrapped;
+    const Vec3 tracked{axes[0].step(target.x, dt, omega), axes[1].step(target.y, dt, omega), axes[2].step(target.z, dt, omega)};
+    const float trackedHeading = heading.step(unwrapped, dt, turnOmega);
     if (rideOfClass(rider, dinoVtables, 2)) {
         // Bounded trace of a legged ride: body heading vs its aim angles (+0x618 heading, +0x61c pitch).
         static uint64_t lastTrace = 0;
@@ -1053,11 +1095,22 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
                 placement.p.x, placement.p.y, placement.p.z, aimHeading, aimPitch, rawHeading);
         }
     }
-    steadyFixedHeading = ballHeading;
-    steadyFixed = fixedView;
-    steadyLevel = !aircraftRide(rider);
-    steadyPlayer = rider.player;
-    steadyRide = rider.ride;
+    SteadyState st;
+    st.player = rider.player;
+    st.ride = rider.ride;
+    st.x = tracked;
+    st.v = Vec3{axes[0].v, axes[1].v, axes[2].v};
+    st.heading = trackedHeading;
+    st.headingRate = heading.v;
+    st.fixedHeading = ballHeading;
+    st.fixed = fixedView;
+    st.level = !aircraftRide(rider);
+    st.stamp = now;
+    st.valid = finite(Pose{{0, 0, 0, 1}, tracked}) && std::isfinite(trackedHeading) && std::isfinite(heading.v) &&
+               std::isfinite(st.v.x + st.v.y + st.v.z);
+    AcquireSRWLockExclusive(&steadyLock);
+    steadyState = st;
+    ReleaseSRWLockExclusive(&steadyLock);
 }
 static uint32_t nativeHandle(void *p, int hand) {
     return *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(p) + (hand == 1 ? 0x800 : 0x804));
@@ -4679,6 +4732,30 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
     bool ready = nativeRiderCurrent(p, eyeSnapshot.rider) &&
                  nativeTrackingAnchor(p, eyeAnchor, &eyeSnapshot.rider) && finite(eyeNativeCamera);
     eyeAnchorReady = ready;
+    if (ready && eyeSnapshot.rider.seated()) {
+        // Lab (SS2VR_LAB_ANCHOR_TRACE=1): the seated anchor per stereo pair, raw and
+        // steadied, with the simulation tick, to measure judder.
+        static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_ANCHOR_TRACE", v, 2) == 1 && v[0] == L'1'; }();
+        static unsigned traced = 0;
+        if (trace && traced < 3000) {
+            ++traced;
+            Pose raw{};
+            steadyBypass = true;
+            nativeTrackingAnchor(p, raw, &eyeSnapshot.rider);
+            steadyBypass = false;
+            LARGE_INTEGER t{}, f{};
+            QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f);
+            AcquireSRWLockShared(&steadyLock);
+            const SteadyState st = steadyState;
+            ReleaseSRWLockShared(&steadyLock);
+            t.QuadPart = LONGLONG(fineSeconds() * 1e6); f.QuadPart = 1000000;
+            log("Lab anchor t=%.3f sim=%llu steady=%.4f,%.4f,%.4f h=%.4f raw=%.4f,%.4f,%.4f h=%.4f valid=%d ride=%08x/%08x age=%.4f v=%.2f,%.2f,%.2f",
+                double(t.QuadPart) * 1000.0 / double(f.QuadPart),
+                static_cast<unsigned long long>(simulationRevision), eyeAnchor.p.x, eyeAnchor.p.y, eyeAnchor.p.z,
+                horizontalHeading(eyeAnchor.q), raw.p.x, raw.p.y, raw.p.z, horizontalHeading(raw.q), int(st.valid), st.ride,
+                eyeSnapshot.rider.ride, fineSeconds() - st.stamp, st.v.x, st.v.y, st.v.z);
+        }
+    }
     if (ready) {
         freezeLasers(request);
         if (settings.headFade && (eyeSnapshot.rider.handheld()||eyeSnapshot.rider.seated())) {
@@ -5773,19 +5850,36 @@ static bool genericVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out
     return true;
 }
 static bool auditedVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out);
+static bool attachedVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out, bool turretOnly);
 static bool readVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out) {
     if (!s.rider.seated() || !nativeMainThread() || !nativeRiderCurrent(s.player, s.rider))
         return false;
-    // The audited turret with its laser attachment; any other ride (or that
-    // turret without the attachment) is generic.
-    return auditedVehicleLaserSource(s, out) || genericVehicleLaserSource(s, out);
+    // The audited turret with its laser attachment; any other ride whose model
+    // has its firing attachment (the beam then leaves the gun's muzzle, where
+    // the old eye-level beam was hidden by the vehicle's own dashboard); else
+    // generic.
+    if (auditedVehicleLaserSource(s, out)) return true;
+    VehicleLaserSource attached;
+    if (attachedVehicleLaserSource(s, attached, false) && laserModelScratchIdle()) {
+        Matrix34 placement;
+        if (laserAttachment(reinterpret_cast<void *>(attached.instance), attached.attachment, placement) != 0) {
+            out = attached;
+            return true;
+        }
+    }
+    return genericVehicleLaserSource(s, out);
 }
 static bool auditedVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out) {
+    return attachedVehicleLaserSource(s, out, true);
+}
+// The ride's firing process blast attachment (the muzzle the model fires from):
+// audited for the turret, tried for other rides by the diagnostics.
+static bool attachedVehicleLaserSource(const Snapshot &s, VehicleLaserSource &out, bool turretOnly) {
     void *ride = resolve(s.rider.ride);
     uint32_t table = 0;
     VehicleLaserSource source;
     source.rider = s.rider;
-    if (!laserRead32(ride, 0, table) || table != laserTurretVtable ||
+    if (!laserRead32(ride, 0, table) || (turretOnly && table != laserTurretVtable) ||
         !laserRead32(ride, 0x120, source.model) || !laserRead32(ride, 0x47c, source.resource) ||
         !laserRead32(ride, 0x1bc, source.action) || !laserRead32(ride, 0x1c4, source.blast) ||
         !laserRead32(ride, 0x114, source.mechanism) || !source.mechanism || !resolve(source.mechanism))
@@ -5959,7 +6053,24 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
         uint32_t sourceHandle = s.handle[h];
         void *mechanism = nullptr;
         if (mounted) {
-            if (h != 1 || !vehicleLaserMuzzle(s, queryRequest, vehicle, muzzle, direction))
+            const bool sourced = h == 1 && vehicleLaserMuzzle(s, queryRequest, vehicle, muzzle, direction);
+            if (h == 1) {
+                static uint64_t lastTrace = 0;
+                static unsigned traced = 0;
+                if (GetTickCount64() - lastTrace > 2000 && traced < 40) {
+                    lastTrace = GetTickCount64(); ++traced;
+                    VehicleLaserSource probe;
+                    void *ride = resolve(s.rider.ride);
+                    VehicleLaserSource attached;
+                    const bool muzzle = attachedVehicleLaserSource(s, attached, false);
+                    log("Vehicle laser sample source=%d read=%d ride=%08x vtable=%lx mechanism=%08x action=%08x blast=%08x muzzle=%d attachment=%08x",
+                        int(sourced), int(readVehicleLaserSource(s, probe)), s.rider.ride,
+                        static_cast<unsigned long>(ride && laserTurretVtable ? primaryField(ride, 0) - (laserTurretVtable - 0x2b39e8) : 0),
+                        ride ? primaryField(ride, 0x114) : 0, ride ? primaryField(ride, 0x1bc) : 0, ride ? primaryField(ride, 0x1c4) : 0,
+                        int(muzzle), attached.attachment);
+                }
+            }
+            if (!sourced)
                 { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,2);continue; }
             if (creatureAimRide(s.rider)) {
                 // A hand-aimed dinosaur: the beam leaves the right hand along its aim.
@@ -10877,6 +10988,21 @@ bool attach(bool headless) {
     S(g, "?CanFireFromOwnWeapons@CPuppetEntity@SeriousEngine@@QAEHXZ", nativeOwnWeapons);
     nativeTeleport = loadProc<TeleportFn>(g, "?Teleport@CPuppetEntity@SeriousEngine@@UAEHVQuatVect@2@@Z");
     labLoadGame = reinterpret_cast<decltype(labLoadGame)>(reinterpret_cast<uintptr_t>(g) + 0x26980);
+    nativeSimNow = loadProc<decltype(nativeSimNow)>(e, "?simNow@SeriousEngine@@YA?AVTime@1@XZ");
+    ticksToSeconds = loadProc<decltype(ticksToSeconds)>(c, "?timTicksToFloat@SeriousEngine@@YAM_J@Z");
+    {
+        // The performance counter's step here (logged once: coarse steps judder anything timed by it).
+        LARGE_INTEGER a{}, b{}, f{};
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&a);
+        double smallest = 1e9;
+        const ULONGLONG until = GetTickCount64() + 40;
+        while (GetTickCount64() < until) {
+            QueryPerformanceCounter(&b);
+            if (b.QuadPart != a.QuadPart) { smallest = std::min(smallest, double(b.QuadPart - a.QuadPart) * 1000.0 / double(f.QuadPart)); a = b; }
+        }
+        log("Startup clock: performance counter %.0f Hz, smallest step %.4f ms", double(f.QuadPart), smallest);
+    }
     S(g, "?IsLocal@CPuppetEntity@SeriousEngine@@QAEHXZ", isLocal);
     S(g, "?IsAlive@CPuppetEntity@SeriousEngine@@UAEHXZ", isAlive);
     S(g, "?RendersIn3rdPerson@CPuppetEntity@SeriousEngine@@UAEHXZ", thirdPerson);
