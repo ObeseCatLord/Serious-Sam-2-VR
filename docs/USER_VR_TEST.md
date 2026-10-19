@@ -23,6 +23,20 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the ride and weapon report (2026-10-18)
+
+- Getting on a vehicle no longer throws you off at once: Use (B) held from
+  boarding or leaving counts again only after you release it.
+- Weapon picks no longer switch straight back (after a ride or a loaded save):
+  an empty weapon left in neither hand kept making the game re-equip your
+  favourite weapon.
+- Rolling ball: the view keeps its own heading and follows the ball's centre;
+  the ball rolls where you look; the right stick turns you as on foot.
+- Dinosaurs: aim with your right hand. A laser from the hand shows where shots
+  land (the dinosaur aims its shots at the laser's dot); the right stick turns
+  you and the left stick walks where you face. `[Rides] HandAimCreatures=0`
+  restores stick aiming.
+
 ## Changed after the sixth headset test (2026-10-14, late night)
 
 - No more tilt after a judder: on foot the view takes only the game's heading

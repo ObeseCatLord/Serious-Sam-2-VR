@@ -30,6 +30,7 @@ struct VrSettings {
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;
     bool instantRides = true; // [Rides] InstantTransitions: mount and dismount without the animation.
+    bool creatureHandAim = true; // [Rides] HandAimCreatures: dinosaurs aim where the right hand points.
     SteeringWheelSettings steeringWheel;
     bool roomscale = false; // Development gate until controller/replication completion.
     bool physicalMelee = false; // Unique-saw single-player integration gate.

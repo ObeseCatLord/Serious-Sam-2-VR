@@ -874,7 +874,7 @@ static std::atomic<bool> steadyLevel{false};
 static std::atomic<bool> steadyFixed{false};
 static std::atomic<float> steadyFixedHeading{0};
 static thread_local bool steadyBypass = false;
-static uintptr_t aircraftVtables[3]{}, ballVtables[2]{};
+static uintptr_t aircraftVtables[3]{}, ballVtables[2]{}, dinoVtables[2]{};
 static bool rideOfClass(const RiderIdentity &rider, const uintptr_t *tables, unsigned count) {
     void *ride = rider.ride && resolve ? resolve(rider.ride) : nullptr;
     uintptr_t table = 0;
@@ -885,6 +885,16 @@ static bool rideOfClass(const RiderIdentity &rider, const uintptr_t *tables, uns
 }
 static bool aircraftRide(const RiderIdentity &rider) { return rideOfClass(rider, aircraftVtables, 3); }
 static bool ballRide(const RiderIdentity &rider) { return rider.seated() && rideOfClass(rider, ballVtables, 2); }
+// Dinosaurs (legged rides) aim where the right hand points ([Rides]
+// HandAimCreatures): a laser from the hand shows where shots land. Their body
+// turns to the aim, so, as in the ball, the view keeps its own heading (the
+// right stick turns it) and the left stick walks where you face.
+static bool creatureAimRide(const RiderIdentity &rider) {
+    // Lab (SS2VR_LAB_CREATURE_ANY=1): any ride except the ball is aimed as a dinosaur.
+    static const bool labAny = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_CREATURE_ANY", v, 2) == 1 && v[0] == L'1'; }();
+    return settings.creatureHandAim && rider.seated() &&
+           (rideOfClass(rider, dinoVtables, 2) || (labAny && !rideOfClass(rider, ballVtables, 2)));
+}
 // The ball's centre: its placement (GetAbsPlacement, vtable +0x54; the ball's
 // override, Sam2Game 0x15aca0, reads its body entity's).
 static bool ballCentre(const RiderIdentity &rider, Vec3 &out) {
@@ -997,7 +1007,8 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     static float ballLift = .5f, ballHeading = 0;
     const bool ball = ballRide(rider);
     Vec3 centre{}, target = raw.p;
-    if (ball && ride != rider.ride) ballHeading = rawHeading;
+    const bool fixedView = ball || creatureAimRide(rider);
+    if (fixedView && ride != rider.ride) ballHeading = rawHeading;
     if (ball && ballCentre(rider, centre)) {
         if (ride != rider.ride) ballLift = std::clamp(raw.p.y - centre.y, -.5f, 1.5f);
         target = centre + Vec3{0, ballLift, 0};
@@ -1023,8 +1034,25 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     steadyOffset = axes[1].step(target.y, dt, omega) - raw.p.y;
     steadyOffsetZ = axes[2].step(target.z, dt, omega) - raw.p.z;
     steadyYaw = heading.step(unwrapped, dt, turnOmega) - unwrapped;
+    if (rideOfClass(rider, dinoVtables, 2)) {
+        // Bounded trace of a legged ride: body heading vs its aim angles (+0x618 heading, +0x61c pitch).
+        static uint64_t lastTrace = 0;
+        static unsigned traced = 0;
+        void *legged = resolve(rider.ride);
+        Pose placement{};
+        if (legged && GetTickCount64() - lastTrace > 500 && traced < 160) {
+            lastTrace = GetTickCount64(); ++traced;
+            using AbsPlacement = Pose *(__thiscall *)(void *, Pose *);
+            reinterpret_cast<AbsPlacement>((*static_cast<uintptr_t **>(legged))[0x54 / 4])(legged, &placement);
+            float aimHeading = 0, aimPitch = 0;
+            std::memcpy(&aimHeading, static_cast<uint8_t *>(legged) + 0x618, 4);
+            std::memcpy(&aimPitch, static_cast<uint8_t *>(legged) + 0x61c, 4);
+            log("Dino ride body heading=%.3f pos=%.2f,%.2f,%.2f aim=%.3f,%.3f riderHeading=%.3f", horizontalHeading(placement.q),
+                placement.p.x, placement.p.y, placement.p.z, aimHeading, aimPitch, rawHeading);
+        }
+    }
     steadyFixedHeading = ballHeading;
-    steadyFixed = ball;
+    steadyFixed = fixedView;
     steadyLevel = !aircraftRide(rider);
     steadyPlayer = rider.player;
     steadyRide = rider.ride;
@@ -1914,7 +1942,8 @@ static void update(void *p) {
     // steers or aims the ride instead (mountedLookClamp). The rolling ball rolls
     // where you look, and the stick turns you as on foot.
     bool turningAllowed = enabled && !resettingControls && !wheels[1].open &&
-        !(input.buttons[1] & Button::WheelOpen) && std::isfinite(ax) && (!rider.seated() || ballRide(rider));
+        !(input.buttons[1] & Button::WheelOpen) && std::isfinite(ax) &&
+        (!rider.seated() || ballRide(rider) || creatureAimRide(rider));
     static LARGE_INTEGER lastTurnClock{};
     LARGE_INTEGER turnClock{}, turnFrequency{};
     QueryPerformanceCounter(&turnClock);
@@ -4798,7 +4827,8 @@ static uintptr_t boardingSeatReturn = 0, useSeatReturn = 0, grenadeViewReturn = 
 static int labRideKind() {
     static const int kind = [] {
         wchar_t v[8]{};
-        if (GetEnvironmentVariableW(L"SS2VR_LAB_RIDE", v, 8)) return !wcscmp(v, L"hover") ? 2 : !wcscmp(v, L"ball") ? 3 : 0;
+        if (GetEnvironmentVariableW(L"SS2VR_LAB_RIDE", v, 8))
+            return !wcscmp(v, L"hover") ? 2 : !wcscmp(v, L"ball") ? 3 : !wcscmp(v, L"dino") ? 4 : 0;
         return GetEnvironmentVariableW(L"SS2VR_LAB_TURRET", v, 2) == 1 && v[0] == L'1' ? 1 : 0;
     }();
     return kind;
@@ -4821,6 +4851,26 @@ static void __fastcall hoverStep(void *ride, void *) { labNoteRide(ride); origin
 static void __fastcall ballStep(void *ride, void *) { labNoteRide(ride); originalBallStep(ride); }
 static void __fastcall ballReset(void *ride, void *) { originalBallReset(ride); labNoteRide(ride); }
 static void __fastcall hoverCreate(void *ride, void *, void *properties) { originalHoverCreate(ride, properties); labNoteRide(ride); }
+// Lab dinosaurs: legged puppets (not the player) that can be ridden.
+static EntityStep originalLeggedStep = nullptr;
+static void __fastcall leggedStep(void *ride, void *) {
+    if (!labSeenRide.load(std::memory_order_relaxed) && ride) {
+        const uintptr_t table = primaryField(ride, 0);
+        static void *listed[16]{};
+        static unsigned count = 0;
+        if (count < 16 && std::find(listed, listed + count, ride) == listed + count) {
+            listed[count++] = ride;
+            using Ridable = int(__thiscall *)(void *);
+            log("Lab legged %p vtable rva=%lx ridable=%d", ride, static_cast<unsigned long>(table - dinoVtables[0] + 0x29e180),
+                reinterpret_cast<Ridable>((*static_cast<uintptr_t **>(ride))[0x1fc / 4])(ride));
+        }
+        if (table && (table == dinoVtables[0] || table == dinoVtables[1])) {
+            using Ridable = int(__thiscall *)(void *);
+            if (reinterpret_cast<Ridable>((*static_cast<uintptr_t **>(ride))[0x1fc / 4])(ride)) labNoteRide(ride);
+        }
+    }
+    originalLeggedStep(ride);
+}
 static void *labFindTurret() {
     if (labRideKind() >= 2) {
         const uint32_t handle = labSeenRide.load(std::memory_order_relaxed);
@@ -5862,6 +5912,13 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
         if (mounted) {
             if (h != 1 || !vehicleLaserMuzzle(s, queryRequest, vehicle, muzzle, direction))
                 { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,2);continue; }
+            if (creatureAimRide(s.rider)) {
+                // A hand-aimed dinosaur: the beam leaves the right hand along its aim.
+                const Pose hand = worldHandTracking(body, s.origin, s.turn, s.input.head, s.input.hand[1]);
+                if (!finite(hand)) { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,2);continue; }
+                muzzle = {normalize(hand.q), hand.p};
+                direction = rotate(muzzle.q, Vec3{0, 0, -1});
+            }
             sourceHandle = s.rider.ride;
             mechanism = resolve(vehicle.mechanism);
         } else {
@@ -5945,7 +6002,17 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
                       s.generation, s.input.sequence, GetTickCount64(), true, hit};
         sampled[h].kind = mounted ? LaserSourceKind::Vehicle : LaserSourceKind::Handheld;
         sampled[h].vehicle = vehicle;
-        if (mounted && !vehicle.attachment) sampled[h].muzzle.p = sampled[h].muzzle.p + genericBeamOffset; // Converging beam.
+        if (mounted && !vehicle.attachment && !creatureAimRide(s.rider))
+            sampled[h].muzzle.p = sampled[h].muzzle.p + genericBeamOffset; // Converging beam.
+        if (mounted && creatureAimRide(s.rider)) {
+            static uint64_t lastTrace = 0;
+            static unsigned traced = 0;
+            if (GetTickCount64() - lastTrace > 1000 && traced < 60) {
+                lastTrace = GetTickCount64(); ++traced;
+                log("Creature beam from=%.2f,%.2f,%.2f dir=%.3f,%.3f,%.3f hit=%d distance=%.2f", muzzle.p.x, muzzle.p.y, muzzle.p.z,
+                    direction.x, direction.y, direction.z, int(hit), distance);
+            }
+        }
         sampled[h].requestSequence = queryRequest.sequence;
         sampled[h].local = local;
         sampled[h].distance = distance;
@@ -6033,6 +6100,14 @@ static void freezeLasers(const Request &request) {
         if (!held || !finite(grip) || !finite(muzzle)) { a.valid = false; continue; }
         a.muzzle = muzzle;
         a.end = muzzle.p + rotate(normalize(muzzle.q), Vec3{0, 0, -1}) * a.distance;
+    }
+    // A hand-aimed dinosaur's beam starts at this frame's right hand, to the
+    // sampled end (where the hand's ray hit).
+    if (frame.kind == LaserSourceKind::Vehicle && creatureAimRide(eyeSnapshot.rider) && pair[1].valid) {
+        auto &a = pair[1];
+        const Pose hand = worldHandTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, request.input.head, request.input.hand[1]);
+        if (finite(hand) && request.input.handValid[1]) a.muzzle = {normalize(hand.q), hand.p};
+        else a.valid = false;
     }
     std::copy(pair.begin(), pair.end(), eyeLasers);
     for(unsigned h=0;h<2;++h) {
@@ -9158,6 +9233,39 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (steeringWheelHeading(look)) {
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
+            } else if (creatureAimRide(captured.rider) && fresh(captured.input) && controllerTracked(captured.input, 1)) {
+                // Aim at the hand laser's end from the dinosaur's eye (where its shots
+                // start), so shots land on the dot; the hand's direction until the
+                // laser has sampled. Native aim: heading as ours, pitch up positive
+                // (CLeggedPuppetEntity::GetFrontDirection, Sam2Game 0x61060).
+                const Pose hand = worldHandTracking(anchor, captured.origin, captured.turn, captured.input.head,
+                                                    captured.input.hand[1]);
+                Vec3 dir = rotate(normalize(hand.q), Vec3{0, 0, -1});
+                AcquireSRWLockShared(&laserLock);
+                const LaserAim beam = laserAim[1];
+                ReleaseSRWLockShared(&laserLock);
+                const uint64_t now = GetTickCount64();
+                void *ride = resolve(captured.rider.ride);
+                if (ride && beam.valid && beam.kind == LaserSourceKind::Vehicle && beam.weapon == captured.rider.ride &&
+                    beam.owner == snapshot.playerHandle && now >= beam.tickMs && now - beam.tickMs < 250) {
+                    Pose eye{};
+                    reinterpret_cast<ViewOrigin>((*static_cast<uintptr_t **>(ride))[0xac / 4])(ride, &eye, 1);
+                    // Only a dot well ahead along the hand's ray: one on something close
+                    // (the dinosaur's own head) swung the aim from the eye's side of it.
+                    const Vec3 d = beam.end - eye.p;
+                    const float n = std::sqrt(dot(d, d));
+                    if (finite(eye) && n > 3.f && std::isfinite(n) && dot(d * (1 / n), dir) > std::cos(.3f)) dir = d * (1 / n);
+                }
+                const float heading = std::atan2(-dir.x, -dir.z), pitch = std::asin(std::clamp(dir.y, -1.f, 1.f));
+                Vec3 converted;
+                if (finite(hand) && std::isfinite(heading) && std::isfinite(pitch) &&
+                    quaternionEuler(&converted, yaw(heading)) == &converted && std::isfinite(converted.x) &&
+                    nativeRiderCurrent(snapshot.player, captured.rider, &rideToken)) {
+                    look.x = converted.x;
+                    look.y = std::clamp(pitch, -1.4f, 1.4f);
+                    static unsigned traced = 0;
+                    if (traced++ % 200 == 0) log("Creature aim heading=%.3f pitch=%.3f", look.x, look.y);
+                }
             } else if (ballRide(captured.rider) && fresh(captured.input) && ![] {
                            wchar_t v[2]{}; // Lab (SS2VR_LAB_BALL_NATIVE_LOOK=1): leave the ball's look alone.
                            return GetEnvironmentVariableW(L"SS2VR_LAB_BALL_NATIVE_LOOK", v, 2) == 1 && v[0] == L'1'; }()) {
@@ -9311,8 +9419,13 @@ static void __fastcall poll(void *b, void *) {
     std::copy_n(s.gripPoseGeneration,2,sampledControls.gripPoseGeneration);
     std::fill(std::begin(values), std::end(values), 0);
     if (enabled) {
+        // A hand-aimed dinosaur moves relative to its aim (the right hand): the
+        // stick is turned by the head's heading from it, so forward is where you face.
+        const bool handAim = creatureAimRide(s.rider) && s.input.headValid && controllerTracked(s.input, 1);
+        const float creatureOffset = handAim ? std::remainder(yawAngle(s.input.head.q) - yawAngle(s.input.hand[1].q), 2 * Pi) : 0.f;
         auto direction = horizontalStickMovement(s.input, s.ui.wheel[0].open,
-                                                s.rider.seated() ? 0.f : moveHeading(s));
+                                                s.rider.seated() ? (std::isfinite(creatureOffset) ? creatureOffset : 0.f)
+                                                                 : moveHeading(s));
         if (steeringWheel.steering == WheelSteering::Axis && steeringWheel.grasp.steering())
             direction.x = steeringWheel.grasp.steer(settings.steeringWheel); // Wheel replaces stick steering.
         // Verified native labels: X+ right, X- left, Z- forward, Z+ backward.
@@ -10575,6 +10688,8 @@ bool attach(bool headless) {
     aircraftVtables[2] = reinterpret_cast<uintptr_t>(g) + 0x2b0760; // CAirBikePuppetEntity
     ballVtables[0] = reinterpret_cast<uintptr_t>(g) + 0x2b9240; // CRollingBallPuppetEntity
     ballVtables[1] = reinterpret_cast<uintptr_t>(g) + 0x2b98f0; // CRollingBallCharacterEntity
+    dinoVtables[0] = reinterpret_cast<uintptr_t>(g) + 0x29e180; // CLeggedPuppetEntity (dinosaurs)
+    dinoVtables[1] = reinterpret_cast<uintptr_t>(g) + 0x2b8ac8; // CLeggedCharacterEntity
     weaponFrustumReturn = reinterpret_cast<uintptr_t>(g) + 0x4c8e9;
     weaponInverseReturn = reinterpret_cast<uintptr_t>(g) + 0x4c915;
     weaponDepthReturn = reinterpret_cast<uintptr_t>(g) + 0x4c9a6;
@@ -11001,6 +11116,8 @@ bool attach(bool headless) {
         if (labRideKind() == 2) {
             H(g, "?OnStep@CHovercraftPuppetEntity@SeriousEngine@@UAEXXZ", hoverStep, originalHoverStep);
             H(g, "?OnCreate@CHovercraftPuppetEntity@SeriousEngine@@UAEXPAVCEntityProperties@2@@Z", hoverCreate, originalHoverCreate);
+        } else if (labRideKind() == 4) {
+            H(g, "?OnStep@CLeggedPuppetEntity@SeriousEngine@@UAEXXZ", leggedStep, originalLeggedStep);
         } else {
             H(g, "?OnStep@CRollingBallPuppetEntity@SeriousEngine@@UAEXXZ", ballStep, originalBallStep);
             H(g, "?ResetDynamicMembers@CRollingBallPuppetEntity@SeriousEngine@@UAEXXZ", ballReset, originalBallReset);
