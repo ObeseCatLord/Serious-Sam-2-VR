@@ -2641,8 +2641,8 @@ struct Host {
         rows[OptScale] = {L"Render scale", scale};
         rows[OptInstancing] = {L"Instanced single pass", instancingSetting() ? L"On" : L"Off", L"(experimental)"};
         const int microphone = settings.voice.microphone;
-        rows[OptMicrophone] = {L"Voice chat microphone", microphone == 0 ? L"Off" : microphone == 1 ? L"Voice activated" : L"Hand to mouth",
-                               microphone == 2 ? L"(hold a controller to your mouth)" : L""};
+        rows[OptMicrophone] = {L"Voice chat microphone", microphone == 0 ? L"Off" : microphone == 1 ? L"Open mic" : L"Hand to mouth",
+                               microphone == 1 ? L"(sends while you speak)" : microphone == 2 ? L"(hold a controller to your mouth)" : L""};
         rows[OptVoiceVolume] = {L"Voice chat volume", percent(settings.voice.volume)};
         rows[OptClose] = {L"Close", L""};
         return rows;

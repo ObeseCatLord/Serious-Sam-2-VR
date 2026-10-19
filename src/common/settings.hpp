@@ -34,7 +34,7 @@ struct VrSettings {
     // [Voice] multiplayer voice chat with other SS2VR players (common/voice.hpp).
     struct Voice {
         bool receive = true;           // Receive: hear other players.
-        int microphone = 1;            // Microphone: 0 off, 1 voice activated, 2 hand to mouth (push to talk).
+        int microphone = 1;            // Microphone: 0 off, 1 open mic (sends while you speak), 2 hand to mouth (push to talk).
         float sensitivity = 55;        // Sensitivity 0..100: how readily the voice gate opens.
         float inputGain = 1;           // InputGain 0..4
         float volume = 1;              // Volume 0..2

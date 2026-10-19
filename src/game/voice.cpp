@@ -1,5 +1,6 @@
 // Multiplayer voice chat: capture, Opus, playout and mixing on one audio thread
-// (see voice.hpp and common/voice.hpp). Windows waveIn/waveOut: 48 kHz mono
+// (see voice.hpp and common/voice.hpp). The microphone is chat only: captured
+// audio goes to the encoder and the network, never to game input. Windows waveIn/waveOut: 48 kHz mono
 // capture and 48 kHz stereo playback in 20 ms buffers, which Wine maps onto
 // PulseAudio/PipeWire. Nothing here calls into the game.
 #include "voice.hpp"

@@ -32,10 +32,13 @@ relays the voices; players without the mod hear nothing and see nothing extra.
 - Voices come from where each player is (left/right by direction, softer with
   distance) and fade to a centred "radio" voice beyond 24 m, so distant
   teammates stay audible.
-- Microphone (VR options panel on the weapon wheel, or `[Voice] Microphone` in
-  `SS2VR.ini`): Voice activated (default), Hand to mouth (hold either
-  controller at your mouth to talk), or Off. The microphone only opens while
-  you are in a multiplayer session with another SS2VR player.
+- The microphone is for chat only: it is sent to the other players and never
+  controls the game (no voice commands; the weapon wheel and every other
+  control work exactly as before).
+- Microphone (VR options panel, or `[Voice] Microphone` in `SS2VR.ini`): Open
+  mic (default; sends while you speak), Hand to mouth (hold either controller
+  at your mouth to talk), or Off. The microphone only opens while you are in a
+  multiplayer session with another SS2VR player.
 - A green ring floats over a player who is talking; a small one sits at your
   left hand while you are sending. `[Voice] Indicators=0` hides them.
 - Voice volume is on the VR options panel too. `[Voice] InputDevice` picks a
