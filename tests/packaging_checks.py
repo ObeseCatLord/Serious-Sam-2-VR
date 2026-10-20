@@ -102,12 +102,12 @@ with tempfile.TemporaryDirectory(prefix='ss2vr-contract-') as temporary:
     import shutil
     import zipfile
     packaging.ROOT = root
-    for directory in ['build-game', 'build-host/openxr/src/loader', 'licenses',
+    for directory in ['build-game', 'build-host/openxr/src/loader', 'build-openal', 'licenses',
                       'config', 'tests', 'tools', 'docs']:
         (root/directory).mkdir(parents=True, exist_ok=True)
     for name in ['README.md', 'AGENTS.md', 'LICENSE', 'THIRD_PARTY.md', 'MODDING_PLAN.md',
                  'MODLOG.md', '.clang-format', '.gitignore', 'tools/install.py',
-                 'licenses/test.txt', 'config/SS2VR.ini', 'config/SS2VR.mod']:
+                 'licenses/test.txt', 'config/SS2VR.ini', 'config/SS2VR.mod', 'config/alsoft.ini']:
         (root/name).write_text('fixture\n')
     (root/'docs/installed-build.json').write_text('{}')
     for component, relative in [('game','build-game/d3d9.dll'),
@@ -115,6 +115,7 @@ with tempfile.TemporaryDirectory(prefix='ss2vr-contract-') as temporary:
                                ('host','build-host/ss2vr_host.exe')]:
         shutil.copy2(products[component],root/relative)
     shutil.copy2(products['host'],root/'build-host/openxr/src/loader/libopenxr_loader.dll')
+    shutil.copy2(products['game'],root/'build-openal/OpenAL32.dll') # A 32-bit PE stands in for OpenAL Soft.
     must_reject(lambda: packaging.package(root/'src/recursive-output'))
     assert not (root/'src/recursive-output').exists()
     out=root/'staged'

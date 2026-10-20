@@ -37,11 +37,14 @@ def package(output=None):
     if any(output.is_relative_to(ROOT/directory) for directory in
            ['src','tests','cmake','tools','docs','licenses','config']):
         raise ValueError('Package output must be outside copied source directories')
+    # Spatial audio: OpenAL Soft built by tools/build_openal.sh (32-bit, loaded by the game).
+    payload['Bin/SS2VR/OpenAL32.dll'] = ROOT/'build-openal/OpenAL32.dll'
     for relative, path in payload.items():
-        expected = 0x14c if relative in ('Bin/d3d9.dll', 'Bin/SS2VRServer.dll') else 0x8664
+        expected = 0x14c if relative in ('Bin/d3d9.dll', 'Bin/SS2VRServer.dll', 'Bin/SS2VR/OpenAL32.dll') else 0x8664
         if machine(path) != expected: raise ValueError('Architecture mismatch: ' + relative)
     payload['Bin/SS2VR/LICENSE.txt'] = ROOT/'LICENSE'
     payload['Bin/SS2VR/SS2VR.ini'] = ROOT/'config/SS2VR.ini'
+    payload['Bin/SS2VR/alsoft.ini'] = ROOT/'config/alsoft.ini'
     payload['Content/SS2VR.mod'] = ROOT/'config/SS2VR.mod'
     payload['Bin/SS2VR/THIRD_PARTY.md'] = ROOT/'THIRD_PARTY.md'
     for path in (ROOT/'licenses').iterdir():

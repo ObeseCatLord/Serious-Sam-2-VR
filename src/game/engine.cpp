@@ -45,6 +45,8 @@
 #include "scope_gpu.hpp"
 #include "multiplayer.hpp"
 #include "voice.hpp"
+#include "spatial_audio.hpp"
+#include "common/spatial_audio.hpp"
 #include "native_tracking.hpp"
 #include "native_memory.hpp"
 #include "native_finally.hpp"
@@ -67,6 +69,7 @@
 #endif
 extern "C" const ss2vr::BuildContract ss2vrBuildContract;
 namespace ss2vr::game {
+namespace spatial_audio_common = ::ss2vr::spatial_audio;
 std::atomic<bool> hooksReady = false;
 using VoidThis = void(__thiscall *)(void *);
 using IntThis = int(__thiscall *)(void *);
@@ -5980,6 +5983,48 @@ static bool vehicleLaserMuzzle(const Snapshot &s, const Request &request, Vehicl
     reinterpret_cast<ShootDirection>(table[0x5a4 / 4])(ride, &direction);
     return vehicleLaserCurrent(s, request, source) && nativeLaserPose(origin, direction, muzzle, &rayDirection);
 }
+// Spatial audio occlusion: rays from the listener toward the sounds due a
+// trace (spatial_audio.hpp), in the same native query lifecycle as the lasers.
+static void traceSoundOcclusion() {
+    if (!settings.spatialAudio || !settings.audioOcclusion) return;
+    const auto s = copySnapshot();
+    if (!s.initialized || !livePlayer(s) || !s.ui.gameplay) return;
+    Vec3 from{};
+    uint32_t ids[spatial_audio_common::TracesPerFrame];
+    Vec3 ends[spatial_audio_common::TracesPerFrame];
+    const unsigned n = spatial_audio::dueTraces(from, ids, ends, spatial_audio_common::TracesPerFrame);
+    if (!n) return;
+    void *mechanism = getMechanism ? getMechanism(s.player) : nullptr;
+    laserQuerying = true;
+    for (unsigned i = 0; i < n; ++i) {
+        const Vec3 d = ends[i] - from;
+        const float distance = std::sqrt(dot(d, d));
+        if (!(distance > .05f) || !std::isfinite(distance)) { spatial_audio::traced(ids[i], false, 0, 0); continue; }
+        originalRayInit();
+        NativeRay ray{from, d * (1 / distance)};
+        setRay(ray);
+        rayMaximum(distance);
+        rayMinimum(.05f);
+        rayRadius(0);
+        rayCategory(bulletCategory);
+        thickCategory(bulletCategory);
+        rayAvatar(s.player);
+        rayMechanism(mechanism);
+        rayFluids(0);
+        checkRay();
+        const bool hit = rayHit() != 0;
+        const float at = hit ? hitDistance() : distance;
+        originalRayInit();
+        spatial_audio::traced(ids[i], hit, at, distance);
+    }
+    laserQuerying = false;
+    static unsigned traced = 0;
+    if (traced < 20 && GetTickCount64() % 1000 < 50) {
+        ++traced;
+        log("Spatial audio: %u occlusion rays from %.1f,%.1f,%.1f, first to %.1f,%.1f,%.1f", n, from.x, from.y, from.z,
+            ends[0].x, ends[0].y, ends[0].z);
+    }
+}
 static void trackedRayInitBody(uintptr_t caller, bool outermost) {
     // The native caller is intentionally beginning a new query. Retire its old
     // query first, use the same native lifecycle for our rays, then leave a fresh
@@ -5992,6 +6037,7 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
             laserTraceValue(LaserTraceStage::Query,"admission-rejected",Snapshot{},2,0,1,nullptr,caller);
         return;
     }
+    traceSoundOcclusion();
     auto s = copySnapshot();
     if ((!settings.lasers && !s.zoom[0] && !s.zoom[1]) ||
         !vrSession(s) || !fresh(s.input) || !s.ui.gameplay || !livePlayer(s)) {
@@ -7279,7 +7325,7 @@ bool scopePreviewNeeded(void *player, const Request &request) {
     if (!scopeInjectionReturn || player != eyeSnapshot.player || !eyeSnapshot.rider.handheld() ||
         !nativeUiFrameCurrent(player,request)) return false;
     for (unsigned hand = 0; hand < 2; ++hand)
-        if (eyeSnapshot.zoom[hand] && eyeSnapshot.handle[hand] &&
+        if ((eyeSnapshot.zoom[hand] || settings.scopeAlwaysLive) && eyeSnapshot.handle[hand] &&
             nativeSniper(resolve(eyeSnapshot.handle[hand]))) return true;
     return false;
 }
@@ -7291,7 +7337,10 @@ static bool copyScopeSourceViewChecked(unsigned hand, ScopeSourceView &out, unsi
     reason = 4; if (!out.pose.imageCoordinates.valid) return false;
     reason = 5; if (!scopeOpticalFrameValid(out.pose.opticalFrame)) return false;
     float magnification = 0;
-    reason = 6; if (!scopeNativeMagnification(out.pose.nativeBaseFovRadians,out.pose.zoom,magnification)) return false;
+    // Not zoomed: the always-live scope's own magnification.
+    reason = 6; if (!scopeNativeMagnification(out.pose.nativeBaseFovRadians,out.pose.zoom,magnification) &&
+                    !(settings.scopeAlwaysLive && !out.pose.zoom.valid && (magnification = settings.scopeIdleMagnification) >= 1))
+        return false;
     reason = 7; if (!scopeOpticalProjection(out.pose.opticalFrame,settings.scopeEyeRelief,magnification,out.opticalProjection) ||
         !scopeOpticalFov(out.opticalProjection,out.fov)) return false;
     matrixPose(&out.camera,out.pose.opticalFrame.camera);
@@ -9369,7 +9418,35 @@ static void __fastcall unregisterFromRide(void *p, void *) {
     originalUnregisterFromRide(p);
 }
 static int(__cdecl *originalAppForeground)() = nullptr;
+// Spatial audio (spatial_audio.hpp): the sound API the options menu restarts
+// (its startup is hooked at Direct3DCreate9) and the listener the game places
+// each frame (the tracked head instead).
+using SfxApiCall = void(__cdecl *)(int, long);
+static SfxApiCall originalChangeApi = nullptr;
+static void __cdecl changeSoundApi(int api, long frequency) {
+    originalChangeApi(spatial_audio::chooseApi(api), frequency);
+}
+using SoundListener = void(__thiscall *)(void *, float, float, const Pose &, const Vec3 &);
+static SoundListener originalSoundListener = nullptr;
+static void __fastcall soundListener(void *list, void *, float a, float b, const Pose &placement, const Vec3 &velocity) {
+    if (settings.spatialAudio) {
+        const auto s = copySnapshot();
+        Pose body;
+        if (s.initialized && fresh(s.input) && s.input.headValid && livePlayer(s) && trackingAnchor(s.player, body)) {
+            const Pose head = worldHeadTracking(body, s.origin, s.turn, s.input.head);
+            if (finite(head)) spatial_audio::noteHead(head, GetTickCount64());
+        }
+        Pose listener;
+        if (spatial_audio::listener(placement, listener)) { originalSoundListener(list, a, b, listener, velocity); return; }
+    }
+    originalSoundListener(list, a, b, placement, velocity);
+}
+static void maintainSpatialAudio() {
+    spatial_audio::configure({settings.spatialAudio, settings.audioOcclusion});
+    spatial_audio::frame();
+}
 static int __cdecl appForeground() {
+    maintainSpatialAudio();
     if (labLoadPending.exchange(false) && labLoadGame) {
         log("Lab load of Temp/SS2VR/user.sav issued");
         labLoadGame("Temp/SS2VR/user.sav");
@@ -11319,6 +11396,11 @@ bool attach(bool headless) {
     ok = hook(module, name, reinterpret_cast<void *>(fn), reinterpret_cast<void **>(&orig)) && ok
     if (!headless)
         H(c, "?sysIsAppForeground@SeriousEngine@@YAHXZ", appForeground, originalAppForeground);
+    if (!headless) {
+        H(e, "?sfuChangeAPI_t@SeriousEngine@@YAXW4SfxAPI@1@J@Z", changeSoundApi, originalChangeApi);
+        H(e, "?AddSoundListener@CSoundSyncList@SeriousEngine@@QAEXMMABVQuatVect@2@ABVVector3f@2@@Z", soundListener,
+          originalSoundListener);
+    }
     if(!headless && labSniperConfigured && labPreparation->sniperZoom)
         H(e,"?mdlGetAttachmentAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z",
           observedAttachment,originalObservedAttachment);

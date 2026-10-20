@@ -41,6 +41,8 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.lasers = number(L"Laser", L"Enabled", 1, 0, 1) >= .5f;
     settings.laserDistance = number(L"Laser", L"MaxDistanceMeters", 100, 5, 200);
     settings.scopeEyeRelief = number(L"Scope", L"EyeReliefMeters", .1f, .02f, .3f);
+    settings.scopeAlwaysLive = number(L"Scope", L"AlwaysLive", 1, 0, 1) >= .5f;
+    settings.scopeIdleMagnification = number(L"Scope", L"IdleMagnification", 4, 1.5f, 10);
     settings.renderScale = number(L"Render", L"Scale", 1, .25f, 4);
     settings.foveation.mode = int(number(L"Render", L"Foveation", 1, 0, 2) + .5f);
     settings.desktopWorld = number(L"Render", L"DesktopWorld", 0, 0, 1) >= .5f;
@@ -50,6 +52,8 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.instantRides = number(L"Rides", L"InstantTransitions", 1, 0, 1) >= .5f;
     settings.creatureHandAim = number(L"Rides", L"HandAimCreatures", 1, 0, 1) >= .5f;
     settings.rideHeadPitch = number(L"Rides", L"HeadPitchAim", 1, 0, 1) >= .5f;
+    settings.spatialAudio = number(L"Audio", L"Spatial", 1, 0, 1) >= .5f;
+    settings.audioOcclusion = number(L"Audio", L"Occlusion", 1, 0, 1) >= .5f;
     {
         auto &v = settings.voice;
         v.receive = number(L"Voice", L"Receive", 1, 0, 1) >= .5f;

@@ -27,10 +27,17 @@ struct VrSettings {
     bool labFixedPose = false;   // Measurement only: untracked headset uses a fixed head pose.
     bool labAutoContinue = false; // Measurement only: confirm loading prompts/menus until gameplay.
     float scopeEyeRelief = .1f; // Optical presentation parameter, not native zoom timing.
+    // [Scope] AlwaysLive: a held sniper's scope always shows the magnified view
+    // (IdleMagnification while not zoomed; zooming uses the game's own zoom).
+    bool scopeAlwaysLive = true;
+    float scopeIdleMagnification = 4;
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;
     bool instantRides = true; // [Rides] InstantTransitions: mount and dismount without the animation.
     bool creatureHandAim = true; // [Rides] HandAimCreatures: dinosaurs aim where the right hand points.
+    // [Audio] Spatial: the game's sound on OpenAL Soft with HRTF and the tracked
+    // head as the listener; Occlusion: sounds behind walls are muffled.
+    bool spatialAudio = true, audioOcclusion = true;
     bool rideHeadPitch = true; // [Rides] HeadPitchAim: a ride's guns pitch with the head.
     // [Vehicles] GripTurnRateDegrees: holding a ride's own controls turned turns
     // it at up to this rate (a control stick); 0 turns it with the hands 1:1.
