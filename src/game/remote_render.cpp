@@ -964,57 +964,63 @@ __attribute__((noinline,noclone)) static bool rideObservationOwnerCurrent(uint32
 // Copy raw words after native DDE30 production. No reference arithmetic, native
 // evaluation, allocation or virtual resource load occurs in this observer.
 __attribute__((noinline,optimize("no-tree-vectorize","no-tree-loop-distribute-patterns")))
+// Bounded trace: the first time each reason declines a ride palette copy.
+static bool ridePaletteFail(unsigned reason) {
+    static uint64_t seen=0;
+    if(reason<64 && !(seen&(1ull<<reason))) {seen|=1ull<<reason;log("Ride palette declined reason=%u",reason);}
+    return false;
+}
 static bool copyRidePaletteBookend(RidePaletteBookend &out,bool &selected) {
     selected=false;
     if(!rideObservationOwnerCurrent(currentFrozenOwner) || !rideObservationEnabled ||
-       !frozenRide.valid() || rideObservationDeclined)return false;
+       !frozenRide.valid() || rideObservationDeclined)return ridePaletteFail(1);
     out={}; // Even compiler-generated clearing stays behind owner admission.
     selected=true; // Losing the captured actor/model owner declines the bank.
     auto &frame=out.frame;
-    if(!copyNativeRideRenderIdentity(frozenRide.player,frame.identity) || frame.identity!=frozenRide)return false;
+    if(!copyNativeRideRenderIdentity(frozenRide.player,frame.identity) || frame.identity!=frozenRide)return ridePaletteFail(2);
     void *instance=reinterpret_cast<void*>(frame.identity.instance);
-    if(!readableMemory(instance,0x2c))return false;
+    if(!readableMemory(instance,0x2c))return ridePaletteFail(3);
     std::memcpy(&frame.evaluated,reinterpret_cast<void*>(engineBase+0x2eab68),4);
     uint32_t linked=0,evaluatedOwner=0;
     std::memcpy(&linked,static_cast<uint8_t*>(instance)+0x28,4);
-    if(!frame.evaluated || frame.evaluated!=linked) {selected=false;return false;}
-    if(!readableMemory(reinterpret_cast<void*>(frame.evaluated),0x38))return false;
+    if(!frame.evaluated || frame.evaluated!=linked) {selected=false;return ridePaletteFail(4);}
+    if(!readableMemory(reinterpret_cast<void*>(frame.evaluated),0x38))return ridePaletteFail(5);
     std::memcpy(&evaluatedOwner,reinterpret_cast<void*>(frame.evaluated+0x18),4);
-    if(evaluatedOwner!=frame.identity.instance)return false;
+    if(evaluatedOwner!=frame.identity.instance)return ridePaletteFail(6);
     selected=true; // Subsequent failed association invalidates a provisional copy.
     std::span<NativeModelRecord> records;std::span<NativeBone> bones;
     if(!rendererArray(0x2eac20,MaxModelRecords,records) || records.empty() || records[0].instance ||
-       !rendererArray(0x2eac60,MaxNativeBones,bones))return false;
+       !rendererArray(0x2eac60,MaxNativeBones,bones))return ridePaletteFail(7);
     std::memcpy(out.modelArray.data(),reinterpret_cast<void*>(engineBase+0x2eac20),12);
     std::memcpy(out.boneArray.data(),reinterpret_cast<void*>(engineBase+0x2eac60),12);
     size_t owner=0;unsigned matches=0;
     for(size_t i=1;i<records.size();++i)
         if(reinterpret_cast<uintptr_t>(records[i].instance)==frame.identity.instance) {owner=i;++matches;}
-    if(matches!=1)return false;
+    if(matches!=1)return ridePaletteFail(8);
     frame.modelRecord=uint32_t(owner);
     const auto *model=reinterpret_cast<const uint8_t*>(&records[owner]);
     std::memcpy(&out.boneFirst,model+0x18,4);
     std::memcpy(&out.boneCount,model+0x1c,4);
     std::memcpy(&out.lod,model+0x5c,4);
     if(!out.boneFirst || !out.boneCount || out.boneFirst>bones.size() ||
-       out.boneCount>bones.size()-out.boneFirst)return false;
+       out.boneCount>bones.size()-out.boneFirst)return ridePaletteFail(9);
     IdleConfigIdentity config;
     if(!idleConfig(instance,config) || config!=frozenRideConfig ||
-       !readableMemory(reinterpret_cast<void*>(config.configuration),0x34))return false;
+       !readableMemory(reinterpret_cast<void*>(config.configuration),0x34))return ridePaletteFail(10);
     frame.configuration=config.configuration;frame.file=config.file;frame.resource=uint32_t(config.resource);
     std::memcpy(frame.stretch.data(),instance,12);
     std::memcpy(&out.skeleton,reinterpret_cast<void*>(config.configuration+0x30),4);
-    if(!readableMemory(reinterpret_cast<void*>(out.skeleton),0x38))return false;
+    if(!readableMemory(reinterpret_cast<void*>(out.skeleton),0x38))return ridePaletteFail(11);
     std::memcpy(&out.skeletonFlags,reinterpret_cast<void*>(out.skeleton+4),4);
     std::memcpy(&out.lodCount,reinterpret_cast<void*>(out.skeleton+0x30),4);
     std::memcpy(&out.lods,reinterpret_cast<void*>(out.skeleton+0x34),4);
     if((out.skeletonFlags&1) || !out.lodCount || out.lodCount>64 || !out.lods || out.lod<out.lods ||
        (out.lod-out.lods)%0x20 || (out.lod-out.lods)/0x20>=out.lodCount ||
-       !readableMemory(reinterpret_cast<void*>(out.lods),size_t(out.lodCount)*0x20))return false;
+       !readableMemory(reinterpret_cast<void*>(out.lods),size_t(out.lodCount)*0x20))return ridePaletteFail(12);
     std::memcpy(&out.definitions,reinterpret_cast<void*>(out.lod+0xc),4);
     std::memcpy(&out.definitionCount,reinterpret_cast<void*>(out.lod+0x10),4);
     if(!out.definitionCount || out.definitionCount>MaxNativeBones || !out.definitions ||
-       !readableMemory(reinterpret_cast<void*>(out.definitions),size_t(out.definitionCount)*0x78))return false;
+       !readableMemory(reinterpret_cast<void*>(out.definitions),size_t(out.definitionCount)*0x78))return ridePaletteFail(13);
     std::memcpy(&frame.matrices,reinterpret_cast<void*>(frame.evaluated+0x20),4);
     std::memcpy(&out.canonicalCount,reinterpret_cast<void*>(frame.evaluated+0x24),4);
     std::memcpy(out.cacheRows.data(),reinterpret_cast<void*>(frame.evaluated+0x2c),12);
@@ -1022,15 +1028,15 @@ static bool copyRidePaletteBookend(RidePaletteBookend &out,bool &selected) {
        out.canonicalCount>MaxNativeBones || !frame.matrices ||
        out.cacheRows[2]!=records.size() || out.cacheRows[0]<out.cacheRows[2] || !out.cacheRows[1] ||
        !readableMemory(reinterpret_cast<void*>(out.cacheRows[1]),records.size()*8) ||
-       !readableMemory(reinterpret_cast<void*>(frame.matrices),size_t(out.canonicalCount)*sizeof(Matrix34)))return false;
+       !readableMemory(reinterpret_cast<void*>(frame.matrices),size_t(out.canonicalCount)*sizeof(Matrix34)))return ridePaletteFail(14);
     uint32_t cacheLod=0;
     std::memcpy(&cacheLod,reinterpret_cast<void*>(out.cacheRows[1]+owner*8+4),4);
-    if(cacheLod!=out.lod)return false;
+    if(cacheLod!=out.lod)return ridePaletteFail(15);
     unsigned mains=0,seats=0;
     for(size_t i=out.boneFirst;i<size_t(out.boneFirst)+out.boneCount;++i) {
         const auto &bone=bones[i];const auto definition=reinterpret_cast<uintptr_t>(bone.definition);
         if(bone.owner!=int32_t(owner) || definition<out.definitions ||
-           (definition-out.definitions)%0x78 || (definition-out.definitions)/0x78>=out.definitionCount)return false;
+           (definition-out.definitions)%0x78 || (definition-out.definitions)/0x78>=out.definitionCount)return ridePaletteFail(16);
         uint32_t name=0;std::memcpy(&name,bone.definition,4);
         if(name==mainName) {++mains;frame.mainBone=uint32_t(i);frame.boneDefinition=uint32_t(definition);}
         if(name==seatName) {++seats;frame.seatBone=uint32_t(i);frame.seatDefinition=uint32_t(definition);}
@@ -1141,39 +1147,47 @@ __attribute__((noinline)) static void observeRidePalette() {
     if(mapped)before.frame.attachment=attachmentBefore.copy;
     rideFrames[index]=before.frame;rideFrameSeen[index]=true;
 }
+// Bounded trace: the first time each reason declines a ride handle frame.
+static bool rideGripFrameFail(unsigned reason) {
+    static uint64_t seen=0;
+    if(reason<64 && !(seen&(1ull<<reason))) {seen|=1ull<<reason;log("Ride grip frame declined reason=%u",reason);}
+    return false;
+}
 static bool buildRideGripFrame(const Request &request,const RideGripRig &rig,RideGripFrame &out) {
     out={};const RideDrawGpuCopy *selected[2]{};const RideMainDrawCopy *draw[2]{};
     for(unsigned eye=0;eye<2;++eye) {
-        if(rideMainDrawOverflow[eye])return false;
+        if(rideMainDrawOverflow[eye])return rideGripFrameFail(1);
         for(unsigned i=0;i<rideMainDrawCounts[eye];++i) {
             const auto &d=rideMainDraws[eye][i];const auto &g=rideMainGpu[eye][i];
             if(!rideSurfaceSupported(d.layout))continue;
-            if(selected[eye] || !g.copied || !g.handles.copied || !g.handlePositionAgrees)return false;
+            // The same mesh can be drawn again in one eye (another pass); the
+            // first draw whose copy completed stands for it.
+            if(selected[eye] || !g.copied || !g.handles.copied || !g.handlePositionAgrees)continue;
             selected[eye]=&g;draw[eye]=&d;
         }
-        if(!selected[eye])return false;
+        if(!selected[eye])return rideGripFrameFail(3);
     }
     const auto &left=*selected[0],&right=*selected[1];
     if(left.handles.profile!=right.handles.profile || draw[0]->identity!=draw[1]->identity ||
        draw[0]->configuration!=draw[1]->configuration || draw[0]->file!=draw[1]->file ||
        draw[0]->resource!=draw[1]->resource || !draw[0]->identity.parameter ||
        rig.rider.player!=draw[0]->identity.player || rig.rider.ride!=draw[0]->identity.ride ||
-       rig.rider.seat!=draw[0]->identity.seat || !validNativeBodyPose(rig.anchor))return false;
+       rig.rider.seat!=draw[0]->identity.seat || !validNativeBodyPose(rig.anchor))return rideGripFrameFail(4);
     RideGripFrame next;next.request=request;next.rig=rig;next.render=draw[0]->identity;
     next.configuration=draw[0]->configuration;next.file=draw[0]->file;next.resource=draw[0]->resource;
-    if(rideFrames[0].stretch!=rideFrames[1].stretch)return false;
+    if(rideFrames[0].stretch!=rideFrames[1].stretch)return rideGripFrameFail(5);
     next.stretch=rideFrames[0].stretch;
     next.parameter=next.render.parameter;next.profile=left.handles.profile;
     for(unsigned hand=0;hand<2;++hand) {
         const auto &a=left.handles.handles[hand],&b=right.handles.handles[hand];
-        if(a.vertices!=b.vertices || a.indices!=b.indices)return false;
+        if(a.vertices!=b.vertices || a.indices!=b.indices)return rideGripFrameFail(6);
         auto &surface=next.surfaces[hand];surface.vertices=a.vertices;surface.indices=a.indices;
         for(unsigned v=0;v<a.vertices;++v) {
             const auto p=left.handleWorld[hand][v],q=right.handleWorld[hand][v],delta=p-q;
-            if(!std::isfinite(dot(delta,delta)) || dot(delta,delta)>.0005f*.0005f)return false;
+            if(!std::isfinite(dot(delta,delta)) || dot(delta,delta)>.0005f*.0005f)return rideGripFrameFail(7);
             surface.positions[v]=rotate(inverse(rig.anchor.q),p-rig.anchor.p);
             const auto local=surface.positions[v];
-            if(!std::isfinite(local.x)||!std::isfinite(local.y)||!std::isfinite(local.z))return false;
+            if(!std::isfinite(local.x)||!std::isfinite(local.y)||!std::isfinite(local.z))return rideGripFrameFail(8);
         }
     }
     next.valid=true;out=next;return true;
@@ -1189,8 +1203,14 @@ __attribute__((noinline)) static void publishRideObservation(uint32_t owner,bool
     // endEye retires native scratch use before stereo Ready. It does not retire
     // the bank owner; only this copied-value publication uses the retained phase.
     if(!rideObservationOwnerCurrent(owner,RideReadPhase::Retained) || !rideObservationEnabled || rideObservationDeclined ||
-       !frozenRide.valid() ||
-       !rideFrameSeen[0] || (stereo && !rideFrameSeen[1]))return;
+       !frozenRide.valid() || !rideFrameSeen[0])return;
+    if(stereo && !rideFrameSeen[1]) {
+        // Single-pass stereo draws the world (and the ride) once for both eyes:
+        // that one observation stands for the second eye as well.
+        rideFrames[1]=rideFrames[0];rideFrameSeen[1]=true;
+        rideMainDraws[1]=rideMainDraws[0];rideMainDrawCounts[1]=rideMainDrawCounts[0];
+        rideMainDrawOverflow[1]=rideMainDrawOverflow[0];rideMainGpu[1]=rideMainGpu[0];
+    }
     if(rideGripEnabled && stereo && request && rig)publishRideGripFrame(*request,*rig);
     if(!rideDiagnosticEnabled || rideObservationRows.load(std::memory_order_relaxed)>=32)return;
     const unsigned row=rideObservationRows.fetch_add(1,std::memory_order_relaxed);
@@ -1765,7 +1785,9 @@ bool initialize(HMODULE engine, HMODULE core, HMODULE sam, HookInstallerRva inst
     stringId(&splitArmName, "Arm_Left");
     stringId(&splitPalmName, "Palm_Left");
     stringId(&scopeBoneName, "Sniper");
-    if(observeRideControl) {
+    // The ride's Main and Seat bones (names to match) are needed by the grips
+    // too: set only for the lab ride diagnostic, no vehicle handle was ever admitted.
+    if(observeRideControl || produceGrips) {
         stringId(&mainName,"Main");stringId(&seatName,"Seat");
         if(!invalidId || mainName==*invalidId || seatName==*invalidId || mainName==seatName)return false;
     }
@@ -2075,6 +2097,8 @@ uint32_t freezePair(uint32_t localPlayer) {
                copyNativeRideRenderIdentity(localPlayer,after) && after==identity) {
                 frozenRide=identity;frozenRideConfig=config;
             }
+            static unsigned traced=0;
+            if(traced<6 && identity.ride) {++traced;log("Ride render frozen=%d config=%08x",int(frozenRide.valid()),config.configuration);}
         }
         // Native model/handle access stays on the established simulation thread.
         // A bank with no admissible remote players is a valid native-only pair.

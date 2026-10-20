@@ -756,9 +756,51 @@ static bool beginRideGpu(IDirect3DDevice9 *d) {
         std::memcpy(main.m,probe.rideBefore.actualPalette.data(),sizeof(main.m));
         g.handlePositionAgrees=rideHandlesPosition(g.handles,probe.rideBefore.paletteCount,probe.rideBefore.localMainSlot,
             std::span(g.program).first(g.programWords),std::span(b.constants).first(b.constantCount),layout,
-            world,main,probe.rideCamera.view,probe.rideCamera.projection,g.handleWorld);
+            world,main,probe.rideCamera.view,probe.rideCamera.projection,g.handleWorld) ||
+            rideHandlesWorld(g.handles,probe.rideBefore.paletteCount,probe.rideBefore.localMainSlot,world,main,g.handleWorld);
     }
     return true;
+}
+// Lab (SS2VR_LAB_RIDE_DUMP=1): an unknown ride surface's positions and
+// indices, once per layout, as Bin/ride-surface-<vertices>-<triangles>.bin
+// (u32 vertices, u32 triangles, float3 positions, u16 indices), to find a
+// vehicle's control handles offline. Read-only locks, nothing retained.
+static void labDumpRideSurface(IDirect3DDevice9 *d,const RideMainDrawCopy &draw) {
+    static const bool enabled=[] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_RIDE_DUMP",v,2)==1 && v[0]==L'1'; }();
+    static std::array<std::pair<int32_t,int32_t>,16> done{};
+    static unsigned doneCount=0;
+    const auto &l=draw.layout;
+    if(!enabled || l.vertices<=0 || l.triangles<=0 || l.vertices>200000 || l.triangles>400000 || doneCount>=done.size())return;
+    for(unsigned i=0;i<doneCount;++i)if(done[i]==std::make_pair(l.vertices,l.triangles))return;
+    done[doneCount++]={l.vertices,l.triangles};
+    log("Lab ride surface layout vertices=%d triangles=%d positions=%u/%02x/%u indices=%u/%02x/%u weights=%u/%02x/%u local=%u/%02x/%u palette=%u",
+        l.vertices,l.triangles,l.channels[0].offset,l.channels[0].format,l.channels[0].buffer,l.channels[1].offset,l.channels[1].format,
+        l.channels[1].buffer,l.channels[2].offset,l.channels[2].format,l.channels[2].buffer,l.channels[3].offset,l.channels[3].format,
+        l.channels[3].buffer,draw.paletteCount);
+    if(l.channels[0].format!=0x85 || l.channels[1].format!=0x87)return;
+    IDirect3DVertexBuffer9 *vb=nullptr;UINT offset=0,stride=0;IDirect3DIndexBuffer9 *ib=nullptr;
+    if(FAILED(d->GetStreamSource(l.channels[0].buffer,&vb,&offset,&stride)) || !vb)return;
+    if(FAILED(d->GetIndices(&ib)) || !ib) {vb->Release();return;}
+    std::vector<uint8_t> positions(size_t(l.vertices)*12),indices(size_t(l.triangles)*6);
+    void *mapped=nullptr;
+    bool ok=SUCCEEDED(vb->Lock(l.channels[0].offset,UINT(positions.size()),&mapped,D3DLOCK_READONLY)) && mapped;
+    if(ok){std::memcpy(positions.data(),mapped,positions.size());vb->Unlock();}
+    mapped=nullptr;
+    ok=ok && SUCCEEDED(ib->Lock(l.channels[1].offset,UINT(indices.size()),&mapped,D3DLOCK_READONLY)) && mapped;
+    if(ok){std::memcpy(indices.data(),mapped,indices.size());ib->Unlock();}
+    vb->Release();ib->Release();
+    if(!ok)return;
+    wchar_t path[MAX_PATH]{};HMODULE self=nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&labDumpRideSurface),&self);
+    std::wstring file(path,GetModuleFileNameW(self,path,MAX_PATH));
+    file=file.substr(0,file.find_last_of(L"\\/")+1)+L"ride-surface-"+std::to_wstring(l.vertices)+L"-"+std::to_wstring(l.triangles)+L".bin";
+    if(FILE *f=_wfopen(file.c_str(),L"wb")) {
+        const uint32_t header[2]{uint32_t(l.vertices),uint32_t(l.triangles)};
+        std::fwrite(header,4,2,f);std::fwrite(positions.data(),1,positions.size(),f);std::fwrite(indices.data(),1,indices.size(),f);
+        std::fclose(f);
+        log("Lab ride surface written vertices=%d triangles=%d",l.vertices,l.triangles);
+    }
 }
 static bool finishRideGpu(IDirect3DDevice9 *d) {
     return rideGpuOwnerCurrent(d) &&
@@ -952,9 +994,31 @@ static HRESULT probeScopeDraw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
         if(paletteContentEligible && remote_render::copyCurrentRideMainDraw(probe.rideBefore))
             probe.rideBefore.api={uint32_t(type),base,minimum,vertices,start,primitives};
         probe.device = d; d->AddRef();
+        if(probe.rideBefore.bank) {
+            // Bounded trace: which ride surfaces are seen and whether they are admitted.
+            static unsigned traced=0;
+            static std::array<std::pair<int32_t,int32_t>,24> seen{};
+            const auto key=std::make_pair(probe.rideBefore.layout.vertices,probe.rideBefore.layout.triangles);
+            bool fresh=true;for(unsigned i=0;i<traced && i<seen.size();++i)fresh=fresh && seen[i]!=key;
+            if(fresh && traced<seen.size()) {
+                seen[traced++]=key;
+                log("Ride surface seen vertices=%d triangles=%d supported=%d palette=%u",key.first,key.second,
+                    int(rideSurfaceSupported(probe.rideBefore.layout)),probe.rideBefore.paletteCount);
+            }
+        }
         if(probe.rideBefore.bank && rideSurfaceSupported(probe.rideBefore.layout) && !probe.submissionOwner && !probe.idleTrace && !probe.raster.pose.valid &&
            remote_render::claimRideGpuAttempt(probe.rideBefore)) {
             probe.rideGpuAttempt=beginRideGpu(d);
+            static unsigned traced=0;
+            if(traced<40) {
+                ++traced;
+                const auto &g=probe.rideGpu;
+                log("Ride gpu attempt=%d copied=%d profile=%u handles=%d agrees=%d camera=%d",int(probe.rideGpuAttempt),int(g.copied),
+                    unsigned(g.handles.profile),int(g.handles.copied),int(g.handlePositionAgrees),int(probe.rideCameraCaptured));
+            }
+        } else if(probe.rideBefore.bank && !rideSurfaceSupported(probe.rideBefore.layout) && !probe.submissionOwner &&
+                  !probe.idleTrace && !probe.raster.pose.valid) {
+            labDumpRideSurface(d,probe.rideBefore);
         }
         if (admitted) probe.transaction = scopeGpuTransactionBegin(d);
         if (admitted) {

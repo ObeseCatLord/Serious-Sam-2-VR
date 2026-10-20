@@ -91,4 +91,31 @@ inline bool rideHandlesPosition(const RideHandleGeometry &geometry,uint32_t pale
     }
     world=next;return true;
 }
+// The handles' world positions from the model's world and Main palette
+// transforms alone (mesh and palette input checked as above). Single-pass
+// stereo rewrites the vertex constants, so the emulated clip comparison of
+// rideHandlesPosition cannot agree in VR; the transforms are the same ones.
+inline bool rideHandlesWorld(const RideHandleGeometry &geometry,uint32_t paletteCount,uint32_t mainSlot,
+        const Matrix34 &modelWorld,const Matrix34 &main,std::array<std::array<Vec3,RideHandleMesh::MaxVertices>,2> &world) {
+    world={};
+    if(!geometry.copied || geometry.profile==RideHandleProfile::Unknown || !paletteCount || paletteCount>32 ||
+       mainSlot>=paletteCount)return false;
+    const auto affine=affineMultiply(modelWorld,main);
+    std::array<std::array<Vec3,RideHandleMesh::MaxVertices>,2> next{};
+    for(unsigned hand=0;hand<2;++hand) {
+        const auto &mesh=geometry.handles[hand];
+        if(!mesh.vertices || mesh.vertices>RideHandleMesh::MaxVertices)return false;
+        for(unsigned vertex=0;vertex<mesh.vertices;++vertex) {
+            const auto p=mesh.positions[vertex];
+            const scope_position::VehicleRigidPaletteInput input{mesh.localIndices[vertex],mesh.weights[vertex],paletteCount};
+            if(input.indices[0]!=mainSlot || !input.valid())return false;
+            const Vec3 w{affine.m[0]*p.x+affine.m[1]*p.y+affine.m[2]*p.z+affine.m[3],
+                affine.m[4]*p.x+affine.m[5]*p.y+affine.m[6]*p.z+affine.m[7],
+                affine.m[8]*p.x+affine.m[9]*p.y+affine.m[10]*p.z+affine.m[11]};
+            if(!std::isfinite(w.x+w.y+w.z))return false;
+            next[hand][vertex]=w;
+        }
+    }
+    world=next;return true;
+}
 } // namespace ss2vr

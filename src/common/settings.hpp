@@ -31,6 +31,10 @@ struct VrSettings {
     bool immersiveVehicleGrips = true;
     bool instantRides = true; // [Rides] InstantTransitions: mount and dismount without the animation.
     bool creatureHandAim = true; // [Rides] HandAimCreatures: dinosaurs aim where the right hand points.
+    bool rideHeadPitch = true; // [Rides] HeadPitchAim: a ride's guns pitch with the head.
+    // [Vehicles] GripTurnRateDegrees: holding a ride's own controls turned turns
+    // it at up to this rate (a control stick); 0 turns it with the hands 1:1.
+    float gripTurnRateDegrees = 120;
     // [Voice] multiplayer voice chat with other SS2VR players (common/voice.hpp).
     struct Voice {
         bool receive = true;           // Receive: hear other players.

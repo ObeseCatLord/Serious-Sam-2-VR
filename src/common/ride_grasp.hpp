@@ -71,6 +71,7 @@ struct RideGrasp {
     uint64_t sequence=0;
     float angle=0,travel=0,baseHeading=0,returnedHeading=0;
     bool keyed=false;
+    uint32_t mismatch=0,rekeys=0; // Diagnostics, after the verified layout.
     void cancel(const Input &input,uint32_t producer) {
         for(auto &hand:hands) {
             hand.armed=hand.held=false;hand.handle=-1;
@@ -94,6 +95,17 @@ struct RideGrasp {
             continuity==worldContinuity;
         if(!eligible || !worldContinuity || !std::isfinite(nativeHeading)) {cancel(input,producer);return false;}
         if(!same || input.sequence<sequence) {
+            // Which part of the identity changed (diagnostics only).
+            mismatch=(keyed?0u:1u)|(identity.render==frame.render?0u:2u)|
+                (identity.configuration==frame.configuration&&identity.file==frame.file&&identity.resource==frame.resource?0u:4u)|
+                (identity.parameter==frame.parameter&&identity.stretch==frame.stretch?0u:8u)|
+                (identity.rig.graphics==frame.rig.graphics?0u:16u)|
+                (!std::memcmp(&identity.rig.origin,&frame.rig.origin,sizeof(Pose))&&identity.rig.turn==frame.rig.turn?0u:32u)|
+                (identity.profile==frame.profile&&identity.rig.revision==frame.rig.revision&&identity.rig.generation==frame.rig.generation?0u:64u)|
+                (identity.rig.producer==producer&&identity.rig.rider==frame.rig.rider?0u:128u)|
+                (identity.session==input.session&&identity.reference==input.reference?0u:256u)|
+                (continuity==worldContinuity?0u:512u)|(input.sequence<sequence?1024u:0u);
+            ++rekeys;
             cancel(input,producer);identity={frame.rig,frame.render,frame.configuration,frame.file,frame.resource,
                 frame.parameter,input.session,input.reference,frame.stretch,frame.profile};
             continuity=worldContinuity;keyed=true;

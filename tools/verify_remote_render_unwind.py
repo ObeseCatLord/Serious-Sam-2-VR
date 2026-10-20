@@ -45,7 +45,10 @@ def verify_ride_frame_source(text):
             commit.index('committed=commitNativeFrame(')<commit.index('if(committed)publishRideObservation(') and
             'if(completed)publishRideObservation(owner,false);' in mono,
             'Retained publication must follow successful stereo or normal mono completion')
-    require('!rideFrameSeen[0]||(stereo&&!rideFrameSeen[1])' in publish and
+    # Single-pass stereo observes the ride once: eye 0 stands for eye 1.
+    require('!rideFrameSeen[0])return;' in publish and
+            'if(stereo&&!rideFrameSeen[1]){' in publish and
+            'rideFrames[1]=rideFrames[0];rideFrameSeen[1]=true;' in publish and
             'emit("SeatCanonical",frame.seat);' in publish and
             'resourceClaim=0seatClaim=0graspClaim=0steeringClaim=0' in publish and
             'schema=5source=%.*s' in publish,
@@ -90,8 +93,11 @@ def verify_ride_grip_submission_source(host,remote):
             'if(rideGripEnabled&&stereo&&request&&rig)publishRideGripFrame(*request,*rig);' in publish and
             publish.index('rideObservationOwnerCurrent(')<publish.index('publishRideGripFrame(*request,*rig)'),
             'Geometry handoff must stay behind retained-bank stereo admission')
-    require('if(selected[eye]||!g.copied||!g.handles.copied||!g.handlePositionAgrees)returnfalse;' in r,
-            'Production geometry must reject draw ambiguity and unproved positions')
+    # The first copied draw with proved positions is used; later duplicates of
+    # the same draw (single-pass stereo) are skipped, never mixed in.
+    require('if(selected[eye]||!g.copied||!g.handles.copied||!g.handlePositionAgrees)continue;' in r and
+            'if(!selected[eye])returnrideGripFrameFail(3);' in r,
+            'Production geometry must take one copied draw with proved positions')
     return {'finite_submission_guards_checked':True,'runtime_executed':False}
 
 

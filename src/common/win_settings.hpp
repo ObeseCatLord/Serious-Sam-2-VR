@@ -49,6 +49,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.singlePass = number(L"Render", L"SinglePass", 1, 0, 1) >= .5f;
     settings.instantRides = number(L"Rides", L"InstantTransitions", 1, 0, 1) >= .5f;
     settings.creatureHandAim = number(L"Rides", L"HandAimCreatures", 1, 0, 1) >= .5f;
+    settings.rideHeadPitch = number(L"Rides", L"HeadPitchAim", 1, 0, 1) >= .5f;
     {
         auto &v = settings.voice;
         v.receive = number(L"Voice", L"Receive", 1, 0, 1) >= .5f;
@@ -81,6 +82,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.physicalMelee = number(L"Melee", L"Enabled", 0, 0, 1) >= .5f;
     settings.immersiveSwimming = number(L"Swimming", L"Immersive", 0, 0, 1) >= .5f;
     settings.immersiveVehicleGrips = number(L"Vehicles", L"ImmersiveGrips", 1, 0, 1) >= .5f;
+    settings.gripTurnRateDegrees = number(L"Vehicles", L"GripTurnRateDegrees", 120, 0, 360);
     {
         auto &w = settings.steeringWheel;
         w.enabled = number(L"SteeringWheel", L"Enabled", 1, 0, 1) >= .5f;
