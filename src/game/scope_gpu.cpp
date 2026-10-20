@@ -1,3 +1,4 @@
+#include "single_pass.hpp"
 #include "scope_gpu.hpp"
 #include "scope_observer.hpp"
 #include "idle_observer.hpp"
@@ -37,7 +38,9 @@ struct BoundColor {
     RECT scissor{};
     std::array<DWORD,colorStates.size()> states{};
     std::array<std::array<float,4>,6> clipPlanes{};
-    UINT width=0,height=0;
+    UINT width=0,height=0;               // The eye's (logical) size.
+    UINT surfaceWidth=0,surfaceHeight=0; // The bound surfaces' (single pass: the pass target).
+    bool stereo=false;                   // A single-pass draw for both eyes.
     bool valid=false;
 };
 struct BoundInputs {
@@ -92,6 +95,8 @@ struct ProbeOwner {
     IDirect3DPixelShader9 *imageShader = nullptr;
     ScopeSourceView sourceView;
     ScopeShaderConstants imageConstants;
+    ScopeShaderConstants eyeConstants[2]; // Single pass: each eye's lens constants.
+    bool stereoImage = false;
     size_t programWords = 0;
     std::array<std::array<float,4>,7> pixelConstants{};
     std::array<DWORD,10> sampler{};
@@ -136,6 +141,8 @@ static bool unlock() noexcept {
     return true;
 }
 static void cleanup(bool aborted) noexcept {
+    single_pass::setEyePixelConstants(0,0,nullptr,nullptr); // Never left set past this draw (or a foreign unwind).
+    single_pass::setInstancingSuspended(false);
     const bool retired = probe.generation != graphicsResourceGeneration();
     if (aborted && probe.idleTrace) probe.idleTrace->reject(IdleWeaponTrace::Rejection::GpuAbort);
     if (aborted) { retireScopeGeometry(); if (!retired) scopeGpuFault(); }
@@ -181,6 +188,7 @@ static void cleanup(bool aborted) noexcept {
     probe.submissionOwner=nullptr;probe.submissionSlot=IdleSubmissionTrace::NoSlot;
     probe.paletteApiSlot=IdleWeaponTrace::MaxPaletteApiPayloads;
     probe.sourceView = {}; probe.imageConstants = {};
+    probe.eyeConstants[0] = probe.eyeConstants[1] = {}; probe.stereoImage = false;
     // No transaction is required for this value-only mapping observation. Its
     // own tail checks run AFTER every Release and retain the sticky reentry bit.
     // `device` is only compared numerically after its invocation reference retires.
@@ -551,7 +559,7 @@ unsigned scopeColorFailure() noexcept { return lastColorFailure; }
 const uint32_t *scopeColorStates() noexcept { return lastColorStates; }
 static bool boundColor(IDirect3DDevice9 *d,BoundColor &b,bool program) {
     if (!probe.raster.opaqueMode || !currentScopeQueryBoundary() ||
-        !scopeGpuEyeOwner(d,b.identity[3],b.identity[4],b.width,b.height) ||
+        !scopeGpuEyeOwner(d,b.identity[3],b.identity[4],b.width,b.height,b.surfaceWidth,b.surfaceHeight,b.stereo) ||
         FAILED(d->GetRenderTarget(0,&b.target)) || !b.target || !identity(b.target,b.identity[1]) ||
         FAILED(d->GetDepthStencilSurface(&b.depth)) || !b.depth || !identity(b.depth,b.identity[2]) ||
         b.identity[1]!=b.identity[3] || b.identity[2]!=b.identity[4] ||
@@ -564,7 +572,7 @@ static bool boundColor(IDirect3DDevice9 *d,BoundColor &b,bool program) {
     D3DSURFACE_DESC target{},depth{};
     if (FAILED(b.target->GetDesc(&target)) || FAILED(b.depth->GetDesc(&depth))) { lastColorFailure=3; return false; }
     for (const auto &surface:{target,depth})
-        if (surface.Type!=D3DRTYPE_SURFACE || surface.Width!=b.width || surface.Height!=b.height ||
+        if (surface.Type!=D3DRTYPE_SURFACE || surface.Width!=b.surfaceWidth || surface.Height!=b.surfaceHeight ||
             surface.MultiSampleType!=D3DMULTISAMPLE_NONE || surface.MultiSampleQuality) { lastColorFailure=4; return false; }
     if (!(target.Usage&D3DUSAGE_RENDERTARGET) || !(depth.Usage&D3DUSAGE_DEPTHSTENCIL)) { lastColorFailure=5; return false; }
     D3DCAPS9 caps{};
@@ -607,6 +615,7 @@ static bool boundColor(IDirect3DDevice9 *d,BoundColor &b,bool program) {
 }
 static bool sameColor(const BoundColor &a,const BoundColor &b) noexcept {
     return a.valid && b.valid && a.width==b.width && a.height==b.height &&
+        a.surfaceWidth==b.surfaceWidth && a.surfaceHeight==b.surfaceHeight && a.stereo==b.stereo &&
         std::equal(std::begin(a.identity),std::end(a.identity),std::begin(b.identity)) &&
         !std::memcmp(&a.viewport,&b.viewport,sizeof(a.viewport)) &&
         !std::memcmp(&a.scissor,&b.scissor,sizeof(a.scissor)) && a.states==b.states &&
@@ -889,37 +898,55 @@ static bool imageCurrent(IDirect3DDevice9 *d) noexcept {
     return scopeGpuTransactionCurrent(d) && scopeGpuForwardingAllowed() && nativeUiDeviceCurrent(d) &&
         d->TestCooperativeLevel() == D3D_OK &&
         !probe.imageRestoreFailed && currentScopeRaster(current) && currentScopeQueryBoundary() &&
-        current.hand == probe.raster.hand && scopeImagePoseMatches(probe.raster.pose,current.pose);
+        current.hand == probe.raster.hand && scopeImagePoseMatches(probe.raster.pose,current.pose,probe.sourceView.alwaysLive);
 }
 static bool prepareImage(IDirect3DDevice9 *d) {
     auto &color = probe.bindings[0].color;
     if (!color.valid || color.states[15] != FALSE ||
         !scopeGpuImage(d,probe.raster.hand,probe.sourceView,probe.image,probe.imageShader) ||
         probe.sourceView.hand != probe.raster.hand ||
-        !scopeImageSourceRecent(probe.sourceView.pose,probe.raster.pose) ||
+        !scopeImageSourceRecent(probe.sourceView.pose,probe.raster.pose,probe.sourceView.alwaysLive) ||
         !scopeOpticalFrameValid(probe.sourceView.pose.opticalFrame)) return false;
     ScopeOpticalFrame optic;
     ScopeImageCoordinates coordinates;
-    Vec3 eye;
     if (!scopeOpticalFrame(probe.cap,probe.raster.pose.affine,optic) ||
-        !scopeImageCoordinates(probe.cap,probe.raster.pose.affine,ScopeUvTransform{probe.uvRows},coordinates) ||
-        !scopeImageEye(eye) ||
-        !scopeShaderConstants(optic,probe.sourceView.opticalProjection,coordinates,eye,1,0,0,probe.imageConstants))
+        !scopeImageCoordinates(probe.cap,probe.raster.pose.affine,ScopeUvTransform{probe.uvRows},coordinates))
         return false;
-    // Forgiving eye box: the sniper's scope rides well above the controller, so
-    // a strict exit pupil (about 8 degrees at 4x) blacks the lens unless the
-    // head is exactly behind it. Only a quarter of the eye's sideways offset
-    // drives parallax; the lens still shifts naturally as the head moves.
-    constexpr float EyeBoxParallax = .25f;
-    probe.imageConstants.rows[3][0] *= EyeBoxParallax;
-    probe.imageConstants.rows[3][1] *= EyeBoxParallax;
-    // The source image was rendered from the previous frame's scope pose:
-    // look it up in that camera's frame (rotation and translation exact).
     const auto &source = probe.sourceView.pose.opticalFrame;
-    if (!scopeReprojectConstants(optic,source,probe.imageConstants)) return false;
     Vec3 target;
-    if (scopeImageTarget(probe.raster.hand,target))
-        scopeReticleTarget(source,probe.sourceView.opticalProjection,target,.001f,.012f,probe.imageConstants);
+    const bool aimed = scopeImageTarget(probe.raster.hand,target);
+    // One eye's lens constants (only the eye position, row 3, differs per eye).
+    const auto build = [&](Vec3 eye, ScopeShaderConstants &out) {
+        if (!scopeShaderConstants(optic,probe.sourceView.opticalProjection,coordinates,eye,1,0,0,out)) return false;
+        // Forgiving eye box: the sniper's scope rides well above the controller, so
+        // a strict exit pupil (about 8 degrees at 4x) blacks the lens unless the
+        // head is exactly behind it. Only a quarter of the eye's sideways offset
+        // drives parallax; the lens still shifts naturally as the head moves.
+        constexpr float EyeBoxParallax = .25f;
+        out.rows[3][0] *= EyeBoxParallax;
+        out.rows[3][1] *= EyeBoxParallax;
+        // The source image was rendered from the previous frame's scope pose:
+        // look it up in that camera's frame (rotation and translation exact).
+        if (!scopeReprojectConstants(optic,source,out)) return false;
+        // The crosshair: thin lines across the whole lens through where the shot
+        // lands (the laser's hit), as a rifle scope's reticle.
+        // Without this frame's laser sample: the optical centre, where the shots
+        // land too (lab V621: the laser's hit at uv 0.500,0.49).
+        if (!aimed || !scopeReticleTarget(source,probe.sourceView.opticalProjection,target,.0015f,2.f,out))
+            out.rows[6] = {.5f,.5f,.0015f,2.f};
+        return true;
+    };
+    probe.stereoImage = false;
+    if (probe.bindings[0].color.stereo) {
+        Vec3 eyes[2];
+        if (!scopeImageEyes(eyes) || !build(eyes[0],probe.eyeConstants[0]) || !build(eyes[1],probe.eyeConstants[1]) ||
+            !(probe.eyeConstants[0].rows[3][2] > 1e-6f) || !(probe.eyeConstants[1].rows[3][2] > 1e-6f)) return false;
+        probe.imageConstants = probe.eyeConstants[0];
+        probe.stereoImage = true;
+    } else {
+        Vec3 eye;
+        if (!scopeImageEye(eye) || !build(eye,probe.imageConstants)) return false;
+    }
     if (FAILED(d->GetTexture(0,&probe.originalTexture)) ||
         FAILED(d->GetPixelShaderConstantF(0,probe.pixelConstants[0].data(),7))) return false;
     for (unsigned i=0;i<std::size(imageSamplerStates);++i)
@@ -940,8 +967,13 @@ static bool drawImage(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base,UINT mi
         ok = SUCCEEDED(d->SetSamplerState(0,imageSamplerStates[i],imageSamplerValues[i])) && ok;
     const DWORD values[]{FALSE,D3DCMP_EQUAL,D3DCOLORWRITEENABLE_RED|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_BLUE};
     for (unsigned i=0;i<std::size(imageStates);++i) ok = SUCCEEDED(d->SetRenderState(imageStates[i],values[i])) && ok;
-    if (ok && imageCurrent(d)) ok = SUCCEEDED(forward(d,type,base,minimum,vertices,start+range.firstIndex,range.triangles));
-    else ok = false;
+    if (ok && imageCurrent(d)) {
+        // Single pass: each eye's region gets its own eye position (parallax).
+        if (probe.stereoImage)
+            single_pass::setEyePixelConstants(0,7,probe.eyeConstants[0].rows[0].data(),probe.eyeConstants[1].rows[0].data());
+        ok = SUCCEEDED(forward(d,type,base,minimum,vertices,start+range.firstIndex,range.triangles));
+        single_pass::setEyePixelConstants(0,0,nullptr,nullptr);
+    } else ok = false;
     ok = restoreImageState(d) && ok;
     return ok && imageCurrent(d);
 }
@@ -1071,12 +1103,16 @@ static HRESULT probeScopeDraw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
                     sameColor(a.color,b.color) && imageCurrent(d) && start <= UINT32_MAX-ScopeTriangles*3;
                 if (unchanged) {
                     probe.split = true;
+                    // The native cap ranges and the lens over them (EQUAL depth) take
+                    // the same per-region path in a single pass.
+                    single_pass::setInstancingSuspended(true);
                     const bool rendered = executeScopeCapDraw(
                         [&](ScopeDrawRange range) noexcept {
                             return SUCCEEDED(forward(d,type,base,minimum,vertices,start+range.firstIndex,range.triangles));
                         },[&](ScopeDrawRange range) noexcept {
                             return drawImage(d,type,base,minimum,vertices,start,forward,range);
                         },[&]() noexcept { return imageCurrent(d); });
+                    single_pass::setInstancingSuspended(false);
                     if (!rendered) { scopeGpuFault(); result = D3DERR_INVALIDCALL; }
                     else result = D3D_OK;
                 }

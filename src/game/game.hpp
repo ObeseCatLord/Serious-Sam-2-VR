@@ -30,7 +30,7 @@ void installEyeCanvas() noexcept;
 void setDesktopWorld(bool render) noexcept;
 void setSinglePass(bool enabled) noexcept;
 void setEyeReplay(bool enabled) noexcept;
-void setSinglePassWorld(bool on) noexcept;
+void setSinglePassWorld(bool on, const Request *real = nullptr) noexcept;
 bool singlePassChanges(const Request &real, const Request &centre, ss2vr::replay::EyeChange (&out)[2]) noexcept;
 bool singlePassCaptureCentre(const Request &centre) noexcept;
 bool singlePassAdoptEye(void *player, const Request &real, int i) noexcept;

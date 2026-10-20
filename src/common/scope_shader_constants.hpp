@@ -96,7 +96,7 @@ inline bool scopeReticleTarget(const ScopeOpticalFrame &frame,const ScopeOptical
     if (!out.valid || !scopeOpticalFrameValid(frame) || !scopeOpticalProjectionValid(projection) ||
         !std::isfinite(target.x) || !std::isfinite(target.y) || !std::isfinite(target.z) ||
         !std::isfinite(halfWidth) || !std::isfinite(halfLength) ||
-        halfWidth<=0 || halfLength<halfWidth || halfLength>.5f) return false;
+        halfWidth<=0 || halfLength<halfWidth || halfLength>2.f) return false; // Up to lines across the whole lens.
     const double delta[]{double(target.x)-frame.camera.m[3],double(target.y)-frame.camera.m[7],
                          double(target.z)-frame.camera.m[11]};
     double local[3]{};

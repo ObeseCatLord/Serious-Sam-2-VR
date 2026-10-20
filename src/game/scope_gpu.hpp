@@ -18,8 +18,8 @@ const uint32_t *scopeColorStates() noexcept;
 double scopeCapError() noexcept; // Diagnostic: last cap position error (clip-scaled).
 unsigned scopeImageDraws() noexcept;
 const float *scopeEyeInOptic() noexcept; // Diagnostic: last eye position in the optic frame. // Diagnostic: lens image draws so far.
-bool scopeGpuEyeOwner(IDirect3DDevice9 *, IUnknown *&color, IUnknown *&depth,
-                     UINT &width, UINT &height) noexcept;
+bool scopeGpuEyeOwner(IDirect3DDevice9 *, IUnknown *&color, IUnknown *&depth, UINT &width, UINT &height,
+                      UINT &surfaceWidth, UINT &surfaceHeight, bool &stereo) noexcept;
 // Reuse the bridge's existing resource epoch and unconditional pair fault.
 uint64_t graphicsResourceGeneration() noexcept;
 void scopeGpuFault() noexcept;
@@ -32,5 +32,6 @@ bool scopeGpuTransactionCurrent(IDirect3DDevice9 *) noexcept;
 void scopeGpuTransactionEnd() noexcept;
 void scopeGpuOutput(IDirect3DDevice9 *) noexcept;
 bool scopeImageEye(Vec3 &out) noexcept;
+bool scopeImageEyes(Vec3 (&out)[2]) noexcept;
 bool scopeImageTarget(unsigned hand,Vec3 &out) noexcept;
 } // namespace ss2vr::game

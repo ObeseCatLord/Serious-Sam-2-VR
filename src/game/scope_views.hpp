@@ -10,6 +10,7 @@ struct ScopeSourceView {
     Pose camera;
     Fov fov;
     unsigned hand = 2;
+    bool alwaysLive = false; // [Scope] AlwaysLive: admitted while unzoomed too.
 };
 bool scopePreviewNeeded(void *player, const Request &request);
 bool copyScopeSourceView(unsigned hand, ScopeSourceView &out);

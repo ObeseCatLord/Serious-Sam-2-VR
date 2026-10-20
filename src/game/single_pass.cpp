@@ -63,6 +63,10 @@ bool planesApplied = false;     // The device holds transformed planes.
 
 // Pass state.
 bool active = false;
+// Per-eye pixel constants and instancing suspension (setEyePixelConstants).
+const float *eyePixel[2]{};
+UINT eyePixelStart = 0, eyePixelCount = 0;
+bool instancingSuspended = false;
 IDirect3DSurface9 *wideTarget = nullptr;
 UINT eyeWidth = 0, eyeHeight = 0;
 Layout layout;      // Regions of the target the eyes are drawn into.
@@ -874,7 +878,7 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
         });
         return result;
     }
-    if (stereo && instancing && !waterDraw() && instanced(d, call, result)) return result;
+    if (stereo && instancing && !instancingSuspended && !eyePixelCount && !waterDraw() && instanced(d, call, result)) return result;
     return perHalf(d, call, stereo);
 }
 template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo, bool shifted) noexcept {
@@ -956,6 +960,7 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
             applyScissor(d, r);
             applyPlanes(d, int(2 + j));
             waterScope.eye(layout.region[j].eye);
+            if (eyePixelCount) d->SetPixelShaderConstantF(eyePixelStart, eyePixel[layout.region[j].eye], eyePixelCount);
             d->SetStreamSource(15, ring, regionOffset + j * RecordBytes, RecordBytes);
             const HRESULT one = call(false);
             if (SUCCEEDED(hr)) hr = one;
@@ -983,6 +988,7 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
             oSetScissor(d, &s);
         }
         if (stereo) { d->SetStreamSource(15, ring, eyeOffset[g.eye], RecordBytes); applyPlanes(d, int(g.eye)); }
+        if (eyePixelCount) d->SetPixelShaderConstantF(eyePixelStart, eyePixel[g.eye], eyePixelCount);
         const HRESULT one = call(false);
         if (SUCCEEDED(hr)) hr = one;
     }
@@ -1059,6 +1065,7 @@ bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, UINT width, UINT heig
         !width || !height || (regions && (!regions->count || regions->count > MaxRegions)))
         return false;
     engineScreenLock = false; // Never inherited from an earlier, interrupted pass.
+    eyePixelCount = 0; eyePixel[0] = eyePixel[1] = nullptr; instancingSuspended = false;
     active = true; wideTarget = target; eyeWidth = width; eyeHeight = height;
     layout = regions ? *regions : wideLayoutOf(width, height);
     wideLayout = !regions;
@@ -1101,6 +1108,7 @@ void end(IDirect3DDevice9 *d) noexcept {
     lastEligible = eligibleIndex;
     labRangeSet = false; labDetail = ~0u;
     active = false; wideTarget = nullptr; suspended = false;
+    eyePixelCount = 0; eyePixel[0] = eyePixel[1] = nullptr; instancingSuspended = false;
     d->SetStreamSource(15, nullptr, 0, 0);
     d->SetStreamSourceFreq(15, 1);
     if (engineDeclaration) oSetDeclaration(d, engineDeclaration);
@@ -1131,6 +1139,16 @@ void afterRenderTarget(IDirect3DDevice9 *d, DWORD index, IDirect3DSurface9 *targ
         oSetVertexShader(d, engineShader);
     } else bindVariants(d);
 }
+bool passExtent(UINT &targetWidth, UINT &targetHeight, UINT &width, UINT &height) noexcept {
+    if (!active || !wideTarget) return false;
+    targetWidth = layout.width; targetHeight = layout.height; width = eyeWidth; height = eyeHeight;
+    return targetWidth && targetHeight && width && height;
+}
+void setEyePixelConstants(UINT start, UINT count, const float *left, const float *right) noexcept {
+    if (!count || !left || !right) { eyePixelCount = 0; eyePixel[0] = eyePixel[1] = nullptr; return; }
+    eyePixelStart = start; eyePixelCount = count; eyePixel[0] = left; eyePixel[1] = right;
+}
+void setInstancingSuspended(bool value) noexcept { instancingSuspended = value; }
 bool drawing(IDirect3DDevice9 *d) noexcept {
     if (!active || !wideTarget) return false;
     IDirect3DSurface9 *rt = nullptr;

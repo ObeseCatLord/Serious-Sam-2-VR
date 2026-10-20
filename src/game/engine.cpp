@@ -4895,8 +4895,13 @@ void endEye() {
 }
 // True while the single-pass world renders from the centre camera (its per-eye
 // lab camera receipts come from singlePassAdoptEye instead).
-static bool singlePassWorld = false;
-void setSinglePassWorld(bool on) noexcept { singlePassWorld = on; }
+static bool singlePassWorld = false, singlePassRealValid = false;
+static Request singlePassReal{}; // The real stereo request while the centre pass renders.
+void setSinglePassWorld(bool on, const Request *real) noexcept {
+    singlePassWorld = on;
+    singlePassRealValid = on && real;
+    if (singlePassRealValid) singlePassReal = *real;
+}
 static Pose *__fastcall camera(void *p, void *, Pose *out) {
     originalCamera(p, out);
     auto s = copySnapshot();
@@ -7315,6 +7320,16 @@ bool scopeImageTarget(unsigned hand,Vec3 &out) noexcept {
     out = aim.end;
     return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.z);
 }
+// Single pass: both eyes' positions (the pass renders from the centre camera).
+bool scopeImageEyes(Vec3 (&out)[2]) noexcept {
+    if (!eyePlayer || eyeIndex != 0 || scopePreview || weaponPairFault || !singlePassWorld || !singlePassRealValid ||
+        singlePassReal.sequence != eyeRequest.sequence || singlePassReal.input.sequence != eyeRequest.input.sequence) return false;
+    for (unsigned k = 0; k < 2; ++k) {
+        out[k] = worldEyeTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head,singlePassReal.eye[k]).p;
+        if (!std::isfinite(out[k].x) || !std::isfinite(out[k].y) || !std::isfinite(out[k].z)) return false;
+    }
+    return true;
+}
 bool scopeImageEye(Vec3 &out) noexcept {
     if (!eyePlayer || eyeIndex < 0 || eyeIndex > 1 || scopePreview || weaponPairFault) return false;
     out = worldEyeTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head,
@@ -7346,6 +7361,7 @@ static bool copyScopeSourceViewChecked(unsigned hand, ScopeSourceView &out, unsi
     matrixPose(&out.camera,out.pose.opticalFrame.camera);
     reason = 8; if (!finite(out.camera) || !sameWeaponView(matrix(out.camera),out.pose.opticalFrame.camera)) return false;
     out.hand = hand;
+    out.alwaysLive = settings.scopeAlwaysLive;
     reason = 0;
     return true;
 }

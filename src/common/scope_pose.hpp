@@ -99,7 +99,22 @@ struct ScopePoseObservation {
 // Correspondence of one source preview to a current native final-eye draw.
 // Geometry is independently hashed from that draw; neither this comparison nor
 // a true valid bit alone admits an image. Zero/unavailable angle always declines.
-inline bool scopeImagePoseMatches(const ScopePoseObservation &a,const ScopePoseObservation &b) noexcept {
+// Both unzoomed, or both zoomed with the same native interpolation.
+inline bool scopeZoomSame(const ScopeNativeZoom &a,const ScopeNativeZoom &b) noexcept {
+    if (!a.valid || !b.valid) return !a.valid && !b.valid;
+    return scopeNativeZoom(1,1,a.startMultiplier,a.endMultiplier,a.progress).valid &&
+        a.startMultiplier == b.startMultiplier && a.endMultiplier == b.endMultiplier && a.progress == b.progress;
+}
+// unzoomed: an always-live scope ([Scope] AlwaysLive) also admits the
+// unzoomed sniper (its magnification travels with the source projection).
+inline bool scopeImagePoseMatches(const ScopePoseObservation &a,const ScopePoseObservation &b,
+                                  bool unzoomed = false) noexcept {
+    if (unzoomed) {
+        ScopePoseObservation za = a, zb = b;
+        if (!scopeZoomSame(a.zoom,b.zoom)) return false;
+        if (!a.zoom.valid) { za.zoom = zb.zoom = ScopeNativeZoom{1,1,1,true}; }
+        return scopeImagePoseMatches(za,zb,false);
+    }
     return a.valid && b.valid && a.requestSequence && a.requestSequence == b.requestSequence &&
         a.inputSequence == b.inputSequence && a.ownerHandle && a.ownerHandle == b.ownerHandle &&
         a.weaponHandle && a.weaponHandle == b.weaponHandle && a.modelHandle && a.modelHandle == b.modelHandle &&
@@ -117,13 +132,14 @@ inline bool scopeImagePoseMatches(const ScopePoseObservation &a,const ScopePoseO
 // into the current optic frame; zoom need not match (magnification is the
 // source's own and travels with its projection).
 inline constexpr uint64_t ScopeSourceMaxRequestAge = 64; // Staleness guard only (slow frames latch many requests).
-inline bool scopeImageSourceRecent(const ScopePoseObservation &source,const ScopePoseObservation &current) noexcept {
+inline bool scopeImageSourceRecent(const ScopePoseObservation &source,const ScopePoseObservation &current,
+                                   bool unzoomed = false) noexcept {
     return source.valid && current.valid && source.requestSequence && current.requestSequence > source.requestSequence &&
         current.requestSequence - source.requestSequence <= ScopeSourceMaxRequestAge && source.ownerHandle &&
         source.ownerHandle == current.ownerHandle && source.weaponHandle && source.weaponHandle == current.weaponHandle &&
         source.modelHandle && source.modelHandle == current.modelHandle && source.generation &&
         source.generation == current.generation && source.layout == current.layout &&
-        finiteMatrix(source.affine) && finiteMatrix(current.affine) && source.zoom.valid && current.zoom.valid;
+        finiteMatrix(source.affine) && finiteMatrix(current.affine) && (unzoomed || (source.zoom.valid && current.zoom.valid));
 }
 inline bool scopeObservationThread(uint32_t owner, uint32_t current, bool mainThread) {
     return owner && owner != UINT32_MAX && owner == current && mainThread;

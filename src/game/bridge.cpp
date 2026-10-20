@@ -735,7 +735,8 @@ bool scopeGpuImage(IDirect3DDevice9 *d,unsigned hand,ScopeSourceView &view,
     shader = uiFrame.scopeShader; shader->AddRef();
     return true;
 }
-bool scopeGpuEyeOwner(IDirect3DDevice9 *d,IUnknown *&color,IUnknown *&z,UINT &w,UINT &h) noexcept {
+bool scopeGpuEyeOwner(IDirect3DDevice9 *d,IUnknown *&color,IUnknown *&z,UINT &w,UINT &h,
+                      UINT &surfaceW,UINT &surfaceH,bool &stereo) noexcept {
     if(color || z || !scopeGpuRoutingCurrent(d) || activeEye<0 || activeEye>1 ||
         uiFrame.slot<0 || uiFrame.device!=d || uiFrame.fault || uiFrame.overlay || stopping || uiHalted ||
         uiFrame.generation!=graphicsResourceGeneration() ||
@@ -743,6 +744,14 @@ bool scopeGpuEyeOwner(IDirect3DDevice9 *d,IUnknown *&color,IUnknown *&z,UINT &w,
         renderRequest.input.sequence!=uiFrame.request.input.sequence ||
         !uiFrame.target[activeEye] || !uiFrame.z[activeEye]) return false;
     w=uiFrame.request.width; h=uiFrame.request.height;
+    surfaceW=w; surfaceH=h; stereo=false;
+    // Single pass: one draw for both eyes into the pass's wide (or atlas) target,
+    // swapped in as eye 0's; viewport and scissor read back as the eye's own.
+    UINT targetW=0,targetH=0,eyeW=0,eyeH=0;
+    if(single_pass::passExtent(targetW,targetH,eyeW,eyeH)) {
+        if(activeEye!=0 || eyeW!=w || eyeH!=h || !single_pass::drawing(d)) return false;
+        surfaceW=targetW; surfaceH=targetH; stereo=true;
+    }
     return w && h &&
         SUCCEEDED(uiFrame.target[activeEye]->QueryInterface(IID_IUnknown,reinterpret_cast<void **>(&color))) && color &&
         SUCCEEDED(uiFrame.z[activeEye]->QueryInterface(IID_IUnknown,reinterpret_cast<void **>(&z))) && z;
@@ -3962,7 +3971,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                     const bool spCompare=spBisect && !foveated && !spDone && ++spFrames%30==0;
                     if(ok && spCompare && single_pass::begin(d,uiFrame.target[0],width,height,singlePassChange)) {
                         single_pass::labInstanceRange(0,0,~0u);
-                        setSinglePassWorld(true);
+                        setSinglePassWorld(true,&request);
                         ok=observedWorldRender(d,puppet,original,centre,0,false);
                         setSinglePassWorld(false);
                         single_pass::end(d);
@@ -3977,7 +3986,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                         const unsigned mid=spLo+(spHi-spLo)/2;
                         if(ok && single_pass::begin(d,uiFrame.target[0],width,height,singlePassChange)) {
                             single_pass::labInstanceRange(0,mid,spHi-spLo<=1 ? spLo : ~0u);
-                            setSinglePassWorld(true);
+                            setSinglePassWorld(true,&request);
                             ok=observedWorldRender(d,puppet,original,centre,0,traceDepth);
                             setSinglePassWorld(false);
                             const unsigned eligible=single_pass::labEligibleCount();
@@ -4007,7 +4016,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                             else if(single_pass::labMirrorTarget() || sweep) single_pass::labAllowPixelShaders(rb.step-2<psList.size() ? std::vector<uint32_t>{psList[rb.step-2]} : psList,true);
                             else single_pass::labAllowPixelShaders(std::vector<uint32_t>(psList.begin()+rb.lo,psList.begin()+(rb.lo+rb.hi)/2),true);
                         } else if(rb.on) single_pass::labAllowPixelShaders({},false);
-                        setSinglePassWorld(true);
+                        setSinglePassWorld(true,&request);
                         ok=observedWorldRender(d,puppet,original,centre,0,traceDepth);
                         if(measure && ok) {
                             IDirect3DSurface9 *mirror=single_pass::labMirrorTarget();

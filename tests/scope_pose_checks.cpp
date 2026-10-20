@@ -84,6 +84,16 @@ int main() {
         other = next; other.generation++; assert(!scopeImageSourceRecent(accepted,other));
         other = next; other.ownerHandle++; assert(!scopeImageSourceRecent(accepted,other));
         other = next; other.zoom = {}; assert(!scopeImageSourceRecent(accepted,other));
+        assert(scopeImageSourceRecent(accepted,other,true)); // Always-live scope: unzoomed is admitted.
+    }
+    {
+        // Always-live scope: both unzoomed match; one zoomed and one not never does.
+        auto a = accepted, b = accepted;
+        a.zoom = {}; b.zoom = {};
+        assert(!scopeImagePoseMatches(a,b) && scopeImagePoseMatches(a,b,true));
+        assert(!scopeImagePoseMatches(a,accepted,true) && !scopeImagePoseMatches(accepted,a,true));
+        assert(scopeImagePoseMatches(accepted,accepted,true));
+        b.requestSequence++; assert(!scopeImagePoseMatches(a,b,true));
     }
     auto changed = accepted;
     changed.requestSequence++; assert(!scopeImagePoseMatches(accepted,changed)); changed=accepted;

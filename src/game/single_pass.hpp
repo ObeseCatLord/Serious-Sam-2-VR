@@ -58,6 +58,15 @@ bool begin(IDirect3DDevice9 *device, IDirect3DSurface9 *target, UINT eyeWidth, U
 void end(IDirect3DDevice9 *device) noexcept;
 // Whether a draw on this device belongs to the pass (active and RT0 is the wide target).
 bool drawing(IDirect3DDevice9 *device) noexcept;
+// The active pass's target size and each eye's (logical) size.
+bool passExtent(UINT &targetWidth, UINT &targetHeight, UINT &eyeWidth, UINT &eyeHeight) noexcept;
+// Pixel constants that differ per eye (the scope lens's eye position): set in
+// each eye's region before its draw, for draws issued while set. Null clears.
+// Also keeps those draws off the instanced path (one draw cannot carry both).
+void setEyePixelConstants(UINT start, UINT count, const float *left, const float *right) noexcept;
+// Keeps draws on the per-region path (the native scope cap the lens is drawn over
+// with an EQUAL depth test must take the same path as the lens).
+void setInstancingSuspended(bool suspended) noexcept;
 // Around the engine's SetRenderTarget: the pass restores the engine's state
 // first, and suspends its stereo bindings while another target is bound.
 void beforeRenderTarget(IDirect3DDevice9 *device, DWORD index) noexcept;
