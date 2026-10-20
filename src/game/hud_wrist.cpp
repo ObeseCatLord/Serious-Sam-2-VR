@@ -7,17 +7,17 @@
 namespace ss2vr::game::hud_wrist {
 namespace {
 
-// Left wrist: the player's own state (health, armor, lives, Netricsa's new
-// message icon, air, power-ups) and the left hand's ammo. Right wrist: ammo,
-// grenades and bombs, weapon combos, vehicle ammo, score. Everything else
-// (messages, prompts, subtitles, boss bar, the Netricsa screen) stays head-mounted.
+// Left wrist: the player's own state (health, armor, lives, air, power-ups)
+// and the left hand's ammo. Right wrist: ammo, grenades and bombs, weapon
+// combos, vehicle ammo, score. Everything else (Netricsa's icon and screen,
+// messages, prompts, subtitles, boss bar) stays head-mounted.
 struct Element {
     const char *name;
     int side;
 };
 constexpr Element Elements[] = {
     {"CHealthSimpleHudElement", Left},       {"CArmorSimpleHudElement", Left},
-    {"CLivesSimpleHudElement", Left},        {"CNetricsaIconHudElement", Left},
+    {"CLivesSimpleHudElement", Left},
     {"CAirSimpleHudElement", Left},          {"CAdrenalineSimpleHudElement", Left},
     {"CFrozenSimpleHudElement", Left},       {"CLeftAmmoHudElement", Left},
     {"CSeriousDamageHudElement", Left},      {"CSeriousJumpHudElement", Left},

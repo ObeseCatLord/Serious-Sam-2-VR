@@ -3,7 +3,8 @@
 #include <cmath>
 #include <cstdint>
 
-// Immersive hand grenades. The grenade button puts a grenade in the off hand;
+// Immersive hand grenades. The grenade button puts a grenade in a hand (the game
+// passes the right one, its weapon put away meanwhile);
 // a throwing motion of that hand (fast and away from the body) releases it, and
 // it flies toward where the other hand's laser points. Pressing the button again
 // puts the grenade away. Positions are in tracking space (metres), times in ms.

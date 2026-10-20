@@ -2612,10 +2612,10 @@ static void update(void *p) {
     // otherwise throws a hand grenade.
     s.sprint = enabled && !resettingControls && (leftContextual & Button::Sprint);
     {
-        // The right stick click takes a grenade into the off hand (the hand
-        // without the lone weapon, else the left) or puts it away; a throwing
-        // motion of that hand throws it (the native throw, plcmdTertFire, aimed
-        // in playerViewOrigin).
+        // The right stick click takes a grenade into the right hand (its weapon
+        // is put away meanwhile) or puts it away; a throwing motion of that hand
+        // throws it at where the left hand aims (the native throw, plcmdTertFire,
+        // aimed in playerViewOrigin).
         // On release of the click, so that clicking both sticks (recentre) does
         // not also take a grenade.
         static bool previousButton = false, armed = false;
@@ -2625,9 +2625,7 @@ static void update(void *p) {
         const bool pressed = !button && previousButton && armed;
         if (!button) armed = false;
         previousButton = button;
-        unsigned offHand = 0;
-        if (rider.handheld() && !aliased(s) && (s.handle[0] != 0) != (s.handle[1] != 0))
-            offHand = 1u - mountHand(s, s.handle[0] ? 0u : 1u);
+        constexpr unsigned offHand = 1; // The right hand throws; the left aims.
         const int32_t grenades = grenadeAmmoQuantity ? grenadeAmmoQuantity(static_cast<uint8_t *>(p) + 0x8f8,
                                                                                HandGrenadeAmmo) : 1;
         if (!enabled || resettingControls || !rider.handheld() || wheels[0].open || wheels[1].open)
@@ -5110,8 +5108,8 @@ static Pose *__fastcall playerViewOrigin(void *p, void *, Pose *out, int purpose
     originalViewOrigin(p, out, purpose);
     if (caller == grenadeViewReturn) {
         // The hand-grenade throw (after its cooldown and ammo checks) takes its
-        // start and direction from here: start at the grenade in the off hand,
-        // aimed at the end of the other hand's laser (its aim if it has none).
+        // start and direction from here: start at the grenade in the right hand,
+        // aimed at the end of the left hand's laser (its aim if it has none).
         // The game then adds its throw pitch and picks the speed from the pitch.
         if (!grenadeLaunching.load() || !nativeMainThread || !nativeMainThread()) return out;
         const auto s = copySnapshot();

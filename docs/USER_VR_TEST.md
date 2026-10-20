@@ -39,7 +39,8 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
    instead of arms reaching back to your face.
 4. Wrist HUD (`[HUD] Mode=1`, or "HUD" in the VR options menu). Turn your left
    wrist toward you to see health, armor and lives on a watch face, and the right
-   wrist for ammo, grenades and score. Messages and prompts stay in front of you.
+   wrist for ammo, grenades and score. Messages, prompts and Netricsa stay in front
+   of you.
    "Head-mounted" in the options menu brings back the old HUD. "Wrist HUD size"
    scales the watches.
 5. Spatial sound (`[Audio] Spatial`): the game now plays through OpenAL Soft with
@@ -48,6 +49,11 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
    (`[Audio] Occlusion`). `Sam2.log` should say `Sfx API: OpenAL` and `Device:
    OpenAL Soft`. If sound is missing, set `Spatial=0` and report the
    `Spatial audio:` lines in `Bin/SS2VR.log`.
+
+6. Hand grenades (2026-10-20, later): the right stick click now always puts the
+   grenade in your right hand (its weapon is put away until you throw or click
+   again). Throw it with the right hand; it flies where your left hand aims (the
+   left laser's dot, or where the left controller points).
 
 ## Voice chat (multiplayer, 2026-10-19)
 
