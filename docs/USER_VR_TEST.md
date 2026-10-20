@@ -23,6 +23,32 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## New after the vehicle and scope report (2026-10-20)
+
+1. Hoverbike (Road to Ursul save): no steering wheel. Squeeze both grips on the
+   bike's own red-knob handles and twist your hands. Held twisted, the bike keeps
+   turning, like a control stick (`[Vehicles] GripTurnRateDegrees`, 0 for 1:1
+   handlebars). The right stick does not turn a ride that has handles. Look up and
+   down: the guns pitch with your head (`[Rides] HeadPitchAim`). The laser leaves
+   the gun muzzle. The view should stay steady while riding.
+2. Sniper rifle, in either hand: the scope shows a live 4x picture without zooming
+   (`[Scope] AlwaysLive`, `IdleMagnification`). Zooming uses the game's own zoom.
+   Thin crosshair lines cross the lens through where the shot lands. Both eyes
+   should see it (single-pass stereo stays on).
+3. Serious Bomb: the gloves match the other weapons' hands, with short forearms
+   instead of arms reaching back to your face.
+4. Wrist HUD (`[HUD] Mode=1`, or "HUD" in the VR options menu). Turn your left
+   wrist toward you to see health, armor and lives on a watch face, and the right
+   wrist for ammo, grenades and score. Messages and prompts stay in front of you.
+   "Head-mounted" in the options menu brings back the old HUD. "Wrist HUD size"
+   scales the watches.
+5. Spatial sound (`[Audio] Spatial`): the game now plays through OpenAL Soft with
+   headphone HRTF, and your head is the listener. Turn your head and sounds should
+   stay put around you. Sounds behind walls should be muffled
+   (`[Audio] Occlusion`). `Sam2.log` should say `Sfx API: OpenAL` and `Device:
+   OpenAL Soft`. If sound is missing, set `Spatial=0` and report the
+   `Spatial audio:` lines in `Bin/SS2VR.log`.
+
 ## Voice chat (multiplayer, 2026-10-19)
 
 Players who all run SS2VR can talk. The server must run SS2VR too: a listen
@@ -279,4 +305,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `7438741`, version `0.2.11-dev.080dd55c12f6` (2026-10-19).
+Installed candidate: commit `884a5dd`, version `0.2.11-dev.a57b6397fa82` (2026-10-20).
