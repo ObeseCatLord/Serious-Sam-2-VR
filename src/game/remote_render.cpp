@@ -1557,7 +1557,7 @@ static void labBoneDump() {
 // stale one (the bomb gone, nothing placed in the right hand since) whose
 // freed instance address another model reused must not move that model's arm.
 static struct { uintptr_t instance = 0; Pose left{}; Quat right{0, 0, 0, 1}; bool valid = false; uint64_t tick = 0; } splitModel;
-static uint32_t splitArmName = 0, splitPalmName = 0;
+static uint32_t splitArmName = 0, splitPalmName = 0, splitArmRightName = 0, splitPalmRightName = 0;
 static void applySplitModel() {
     if (!splitModel.valid || !splitModel.instance || !splitArmName || !finite(splitModel.left) ||
         GetTickCount64() - splitModel.tick > 250)
@@ -1639,6 +1639,53 @@ static void applySplitModel() {
     for (const auto &draw : draws) drawRanges.push_back({draw.mesh, draw.first, draw.count});
     if (!paletteDrawOwners(models, meshRanges, drawRanges, mappings, drawOwners)) return;
     if (paletteInvalidated) return;
+    // The model's arms reach back to the flat view's shoulders; held at the
+    // controllers they swung about rigidly. The arm bones above each palm
+    // (Arm_* down to the palm) shrink toward the palm, leaving a short forearm
+    // behind the glove's cuff, as the revolvers' hands have.
+    std::vector<uint8_t> shrink(bones.size(), 0);
+    std::array<Vec3, 2> palmAt{};
+    for (unsigned side = 0; side < 2; ++side) {
+        const uint32_t armId = side ? splitArmRightName : splitArmName, palmId = side ? splitPalmRightName : splitPalmName;
+        size_t sidePalm = bones.size();
+        for (size_t b = 0; b < bones.size(); ++b)
+            if (bones[b].owner == int32_t(owner) && names[b] == palmId) sidePalm = b;
+        if (sidePalm == bones.size() || !armId ||
+            !readableMemory(static_cast<const uint8_t *>(bones[sidePalm].definition) + 0x48, sizeof(Matrix34)))
+            continue;
+        Matrix34 sideInverseBind, sideBind;
+        std::memcpy(&sideInverseBind, static_cast<const uint8_t *>(bones[sidePalm].definition) + 0x48, sizeof(Matrix34));
+        if (!affineInverse(sideInverseBind, sideBind)) continue;
+        palmAt[side] = matrixTranslation(affineMultiply(canonical[sidePalm], sideBind));
+        // The palm's ancestors up to and including Arm_*.
+        std::vector<size_t> chain;
+        bool reached = false;
+        size_t node = bones[sidePalm].parent < 0 ? bones.size() : size_t(bones[sidePalm].parent);
+        for (size_t hops = 0; hops <= bones.size() && node < bones.size() && bones[node].owner == int32_t(owner); ++hops) {
+            chain.push_back(node);
+            if (names[node] == armId) { reached = true; break; }
+            if (bones[node].parent < 0) break;
+            node = size_t(bones[node].parent);
+        }
+        if (!reached) continue;
+        for (size_t b : chain) shrink[b] = uint8_t(side + 1);
+        static unsigned traced = 0;
+        if (traced++ < 2) log("Bomb arm side=%u chain=%zu palm=%.3f,%.3f,%.3f", side, chain.size(), palmAt[side].x,
+                              palmAt[side].y, palmAt[side].z);
+    }
+    constexpr float ArmKept = .3f;
+    for (size_t i = 0; i < mappings.size(); ++i) {
+        const auto &map = mappings[i];
+        if (map.bone < 0 || size_t(map.bone) >= bones.size() || map.draw < 0 || size_t(map.draw) >= drawOwners.size() ||
+            drawOwners[size_t(map.draw)] != int32_t(owner) || !shrink[size_t(map.bone)])
+            continue;
+        const Vec3 c = palmAt[shrink[size_t(map.bone)] - 1u];
+        Matrix34 scale{};
+        scale.m[0] = scale.m[5] = scale.m[10] = ArmKept;
+        scale.m[3] = c.x * (1 - ArmKept); scale.m[7] = c.y * (1 - ArmKept); scale.m[11] = c.z * (1 - ArmKept);
+        const Matrix34 next = affineMultiply(scale, palette[i]);
+        if (finiteMatrix(next)) palette[i] = next;
+    }
     for (size_t i = 0; i < mappings.size(); ++i) {
         const auto &map = mappings[i];
         if (map.bone < 0 || size_t(map.bone) >= bones.size() || map.draw < 0 || size_t(map.draw) >= drawOwners.size() ||
@@ -1784,6 +1831,8 @@ bool initialize(HMODULE engine, HMODULE core, HMODULE sam, HookInstallerRva inst
     stringId(&scopeName, "Scope");
     stringId(&splitArmName, "Arm_Left");
     stringId(&splitPalmName, "Palm_Left");
+    stringId(&splitArmRightName, "Arm_Right");
+    stringId(&splitPalmRightName, "Palm_Right");
     stringId(&scopeBoneName, "Sniper");
     // The ride's Main and Seat bones (names to match) are needed by the grips
     // too: set only for the lab ride diagnostic, no vehicle handle was ever admitted.

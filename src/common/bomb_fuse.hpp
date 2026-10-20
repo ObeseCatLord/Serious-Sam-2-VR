@@ -18,7 +18,7 @@ struct BombFuse {
     // The flame above the lighter hand's thumb, and the fuse on top of the bomb,
     // in each controller's frame (x right, y up, -z forward).
     static constexpr Vec3 Flame{0, .05f, -.05f};
-    static constexpr Vec3 Fuse{-.03f, .15f, -.05f};
+    static constexpr Vec3 Fuse{-.02f, .10f, -.034f}; // At 87% of the revolver (hand-matched).
     bool lit = false, spent = false;
     uint64_t firedAt = 0;
     bool firing = false;
