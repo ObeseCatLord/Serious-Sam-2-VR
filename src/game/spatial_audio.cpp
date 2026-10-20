@@ -76,6 +76,13 @@ void __cdecl sourcePlay(ALuint source) {
     ++playCalls;
     originalSourcePlay(source);
 }
+std::atomic<int> probeResult{0};
+DWORD WINAPI probeDevice(void *) {
+    void *device = alcOpenDevice(nullptr);
+    if (device) alcCloseDevice(device);
+    probeResult = device ? 1 : -1;
+    return 0;
+}
 std::wstring binDirectory() {
     wchar_t path[MAX_PATH]{};
     const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -206,13 +213,18 @@ bool prepare() {
         log("Spatial audio: OpenAL32.dll did not load (%lu)", GetLastError());
         return false;
     }
-    // The game has no fallback once it picks OpenAL: open the device first.
-    void *device = alcOpenDevice(nullptr);
-    if (!device) {
-        log("Spatial audio: no OpenAL output device; the game's own sound stays");
+    // The game has no fallback once it picks OpenAL: open the device first, on
+    // its own thread with a time limit (an audio service that does not answer
+    // must not hang the game's start; lab V628 stalled here once).
+    probeResult = 0;
+    HANDLE thread = CreateThread(nullptr, 0, probeDevice, nullptr, 0, nullptr);
+    const DWORD waited = thread ? WaitForSingleObject(thread, 4000) : WAIT_FAILED;
+    if (thread) CloseHandle(thread);
+    if (waited != WAIT_OBJECT_0 || probeResult != 1) {
+        log(waited == WAIT_TIMEOUT ? "Spatial audio: the OpenAL output device did not open in 4 s; the game's own sound stays"
+                                   : "Spatial audio: no OpenAL output device; the game's own sound stays");
         return false;
     }
-    alcCloseDevice(device);
     hooked = hookOpenAl();
     log("Spatial audio: OpenAL Soft ready (hooks=%d)", int(hooked));
     preparedOk = true;

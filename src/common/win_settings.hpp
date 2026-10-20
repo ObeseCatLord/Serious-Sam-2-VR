@@ -54,6 +54,8 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.rideHeadPitch = number(L"Rides", L"HeadPitchAim", 1, 0, 1) >= .5f;
     settings.spatialAudio = number(L"Audio", L"Spatial", 1, 0, 1) >= .5f;
     settings.audioOcclusion = number(L"Audio", L"Occlusion", 1, 0, 1) >= .5f;
+    settings.hudMode = int(number(L"HUD", L"Mode", 1, 0, 1) + .5f);
+    settings.hudWristScale = number(L"HUD", L"WristScale", .36f, .1f, 1.f);
     {
         auto &v = settings.voice;
         v.receive = number(L"Voice", L"Receive", 1, 0, 1) >= .5f;

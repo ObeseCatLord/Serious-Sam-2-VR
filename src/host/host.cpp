@@ -2645,7 +2645,7 @@ struct Host {
     // --- VR options panel ---
     enum OptionsItem : unsigned {
         OptFoveation, OptInset, OptPeriphery, OptTurning, OptTurnSpeed, OptLasers, OptFireHaptic, OptDamageHaptic,
-        OptScale, OptInstancing, OptMicrophone, OptVoiceVolume, OptClose, OptCount
+        OptScale, OptInstancing, OptMicrophone, OptVoiceVolume, OptHud, OptHudSize, OptClose, OptCount
     };
     bool instancingSetting() const { return loadSettings(settingsFile).singlePassInstancing; }
     std::vector<OptionsRow> optionRows() const {
@@ -2671,6 +2671,11 @@ struct Host {
         rows[OptMicrophone] = {L"Voice chat microphone", microphone == 0 ? L"Off" : microphone == 1 ? L"Open mic" : L"Hand to mouth",
                                microphone == 1 ? L"(sends while you speak)" : microphone == 2 ? L"(hold a controller to your mouth)" : L""};
         rows[OptVoiceVolume] = {L"Voice chat volume", percent(settings.voice.volume)};
+        rows[OptHud] = {L"HUD", settings.hudMode == 1 ? L"Wrist watches" : L"Head-mounted",
+                        settings.hudMode == 1 ? L"(health left, ammo right)" : L""};
+        wchar_t wrist[24];
+        std::swprintf(wrist, 24, L"%d cm", int(std::lround(settings.hudWristScale * 100)));
+        rows[OptHudSize] = {L"Wrist HUD size", wrist, L"(width of the full HUD)"};
         rows[OptClose] = {L"Close", L""};
         return rows;
     }
@@ -2725,6 +2730,11 @@ struct Host {
         case OptVoiceVolume:
             settings.voice.volume = stepped(settings.voice.volume, direction, .1f, 0, 2);
             saveSetting(L"Voice", L"Volume", settings.voice.volume);
+            break;
+        case OptHud: settings.hudMode = settings.hudMode == 1 ? 0 : 1; saveSetting(L"HUD", L"Mode", settings.hudMode); break;
+        case OptHudSize:
+            settings.hudWristScale = stepped(settings.hudWristScale, direction, .04f, .2f, .6f);
+            saveSetting(L"HUD", L"WristScale", settings.hudWristScale);
             break;
         default: break;
         }

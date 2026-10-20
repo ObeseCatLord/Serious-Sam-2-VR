@@ -38,6 +38,11 @@ struct VrSettings {
     // [Audio] Spatial: the game's sound on OpenAL Soft with HRTF and the tracked
     // head as the listener; Occlusion: sounds behind walls are muffled.
     bool spatialAudio = true, audioOcclusion = true;
+    // [HUD] Mode: 1 the game's HUD as watch faces on the wrists (health, armor,
+    // lives, Netricsa left; ammo, grenades right; the rest head-mounted), 0 all
+    // head-mounted. WristScale: metres the HUD's full width spans on a wrist.
+    int hudMode = 1;
+    float hudWristScale = .36f;
     bool rideHeadPitch = true; // [Rides] HeadPitchAim: a ride's guns pitch with the head.
     // [Vehicles] GripTurnRateDegrees: holding a ride's own controls turned turns
     // it at up to this rate (a control stick); 0 turns it with the hands 1:1.

@@ -46,6 +46,7 @@
 #include "multiplayer.hpp"
 #include "voice.hpp"
 #include "spatial_audio.hpp"
+#include "hud_wrist.hpp"
 #include "common/spatial_audio.hpp"
 #include "native_tracking.hpp"
 #include "native_memory.hpp"
@@ -9459,6 +9460,7 @@ static void __fastcall soundListener(void *list, void *, float a, float b, const
 }
 static void maintainSpatialAudio() {
     spatial_audio::configure({settings.spatialAudio, settings.audioOcclusion});
+    hud_wrist::configure(settings.hudMode == 1, settings.hudWristScale);
     spatial_audio::frame();
 }
 static int __cdecl appForeground() {
@@ -10626,6 +10628,7 @@ static std::vector<void *> ownedHooks;
 static bool attachPoisoned = false;
 static bool rollbackNativeHooks() {
     hooksReady = false;
+    hud_wrist::uninstall();
     rideModelRenderableReturn=0;
     bool result = rollbackHooks(
         ownedHooks,
@@ -11564,6 +11567,7 @@ bool attach(bool headless) {
       originalSetToHand);
     H(g, "?OnWeaponPutDown@CPlayerPuppetEntity@SeriousEngine@@UAEXV?$Handle@VCBaseWeaponEntity@SeriousEngine@@@2@@Z", weaponPutDownTraced,
       originalWeaponPutDown);
+    if (!headless) hud_wrist::install(g, e); // Wrist HUD element tags (no effect in [HUD] Mode=Head).
     if (labRideKind() >= 2) {
         H(g, "?ProcessViewRayCasting@CPlayerBrainEntity@SeriousEngine@@QAEXXZ", viewRayCasting, originalViewRayCasting);
         if (labRideKind() == 2) {

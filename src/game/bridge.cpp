@@ -12,6 +12,7 @@
 #include "native_finally.hpp"
 #include "native_memory.hpp"
 #include "eye_replay.hpp"
+#include "hud_wrist.hpp"
 #include "single_pass.hpp"
 #include "env_probe.hpp"
 #include "scope_gpu.hpp"
@@ -593,6 +594,10 @@ struct NativeUiFrame {
     bool restore = false, ui = false, fault = false, world = false, zeroCopy = false, published = false;
     bool overlay = false, overlaySeen = false, complete = false, fade = false;
     bool hudLayerDirty = false, hudLayerCleared = false; // HUD layer content this frame / cleared this frame.
+    bool hudWristCleared = false;                        // Wrist layer cleared since the last flush.
+    // Wrist HUD: each tagged element's canvas rectangle since the last flush.
+    struct WristRect { float x0 = 0, y0 = 0, x1 = 0, y1 = 0; int side = -1; bool used = false; };
+    WristRect wristRects[hud_wrist::MaxElements];
     bool panelHidden[2]{}; // The HUD panel is behind this eye: the HUD is drawn in neither eye.
     uintptr_t faultOrigin = 0;
     const char *faultReason = "none";
@@ -994,6 +999,9 @@ static DrawUp originalDrawUp = nullptr;
 // expressed as a layer, and fades, flush the layer and keep the per-eye path.
 static IDirect3DTexture9 *hudLayer = nullptr;
 static IDirect3DSurface9 *hudLayerSurface = nullptr;
+// Wrist HUD ([HUD] Mode=1): the wrist elements' layer, beside the head layer.
+static IDirect3DTexture9 *hudWrist = nullptr;
+static IDirect3DSurface9 *hudWristSurface = nullptr;
 static IDirect3DDevice9 *hudLayerDevice = nullptr;
 static bool hudLayerDisabled = false; // Composition failed: keep the per-eye path until resources change.
 static uint64_t hudLayerDisabledGeneration = 0;
@@ -1001,6 +1009,9 @@ static IDirect3DStateBlock9 *hudState = nullptr; // Reused per flush (Capture/Ap
 static void releaseHudLayer() noexcept {
     if (hudLayerSurface) hudLayerSurface->Release();
     if (hudLayer) hudLayer->Release();
+    if (hudWristSurface) hudWristSurface->Release();
+    if (hudWrist) hudWrist->Release();
+    hudWristSurface = nullptr; hudWrist = nullptr;
     if (hudState) hudState->Release();
     hudLayerSurface = nullptr; hudLayer = nullptr; hudLayerDevice = nullptr; hudState = nullptr;
 }
@@ -1033,6 +1044,17 @@ static bool hudLayerReady(IDirect3DDevice9 *d) noexcept {
         hudLayerDevice = d;
         log("HUD layer %ux%u", w, h);
     }
+    if (hud_wrist::wrists() && !hudWrist) {
+        if (FAILED(d->CreateTexture(w,h,0,D3DUSAGE_RENDERTARGET|D3DUSAGE_AUTOGENMIPMAP,D3DFMT_A8R8G8B8,
+                                    D3DPOOL_DEFAULT,&hudWrist,nullptr)) || !hudWrist ||
+            FAILED(hudWrist->GetSurfaceLevel(0,&hudWristSurface)) || !hudWristSurface) {
+            if (hudWristSurface) hudWristSurface->Release();
+            if (hudWrist) hudWrist->Release();
+            hudWristSurface = nullptr; hudWrist = nullptr;
+            static bool logged = false;
+            if (!logged) { logged = true; log("Wrist HUD layer unavailable; the HUD stays head-mounted"); }
+        } else log("Wrist HUD layer %ux%u", w, h);
+    }
     return true;
 }
 // Alpha blending that turns the engine's colour blend into premultiplied layer
@@ -1062,6 +1084,8 @@ static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
     const LARGE_INTEGER start = PerfClock::now();
     ++perf.hudFlushes;
     hudLayer->GenerateMipSubLevels();
+    const bool wristContent = hudWrist && hud_wrist::wrists() && uiFrame.hudWristCleared;
+    if (wristContent) hudWrist->GenerateMipSubLevels();
     if (!hudState && FAILED(d->CreateStateBlock(D3DSBT_ALL,&hudState))) hudState = nullptr;
     IDirect3DStateBlock9 *saved = hudState;
     IDirect3DSurface9 *bound = nullptr;
@@ -1106,7 +1130,15 @@ static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
         // Desktop: exactly one texel per pixel (D3D9 centres pre-transformed pixels on integers).
         const HudVertex desktop[4]{{-.5f,-.5f,.5f,1,0,0},{W-.5f,-.5f,.5f,1,1,0},
                                    {W-.5f,H-.5f,.5f,1,1,1},{-.5f,H-.5f,.5f,1,0,1}};
-        ok = ok && draw(uiFrame.color,desktop,false);
+        // The head layer holds only what was drawn since the last flush (with
+        // every element on the wrists it may hold nothing new: not drawn then).
+        const bool headContent = uiFrame.hudLayerCleared;
+        if (headContent) ok = ok && draw(uiFrame.color,desktop,false);
+        // The desktop mirror shows the whole HUD, wrist elements in place.
+        if (ok && wristContent) {
+            ok = SUCCEEDED(d->SetTexture(0,hudWrist)) && draw(uiFrame.color,desktop,false) &&
+                SUCCEEDED(d->SetTexture(0,hudLayer));
+        }
         // Both eyes or neither: a panel partly behind one eye is hidden in both
         // (one eye only showed the HUD to the other eye during fast turns).
         HudVertex quad[2][4]{};
@@ -1133,8 +1165,89 @@ static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
                         float(1/clip[3]), corner[k][2], corner[k][3]};
             }
         }
-        for (unsigned i=0;i<2 && ok && visible;++i)
+        for (unsigned i=0;i<2 && ok && visible && headContent;++i)
             ok = draw(uiFrame.target[i],quad[i],true);
+        // Wrist watch faces: each wrist's elements stacked (in their screen order)
+        // on the back of that wrist, turned with the controller.
+        if (ok && wristContent) ok = SUCCEEDED(d->SetTexture(0,hudWrist));
+        for (unsigned side=0; ok && wristContent && side<2; ++side) {
+            const auto &input = uiFrame.request.input;
+            if (!input.gripValid[side] || !finite(input.grip[side])) continue;
+            unsigned order[hud_wrist::MaxElements], count = 0;
+            for (unsigned e=0;e<hud_wrist::MaxElements;++e) {
+                const auto &r = uiFrame.wristRects[e];
+                if (r.used && r.side == int(side) && r.x1 > r.x0 && r.y1 > r.y0) order[count++] = e;
+            }
+            if (!count) continue;
+            std::sort(order,order+count,[&](unsigned a,unsigned b) { return uiFrame.wristRects[a].y0 < uiFrame.wristRects[b].y0; });
+            // Metres per canvas pixel; pieces centred, top to bottom, with a gap.
+            const float scale = hud_wrist::scale()/W, gap = .006f;
+            float height = gap*float(count-1), width = 0;
+            for (unsigned k=0;k<count;++k) {
+                const auto &r = uiFrame.wristRects[order[k]];
+                height += (std::min(r.y1,H)-std::max(r.y0,0.f))*scale;
+                width = std::max(width,(std::min(r.x1,W)-std::max(r.x0,0.f))*scale);
+            }
+            // The back of the wrist: behind the grip (toward the elbow), on the back of
+            // the hand's side; the face's right runs along the forearm, read across the body.
+            const float h = 1/std::sqrt(2.f);
+            const Quat face = side==0 ? Quat{h,0,-h,0} : Quat{h,0,h,0};
+            const Pose grip = input.grip[side];
+            const Pose watch{normalize(multiply(normalize(grip.q),face)),
+                             grip.p + rotate(normalize(grip.q),Vec3{side==0 ? -.05f : .05f,0,.15f})};
+            // Only the face's front: turned away, the watch shows nothing.
+            const Vec3 centre = (uiFrame.request.eye[0].p + uiFrame.request.eye[1].p)*.5f;
+            if (!(rotate(inverse(watch.q),centre-watch.p).z > .01f)) continue;
+            const auto project = [&](const float (&corner)[4][4],HudVertex (&out)[2][4]) {
+                for (unsigned i=0;i<2;++i) {
+                    const Matrix34 panel = matrix(compose(inverse(uiFrame.request.eye[i]),watch));
+                    const Matrix44 &eye = uiFrame.projection[i];
+                    for (unsigned c=0;c<4;++c) {
+                        double local[3]{};
+                        for (unsigned row=0;row<3;++row)
+                            local[row] = double(panel.m[4*row])*corner[c][0] + double(panel.m[4*row+1])*corner[c][1] + panel.m[4*row+3];
+                        double clip[4]{};
+                        for (unsigned row=0;row<4;++row)
+                            clip[row] = double(eye.m[4*row])*local[0] + double(eye.m[4*row+1])*local[1] +
+                                        double(eye.m[4*row+2])*local[2] + eye.m[4*row+3];
+                        const double margin = std::max(1.,std::abs(clip[3]))*1e-5;
+                        if (!(clip[3] > margin) || !(clip[2] > margin) || !(clip[3]-clip[2] > margin)) return false;
+                        out[i][c] = {float((clip[0]/clip[3]+1)*.5*W), float((1-clip[1]/clip[3])*.5*H), .5f,
+                                     float(1/clip[3]), corner[c][2], corner[c][3]};
+                    }
+                }
+                return true;
+            };
+            // The watch: a grey bezel around a dark face, the elements on it.
+            const auto plate = [&](float halfWidth,float halfHeight,DWORD premultiplied) {
+                const float corner[4][4]{{-halfWidth,halfHeight,0,0},{halfWidth,halfHeight,0,0},
+                                         {halfWidth,-halfHeight,0,0},{-halfWidth,-halfHeight,0,0}};
+                HudVertex quad[2][4]{};
+                if (!project(corner,quad)) return true;
+                bool drawn = SUCCEEDED(d->SetRenderState(D3DRS_TEXTUREFACTOR,premultiplied)) &&
+                    SUCCEEDED(d->SetTextureStageState(0,D3DTSS_COLORARG1,D3DTA_TFACTOR)) &&
+                    SUCCEEDED(d->SetTextureStageState(0,D3DTSS_ALPHAARG1,D3DTA_TFACTOR));
+                for (unsigned i=0;i<2 && drawn;++i) drawn = draw(uiFrame.target[i],quad[i],true);
+                return SUCCEEDED(d->SetTextureStageState(0,D3DTSS_COLORARG1,D3DTA_TEXTURE)) &&
+                    SUCCEEDED(d->SetTextureStageState(0,D3DTSS_ALPHAARG1,D3DTA_TEXTURE)) &&
+                    SUCCEEDED(d->SetRenderState(D3DRS_TEXTUREFACTOR,0xffffffff)) && drawn;
+            };
+            const float inset = .008f, bezel = .004f;
+            ok = plate(width*.5f+inset+bezel,height*.5f+inset+bezel,0xf0383c42) &&
+                plate(width*.5f+inset,height*.5f+inset,0xd80a0c10);
+            float top = height*.5f;
+            for (unsigned k=0;k<count && ok;++k) {
+                const auto &r = uiFrame.wristRects[order[k]];
+                const float x0 = std::max(r.x0,0.f), x1 = std::min(r.x1,W), y0 = std::max(r.y0,0.f), y1 = std::min(r.y1,H);
+                if (!(x1 > x0) || !(y1 > y0)) continue;
+                const float hw = (x1-x0)*scale*.5f, ph = (y1-y0)*scale;
+                const float corner[4][4]{{-hw,top,x0/W,y0/H},{hw,top,x1/W,y0/H},{hw,top-ph,x1/W,y1/H},{-hw,top-ph,x0/W,y1/H}};
+                top -= ph+gap;
+                HudVertex piece[2][4]{};
+                const bool shown = project(corner,piece);
+                for (unsigned i=0;i<2 && ok && shown;++i) ok = draw(uiFrame.target[i],piece[i],true);
+            }
+        }
     }
     bool restored = bound && SUCCEEDED(originalSetRT(d,0,bound));
     restored = saved && SUCCEEDED(saved->Apply()) && restored;
@@ -1149,6 +1262,8 @@ static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
         return false;
     }
     uiFrame.hudLayerCleared = false; // The next layer draw starts from a clear layer.
+    uiFrame.hudWristCleared = false;
+    for (auto &r : uiFrame.wristRects) r = {};
     return true;
 }
 // One admitted HUD draw into the layer. Captured state (uiDraw) restores the
@@ -1159,12 +1274,58 @@ template<class Call> static bool hudLayerDraw(IDirect3DDevice9 *d,Call call,DWOR
         if (FAILED(d->GetRenderState(hudLayerStates[i],&uiDraw.layerState[i]))) return false;
     uiBypass = true;
     uiDraw.changed = true; uiDraw.layered = true;
-    bool ok = SUCCEEDED(originalSetRT(d,0,hudLayerSurface));
-    if (ok && !uiFrame.hudLayerCleared) {
+    // A wrist element's draw goes to the wrist layer, and its rectangle (its 2D
+    // vertices through this draw's projection) to its wrist's watch face.
+    const int element = hud_wrist::currentIndex();
+    const bool wrist = hudWrist && hud_wrist::wrists() && hud_wrist::currentSide() != hud_wrist::Head &&
+        element >= 0 && element < int(hud_wrist::MaxElements);
+    bool ok = SUCCEEDED(originalSetRT(d,0,wrist ? hudWristSurface : hudLayerSurface));
+    if (ok && wrist && !uiFrame.hudWristCleared) {
+        ok = SUCCEEDED(originalClear(d,0,nullptr,D3DCLEAR_TARGET,0,1,0));
+        uiFrame.hudWristCleared = ok;
+    }
+    if (ok && !wrist && !uiFrame.hudLayerCleared) {
         ok = SUCCEEDED(originalClear(d,0,nullptr,D3DCLEAR_TARGET,0,1,0));
         uiFrame.hudLayerCleared = ok;
     }
+    if (ok && wrist) {
+        float lo[3], hi[3];
+        if (hud_wrist::takeBounds(lo,hi)) {
+            const auto &c = uiDraw.constants.m; // c1..c4: clip = (dot(c1,p), dot(c2,p), dot(c3,p), dot(c4,p))
+            const auto &v = uiDraw.viewport;
+            auto &r = uiFrame.wristRects[element];
+            for (unsigned k=0;k<4;++k) {
+                const float p[4]{k&1 ? hi[0] : lo[0], k&2 ? hi[1] : lo[1], lo[2], 1};
+                float clip[4]{};
+                for (unsigned row=0;row<4;++row)
+                    clip[row] = c[4*row]*p[0]+c[4*row+1]*p[1]+c[4*row+2]*p[2]+c[4*row+3]*p[3];
+                if (!(std::abs(clip[3]) > 1e-6f)) continue;
+                const float x = v.X + (clip[0]/clip[3]+1)*.5f*v.Width, y = v.Y + (1-clip[1]/clip[3])*.5f*v.Height;
+                if (!std::isfinite(x) || !std::isfinite(y)) continue;
+                if (!r.used) { r.x0 = r.x1 = x; r.y0 = r.y1 = y; r.used = true; }
+                else { r.x0 = std::min(r.x0,x); r.x1 = std::max(r.x1,x); r.y0 = std::min(r.y0,y); r.y1 = std::max(r.y1,y); }
+            }
+            r.side = hud_wrist::currentSide();
+        }
+    }
     ok = ok && SUCCEEDED(d->SetViewport(&uiDraw.viewport)) && SUCCEEDED(d->SetScissorRect(&uiDraw.scissor));
+    {
+        // Lab (SS2VR_LAB_HUD_TRACE=1): each HUD element's draw rectangle state.
+        static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_HUD_TRACE", v, 2) == 1 && v[0] == L'1'; }();
+        static unsigned traced = 0;
+        if (trace && traced < 400) {
+            ++traced;
+            const auto &v = uiDraw.viewport; const auto &r = uiDraw.scissor;
+            if (wrist && uiFrame.wristRects[element].used)
+                log("Lab HUD wrist rect element=%s %.0f,%.0f-%.0f,%.0f", hud_wrist::currentElement(),
+                    uiFrame.wristRects[element].x0, uiFrame.wristRects[element].y0, uiFrame.wristRects[element].x1,
+                    uiFrame.wristRects[element].y1);
+            log("Lab HUD draw element=%s side=%d viewport=%lu,%lu %lux%lu scissor=%ld,%ld-%ld,%ld scissorOn=%lu c1=%.4f,%.4f,%.4f,%.4f c2=%.4f,%.4f,%.4f,%.4f",
+                hud_wrist::currentElement() ? hud_wrist::currentElement() : "-", hud_wrist::currentSide(), v.X, v.Y, v.Width, v.Height,
+                r.left, r.top, r.right, r.bottom, uiDraw.layerState[0], uiDraw.constants.m[0], uiDraw.constants.m[1], uiDraw.constants.m[2],
+                uiDraw.constants.m[3], uiDraw.constants.m[4], uiDraw.constants.m[5], uiDraw.constants.m[6], uiDraw.constants.m[7]);
+        }
+    }
     ok = ok && SUCCEEDED(d->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE,TRUE)) &&
         SUCCEEDED(d->SetRenderState(D3DRS_SRCBLENDALPHA,alphaSource)) &&
         SUCCEEDED(d->SetRenderState(D3DRS_DESTBLENDALPHA,alphaDestination)) &&
