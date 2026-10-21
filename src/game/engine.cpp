@@ -1682,6 +1682,21 @@ static void __fastcall carryJointPlacements(void *joint, void *, const Pose &a, 
     jointPlacements(joint, a, b);
 }
 static void(__thiscall *jointMaxLinVel)(void *, float) = nullptr;
+// A carried object does not collide with its carrier (CMechanism ignore list,
+// symmetric: each mechanism lists the other). Without it the player's capsule
+// pushed an object held near the body up and over the head. After the drop the
+// pair stays ignored until the object is clear of the body, so it does not pop
+// out of the player.
+static void *(__thiscall *hullMechanism)(void *) = nullptr;
+static void(__thiscall *mechanismIgnore)(void *, void *) = nullptr, (__thiscall *mechanismUnignore)(void *, void *) = nullptr;
+static int(__thiscall *mechanismIgnored)(void *, void *) = nullptr;
+struct CarryIgnore {
+    uint32_t hull = 0;              // The carried hull (its mechanism resolved afresh each time).
+    void *player = nullptr, *object = nullptr;
+    uint64_t releasedAt = 0;        // Set at the drop: unpair once clear of the body.
+    bool active = false;
+};
+static CarryIgnore carryIgnore; // Game thread only.
 static void(__cdecl *preDeleteArray)(const void *, void *) = nullptr;
 static void(__cdecl *deleteArray)(void *) = nullptr;
 static void(__cdecl *postDeleteArray)(void *) = nullptr;
@@ -1702,6 +1717,41 @@ struct GripCarry {
     unsigned samples = 0;
 };
 static GripCarry gripCarry; // Game thread only.
+static void *carriedMechanism(uint32_t hullHandle) {
+    void *hull = hullHandle ? resolve(hullHandle) : nullptr;
+    return hull && hullMechanism ? hullMechanism(hull) : nullptr;
+}
+static void beginCarryIgnore(void *puppet, uint32_t hullHandle) {
+    if (carryIgnore.active || !hullMechanism || !mechanismIgnore || !mechanismUnignore || !mechanismIgnored || !getMechanism) return;
+    void *player = getMechanism(puppet), *object = carriedMechanism(hullHandle);
+    if (!player || !object || player == object || mechanismIgnored(player, object)) return; // Already apart: not ours to undo.
+    mechanismIgnore(player, object);
+    carryIgnore = {hullHandle, player, object, 0, true};
+    log("Grip carry: object collision with the player off");
+}
+// Unpairs when dropped and clear of the body (or after 2.5 s), or at once when
+// `now` is set; either mechanism gone or replaced means the engine already did.
+static void updateCarryIgnore(void *puppet, bool now) {
+    auto &c = carryIgnore;
+    if (!c.active || (!now && !c.releasedAt)) return;
+    void *player = puppet && getMechanism ? getMechanism(puppet) : nullptr, *object = carriedMechanism(c.hull);
+    const bool same = player == c.player && object == c.object;
+    if (!now && same) {
+        void *hull = resolve(c.hull);
+        void *body = hull ? hullBody(hull) : nullptr;
+        void *own = resolve(primaryField(puppet, 0x118));
+        if (body && own && GetTickCount64() - c.releasedAt < 2500) {
+            Pose a, b;
+            memcpy(&a, static_cast<uint8_t *>(body) + 0x2c, sizeof(a));
+            memcpy(&b, static_cast<uint8_t *>(own) + 0x2c, sizeof(b));
+            const float dx = a.p.x - b.p.x, dz = a.p.z - b.p.z;
+            if (finite(a) && finite(b) && dx * dx + dz * dz < .9f * .9f) return; // Still at the body.
+        }
+    }
+    if (same && mechanismIgnored(player, object)) mechanismUnignore(player, object);
+    log("Grip carry: object collision with the player on again");
+    c = {};
+}
 static std::atomic<bool> gripCarrying{false};
 // Grab: objects within GripReach of the hand, else the first one along the
 // hand's pointing ray out to GripPointReach (it then comes to the hand).
@@ -1784,6 +1834,7 @@ static void releaseGripCarry(void *puppet, bool throwIt) {
         }
     }
     log("Grip carry released hand=%d velocity=%.2f,%.2f,%.2f", gripCarry.hand, velocity.x, velocity.y, velocity.z);
+    if (carryIgnore.active && !carryIgnore.releasedAt) carryIgnore.releasedAt = GetTickCount64();
     gripCarry.hand = -1;
     gripCarry.joint = 0;
     gripCarry.samples = 0;
@@ -1802,6 +1853,7 @@ static void __fastcall carryStep(void *puppet, void *) {
     if (g.hand >= 0) {
         if (!primaryField(puppet, 0x564)) { // Ended natively: Use, death, object destroyed.
             log("Grip carry ended natively hand=%d", g.hand);
+            if (carryIgnore.active && !carryIgnore.releasedAt) carryIgnore.releasedAt = GetTickCount64();
             g.hand = -1; g.samples = 0; gripCarrying = false; carryTargetValid = false;
         } else if (!live || !(s.input.buttons[g.hand] & Wheel)) {
             releaseGripCarry(puppet, live);
@@ -1817,10 +1869,12 @@ static void __fastcall carryStep(void *puppet, void *) {
                 g.hand = int(h); g.samples = 0; g.joint = 0; g.carriedHull = g.requestHull;
                 gripCarrying = true;
                 log("Grip carry taken hand=%u object=%u", h, primaryField(puppet, 0x564));
+                beginCarryIgnore(puppet, g.requestHull);
             }
         }
     }
     originalCarrying(puppet); // Creates the joint and computes the native camera target.
+    updateCarryIgnore(puppet, false);
     Pose hand;
     if (g.hand < 0 || !primaryField(puppet, 0x564) || !handWorldPose(s, puppet, unsigned(g.hand), hand)) return;
     void *joint = resolve(primaryField(puppet, 0x374));
@@ -1841,7 +1895,8 @@ static void __fastcall carryStep(void *puppet, void *) {
     // there was pushed out over the top and ended above the head (V499/V500:
     // 0.65 m above the hand after overshooting to 3 m). Hold it at the hand's
     // height but at least CarryClearance out from the body's vertical axis.
-    {
+    // Without the ignore pair (unavailable), still hold it out of the capsule.
+    if (!carryIgnore.active) {
         constexpr float CarryClearance = .7f;
         Vec3 out{hand.p.x - own.p.x, 0, hand.p.z - own.p.z};
         float reach = std::sqrt(out.x * out.x + out.z * out.z);
@@ -11250,6 +11305,10 @@ bool attach(bool headless) {
         symbol(e, "?GetOwner@CAspect@SeriousEngine@@QAEPAVCEntity@2@XZ", hullOwner);
         symbol(e, "?GetBody@CHull@SeriousEngine@@QAEPAVCBody@2@XZ", hullBody);
         symbol(e, "?SetMaxLinVel@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxLinVel);
+        symbol(e, "?GetMechanism@CHull@SeriousEngine@@QAEPAVCMechanism@2@XZ", hullMechanism);
+        symbol(e, "?AddToIgnoreList@CMechanism@SeriousEngine@@QAEXPAV12@@Z", mechanismIgnore);
+        symbol(e, "?RemoveFromIgnoreList@CMechanism@SeriousEngine@@QAEXPAV12@@Z", mechanismUnignore);
+        symbol(e, "?IsIgnored@CMechanism@SeriousEngine@@QAEHPAV12@@Z", mechanismIgnored);
         symbol(e, "?mdlGetBoneAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z", boneAbsolute);
         symbol(e, "?mdlGetBonesAbsPlacement@SeriousEngine@@YAXPAVCModelInstance@1@AAV?$CStaticStackArray@UBonePlacement@SeriousEngine@@@1@@Z", bonesAbsolute);
         symbol(c, "?strConvertIDToString@SeriousEngine@@YAPBDVIDENT@1@@Z", identToString);
