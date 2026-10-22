@@ -329,13 +329,25 @@ static void (__cdecl *labOriginalInitialize)() = nullptr;
 // not. When the ID is a game server's, connect to it directly as the server
 // browser does (net_bSteamGameserver), just before CClientInterface::Connect.
 static int(__fastcall *labOriginalClientConnect)(void *, void *, int, int) = nullptr;
-static uint32_t *labSteamGameserver = nullptr, *labServerLobby = nullptr;
+static uint32_t *labSteamGameserver = nullptr, *labServerLobby = nullptr, *labServerAddress = nullptr;
+static int32_t *labServerPort = nullptr;
 static int __fastcall labClientConnect(void *client, void *edx, int a, int b) {
+    // The server browser also names the server's address (host order) and game
+    // port, which +connect clears: the client queries and authenticates with them.
+    char address[32]{};
+    unsigned ip[4]{}, port = 0;
+    if (labServerAddress && labServerPort &&
+        GetEnvironmentVariableA("SS2VR_LAB_SERVER_ADDRESS", address, sizeof address) &&
+        std::sscanf(address, "%u.%u.%u.%u:%u", &ip[0], &ip[1], &ip[2], &ip[3], &port) == 5) {
+        *labServerAddress = ip[0] << 24 | ip[1] << 16 | ip[2] << 8 | ip[3];
+        *labServerPort = int32_t(port);
+    }
     if (labSteamGameserver && labServerLobby && (labServerLobby[0] || labServerLobby[1])) {
         const uint32_t type = (labServerLobby[1] >> 20) & 0xf; // EAccountType
         if (type == 3 || type == 4) { // Game server or anonymous game server.
             *labSteamGameserver = 1;
-            log("Lab multiplayer: connecting directly to game server %08x%08x", labServerLobby[1], labServerLobby[0]);
+            log("Lab multiplayer: connecting directly to game server %08x%08x at %08x:%d", labServerLobby[1], labServerLobby[0],
+                labServerAddress ? *labServerAddress : 0u, labServerPort ? int(*labServerPort) : 0);
         }
     }
     return labOriginalClientConnect(client, edx, a, b);
@@ -352,6 +364,8 @@ static void labInstallSteamWriteBarrier() {
     HMODULE engine = GetModuleHandleW(L"Engine.dll");
     labSteamGameserver = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_bSteamGameserver@SeriousEngine@@3HA"));
     labServerLobby = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_idSteamServerLobby@SeriousEngine@@3VCSteamID@@A"));
+    labServerAddress = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_ulServerAddress@SeriousEngine@@3KA"));
+    labServerPort = reinterpret_cast<int32_t *>(GetProcAddress(engine, "?net_iServerPort@SeriousEngine@@3JA"));
     void *connect = reinterpret_cast<void *>(GetProcAddress(engine, "?Connect@CClientInterface@SeriousEngine@@UAEHHH@Z"));
     if (!labSteamGameserver || !labServerLobby || !connect ||
         MH_CreateHook(connect, reinterpret_cast<void *>(labClientConnect), reinterpret_cast<void **>(&labOriginalClientConnect)) != MH_OK ||

@@ -696,6 +696,9 @@ def validate(cfg):
             raise ValueError('Multiplayer connect must be the server SteamID in decimal')
         if preparation_weapon(cfg) is not None:raise ValueError('A multiplayer client has no fixture preparation')
         expected_arguments=['+mod','SS2VR','+sam_bBootSequence','0','+sam_bSkipMovies','1','+connect',connect]
+        address=cfg.get('multiplayer_address')
+        if address is not None and (not isinstance(address,str) or not re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}:\d{2,5}',address)):
+            raise ValueError('Multiplayer address must be an IPv4 address and game port')
         password=cfg.get('multiplayer_password')
         if password is not None:
             if not isinstance(password,str) or not re.fullmatch(r'[a-z0-9]{4,32}',password):
@@ -1171,7 +1174,10 @@ def run(cfg):
     env.update(cfg.get('proton_environment',{}))
     env.pop('SS2VR_LAB_STOCK_RENDER',None)
     env.pop('SS2VR_LAB_MULTIPLAYER',None)
-    if multiplayer:env['SS2VR_LAB_MULTIPLAYER']='1'
+    env.pop('SS2VR_LAB_SERVER_ADDRESS',None)
+    if multiplayer:
+        env['SS2VR_LAB_MULTIPLAYER']='1'
+        if cfg.get('multiplayer_address'):env['SS2VR_LAB_SERVER_ADDRESS']=cfg['multiplayer_address']
     env.pop('SS2VR_LAB_BACKGROUND_MOVE',None)
     if cfg.get('background_controls_probe')=='joystick-native-movement':env['SS2VR_LAB_BACKGROUND_MOVE']='1'
     env.pop('SS2VR_LAB_IDLE_WEAPON',None)
