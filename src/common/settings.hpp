@@ -13,7 +13,6 @@ struct VrSettings {
     float renderScale = 1.f; // Multiplier on the runtime's recommended per-eye size.
     FoveationSettings foveation;
     bool snapTurn = false;                 // Smooth stick turning unless enabled.
-    bool sprintDefault = true; // [Comfort] SprintByDefault: sprint unless the left stick click toggled to walk.
     float smoothTurnRate = 150 * Pi / 180; // Radians per second at full deflection.
     bool eyeReplay = false; // Right eye replayed from the left eye's recorded D3D9 calls.
     bool singlePass = true; // Both eyes from one world traversal (double-wide target).

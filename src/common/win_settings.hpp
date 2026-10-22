@@ -74,7 +74,6 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.singlePassInstancing = number(L"Render", L"SinglePassInstancing", 0, 0, 1) >= .5f;
     settings.uiAspect = number(L"Render", L"UiAspect", 16.f / 9, 1.f, 2.5f);
     settings.snapTurn = number(L"Comfort", L"SnapTurn", 0, 0, 1) >= .5f;
-    settings.sprintDefault = number(L"Comfort", L"SprintByDefault", 1, 0, 1) >= .5f;
     settings.smoothTurnRate = number(L"Comfort", L"SmoothTurnDegreesPerSecond", 150, 30, 360) * Pi / 180;
     settings.labWeaponAudit = number(L"Lab", L"WeaponAudit", 0, 0, 1) >= .5f;
     settings.labWeaponAuditHand = number(L"Lab", L"WeaponAuditHand", 1, 0, 1) >= .5f ? 1 : 0;

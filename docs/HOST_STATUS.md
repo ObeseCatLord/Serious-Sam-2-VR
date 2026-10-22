@@ -35,13 +35,13 @@ Profile/component paths were checked against pinned Khronos xr.xml. Triggers are
 
 | Profile | Axes | Weapon wheel (left / right) | Use | Jump | Menu | Sprint | Reload |
 |---|---|---|---|---|---|---|---|
-| Oculus Touch | Thumbsticks | Y / B | A | Grip | Left menu | On; left stick click toggles walk | X |
-| Valve Index | Thumbsticks | Trackpad press, each hand | Right A | Right B | Left B | On; left stick click toggles walk | Left A |
-| HTC Vive | Trackpads | Trackpad click, each hand | Right menu | Grip | Left menu | On; left trackpad click toggles walk | — |
-| Microsoft Motion | Thumbsticks | Trackpad click, each hand | Left menu | Grip | Right menu | On; left stick click toggles walk | — |
-| Valve Frame (extension advertised) | Thumbsticks | Left D-pad up / right B | Right A | Grip | Left view / right menu | On; left stick click toggles walk | Left D-pad down |
+| Oculus Touch | Thumbsticks | Y / B | A | Grip | Left menu | Left stick click toggles | X |
+| Valve Index | Thumbsticks | Trackpad press, each hand | Right A | Right B | Left B | Left stick click toggles | Left A |
+| HTC Vive | Trackpads | Trackpad click, each hand | Right menu | Grip | Left menu | Left trackpad click toggles | — |
+| Microsoft Motion | Thumbsticks | Trackpad click, each hand | Left menu | Grip | Right menu | Left stick click toggles | — |
+| Valve Frame (extension advertised) | Thumbsticks | Left D-pad up / right B | Right A | Grip | Left view / right menu | Left stick click toggles | Left D-pad down |
 
-On every profile you sprint by default (the game's 1.5x speed, which it applies only while moving roughly forward) and the left stick click toggles between sprinting and walking ([Comfort] SprintByDefault, or Sprint in the VR options, picks the starting state); the right stick click zooms a held sniper rifle, otherwise it throws a hand grenade. Use (right A on Index/Touch) enters and leaves turrets and vehicles: look at the seat. Native prompts name the VR button ("Press A to enter").
+On every profile the left stick click toggles sprint (the game's own 1.5x sprint): it stays on while the stick points within about 45 degrees of where you walk and switches off when you stop, strafe or back up. The game's Enable sprinting option is off by default; the mod turns it on in single player, on a VR server (listen or dedicated) and for a VR client of one. The right stick click zooms a held sniper rifle, otherwise it throws a hand grenade. Use (right A on Index/Touch) enters and leaves turrets and vehicles: look at the seat. Native prompts name the VR button ("Press A to enter").
 
 The Vive right hand has no free button for its contextual sniper zoom (formerly
 the right trackpad jump), so sniper zoom is unavailable on that hand.

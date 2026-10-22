@@ -639,7 +639,6 @@ static void pollSettingsFile() {
     settings.laserDistance = fresh.laserDistance;
     settings.snapTurn = fresh.snapTurn;
     settings.smoothTurnRate = fresh.smoothTurnRate;
-    settings.sprintDefault = fresh.sprintDefault;
     settings.singlePassInstancing = fresh.singlePassInstancing;
     settings.voice = fresh.voice;
     single_pass::setInstancing(fresh.singlePassInstancing);
@@ -1581,6 +1580,76 @@ static AmmoQuantity grenadeAmmoQuantity = nullptr; // CPlayerInventory::GetAmmoQ
 constexpr int HandGrenadeAmmo = 4;                 // AmmoIndex the native throw drains
 using PuppetFlag = int(__thiscall *)(void *);
 static PuppetFlag puppetSprinting = nullptr; // CPlayerPuppetEntity::IsSprinting (the speed boost is on)
+constexpr float SprintCone = .7f;          // The game sprints within ~45 degrees of forward (its own test).
+constexpr float SprintNativeForward = -.7f, SprintVrForward = 2.f; // z below it: forward enough (2: any).
+constexpr float SprintStickMinimum = .25f; // Below this the stick is at rest.
+constexpr uint64_t SprintGraceMs = 250;    // Off course this long ends a toggled sprint.
+// Sprinting is a game option ("Enable sprinting", game info +0x12c), off by
+// default. VR has a sprint toggle, so single player, a VR server (listen or
+// dedicated) and a VR client of one turn it on; any other server keeps its choice.
+static void allowNativeSprinting() {
+    uint32_t handle = 0;
+    if (!nativeGameInfo || !nativeGameInfo(&handle) || !handle) return;
+    void *game = resolve(handle);
+    if (!game || primaryField(game, 0x12c)) return;
+    const uint32_t on = 1;
+    memcpy(static_cast<uint8_t *>(game) + 0x12c, &on, sizeof on);
+    log("Sprinting allowed (the game's Enable sprinting option)");
+}
+// The game sprints only moving within ~45 degrees of the puppet's heading: the
+// player's controls set the sprint action bit (Sam2Game +0xf342a) and
+// CPlayerPuppetEntity::OnStep the sprinting state (+0x103e97), each comparing
+// the local move direction's z with one shared -0.7 (fcomps [+0x2c3474]). A VR
+// player turns with the mod and the head, never the puppet, so for one those
+// two compares read thresholds the mod owns: VR sends the sprint command only
+// while its stick points within that cone of where the player walks (toggle
+// sprint), so for a VR player the command decides. Anyone else keeps -0.7.
+static float sprintActionForward = SprintNativeForward, sprintStepForward = SprintNativeForward;
+static uintptr_t sprintPatchedBase = 0;
+static bool patchSprintForward(HMODULE game) {
+    const auto base = reinterpret_cast<uintptr_t>(game);
+    if (sprintPatchedBase == base) return true;
+    struct Site { uintptr_t rva; float *threshold; } sites[]{{0xf342a, &sprintActionForward}, {0x103e97, &sprintStepForward}};
+    for (const auto &site : sites) {
+        uint8_t code[6];
+        memcpy(code, reinterpret_cast<const void *>(base + site.rva), sizeof code);
+        uint32_t operand = 0;
+        memcpy(&operand, code + 2, sizeof operand);
+        float value = 0;
+        if (code[0] != 0xd8 || code[1] != 0x1d || operand != base + 0x2c3474 ||
+            (memcpy(&value, reinterpret_cast<const void *>(base + 0x2c3474), sizeof value), value != SprintNativeForward)) {
+            log("Sprint forward test not recognised at +%x; sprinting keeps the game's forward rule", unsigned(site.rva));
+            return false;
+        }
+    }
+    for (const auto &site : sites) {
+        void *at = reinterpret_cast<void *>(base + site.rva + 2);
+        DWORD old = 0;
+        if (!VirtualProtect(at, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
+        const uint32_t operand = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(site.threshold));
+        memcpy(at, &operand, sizeof operand);
+        DWORD unused = 0;
+        VirtualProtect(at, 4, old, &unused);
+        FlushInstructionCache(GetCurrentProcess(), at, 4);
+    }
+    sprintPatchedBase = base;
+    return true;
+}
+// Rollback: both compares read the game's own constant again.
+static void unpatchSprintForward() {
+    if (!sprintPatchedBase) return;
+    for (const uintptr_t rva : {uintptr_t(0xf342a), uintptr_t(0x103e97)}) {
+        void *at = reinterpret_cast<void *>(sprintPatchedBase + rva + 2);
+        DWORD old = 0;
+        if (!VirtualProtect(at, 4, PAGE_EXECUTE_READWRITE, &old)) continue;
+        const uint32_t operand = static_cast<uint32_t>(sprintPatchedBase + 0x2c3474);
+        memcpy(at, &operand, sizeof operand);
+        DWORD unused = 0;
+        VirtualProtect(at, 4, old, &unused);
+        FlushInstructionCache(GetCurrentProcess(), at, 4);
+    }
+    sprintPatchedBase = 0;
+}
 static int handOf(void *weapon, const Snapshot &s) {
     if (!s.rider.handheld() || !nativeRiderCurrent(s.player, s.rider))
         return -1;
@@ -2676,34 +2745,72 @@ static void update(void *p) {
     const bool gripJump = !((input.buttons[0] | input.buttons[1]) & Button::JumpBound);
     s.jump = enabled && !resettingControls && ((contextualButtons & Button::Jump) ||
         (gripJump && (gripJumps[0].jumping || gripJumps[1].jumping)));
-    // Left stick click toggles between sprinting and walking ([Comfort]
-    // SprintByDefault picks which you start in; the game sprints only while
-    // moving roughly forward). On release, so that clicking both sticks
-    // (recentre) toggles nothing. The right click zooms a sniper (above) and
-    // otherwise throws a hand grenade.
+    // Toggle sprint: the left stick click starts sprinting (on release, so
+    // that clicking both sticks to recentre starts nothing). The game sprints
+    // only while moving roughly forward, so like forward-only sprint elsewhere
+    // the toggle switches off once the stick stops or leaves that cone (more
+    // than SprintCone off forward for SprintGraceMs), or the left wheel opens.
+    // The right click zooms a sniper (above) and otherwise throws a grenade.
     {
-        static bool previousClick = false, armed = false, toggled = false, lastDefault = true;
-        if (settings.sprintDefault != lastDefault) toggled = false; // A new default applies at once.
-        lastDefault = settings.sprintDefault;
+        static bool previousClick = false, armed = false, sprinting = false;
+        static uint64_t offCourseSince = 0;
+        const uint64_t now = GetTickCount64();
         const bool click = enabled && !resettingControls && (leftContextual & Button::Sprint);
         if (click && !previousClick) armed = true;
         if (recenterHeld(input) || !enabled) armed = false;
         if (!click && previousClick && armed) {
-            toggled = !toggled;
-            log("Sprint toggled: %s", settings.sprintDefault != toggled ? "sprint" : "walk");
+            sprinting = !sprinting;
+            offCourseSince = 0;
+            log("Sprint toggled %s", sprinting ? "on" : "off");
         }
         if (!click) armed = false;
         previousClick = click;
-        s.sprint = enabled && !resettingControls && settings.sprintDefault != toggled;
-        // The game's own state (its "Enable sprinting" option, moving forward).
-        static int lastSprinting = -1;
-        static unsigned sprintLogs = 0;
-        const int sprinting = puppetSprinting ? puppetSprinting(p) != 0 : -1;
-        if (sprinting != lastSprinting && sprintLogs < 200) {
-            ++sprintLogs;
-            log("Sprinting native=%d requested=%d", sprinting, int(s.sprint));
+        const float x = input.axis[0][0], y = input.axis[0][1], length = std::sqrt(x * x + y * y);
+        const bool forward = std::isfinite(length) && length > SprintStickMinimum && y > SprintCone * length;
+        if (!forward && !click) {
+            if (!offCourseSince) offCourseSince = now;
+        } else
+            offCourseSince = 0;
+        if (sprinting && (!enabled || resettingControls || s.ui.wheel[0].open ||
+                          (offCourseSince && now - offCourseSince >= SprintGraceMs))) {
+            sprinting = false;
+            log("Sprint toggled off (%s)", !enabled || resettingControls ? "controls" : s.ui.wheel[0].open ? "wheel" : "not forward");
         }
-        lastSprinting = sprinting;
+        s.sprint = enabled && !resettingControls && sprinting;
+        // A VR client of a VR server sprints like the server lets it (the
+        // server turns the game's option on: allowNativeSprinting).
+        if (multiplayer::negotiatedLocal()) allowNativeSprinting();
+        // The game's own state: it sprints with its "Enable sprinting" option
+        // (game info +0x12c), the command (brain +0x160 bit 0x20) and moving forward.
+        static int lastState = -1;
+        static unsigned sprintLogs = 0;
+        const int native = puppetSprinting ? puppetSprinting(p) != 0 : -1;
+        uint32_t gameHandle = 0;
+        if (nativeGameInfo) nativeGameInfo(&gameHandle);
+        void *game = gameHandle ? resolve(gameHandle) : nullptr;
+        const uint32_t brainHandle = primaryField(p, 0x38c);
+        void *brain = brainHandle ? resolve(brainHandle) : nullptr;
+        const int allowed = game ? primaryField(game, 0x12c) != 0 : -1;
+        const int command = brain ? (primaryField(brain, 0x160) & 0x20) != 0 : -1;
+        const int key = (native + 1) | (allowed + 1) << 2 | (command + 1) << 4 | int(s.sprint) << 6;
+        if (key != lastState && sprintLogs < 200) {
+            ++sprintLogs;
+            log("Sprinting native=%d requested=%d enabled=%d command=%d", native, int(s.sprint), allowed, command);
+        }
+        lastState = key;
+        // Lab (SS2VR_LAB_SPRINT_TRACE=1): horizontal speed each second.
+        static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SPRINT_TRACE", v, 2) == 1 && v[0] == L'1'; }();
+        static Vec3 tracePosition{};
+        static uint64_t traceTick = 0;
+        Pose body;
+        if (trace && trackingAnchor(p, body) && now - traceTick >= 1000) {
+            const Vec3 d = body.p - tracePosition;
+            if (traceTick && now - traceTick < 1500)
+                log("Lab sprint speed=%.2f m/s requested=%d native=%d stick=%.2f,%.2f", double(std::sqrt(d.x * d.x + d.z * d.z) * 1000.f / float(now - traceTick)),
+                    int(s.sprint), native, double(x), double(y));
+            tracePosition = body.p;
+            traceTick = now;
+        }
     }
     {
         // The right stick click takes a grenade into the right hand (its weapon
@@ -4028,6 +4135,7 @@ static void __fastcall entityStep(void *manager, void *) {
                 interval->preparedWorld=world;
                 interval->preparedManager=manager;
                 interval->networkPrepared = !singlePlayer() && multiplayer::server() && multiplayer::beginTick();
+                if (singlePlayer() || multiplayer::server()) allowNativeSprinting();
                 const auto players = multiplayer::activePlayers();
                 const auto snapshot = copySnapshot();
                 // Reserve ALL subjects before any update, freeze or gameplay
@@ -4450,7 +4558,18 @@ static void __fastcall step(void *p, void *) {
         if (aborted)
             nativeInputFailed();
     });
+    const float outerSprintForward = sprintStepForward; // OnStep may reenter for another puppet.
+    {
+        // Sprint's forward test for this puppet (patchSprintForward).
+        const auto snapshot = copySnapshot();
+        const bool own = p == snapshot.player && local(p);
+        const uint32_t handle = pointerHandle(p);
+        const bool vr = (own && vrSession(snapshot)) || (handle && multiplayer::knownVrAvatar(handle));
+        if (own) sprintActionForward = vr ? SprintVrForward : SprintNativeForward;
+        sprintStepForward = vr ? SprintVrForward : SprintNativeForward;
+    }
     originalStep(p);
+    sprintStepForward = outerSprintForward;
     withNativeFinally([&] {
         authorityAfterStep(p);
         remote_render::observePlayer(p);
@@ -10783,6 +10902,7 @@ static int hudAmmoSide(int hand) {
 static bool rollbackNativeHooks() {
     hooksReady = false;
     hud_wrist::uninstall();
+    unpatchSprintForward();
     rideModelRenderableReturn=0;
     bool result = rollbackHooks(
         ownedHooks,
@@ -11405,6 +11525,7 @@ bool attach(bool headless) {
     S(g, "?CanChangeWeapon@CPlayerPuppetEntity@SeriousEngine@@QAEHW4PlayerHand@2@@Z", canChange);
     S(g, "?IsWeaponInInventory@CPlayerInventory@SeriousEngine@@QAEHW4WeaponIndex@2@@Z", inInventory);
     S(g, "?GetAmmoQuantityForWeapon@CPlayerInventory@SeriousEngine@@QAEJW4WeaponIndex@2@@Z", ammo);
+    patchSprintForward(g); // Servers too: a VR avatar sprints in its own forward.
     if (!headless) {
         S(e, "?GetModelInstance@CModelRenderable@SeriousEngine@@QAEPAVCModelInstance@2@XZ", laserModelInstance);
         S(e, "?mdlGetAttachmentAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z", laserAttachment);

@@ -25,13 +25,13 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 
 ## Sprint (2026-10-22)
 
-1. You sprint from the start: walking forward should be faster than before
-   (the game's sprint is 1.5x and only applies while moving roughly forward;
-   strafing and backing up are normal speed).
-2. Click the left stick once: you walk. Click again: you sprint. Clicking both
-   sticks together still recentres and does not toggle.
-3. VR options > Sprint switches which one you start in. If forward speed never
-   changes, check that the game's own Enable sprinting option is on.
+1. Click the left stick while walking forward: you sprint (the game's own sprint,
+   1.5x). It stays on while the stick points roughly forward from where you walk,
+   including after turning with the right stick or with your head turned.
+2. Stop, strafe or back up: sprint switches off; click again to sprint.
+3. Clicking both sticks together still recentres and does not toggle sprint.
+4. Sprinting needs the game's Enable sprinting option, which is off by default:
+   the mod turns it on in single player and on a VR server.
 
 ## Changed after the turret, wrist and prison report (2026-10-21)
 
