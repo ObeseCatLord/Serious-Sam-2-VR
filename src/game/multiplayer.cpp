@@ -6,6 +6,7 @@
 #include "game.hpp"
 #include "native_finally.hpp"
 #include <array>
+#include <atomic>
 #include <bcrypt.h>
 #include <cstring>
 #include <vector>
@@ -109,6 +110,12 @@ static bool receivePeer(Peer &peer, const network::PosePacket &pose, uint64_t no
     return accepted;
 }
 static std::array<Peer, 18> peers;
+// Diagnostics: message counts and the last relayed remote poses, summarised in
+// the log every 5 s (reportDiagnostics) so a session's traffic is visible.
+static std::atomic<unsigned> seenHello{0}, seenPose{0}, seenVoice{0}, seenAck{0}, seenRelay{0}, seenVoiceRelay{0},
+    sentHello{0}, sentPose{0}, sentVoice{0};
+static network::PosePacket lastRelayPose{};
+static uint32_t lastRelayAvatar = 0;
 static uint64_t tickSerial = 0;
 static bool tickPrepared = false;
 struct Local {
@@ -374,9 +381,12 @@ static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
         if (peer.avatar != avatar || peer.brain != brain)
             peer = {};
         if (message.kind == network::Kind::Hello) {
+            ++seenHello;
             if (peer.validation.clientNonce != message.hello.nonce) {
                 uint64_t serverNonce = nonce();
                 if (serverNonce && nextIncarnation != UINT32_MAX) {
+                    log("Multiplayer VR client negotiated slot=%d brain=%08x avatar=%08x incarnation=%u", slot, brain, avatar,
+                        nextIncarnation + 1);
                     network::Ack old{};
                     if (peer.finishInterval(old))
                         discarded[discardCount++] = old;
@@ -389,6 +399,7 @@ static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
             }
             reply = peer.validation.clientNonce == message.hello.nonce && peer.validation.serverNonce != 0;
         } else if (message.kind == network::Kind::Pose && reliableTransport) {
+            ++seenPose;
             if (now - peer.rateStart >= 1000) {
                 peer.rateStart = now;
                 peer.rateCount = 0;
@@ -401,6 +412,7 @@ static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
                    message.voice.serverNonce == peer.validation.serverNonce) {
             unsigned bytes = 30;
             for (unsigned i = 0; i < message.voice.frameCount; ++i) bytes += message.voice.frameBytes[i] + 1u;
+            ++seenVoice;
             voiceAdmitted = peer.voice.admit(now, bytes, message.voice);
             if (voiceAdmitted) {
                 voiceSpeaker = peer.avatar;
@@ -501,6 +513,7 @@ static void executeClientBody(void *unusedThis, int h, uint32_t brain, int j, in
     withPeerLock([&] {
         if (client == local.net && brain == local.brain && avatarFor(brain) == local.avatar) {
             if (message.kind == network::Kind::Ack) {
+                ++seenAck;
                 const uint64_t now = GetTickCount64();
                 if (local.credits.acknowledge(message.ack, local.clientNonce, local.serverNonce,
                                              !local.serverNonce || now - local.lastAck <= 500)) {
@@ -509,13 +522,17 @@ static void executeClientBody(void *unusedThis, int h, uint32_t brain, int j, in
                     }
                     if (!message.ack.acceptedSequence && local.serverNonce != message.ack.serverNonce)
                         local.pending.requireNeutral();
-                    if (!message.ack.acceptedSequence)
+                    if (!message.ack.acceptedSequence) {
+                        if (local.serverNonce != message.ack.serverNonce)
+                            log("Multiplayer VR negotiated with the server (avatar=%08x)", local.avatar);
                         local.serverNonce = message.ack.serverNonce;
+                    }
                     if (local.serverNonce == message.ack.serverNonce)
                         local.lastAck = now;
                     installIntentEpochs(message.ack.intentEpoch, now);
                 }
             }
+            if (message.kind == network::Kind::VoiceRelay) ++seenVoiceRelay;
             if (message.kind == network::Kind::VoiceRelay && local.serverNonce && voiceSink &&
                 message.voiceRelay.voice.clientNonce == local.clientNonce &&
                 message.voiceRelay.voice.serverNonce == local.serverNonce) {
@@ -527,6 +544,11 @@ static void executeClientBody(void *unusedThis, int h, uint32_t brain, int j, in
                 if (mapper(client, message.voiceRelay.subjectAvatar, mapped) >= 0 && resolve(mapped[1]) &&
                     mapped[1] != local.avatar)
                     voiceSink(mapped[1], message.voiceRelay.subjectIncarnation, message.voiceRelay.voice);
+            }
+            if (message.kind == network::Kind::Relay) {
+                ++seenRelay;
+                lastRelayPose = message.relay.pose;
+                lastRelayAvatar = message.relay.subjectAvatar;
             }
             if (message.kind == network::Kind::Relay && local.serverNonce &&
                 message.relay.pose.clientNonce == local.clientNonce &&
@@ -659,6 +681,7 @@ bool sendVoice(void *localPlayer, network::VoicePacket voice) {
             if (!brain) return;
             network::Message message{};
             message.kind = network::Kind::Voice;
+            ++sentVoice;
             message.voice = voice;
             sent = send(brain, message, false);
         } else if (isServer && isServer()) {
@@ -796,6 +819,7 @@ static bool submitInput(void *player, network::PosePacket &admitted, bool reliab
                 !local.credits.hasOutstandingCapability(local.clientNonce, 0)) {
                 if (!local.lastHello || now - local.lastHello >= 500) {
                     outgoing.kind = network::Kind::Hello;
+                    ++sentHello;
                     outgoing.hello.nonce = local.clientNonce;
                     token = {local.clientNonce, 0, 0};
                     ready = handoff.granted = local.credits.grant(token);
@@ -805,6 +829,7 @@ static bool submitInput(void *player, network::PosePacket &admitted, bool reliab
                        !local.credits.hasOutstandingCapability(local.clientNonce, local.serverNonce) &&
                        local.sequence < UINT32_MAX && now - local.lastSent >= 50) {
                 outgoing.kind = network::Kind::Pose;
+                ++sentPose;
                 outgoing.pose = local.latest;
                 outgoing.pose.serverNonce = local.serverNonce;
                 outgoing.pose.sequence = ++local.sequence;
@@ -1002,6 +1027,23 @@ std::array<void *, 18> activePlayers() {
             if (uint32_t avatar = avatarFor(brain))
                 result[slot] = resolve(avatar);
     return result;
+}
+void reportDiagnostics() noexcept {
+    static uint64_t next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now < next || !hooksReady.load(std::memory_order_acquire)) return;
+    next = now + 5000;
+    const bool isSrv = isServer && isServer(), isCli = isClient && isClient();
+    if (!isSrv && !isCli) return;
+    unsigned negotiated = 0;
+    for (const auto &peer : peers) negotiated += peer.validation.serverNonce != 0;
+    const auto &r = lastRelayPose;
+    log("Multiplayer %s: in hello=%u pose=%u voice=%u ack=%u relay=%u voiceRelay=%u out hello=%u pose=%u voice=%u "
+        "peers=%u negotiated=%d relayAvatar=%08x head=%.2f,%.2f,%.2f grip0=%.2f,%.2f,%.2f grip1=%.2f,%.2f,%.2f",
+        isSrv ? "server" : "client", seenHello.load(), seenPose.load(), seenVoice.load(), seenAck.load(), seenRelay.load(),
+        seenVoiceRelay.load(), sentHello.load(), sentPose.load(), sentVoice.load(), negotiated, int(local.serverNonce != 0),
+        lastRelayAvatar, double(r.head.p.x), double(r.head.p.y), double(r.head.p.z), double(r.grip[0].p.x),
+        double(r.grip[0].p.y), double(r.grip[0].p.z), double(r.grip[1].p.x), double(r.grip[1].p.y), double(r.grip[1].p.z));
 }
 bool beginTick() {
     if (!hooksReady.load(std::memory_order_acquire) || !isServer || !isServer())

@@ -9,6 +9,8 @@ bool initialize(HMODULE engine, HMODULE core, HMODULE sam, HookInstaller install
 bool remoteClient();
 bool server();
 bool negotiatedLocal();
+// A 5 s log summary of VR session traffic (client or server; otherwise nothing).
+void reportDiagnostics() noexcept;
 // Voice chat (game/voice.hpp). The sink receives every voice packet for the
 // local player, naming the speaker's local avatar handle and the speaker's
 // capability incarnation; null (dedicated server) only relays.

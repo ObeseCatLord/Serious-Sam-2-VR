@@ -44,8 +44,14 @@ std::atomic<bool> running{false};
 // Lab (SS2VR_LAB_VOICE=1): a session without peers, a synthetic talker (1 s of
 // voice-like tone every 2 s) instead of the microphone, every packet looped back
 // as a speaker 2 m to the right, the mix written to Bin/voice-lab.wav (12 s)
-// and the pipeline counted in the log.
-const bool labLoopback = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_VOICE", v, 2) == 1 && v[0] == L'1'; }();
+// and the pipeline counted in the log. SS2VR_LAB_VOICE=2 (multiplayer lab): the
+// same synthetic talker sent over the real session, and the mix of the voices
+// received from other players written to voice-lab.wav from the first one heard.
+const int labVoiceMode = [] {
+    wchar_t v[2]{};
+    return GetEnvironmentVariableW(L"SS2VR_LAB_VOICE", v, 2) == 1 && (v[0] == L'1' || v[0] == L'2') ? int(v[0] - L'0') : 0;
+}();
+const bool labLoopback = labVoiceMode == 1, labSynthetic = labVoiceMode != 0;
 constexpr uint32_t LabSpeaker = 0x7ab0u;
 struct LabCounters { unsigned captured = 0, synthetic = 0, packets = 0, received = 0, played = 0, concealed = 0, mixed = 0; } labCount;
 HANDLE thread = nullptr, wake = nullptr;
@@ -358,7 +364,7 @@ struct Worker {
         auto *out = reinterpret_cast<int16_t *>(h.lpData);
         for (unsigned i = 0; i < Frame * 2; ++i) out[i] = int16_t(std::clamp(sum[i], -1.f, 1.f) * 32767.f);
         ++labCount.mixed;
-        if (labLoopback) labWrite(out);
+        if (labSynthetic && (labLoopback || labCount.received)) labWrite(out);
         if (!playback.device) return; // Lab: the virtual playback clock.
         h.dwFlags &= ~WHDR_DONE;
         if (waveOutWrite(playback.device, &h, sizeof h) != MMSYSERR_NOERROR) {
@@ -388,7 +394,7 @@ struct Worker {
                 view = scene;
                 session = configured && (labLoopback || (view.session && now - sceneTick < 1000));
             }
-            if (labLoopback) {
+            if (labSynthetic) {
                 static uint64_t nextReport = 0;
                 if (now >= nextReport) {
                     nextReport = now + 2000;
@@ -401,7 +407,7 @@ struct Worker {
                 }
             }
             // Capture only while there is someone to talk to and the microphone is on.
-            const bool wantCapture = session && settings.microphone != 0 && !labLoopback; // Lab: synthetic only.
+            const bool wantCapture = session && settings.microphone != 0 && !labSynthetic; // Lab: synthetic only.
             if (wantCapture && (!capture.device || device != settings.device) && now >= capture.retryAt) {
                 device = settings.device;
                 capture.open(settings.device, wake, now);
@@ -412,7 +418,7 @@ struct Worker {
                 gate = {};
             }
             takeCapture(now);
-            if (labLoopback && !capture.device && settings.microphone != 0) labSynthesize(now);
+            if (labSynthetic && session && !capture.device && settings.microphone != 0) labSynthesize(now);
             if (packer.talking && (!session || settings.microphone == 0)) endSpurt();
             // Playback while a session (or a stream) is live.
             const bool wantPlayback = settings.receive && session;
@@ -425,7 +431,7 @@ struct Worker {
             if (playback.device)
                 for (auto &h : playback.headers)
                     if ((h.dwFlags & WHDR_DONE) && playback.queued() < PlaybackAhead && playback.device) mix(h, now);
-            if (labLoopback && !playback.device) {
+            if (labSynthetic && !playback.device && (labLoopback || labCount.received)) {
                 // Lab: no output device (the lab's ALSA device is the game's alone):
                 // mix on a virtual 20 ms clock into the WAV.
                 static uint64_t nextMix = 0;

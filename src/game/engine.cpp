@@ -4136,6 +4136,7 @@ static void __fastcall entityStep(void *manager, void *) {
                 interval->preparedManager=manager;
                 interval->networkPrepared = !singlePlayer() && multiplayer::server() && multiplayer::beginTick();
                 if (singlePlayer() || multiplayer::server()) allowNativeSprinting();
+                multiplayer::reportDiagnostics();
                 const auto players = multiplayer::activePlayers();
                 const auto snapshot = copySnapshot();
                 // Reserve ALL subjects before any update, freeze or gameplay
