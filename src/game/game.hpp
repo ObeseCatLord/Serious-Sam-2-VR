@@ -22,6 +22,8 @@ bool nativeModuleFingerprint(HMODULE,const char *);
 void installLabOnlineIsolation();
 void validateLabOnlineIsolation(bool gameplay);
 bool labOnlineIsolationInstalled() noexcept;
+// Multiplayer lab client: Steam networking callbacks, once per presented frame.
+void labPumpSteamCallbacks() noexcept;
 bool foregroundGame();
 bool vrInputLive() noexcept;
 // Native eye canvas at the runtime's recommended size (installed before the

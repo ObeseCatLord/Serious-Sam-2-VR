@@ -237,6 +237,32 @@ static __attribute__((force_align_arg_pointer)) void __fastcall labOpenScene(voi
         hashLabScene(stream,resource); // Borrowed synchronously; never close or retain it.
     },[&](bool) noexcept { if (owns) labSceneReading=false; });
 }
+// Opt-in multiplayer lab client (SS2VR_LAB_MULTIPLAYER=1): this Steam edition
+// carries even a connect-by-IP session over Steam networking, so the client
+// starts the Steam API itself (SteamNetworking, SteamUser for the server's
+// authentication) and pumps its callbacks each frame. The game's online object
+// stays unconstructed: no Steam Cloud download or upload, stats or achievements.
+static bool labMultiplayer() noexcept {
+    static const bool on = [] {
+        wchar_t v[2]{};
+        return GetEnvironmentVariableW(L"SS2VR_LAB_MULTIPLAYER", v, 2) == 1 && v[0] == L'1';
+    }();
+    return on;
+}
+static void(__cdecl *labSteamCallbacks)() = nullptr;
+static void labStartSteamNetworking() noexcept {
+    if (!labMultiplayer() || labSteamCallbacks) return;
+    HMODULE steam = GetModuleHandleW(L"steam_api.dll");
+    auto init = steam ? reinterpret_cast<bool(__cdecl *)()>(GetProcAddress(steam, "SteamAPI_Init")) : nullptr;
+    auto callbacks = steam ? reinterpret_cast<void(__cdecl *)()>(GetProcAddress(steam, "SteamAPI_RunCallbacks")) : nullptr;
+    const bool ok = init && callbacks && init();
+    if (ok) labSteamCallbacks = callbacks;
+    log("Lab multiplayer: Steam API for networking %s; online interface stays unconstructed (no cloud or stats)",
+        ok ? "started" : "unavailable");
+}
+void labPumpSteamCallbacks() noexcept {
+    if (labSteamCallbacks) labSteamCallbacks();
+}
 static __attribute__((noinline)) void __cdecl suppressLabOnlineInitialization() {
     const auto caller=reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
     uint32_t pointer = 0;
@@ -246,6 +272,7 @@ static __attribute__((noinline)) void __cdecl suppressLabOnlineInitialization() 
         abortLab("unexpected online initializer owner or existing interface");
     static bool reported = false;
     if (!reported) { reported=true; log("Lab native online initializer suppressed; interface=0; cloud/stats object not constructed"); }
+    labStartSteamNetworking();
 }
 static void __cdecl labOnlineUninitialize() {
     if(labIsolationPhase.load(std::memory_order_acquire)!=2) abortLab("incomplete isolation reached native shutdown");
@@ -341,11 +368,7 @@ void validateLabOnlineIsolation(bool gameplay) {
     if (!net) { if (gameplay) abortLab("gameplay has no native local transport"); return; }
     // Opt-in multiplayer client (SS2VR_LAB_MULTIPLAYER=1): the native UDP
     // transport to a server is allowed; Steam's online interface stays null.
-    static const bool multiplayer = [] {
-        wchar_t v[2]{};
-        return GetEnvironmentVariableW(L"SS2VR_LAB_MULTIPLAYER", v, 2) == 1 && v[0] == L'1';
-    }();
-    if (multiplayer) {
+    if (labMultiplayer()) {
         if (gameplay) {
             static bool reported=false;
             if (!reported) { reported=true; log("Lab multiplayer gameplay observed with online interface=0 local=%d", labNetIsLocal()); }

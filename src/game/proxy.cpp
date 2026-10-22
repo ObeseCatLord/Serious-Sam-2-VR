@@ -60,6 +60,7 @@ static __attribute__((noinline)) HRESULT WINAPI chainPresent(IDirect3DSwapChain9
         hr = chainHooks[Index].original(chain, src, dst, window, region, flags);
         QueryPerformanceCounter(&end);
         if (outer) ss2vr::game::notePresentCall(start, end);
+        if (outer) ss2vr::game::labPumpSteamCallbacks();
     }, [&](bool) noexcept { --presentationDepth; });
     if (FAILED(hr)) ss2vr::game::nativePresentationFailed(nullptr, chain);
     // Completion is scalar-only, including failed Present: no COM introspection
