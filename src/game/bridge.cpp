@@ -324,6 +324,22 @@ static void *__cdecl labUserStats() {
     return proxy;
 }
 static void (__cdecl *labOriginalInitialize)() = nullptr;
+// The command line's +connect <SteamID> is taken as a Steam lobby (invites):
+// the client asks Steam for the lobby's owner, which a dedicated server is
+// not. When the ID is a game server's, connect to it directly as the server
+// browser does (net_bSteamGameserver), just before CClientInterface::Connect.
+static int(__fastcall *labOriginalClientConnect)(void *, void *, int, int) = nullptr;
+static uint32_t *labSteamGameserver = nullptr, *labServerLobby = nullptr;
+static int __fastcall labClientConnect(void *client, void *edx, int a, int b) {
+    if (labSteamGameserver && labServerLobby && (labServerLobby[0] || labServerLobby[1])) {
+        const uint32_t type = (labServerLobby[1] >> 20) & 0xf; // EAccountType
+        if (type == 3 || type == 4) { // Game server or anonymous game server.
+            *labSteamGameserver = 1;
+            log("Lab multiplayer: connecting directly to game server %08x%08x", labServerLobby[1], labServerLobby[0]);
+        }
+    }
+    return labOriginalClientConnect(client, edx, a, b);
+}
 static void labInstallSteamWriteBarrier() {
     HMODULE steam = GetModuleHandleW(L"steam_api.dll");
     void *storage = steam ? reinterpret_cast<void *>(GetProcAddress(steam, "SteamRemoteStorage")) : nullptr;
@@ -333,6 +349,14 @@ static void labInstallSteamWriteBarrier() {
         MH_CreateHook(stats, reinterpret_cast<void *>(labUserStats), reinterpret_cast<void **>(&labRealUserStats)) != MH_OK ||
         MH_EnableHook(storage) != MH_OK || MH_EnableHook(stats) != MH_OK)
         abortLab("multiplayer Steam write barrier unavailable");
+    HMODULE engine = GetModuleHandleW(L"Engine.dll");
+    labSteamGameserver = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_bSteamGameserver@SeriousEngine@@3HA"));
+    labServerLobby = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_idSteamServerLobby@SeriousEngine@@3VCSteamID@@A"));
+    void *connect = reinterpret_cast<void *>(GetProcAddress(engine, "?Connect@CClientInterface@SeriousEngine@@UAEHHH@Z"));
+    if (!labSteamGameserver || !labServerLobby || !connect ||
+        MH_CreateHook(connect, reinterpret_cast<void *>(labClientConnect), reinterpret_cast<void **>(&labOriginalClientConnect)) != MH_OK ||
+        MH_EnableHook(connect) != MH_OK)
+        abortLab("multiplayer direct server connect unavailable");
     log("Lab multiplayer: Steam write barrier installed (cloud, stats, achievements)");
 }
 static __attribute__((noinline)) void __cdecl suppressLabOnlineInitialization() {
