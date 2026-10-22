@@ -1622,6 +1622,18 @@ static void logSteamVerdict(const char *verdict, const void *data, bool reason, 
 static void __fastcall steamClientDeny(void *self, void *, void *data) { logSteamVerdict("denied", data, true, true); originalSteamClientDeny(self, data); }
 static void __fastcall steamClientKick(void *self, void *, void *data) { logSteamVerdict("kicked", data, true, false); originalSteamClientKick(self, data); }
 static void __fastcall steamClientApprove(void *self, void *, void *data) { logSteamVerdict("approved", data, false, false); originalSteamClientApprove(self, data); }
+// CSteamOnlineInterface::ChallengeAuthenticate(client, CSteamID&, ticket, size):
+// a game server hands the ticket to SendUserConnectAndAuthenticate; the
+// client's state (+0xa4 + 4*client) is 1 pending, 2 approved, 3 failed.
+using ChallengeAuthenticate = void(__thiscall *)(void *, int, void *, void *, int);
+static ChallengeAuthenticate originalChallengeAuthenticate = nullptr;
+static void __fastcall challengeAuthenticate(void *self, void *, int client, void *id, void *ticket, int size) {
+    originalChallengeAuthenticate(self, client, id, ticket, size);
+    const uint32_t state = client >= 0 && client < 16 ? primaryField(self, 0xa4 + 4 * unsigned(client)) : 0;
+    uint32_t steam[2]{};
+    if (id) memcpy(steam, id, sizeof steam);
+    log("Steam authentication of client %d (%08x%08x, ticket %d bytes): state %u", client, steam[1], steam[0], size, state);
+}
 static uintptr_t sprintPatchedBase = 0;
 static bool patchSprintForward(HMODULE game) {
     const auto base = reinterpret_cast<uintptr_t>(game);
@@ -11737,6 +11749,8 @@ bool attach(bool headless) {
           originalSteamClientKick);
         H(e, "?OnGSClientApprove@CSteamOnlineInterface@SeriousEngine@@QAEXPAUGSClientApprove_t@@@Z", steamClientApprove,
           originalSteamClientApprove);
+        H(e, "?ChallengeAuthenticate@CSteamOnlineInterface@SeriousEngine@@UAEXJAAVCSteamID@@PAEJ@Z", challengeAuthenticate,
+          originalChallengeAuthenticate);
         ok = symbol(g, "?GetCameraPlacement@CPuppetEntity@SeriousEngine@@UAE?AVQuatVect@2@XZ",
                     originalCamera) &&
              ok;
