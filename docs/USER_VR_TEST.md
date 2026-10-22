@@ -23,6 +23,16 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Sprint (2026-10-22)
+
+1. You sprint from the start: walking forward should be faster than before
+   (the game's sprint is 1.5x and only applies while moving roughly forward;
+   strafing and backing up are normal speed).
+2. Click the left stick once: you walk. Click again: you sprint. Clicking both
+   sticks together still recentres and does not toggle.
+3. VR options > Sprint switches which one you start in. If forward speed never
+   changes, check that the game's own Enable sprinting option is on.
+
 ## Changed after the turret, wrist and prison report (2026-10-21)
 
 1. Turrets aim where you look. The right stick turns your view and the turret

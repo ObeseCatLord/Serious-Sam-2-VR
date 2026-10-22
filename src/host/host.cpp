@@ -2644,7 +2644,7 @@ struct Host {
     }
     // --- VR options panel ---
     enum OptionsItem : unsigned {
-        OptFoveation, OptInset, OptPeriphery, OptTurning, OptTurnSpeed, OptLasers, OptFireHaptic, OptDamageHaptic,
+        OptFoveation, OptInset, OptPeriphery, OptTurning, OptTurnSpeed, OptSprint, OptLasers, OptFireHaptic, OptDamageHaptic,
         OptScale, OptInstancing, OptMicrophone, OptVoiceVolume, OptHud, OptHudSize, OptClose, OptCount
     };
     bool instancingSetting() const { return loadSettings(settingsFile).singlePassInstancing; }
@@ -2660,6 +2660,7 @@ struct Host {
         wchar_t speed[24];
         std::swprintf(speed, 24, L"%d deg/s", int(std::lround(settings.smoothTurnRate * 180 / Pi)));
         rows[OptTurnSpeed] = {L"Turn speed", speed};
+        rows[OptSprint] = {L"Sprint", settings.sprintDefault ? L"On" : L"Off", L"(left stick click toggles)"};
         rows[OptLasers] = {L"Aim lasers", settings.lasers ? L"On" : L"Off"};
         rows[OptFireHaptic] = {L"Fire haptics", percent(settings.fireHaptic)};
         rows[OptDamageHaptic] = {L"Damage haptics", percent(settings.damageHaptic)};
@@ -2709,6 +2710,10 @@ struct Host {
             saveSetting(L"Comfort", L"SmoothTurnDegreesPerSecond", degrees);
             break;
         }
+        case OptSprint:
+            settings.sprintDefault = !settings.sprintDefault;
+            saveSetting(L"Comfort", L"SprintByDefault", settings.sprintDefault);
+            break;
         case OptLasers: settings.lasers = !settings.lasers; saveSetting(L"Laser", L"Enabled", settings.lasers); break;
         case OptFireHaptic:
             settings.fireHaptic = stepped(settings.fireHaptic, direction, .1f, 0, 1);

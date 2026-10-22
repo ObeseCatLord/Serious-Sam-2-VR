@@ -639,6 +639,7 @@ static void pollSettingsFile() {
     settings.laserDistance = fresh.laserDistance;
     settings.snapTurn = fresh.snapTurn;
     settings.smoothTurnRate = fresh.smoothTurnRate;
+    settings.sprintDefault = fresh.sprintDefault;
     settings.singlePassInstancing = fresh.singlePassInstancing;
     settings.voice = fresh.voice;
     single_pass::setInstancing(fresh.singlePassInstancing);
@@ -1578,6 +1579,8 @@ static std::atomic<bool> grenadeLaunching{false}, grenadeTaken{false};
 using AmmoQuantity = int32_t(__thiscall *)(void *, int);
 static AmmoQuantity grenadeAmmoQuantity = nullptr; // CPlayerInventory::GetAmmoQuantity
 constexpr int HandGrenadeAmmo = 4;                 // AmmoIndex the native throw drains
+using PuppetFlag = int(__thiscall *)(void *);
+static PuppetFlag puppetSprinting = nullptr; // CPlayerPuppetEntity::IsSprinting (the speed boost is on)
 static int handOf(void *weapon, const Snapshot &s) {
     if (!s.rider.handheld() || !nativeRiderCurrent(s.player, s.rider))
         return -1;
@@ -2673,9 +2676,35 @@ static void update(void *p) {
     const bool gripJump = !((input.buttons[0] | input.buttons[1]) & Button::JumpBound);
     s.jump = enabled && !resettingControls && ((contextualButtons & Button::Jump) ||
         (gripJump && (gripJumps[0].jumping || gripJumps[1].jumping)));
-    // Left stick click sprints; the right one zooms a sniper (above) and
+    // Left stick click toggles between sprinting and walking ([Comfort]
+    // SprintByDefault picks which you start in; the game sprints only while
+    // moving roughly forward). On release, so that clicking both sticks
+    // (recentre) toggles nothing. The right click zooms a sniper (above) and
     // otherwise throws a hand grenade.
-    s.sprint = enabled && !resettingControls && (leftContextual & Button::Sprint);
+    {
+        static bool previousClick = false, armed = false, toggled = false, lastDefault = true;
+        if (settings.sprintDefault != lastDefault) toggled = false; // A new default applies at once.
+        lastDefault = settings.sprintDefault;
+        const bool click = enabled && !resettingControls && (leftContextual & Button::Sprint);
+        if (click && !previousClick) armed = true;
+        if (recenterHeld(input) || !enabled) armed = false;
+        if (!click && previousClick && armed) {
+            toggled = !toggled;
+            log("Sprint toggled: %s", settings.sprintDefault != toggled ? "sprint" : "walk");
+        }
+        if (!click) armed = false;
+        previousClick = click;
+        s.sprint = enabled && !resettingControls && settings.sprintDefault != toggled;
+        // The game's own state (its "Enable sprinting" option, moving forward).
+        static int lastSprinting = -1;
+        static unsigned sprintLogs = 0;
+        const int sprinting = puppetSprinting ? puppetSprinting(p) != 0 : -1;
+        if (sprinting != lastSprinting && sprintLogs < 200) {
+            ++sprintLogs;
+            log("Sprinting native=%d requested=%d", sprinting, int(s.sprint));
+        }
+        lastSprinting = sprinting;
+    }
     {
         // The right stick click takes a grenade into the right hand (its weapon
         // is put away meanwhile) or puts it away; a throwing motion of that hand
@@ -10618,7 +10647,7 @@ static __attribute__((noinline)) void runPostSimulationSniper(SimulationInterval
            !nativePresentationIdleForBodyMove() || !singlePlayer() || !livePlayer(s) ||
            !vrSession(s) || !fresh(s.input) || !s.ui.gameplay || !s.rider.handheld() ||
            !nativeRiderCurrent(s.player,s.rider) || !trackingEligible(s.player))return;
-        if(s.use || s.jump || s.sprint || s.input.zoomDownMask)return fail("nonneutral");
+        if(s.use || s.jump || s.input.zoomDownMask)return fail("nonneutral");
         for(unsigned hand=0;hand<2;++hand)
             if(s.input.trigger[hand]!=0 || s.input.axis[hand][0]!=0 || s.input.axis[hand][1]!=0 ||
                (s.input.buttons[hand] & ~Button::JumpBound) || s.fire[hand] || s.zoom[hand] || s.selecting[hand] ||
@@ -11393,6 +11422,7 @@ bool attach(bool headless) {
         symbol(c, "?strConvertIDToString@SeriousEngine@@YAPBDVIDENT@1@@Z", identToString);
         symbol(g, "?OnGiveAll@CPlayerPuppetEntity@SeriousEngine@@QAEXH@Z", giveAllWeapons);
         symbol(g, "?GetAmmoQuantity@CPlayerInventory@SeriousEngine@@QAEJW4AmmoIndex@2@@Z", grenadeAmmoQuantity);
+        symbol(g, "?IsSprinting@CPlayerPuppetEntity@SeriousEngine@@QAEHXZ", puppetSprinting);
         symbol(c, "?memPreDeleteArrayRC_internal@SeriousEngine@@YAXPBXPAVCDataType@1@@Z", preDeleteArray);
         symbol(c, "?memDeleteArray_internal@SeriousEngine@@YAXPAX@Z", deleteArray);
         symbol(c, "?memPostDeleteArrayRC_internal@SeriousEngine@@YAXPAVCDataType@1@@Z", postDeleteArray);
