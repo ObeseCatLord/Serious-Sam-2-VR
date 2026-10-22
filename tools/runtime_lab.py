@@ -1125,6 +1125,10 @@ def run(cfg):
     if cfg.get('online_isolation')!='native-init-barrier-verified':
         raise RuntimeError('Native save/profile isolation is not verified; no game launched')
     multiplayer=cfg.get('multiplayer_connect') is not None
+    # A multiplayer client builds the game's online object behind the Steam
+    # write barrier (no cloud, stats or achievement writes) instead of none.
+    isolation_receipt=('Lab multiplayer: Steam write barrier installed (cloud, stats, achievements)' if multiplayer else
+                       'Lab native online initializer suppressed; interface=0;')
     # Multiplayer clients run side by side, each owning its own fixture.
     if not multiplayer and (running('Sam2.exe') or running('ss2vr_host.exe')):
         raise RuntimeError('An existing game or host is running; no duplicate test will start')
@@ -1387,7 +1391,7 @@ def run(cfg):
                 if state.get('loading_ready') and not loading_continue_sent:
                     native_log=(lab/'Bin/SS2VR.log').read_text(errors='replace')
                     native_receipts=re.findall(r'Lab native scene stream bytes=(\d+) positionRestored=(\d+) sha256=([a-f0-9]{64})',native_log)
-                    if ('Lab native online initializer suppressed; interface=0;' not in native_log or
+                    if (isolation_receipt not in native_log or
                         not native_receipts or any(h!=cfg['scene']['entry_sha256'] for size,pos,h in native_receipts)):
                         raise RuntimeError('Loading continuation lacks consistent native scene/isolation evidence')
                     receipt=run_dir/'loading-post.json'
@@ -1414,9 +1418,9 @@ def run(cfg):
             raise RuntimeError('Fresh native log does not certify requested simulation')
         manifest['loaded_scene_confirmed']=True
         isolation_log=(lab/'Bin/SS2VR.log').read_text(errors='replace')
-        if 'Lab native online initializer suppressed; interface=0;' not in isolation_log:
+        if isolation_receipt not in isolation_log:
             raise RuntimeError('Fresh native log does not certify early online isolation')
-        gameplay_receipt=('Lab multiplayer gameplay observed with online interface=0' if multiplayer else
+        gameplay_receipt=('Lab multiplayer gameplay observed behind the Steam write barrier' if multiplayer else
                           'Lab local gameplay observed with online interface=0')
         if (not stock and gameplay_receipt not in isolation_log) or \
             (stock and not (state['local_transport'] and state['online_interface_null'])):
@@ -1430,7 +1434,7 @@ def run(cfg):
         if cfg.get('grip_resource_probe'):
             manifest['native_grip_resource_receipts']=native_grip_resource_receipts(isolation_log)
             manifest['rendered_grip_alignment_verified']=False
-        if 'Steam initialize (AppID' in scene_log or 'from Steam cloud:' in scene_log:
+        if not multiplayer and ('Steam initialize (AppID' in scene_log or 'from Steam cloud:' in scene_log):
             raise RuntimeError('Native Steam interface unexpectedly initialized')
         if stock:
             (run_dir/'stock-camera-before.json').write_text(json.dumps(state,indent=2))

@@ -237,11 +237,16 @@ static __attribute__((force_align_arg_pointer)) void __fastcall labOpenScene(voi
         hashLabScene(stream,resource); // Borrowed synchronously; never close or retain it.
     },[&](bool) noexcept { if (owns) labSceneReading=false; });
 }
-// Opt-in multiplayer lab client (SS2VR_LAB_MULTIPLAYER=1): this Steam edition
-// carries even a connect-by-IP session over Steam networking, so the client
-// starts the Steam API itself (SteamNetworking, SteamUser for the server's
-// authentication) and pumps its callbacks each frame. The game's online object
-// stays unconstructed: no Steam Cloud download or upload, stats or achievements.
+// Opt-in multiplayer lab client (SS2VR_LAB_MULTIPLAYER=1). This Steam edition
+// carries every session, even a connect-by-IP one, through its online object
+// (Steam networking, SteamID, message classes), so a multiplayer client builds
+// it as the game does. What must not reach the user's Steam account is write
+// access: SteamRemoteStorage() and SteamUserStats() return proxies that pass
+// every call through except the writing ones, which are refused (Steam Cloud
+// FileWrite, FileForget, FileDelete, FileShare, SetSyncPlatforms and the write
+// streams; SetStat, UpdateAvgRateStat, SetAchievement, ClearAchievement and
+// StoreStats). Interface versions: STEAMREMOTESTORAGE_INTERFACE_VERSION011 and
+// STEAMUSERSTATS_INTERFACE_VERSION011 (this game's steam_api.dll).
 static bool labMultiplayer() noexcept {
     static const bool on = [] {
         wchar_t v[2]{};
@@ -249,19 +254,86 @@ static bool labMultiplayer() noexcept {
     }();
     return on;
 }
-static void(__cdecl *labSteamCallbacks)() = nullptr;
-static void labStartSteamNetworking() noexcept {
-    if (!labMultiplayer() || labSteamCallbacks) return;
-    HMODULE steam = GetModuleHandleW(L"steam_api.dll");
-    auto init = steam ? reinterpret_cast<bool(__cdecl *)()>(GetProcAddress(steam, "SteamAPI_Init")) : nullptr;
-    auto callbacks = steam ? reinterpret_cast<void(__cdecl *)()>(GetProcAddress(steam, "SteamAPI_RunCallbacks")) : nullptr;
-    const bool ok = init && callbacks && init();
-    if (ok) labSteamCallbacks = callbacks;
-    log("Lab multiplayer: Steam API for networking %s; online interface stays unconstructed (no cloud or stats)",
-        ok ? "started" : "unavailable");
+struct LabSteamRule { unsigned slot; uint32_t eax, edx; uint16_t argumentBytes; };
+// A proxy object { vtable, real }: forwarding thunks keep the arguments and
+// replace `this` (thiscall: ecx); refusing thunks return a fixed value and pop
+// their arguments as the callee must.
+static void *labSteamProxy(void *real, const LabSteamRule *rules, size_t count, const char *name) noexcept {
+    constexpr unsigned Slots = 96, Thunk = 16;
+    auto *memory = static_cast<uint8_t *>(VirtualAlloc(nullptr, Slots * Thunk + Slots * 4 + 8, MEM_COMMIT | MEM_RESERVE,
+                                                       PAGE_EXECUTE_READWRITE));
+    if (!real || !memory) return real;
+    auto *table = reinterpret_cast<uint32_t *>(memory + Slots * Thunk);
+    auto *object = reinterpret_cast<uint32_t *>(table + Slots);
+    for (unsigned i = 0; i < Slots; ++i) {
+        uint8_t *t = memory + i * Thunk;
+        const LabSteamRule *rule = nullptr;
+        for (size_t k = 0; k < count; ++k) if (rules[k].slot == i) rule = &rules[k];
+        if (rule) {
+            t[0] = 0xb8; std::memcpy(t + 1, &rule->eax, 4);              // mov eax, value
+            t[5] = 0xba; std::memcpy(t + 6, &rule->edx, 4);              // mov edx, value
+            t[10] = 0xc2; std::memcpy(t + 11, &rule->argumentBytes, 2);  // ret n
+        } else {
+            const uint32_t offset = i * 4;
+            t[0] = 0x8b; t[1] = 0x49; t[2] = 0x04;                       // mov ecx, [ecx+4]
+            t[3] = 0x8b; t[4] = 0x01;                                    // mov eax, [ecx]
+            t[5] = 0xff; t[6] = 0xa0; std::memcpy(t + 7, &offset, 4);    // jmp [eax+offset]
+        }
+        table[i] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(t));
+    }
+    object[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(table));
+    object[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(real));
+    FlushInstructionCache(GetCurrentProcess(), memory, Slots * Thunk);
+    log("Lab multiplayer: %s writes refused (proxy over %p)", name, real);
+    return object;
 }
-void labPumpSteamCallbacks() noexcept {
-    if (labSteamCallbacks) labSteamCallbacks();
+static void *(__cdecl *labRealRemoteStorage)() = nullptr, *(__cdecl *labRealUserStats)() = nullptr;
+static void *__cdecl labRemoteStorage() {
+    static void *real = nullptr, *proxy = nullptr;
+    void *current = labRealRemoteStorage();
+    if (current != real) {
+        static constexpr LabSteamRule rules[]{
+            {0, 0, 0, 12},           // FileWrite -> false
+            {2, 0, 0, 4},            // FileForget -> false
+            {3, 0, 0, 4},            // FileDelete -> false
+            {4, 0, 0, 4},            // FileShare -> k_uAPICallInvalid
+            {5, 0, 0, 8},            // SetSyncPlatforms -> false
+            {6, ~0u, ~0u, 4},        // FileWriteStreamOpen -> invalid handle
+            {7, 0, 0, 16},           // FileWriteStreamWriteChunk -> false
+            {8, 0, 0, 8},            // FileWriteStreamClose -> false
+            {9, 0, 0, 8}};           // FileWriteStreamCancel -> false
+        real = current;
+        proxy = labSteamProxy(current, rules, std::size(rules), "Steam Cloud");
+    }
+    return proxy;
+}
+static void *__cdecl labUserStats() {
+    static void *real = nullptr, *proxy = nullptr;
+    void *current = labRealUserStats();
+    if (current != real) {
+        static constexpr LabSteamRule rules[]{
+            {3, 1, 0, 8},            // SetStat (both overloads) -> true, not set
+            {4, 1, 0, 8},
+            {5, 1, 0, 16},           // UpdateAvgRateStat -> true, not set
+            {7, 1, 0, 4},            // SetAchievement -> true, not set
+            {8, 1, 0, 4},            // ClearAchievement -> true, not cleared
+            {10, 1, 0, 0}};          // StoreStats -> true, nothing stored
+        real = current;
+        proxy = labSteamProxy(current, rules, std::size(rules), "Steam stats and achievements");
+    }
+    return proxy;
+}
+static void (__cdecl *labOriginalInitialize)() = nullptr;
+static void labInstallSteamWriteBarrier() {
+    HMODULE steam = GetModuleHandleW(L"steam_api.dll");
+    void *storage = steam ? reinterpret_cast<void *>(GetProcAddress(steam, "SteamRemoteStorage")) : nullptr;
+    void *stats = steam ? reinterpret_cast<void *>(GetProcAddress(steam, "SteamUserStats")) : nullptr;
+    if (!storage || !stats ||
+        MH_CreateHook(storage, reinterpret_cast<void *>(labRemoteStorage), reinterpret_cast<void **>(&labRealRemoteStorage)) != MH_OK ||
+        MH_CreateHook(stats, reinterpret_cast<void *>(labUserStats), reinterpret_cast<void **>(&labRealUserStats)) != MH_OK ||
+        MH_EnableHook(storage) != MH_OK || MH_EnableHook(stats) != MH_OK)
+        abortLab("multiplayer Steam write barrier unavailable");
+    log("Lab multiplayer: Steam write barrier installed (cloud, stats, achievements)");
 }
 static __attribute__((noinline)) void __cdecl suppressLabOnlineInitialization() {
     const auto caller=reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
@@ -270,16 +342,22 @@ static __attribute__((noinline)) void __cdecl suppressLabOnlineInitialization() 
     if (labIsolationPhase.load(std::memory_order_acquire)!=2 || !labOnlineIsolated ||
         GetCurrentThreadId()!=labStartupThread || pointer || caller!=labInitializerCaller)
         abortLab("unexpected online initializer owner or existing interface");
+    if (labMultiplayer()) {
+        // The session needs the online object; the write barrier is in place.
+        log("Lab multiplayer: native online initializer runs behind the Steam write barrier");
+        labOriginalInitialize();
+        return;
+    }
     static bool reported = false;
     if (!reported) { reported=true; log("Lab native online initializer suppressed; interface=0; cloud/stats object not constructed"); }
-    labStartSteamNetworking();
 }
 static void __cdecl labOnlineUninitialize() {
     if(labIsolationPhase.load(std::memory_order_acquire)!=2) abortLab("incomplete isolation reached native shutdown");
     uint32_t pointer=0;
     std::memcpy(&pointer,reinterpret_cast<const void *>(labEngineBase+0x2ec890),sizeof(pointer));
-    if (pointer) abortLab("online interface appeared before native shutdown");
-    log("Lab native online shutdown wrapper entered; interface=0; Steam synchronization body excluded");
+    if (pointer && !labMultiplayer()) abortLab("online interface appeared before native shutdown");
+    log("Lab native online shutdown wrapper entered; interface=%u; Steam synchronization %s", pointer ? 1u : 0u,
+        pointer ? "behind the write barrier" : "body excluded");
     labOriginalUninitialize(); // Preserve the stock null-interface return.
 }
 void installLabOnlineIsolation() {
@@ -317,8 +395,9 @@ void installLabOnlineIsolation() {
     HMODULE pinned=nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
         reinterpret_cast<LPCWSTR>(engine),&pinned)) abortLab("native online module pin failed");
-    void *unusedOriginal=nullptr;
-    if (MH_CreateHook(entry,reinterpret_cast<void *>(suppressLabOnlineInitialization),&unusedOriginal)!=MH_OK)
+    if (labMultiplayer()) labInstallSteamWriteBarrier();
+    if (MH_CreateHook(entry,reinterpret_cast<void *>(suppressLabOnlineInitialization),
+        reinterpret_cast<void **>(&labOriginalInitialize))!=MH_OK || !labOriginalInitialize)
         abortLab("online isolation hook creation failed");
     if (MH_CreateHook(uninitialize,reinterpret_cast<void *>(labOnlineUninitialize),
         reinterpret_cast<void **>(&labOriginalUninitialize))!=MH_OK || !labOriginalUninitialize)
@@ -363,7 +442,7 @@ void validateLabOnlineIsolation(bool gameplay) {
     if(phase!=2 || !labOnlineIsolated) abortLab("partial lab isolation reached native gameplay");
     uint32_t pointer=0;
     std::memcpy(&pointer,reinterpret_cast<const void *>(labEngineBase+0x2ec890),sizeof(pointer));
-    if (pointer) abortLab("online interface appeared during private fixture");
+    if (pointer && !labMultiplayer()) abortLab("online interface appeared during private fixture");
     const auto *net=labCurrentNet();
     if (!net) { if (gameplay) abortLab("gameplay has no native local transport"); return; }
     // Opt-in multiplayer client (SS2VR_LAB_MULTIPLAYER=1): the native UDP
@@ -371,7 +450,7 @@ void validateLabOnlineIsolation(bool gameplay) {
     if (labMultiplayer()) {
         if (gameplay) {
             static bool reported=false;
-            if (!reported) { reported=true; log("Lab multiplayer gameplay observed with online interface=0 local=%d", labNetIsLocal()); }
+            if (!reported) { reported=true; log("Lab multiplayer gameplay observed behind the Steam write barrier local=%d", labNetIsLocal()); }
         }
         return;
     }
