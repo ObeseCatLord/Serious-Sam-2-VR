@@ -1171,7 +1171,8 @@ def run(cfg):
     env.update(cfg.get('proton_environment',{}))
     env.pop('SS2VR_LAB_STOCK_RENDER',None)
     env.pop('SS2VR_LAB_MULTIPLAYER',None)
-    if multiplayer:env['SS2VR_LAB_MULTIPLAYER']='1'
+    env.pop('SS2VR_LAB_SERVER_STEAMID',None)
+    if multiplayer:env.update(SS2VR_LAB_MULTIPLAYER='1',SS2VR_LAB_SERVER_STEAMID=cfg['multiplayer_connect'])
     env.pop('SS2VR_LAB_BACKGROUND_MOVE',None)
     if cfg.get('background_controls_probe')=='joystick-native-movement':env['SS2VR_LAB_BACKGROUND_MOVE']='1'
     env.pop('SS2VR_LAB_IDLE_WEAPON',None)
