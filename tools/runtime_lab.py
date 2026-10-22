@@ -690,10 +690,17 @@ def validate(cfg):
     if connect is not None:
         # Opt-in multiplayer client: joins the given server by IP over the
         # native UDP transport. Steam's online interface stays suppressed.
-        if not isinstance(connect,str) or not re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}:\d{2,5}',connect):
-            raise ValueError('Multiplayer connect must be an IPv4 address and port')
+        # This Steam edition joins by the server's SteamID (decimal), which a
+        # dedicated server reports in its Steam query (A2S_INFO).
+        if not isinstance(connect,str) or not re.fullmatch(r'\d{17}',connect):
+            raise ValueError('Multiplayer connect must be the server SteamID in decimal')
         if preparation_weapon(cfg) is not None:raise ValueError('A multiplayer client has no fixture preparation')
         expected_arguments=['+mod','SS2VR','+sam_bBootSequence','0','+sam_bSkipMovies','1','+connect',connect]
+        password=cfg.get('multiplayer_password')
+        if password is not None:
+            if not isinstance(password,str) or not re.fullmatch(r'[a-z0-9]{4,32}',password):
+                raise ValueError('Multiplayer password must be 4-32 lowercase letters or digits')
+            expected_arguments+=['+net_strConnectPassword',password]
     zero_mouse_arguments=expected_arguments[:6]+['+inp_fMouseSensitivity','0']+expected_arguments[6:]
     if startup['arguments'] not in (expected_arguments,zero_mouse_arguments):
         raise ValueError('Only the verified stock local +level startup is admitted')
