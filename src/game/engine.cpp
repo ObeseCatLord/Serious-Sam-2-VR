@@ -1029,6 +1029,10 @@ struct RideTracker {
         return x;
     }
 };
+// Turrets follow the head; the right stick turns the view (and so the turret
+// with it): an extra heading on the turret's fixed view, per ride.
+static std::atomic<float> turretViewTurn{0};
+static std::atomic<uint32_t> turretViewRide{0};
 static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     static int64_t lastSim = 0;
     static RideTracker axes[3], heading;
@@ -1060,7 +1064,11 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     // Rides aimed by head or hand keep the view's heading from boarding: the
     // aim turning the ride must not turn the frame the aim is measured in.
     const bool fixedView = ball || creatureAimRide(rider) || seatedInTurret(rider);
-    if (fixedView && ride != rider.ride) ballHeading = rawHeading;
+    if (fixedView && ride != rider.ride) {
+        ballHeading = rawHeading;
+        turretViewTurn = 0;
+        turretViewRide = rider.ride;
+    }
     if (ball && ballCentre(rider, centre)) {
         if (ride != rider.ride) ballLift = std::clamp(raw.p.y - centre.y, -.5f, 1.5f);
         target = centre + Vec3{0, ballLift, 0};
@@ -1108,7 +1116,7 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     st.v = Vec3{axes[0].v, axes[1].v, axes[2].v};
     st.heading = trackedHeading;
     st.headingRate = heading.v;
-    st.fixedHeading = ballHeading;
+    st.fixedHeading = ballHeading + (seatedInTurret(rider) && turretViewRide.load() == rider.ride ? turretViewTurn.load() : 0.f);
     st.fixed = fixedView;
     st.level = !aircraftRide(rider);
     st.stamp = now;
@@ -4987,6 +4995,17 @@ static Pose *__fastcall camera(void *p, void *, Pose *out) {
             }
             void *brain = resolve(primaryField(p, 0x38c));
             const uint32_t usable = brain ? primaryField(brain, 0x1f4) : 0;
+            static uint32_t lastHit = ~0u;
+            const uint32_t hitHandle = brain ? primaryField(brain, 0x1ec) : 0; // What the ray hit.
+            if (trace && hitHandle != lastHit) {
+                lastHit = hitHandle;
+                void *hitEntity = hitHandle ? resolve(hitHandle) : nullptr;
+                const uintptr_t hitTable = hitEntity ? primaryField(hitEntity, 0) : 0;
+                const Vec3 f = rotate(normalize(head.q), Vec3{0, 0, -1});
+                log("Lab use ray hit=%u class=game+%lx pitch=%.2f heading=%.2f", hitHandle,
+                    static_cast<unsigned long>(hitTable ? hitTable - reinterpret_cast<uintptr_t>(GetModuleHandleW(L"Sam2Game.dll")) : 0),
+                    std::asin(std::clamp(f.y, -1.f, 1.f)), std::atan2(-f.x, -f.z));
+            }
             if (trace && usable != lastUsable) {
                 lastUsable = usable;
                 void *entity = usable ? resolve(usable) : nullptr;
@@ -9688,38 +9707,44 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
         if (playerHandle == captured.rider.player && ownedBrain == brainHandle &&
             nativeTrackingAnchor(snapshot.player, anchor, &captured.rider)) {
             if (seatedInTurret(captured.rider) && fresh(captured.input)) {
-                // Turrets aim where the head looks; the right stick adds an offset
-                // (at the smooth-turn rate) for aims beyond a comfortable head turn.
-                // The view keeps the heading it had on mounting (updateRideSteadying),
-                // so turning the turret never turns the head's frame. The native look
-                // is the commanded aim the turret lerps toward, within its limits.
-                static Vec3 offset{};
-                static uint32_t offsetRide = 0;
+                // Turrets aim where the head looks. The right stick turns the view (the
+                // turret's fixed view heading, updateRideSteadying), so the head and the
+                // turret it drives turn together, until the turret reaches its limit and
+                // stops following. Pitch is the head's alone. The native look is the
+                // commanded aim the turret lerps toward, within its limits.
                 static uint64_t turretClock = 0;
                 const uint64_t now = GetTickCount64();
-                if (offsetRide != captured.rider.ride || now - turretClock > 2000) { offset = {}; offsetRide = captured.rider.ride; }
                 const float dt = turretClock && now > turretClock ? std::min(.1f, float(now - turretClock) / 1000.f) : 0.f;
                 turretClock = now;
-                const Vec3 step = advanceTurretLook(Vec3{}, captured.input.axis[1][0], captured.input.axis[1][1],
-                                                   settings.smoothTurnRate, dt);
-                if (std::isfinite(step.x) && std::isfinite(step.y)) {
-                    offset.x = std::remainder(offset.x + step.x, 2 * Pi);
-                    offset.y = std::clamp(offset.y + step.y, -1.2f, 1.2f);
-                }
                 const Pose head = worldHeadTracking(anchor, captured.origin, captured.turn, captured.input.head);
                 const Vec3 forward = rotate(normalize(head.q), Vec3{0, 0, -1});
-                const float pitch = std::asin(std::clamp(forward.y, -1.f, 1.f));
-                Vec3 converted;
+                const float pitch = std::asin(std::clamp(forward.y, -1.f, 1.f)), heading = horizontalHeading(head.q);
+                const auto nativeHeading = [&](float h, float &out) {
+                    Vec3 converted;
+                    if (quaternionEuler(&converted, yaw(h)) != &converted || !std::isfinite(converted.x)) return false;
+                    out = converted.x;
+                    return true;
+                };
+                float desired = 0;
                 void *candidateRideToken = nullptr;
-                if (finite(head) && std::isfinite(pitch) &&
-                    quaternionEuler(&converted, yaw(horizontalHeading(head.q))) == &converted && std::isfinite(converted.x) &&
+                if (finite(head) && std::isfinite(pitch) && std::isfinite(heading) && nativeHeading(heading, desired) &&
                     nativeRiderCurrent(snapshot.player, captured.rider, &candidateRideToken) && resolve(brainHandle) == brain) {
-                    look.x = converted.x + offset.x;
-                    look.y = std::clamp(pitch + offset.y, -1.4f, 1.4f);
+                    const float stick = captured.input.axis[1][0];
+                    if (std::abs(stick) > .2f && dt > 0 && turretViewRide.load() == captured.rider.ride) {
+                        // Push right turns right (heading decreases), at the smooth-turn rate.
+                        const float delta = -std::copysign((std::abs(stick) - .2f) / .8f, stick) * settings.smoothTurnRate * dt;
+                        float next = 0;
+                        const float lag = std::abs(std::remainder(desired - look.x, 2 * Pi));
+                        const bool stops = nativeHeading(heading + delta, next) &&
+                            std::abs(std::remainder(next - look.x, 2 * Pi)) > std::max(lag, .35f);
+                        if (!stops) turretViewTurn = std::remainder(turretViewTurn.load() + delta, 2 * Pi);
+                    }
+                    look.x = desired;
+                    look.y = std::clamp(pitch, -1.4f, 1.4f);
                     rideToken = candidateRideToken;
                     static unsigned calls = 0;
                     if (calls++ % 50 == 0)
-                        log("Turret head aim heading=%.3f pitch=%.3f offset=%.3f,%.3f", look.x, look.y, offset.x, offset.y);
+                        log("Turret head aim heading=%.3f pitch=%.3f view turn=%.3f", look.x, look.y, turretViewTurn.load());
                 }
                 if (!rideToken) nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (steeringWheelHeading(look)) {

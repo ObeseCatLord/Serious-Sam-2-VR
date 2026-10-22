@@ -23,6 +23,21 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the turret, wrist and prison report (2026-10-21)
+
+1. Turrets aim where you look; the right stick nudges the aim further. Your
+   view no longer turns with the turret. The laser leaves the gun barrel along
+   its axis, so it stays on the line of fire at the top of the arc too.
+2. Use (switches, the prison's detonator, doors, pickups, "Press Use" prompts)
+   now looks where your head looks instead of level ahead of your body.
+3. Wrist watches sit on top of the wrists like EDuke32 VR's (behind the
+   controller, along the forearm, tilted toward your eyes), without the dark
+   backgrounds. Health and the left ammo no longer cut each other in half, and
+   each weapon's ammo shows on the wrist of the hand holding it.
+4. The grenade in your hand is the same size as a thrown one.
+5. The weapon wheel opens further out and a little higher; a laser from the
+   hand points at the item to choose. The weapon lasers have no dot at the end.
+
 ## New after the vehicle and scope report (2026-10-20)
 
 1. Hoverbike (Road to Ursul save): no steering wheel. Squeeze both grips on the
