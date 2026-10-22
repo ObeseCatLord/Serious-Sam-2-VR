@@ -1627,11 +1627,69 @@ static void __fastcall steamClientApprove(void *self, void *, void *data) { logS
 // client's state (+0xa4 + 4*client) is 1 pending, 2 approved, 3 failed.
 using ChallengeAuthenticate = void(__thiscall *)(void *, int, void *, void *, int);
 static ChallengeAuthenticate originalChallengeAuthenticate = nullptr;
+// Steam's legacy ticket check (InitiateGameConnection on the client,
+// SendUserConnectAndAuthenticate on the server) is refused by today's Steam
+// (GSClientDeny reason 12), so no client could join a dedicated server. SS2VR
+// clients answer the server's challenge with a current session ticket instead
+// (ISteamUser017::GetAuthSessionTicket, marked SessionTicketMagic), which an
+// SS2VR server validates with ISteamGameServer011::BeginAuthSession: the ticket
+// is signed by Steam for that SteamID and this game. Other answers keep the
+// game's own check.
+constexpr char SessionTicketMagic[8] = {'S', 'S', '2', 'V', 'R', 'A', 'T', '1'};
+constexpr int SessionTicketHeader = 12, ChallengeResponseBuffer = 0x800;
+using ChallengeResponse = void(__thiscall *)(void *, uint8_t *, int, uint8_t **, int *);
+static ChallengeResponse originalChallengeResponse = nullptr;
+static void __fastcall challengeResponse(void *self, void *, uint8_t *challenge, int size, uint8_t **out, int *outSize) {
+    originalChallengeResponse(self, challenge, size, out, outSize);
+    // A legacy ticket fills the game's 2 KB buffer; a lobby gets a 1-byte answer.
+    if (!out || !*out || !outSize || *outSize <= 1) return;
+    using SteamInterface = void *(__cdecl *)();
+    static const auto steamUser = loadProc<SteamInterface>(GetModuleHandleW(L"steam_api.dll"), "SteamUser");
+    void *user = steamUser ? steamUser() : nullptr;
+    if (!user) return;
+    using GetTicket = uint32_t(__thiscall *)(void *, void *, int, uint32_t *);
+    const auto getTicket = reinterpret_cast<GetTicket>((*static_cast<void ***>(user))[13]);
+    uint32_t length = 0;
+    const uint32_t handle = getTicket(user, *out + SessionTicketHeader, ChallengeResponseBuffer - SessionTicketHeader, &length);
+    if (!handle || !length || length > uint32_t(ChallengeResponseBuffer - SessionTicketHeader)) {
+        log("Steam session ticket unavailable (handle %u, %u bytes); legacy answer kept", handle, length);
+        return;
+    }
+    memcpy(*out, SessionTicketMagic, sizeof SessionTicketMagic);
+    memcpy(*out + sizeof SessionTicketMagic, &length, sizeof length);
+    *outSize = int(SessionTicketHeader + length);
+    log("Steam session ticket sent to the server (%u bytes)", length);
+}
 static void __fastcall challengeAuthenticate(void *self, void *, int client, void *id, void *ticket, int size) {
-    originalChallengeAuthenticate(self, client, id, ticket, size);
-    const uint32_t state = client >= 0 && client < 16 ? primaryField(self, 0xa4 + 4 * unsigned(client)) : 0;
     uint32_t steam[2]{};
     if (id) memcpy(steam, id, sizeof steam);
+    uint32_t length = 0;
+    if (ticket && size > SessionTicketHeader && !memcmp(ticket, SessionTicketMagic, sizeof SessionTicketMagic) &&
+        (memcpy(&length, static_cast<uint8_t *>(ticket) + sizeof SessionTicketMagic, sizeof length),
+         length == uint32_t(size - SessionTicketHeader)) &&
+        client >= 0 && client < 16 && id && primaryField(self, 0xc)) {
+        using SteamInterface = void *(__cdecl *)();
+        static const auto steamServer = loadProc<SteamInterface>(GetModuleHandleW(L"steam_api.dll"), "SteamGameServer");
+        void *server = steamServer ? steamServer() : nullptr;
+        if (server) {
+            uint64_t steamId = 0;
+            memcpy(&steamId, steam, sizeof steamId);
+            void **table = *static_cast<void ***>(server);
+            using EndSession = void(__thiscall *)(void *, uint64_t);
+            using BeginSession = int(__thiscall *)(void *, const void *, int, uint64_t);
+            reinterpret_cast<EndSession>(table[30])(server, steamId); // A rejoin replaces its session.
+            const int result = reinterpret_cast<BeginSession>(table[29])(
+                server, static_cast<uint8_t *>(ticket) + SessionTicketHeader, int(length), steamId);
+            const uint32_t state = result == 0 ? 2 : 3; // k_EBeginAuthSessionResultOK
+            memcpy(static_cast<uint8_t *>(self) + 0xa4 + 4 * unsigned(client), &state, sizeof state);
+            memcpy(static_cast<uint8_t *>(self) + 0xe4 + 8 * unsigned(client), steam, sizeof steam);
+            log("Steam session ticket of client %d (%08x%08x): BeginAuthSession result %d -> %s", client, steam[1],
+                steam[0], result, state == 2 ? "authenticated" : "refused");
+            return;
+        }
+    }
+    originalChallengeAuthenticate(self, client, id, ticket, size);
+    const uint32_t state = client >= 0 && client < 16 ? primaryField(self, 0xa4 + 4 * unsigned(client)) : 0;
     log("Steam authentication of client %d (%08x%08x, ticket %d bytes): state %u", client, steam[1], steam[0], size, state);
 }
 static uintptr_t sprintPatchedBase = 0;
@@ -11733,6 +11791,8 @@ bool attach(bool headless) {
     if (!headless)
         H(c, "?sysIsAppForeground@SeriousEngine@@YAHXZ", appForeground, originalAppForeground);
     if (!headless) {
+        H(e, "?ChallengeCalculateResponse@CSteamOnlineInterface@SeriousEngine@@UAEXPAEJAAPAEAAJ@Z", challengeResponse,
+          originalChallengeResponse);
         H(e, "?sfuChangeAPI_t@SeriousEngine@@YAXW4SfxAPI@1@J@Z", changeSoundApi, originalChangeApi);
         H(e, "?AddSoundListener@CSoundSyncList@SeriousEngine@@QAEXMMABVQuatVect@2@ABVVector3f@2@@Z", soundListener,
           originalSoundListener);
