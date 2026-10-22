@@ -85,6 +85,10 @@ def prepared_configuration(path):
     if path.name!='config.json':raise ValueError('Collector must use its sealed config.json')
     cfg=json.loads(path.read_text());validate(cfg)
     selected_shell(cfg)
+    if cfg.get('multiplayer_connect') is not None:
+        # A multiplayer client (runtime_lab) has no neutral collection.
+        if not cfg.get('display_timing_probe'):raise ValueError('Prepared private display requires the timing probe')
+        return cfg
     if cfg.get('idle_weapon_probe') is not True or not cfg.get('display_timing_probe'):
         raise ValueError('Prepared private display requires the neutral collector and timing probe')
     receipt=json.loads(Path(cfg['idle_preparation']['path']).read_text())
@@ -185,6 +189,15 @@ def inside(cfg_path, output, display_only=False, prerequisite_only=False):
             'monado_launched':ordered,'data_ready_for_review':False}))
         return
     cfg=prepared_configuration(cfg_path)
+    if cfg.get('multiplayer_connect') is not None:
+        # A multiplayer client: runtime_lab's run and cleanup, then its hold.
+        try:directory=run(cfg)
+        except BaseException as error:
+            (output/'collection-outcome.json').write_text(json.dumps({'completed':False,'error':str(error)}))
+            raise
+        (output/'collection-outcome.json').write_text(json.dumps({'completed':True,'private_run':str(directory),
+            'evidence_scope':'multiplayer-client','data_ready_for_review':True}))
+        return
     if cfg.get('neutral_runtime_probe') is True:
         def interrupted(signum,frame):raise RuntimeError('Private neutral runtime interrupted')
         signal.signal(signal.SIGTERM,interrupted)
@@ -272,7 +285,8 @@ def launch(cfg_path, cfg, display_only=False, prerequisite_only=False):
             if server.poll() is not None:raise RuntimeError('Private compositor failed before exec certification')
             time.sleep(.01)
         else:raise RuntimeError('Private compositor exec certification timed out')
-        end=time.monotonic()+((cfg.get('timeout',60)+45 if cfg.get('monado_window_order_probe') else 75) if prerequisite_only else 285)
+        end=time.monotonic()+((cfg.get('timeout',60)+45 if cfg.get('monado_window_order_probe') else 75) if prerequisite_only else
+                              cfg['timeout']+60 if cfg.get('multiplayer_connect') is not None else 285)
         if not display_only and not prerequisite_only and cfg.get('startup_snapshot') is True:
             end+=12 # Preserve the existing outer cleanup margin for the optional snapshot.
         while server.poll() is None:
