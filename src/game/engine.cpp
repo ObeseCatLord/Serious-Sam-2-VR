@@ -1605,6 +1605,23 @@ static void allowNativeSprinting() {
 // while its stick points within that cone of where the player walks (toggle
 // sprint), so for a VR player the command decides. Anyone else keeps -0.7.
 static float sprintActionForward = SprintNativeForward, sprintStepForward = SprintNativeForward;
+// Steam game-server callbacks (dedicated server): CSteamID (8 bytes), then for
+// deny and kick the EDenyReason, for deny an optional text (GSClientDeny_t).
+using SteamCallback = void(__thiscall *)(void *, void *);
+static SteamCallback originalSteamClientDeny = nullptr, originalSteamClientKick = nullptr, originalSteamClientApprove = nullptr;
+static void logSteamVerdict(const char *verdict, const void *data, bool reason, bool text) {
+    uint32_t id[2]{}, why = 0;
+    if (data) {
+        memcpy(id, data, sizeof id);
+        if (reason) memcpy(&why, static_cast<const uint8_t *>(data) + 8, sizeof why);
+    }
+    char note[129]{};
+    if (data && text) memcpy(note, static_cast<const uint8_t *>(data) + 12, 128);
+    log("Steam %s client %08x%08x reason=%u %s", verdict, id[1], id[0], why, note);
+}
+static void __fastcall steamClientDeny(void *self, void *, void *data) { logSteamVerdict("denied", data, true, true); originalSteamClientDeny(self, data); }
+static void __fastcall steamClientKick(void *self, void *, void *data) { logSteamVerdict("kicked", data, true, false); originalSteamClientKick(self, data); }
+static void __fastcall steamClientApprove(void *self, void *, void *data) { logSteamVerdict("approved", data, false, false); originalSteamClientApprove(self, data); }
 static uintptr_t sprintPatchedBase = 0;
 static bool patchSprintForward(HMODULE game) {
     const auto base = reinterpret_cast<uintptr_t>(game);
@@ -11712,6 +11729,14 @@ bool attach(bool headless) {
         H(e,"?mdlGetAttachmentAbsolutePlacement@SeriousEngine@@YAHPAVCModelInstance@1@VIDENT@1@AAVMatrix34f@1@@Z",
           observedAttachment,originalObservedAttachment);
     if (headless) {
+        // Steam's verdicts on a joining client (server log; the engine kicks
+        // with "Steam authentication failed" but never says why).
+        H(e, "?OnGSClientDeny@CSteamOnlineInterface@SeriousEngine@@QAEXPAUGSClientDeny_t@@@Z", steamClientDeny,
+          originalSteamClientDeny);
+        H(e, "?OnGSClientKick@CSteamOnlineInterface@SeriousEngine@@QAEXPAUGSClientKick_t@@@Z", steamClientKick,
+          originalSteamClientKick);
+        H(e, "?OnGSClientApprove@CSteamOnlineInterface@SeriousEngine@@QAEXPAUGSClientApprove_t@@@Z", steamClientApprove,
+          originalSteamClientApprove);
         ok = symbol(g, "?GetCameraPlacement@CPuppetEntity@SeriousEngine@@UAE?AVQuatVect@2@XZ",
                     originalCamera) &&
              ok;

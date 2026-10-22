@@ -331,14 +331,6 @@ static void (__cdecl *labOriginalInitialize)() = nullptr;
 static int(__fastcall *labOriginalClientConnect)(void *, void *, int, int) = nullptr;
 static uint32_t *labSteamGameserver = nullptr, *labServerLobby = nullptr;
 static int __fastcall labClientConnect(void *client, void *edx, int a, int b) {
-    // The engine's decimal parse of a 17-digit SteamID is lossy: the harness
-    // passes the exact one (SS2VR_LAB_SERVER_STEAMID) for the parsed target.
-    char exact[24]{};
-    if (labServerLobby && GetEnvironmentVariableA("SS2VR_LAB_SERVER_STEAMID", exact, sizeof exact) &&
-        (labServerLobby[0] || labServerLobby[1])) {
-        const unsigned long long id = std::strtoull(exact, nullptr, 10);
-        if (id) { labServerLobby[0] = uint32_t(id); labServerLobby[1] = uint32_t(id >> 32); }
-    }
     if (labSteamGameserver && labServerLobby && (labServerLobby[0] || labServerLobby[1])) {
         const uint32_t type = (labServerLobby[1] >> 20) & 0xf; // EAccountType
         if (type == 3 || type == 4) { // Game server or anonymous game server.
