@@ -339,6 +339,19 @@ void validateLabOnlineIsolation(bool gameplay) {
     if (pointer) abortLab("online interface appeared during private fixture");
     const auto *net=labCurrentNet();
     if (!net) { if (gameplay) abortLab("gameplay has no native local transport"); return; }
+    // Opt-in multiplayer client (SS2VR_LAB_MULTIPLAYER=1): the native UDP
+    // transport to a server is allowed; Steam's online interface stays null.
+    static const bool multiplayer = [] {
+        wchar_t v[2]{};
+        return GetEnvironmentVariableW(L"SS2VR_LAB_MULTIPLAYER", v, 2) == 1 && v[0] == L'1';
+    }();
+    if (multiplayer) {
+        if (gameplay) {
+            static bool reported=false;
+            if (!reported) { reported=true; log("Lab multiplayer gameplay observed with online interface=0 local=%d", labNetIsLocal()); }
+        }
+        return;
+    }
     uintptr_t table=0;std::memcpy(&table,net,sizeof(table));
     const auto game=reinterpret_cast<uintptr_t>(GetModuleHandleW(L"Sam2Game.dll"));
     if (!labNetIsLocal() || !game || table!=game+0x29d270)

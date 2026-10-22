@@ -686,6 +686,14 @@ def validate(cfg):
     if preparation_weapon(cfg) is not None:
         expected_arguments[6:6]=['+sam_iEnableCheats','1']
         validate_fixture_destination(lab,preparation_weapon(cfg))
+    connect=cfg.get('multiplayer_connect')
+    if connect is not None:
+        # Opt-in multiplayer client: joins the given server by IP over the
+        # native UDP transport. Steam's online interface stays suppressed.
+        if not isinstance(connect,str) or not re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}:\d{2,5}',connect):
+            raise ValueError('Multiplayer connect must be an IPv4 address and port')
+        if preparation_weapon(cfg) is not None:raise ValueError('A multiplayer client has no fixture preparation')
+        expected_arguments=['+mod','SS2VR','+sam_bBootSequence','0','+sam_bSkipMovies','1','+connect',connect]
     zero_mouse_arguments=expected_arguments[:6]+['+inp_fMouseSensitivity','0']+expected_arguments[6:]
     if startup['arguments'] not in (expected_arguments,zero_mouse_arguments):
         raise ValueError('Only the verified stock local +level startup is admitted')
@@ -1115,7 +1123,9 @@ def run(cfg):
     # is compiled and explicitly selected in this private configuration.
     if cfg.get('online_isolation')!='native-init-barrier-verified':
         raise RuntimeError('Native save/profile isolation is not verified; no game launched')
-    if running('Sam2.exe') or running('ss2vr_host.exe'):
+    multiplayer=cfg.get('multiplayer_connect') is not None
+    # Multiplayer clients run side by side, each owning its own fixture.
+    if not multiplayer and (running('Sam2.exe') or running('ss2vr_host.exe')):
         raise RuntimeError('An existing game or host is running; no duplicate test will start')
     observer_exclusions={(i['pid'],i['start']) for i in private_processes(cfg['observer'])}
     run_dir=private/'runs'/time.strftime('%Y%m%dT%H%M%S')
@@ -1148,6 +1158,8 @@ def run(cfg):
     env.update(cfg['monado_environment'])
     env.update(cfg.get('proton_environment',{}))
     env.pop('SS2VR_LAB_STOCK_RENDER',None)
+    env.pop('SS2VR_LAB_MULTIPLAYER',None)
+    if multiplayer:env['SS2VR_LAB_MULTIPLAYER']='1'
     env.pop('SS2VR_LAB_BACKGROUND_MOVE',None)
     if cfg.get('background_controls_probe')=='joystick-native-movement':env['SS2VR_LAB_BACKGROUND_MOVE']='1'
     env.pop('SS2VR_LAB_IDLE_WEAPON',None)
@@ -1397,13 +1409,15 @@ def run(cfg):
         else:raise TimeoutError('Verified scene did not reach gameplay readiness')
         manifest['game_pid']=owned_game['pid'];manifest['host_pid']=owned_host['pid'] if owned_host else None
         scene_log=(lab/'Sam2.log').read_text(errors='replace')
-        if not re.search(r"Started simulation on '"+re.escape(cfg['scene']['entry'])+r"'",scene_log):
+        if not multiplayer and not re.search(r"Started simulation on '"+re.escape(cfg['scene']['entry'])+r"'",scene_log):
             raise RuntimeError('Fresh native log does not certify requested simulation')
         manifest['loaded_scene_confirmed']=True
         isolation_log=(lab/'Bin/SS2VR.log').read_text(errors='replace')
         if 'Lab native online initializer suppressed; interface=0;' not in isolation_log:
             raise RuntimeError('Fresh native log does not certify early online isolation')
-        if (not stock and 'Lab local gameplay observed with online interface=0' not in isolation_log) or \
+        gameplay_receipt=('Lab multiplayer gameplay observed with online interface=0' if multiplayer else
+                          'Lab local gameplay observed with online interface=0')
+        if (not stock and gameplay_receipt not in isolation_log) or \
             (stock and not (state['local_transport'] and state['online_interface_null'])):
             raise RuntimeError('Fresh native local gameplay/isolation invariant not observed')
         receipts=re.findall(r'Lab native scene stream bytes=(\d+) positionRestored=(\d+) sha256=([a-f0-9]{64})',isolation_log)
