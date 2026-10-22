@@ -80,6 +80,10 @@ inline bool modelRotation(const float *wvp, const float *view, const float *proj
 // Below the horizon (unnormalized direction y) and below this clip height the
 // view is not captured: the guns, hands and the water itself are there.
 constexpr float HorizonY = -.08f, ViewFloor = .05f;
+// Only the middle of the view is captured (its edges carry the most view-
+// dependent shading), blended in a little each frame: the cube settles on
+// what the surroundings look like instead of whatever the head just faced.
+constexpr float ViewEdge = .8f, CaptureBlend = .25f;
 // ps_2_0 capture program: t0.xyz = the texel's direction, s0 = the eye image,
 // c0..c3 = captureRows. Texels the eye does not see (behind, outside, too low)
 // are discarded, so the cube keeps what earlier views put there.
@@ -94,7 +98,7 @@ inline std::vector<uint32_t> captureProgram() {
     return {
         0xffff0200u,
         0x05000051u, d(C, 4, 0xf), f(.5f), f(-.5f), f(1), f(0),
-        0x05000051u, d(C, 5, 0xf), f(ViewFloor), f(HorizonY), f(0), f(0),
+        0x05000051u, d(C, 5, 0xf), f(ViewFloor), f(HorizonY), f(ViewEdge), f(CaptureBlend),
         0x0200001fu, 0x80000000u, d(T, 0, 0x7),
         0x0200001fu, 0x90000000u, d(S, 0, 0xf),
         0x03000008u, d(R, 0, 0x1), s(T, 0), s(C, 0),                          // dp3 r0.x, t0, c0
@@ -103,7 +107,7 @@ inline std::vector<uint32_t> captureProgram() {
         0x02000006u, d(R, 1, 0x8), s(R, 0, 0xff),                             // rcp r1.w, r0.w
         0x03000005u, d(R, 1, 0x3), s(R, 0), s(R, 1, 0xff),                    // mul r1.xy, r0, r1.w (ndc)
         0x02000023u, d(R, 2, 0x3), s(R, 1),                                   // abs r2.xy, r1
-        0x03000002u, d(R, 2, 0x3), s(C, 4, 0xaa), s(R, 2, 0xe4, true),        // add r2.xy, 1, -|ndc|
+        0x03000002u, d(R, 2, 0x3), s(C, 5, 0xaa), s(R, 2, 0xe4, true),        // add r2.xy, edge, -|ndc|
         0x03000002u, d(R, 2, 0x4), s(R, 1, 0x55), s(C, 5, 0x00, true),        // add r2.z, ndc.y, -floor
         0x02000001u, d(R, 2, 0x8), s(C, 4, 0xaa),                             // mov r2.w, 1
         0x01000041u, d(R, 2, 0xf),                                            // texkill r2
@@ -113,7 +117,7 @@ inline std::vector<uint32_t> captureProgram() {
         0x01000041u, d(R, 3, 0xf),                                            // texkill r3
         0x04000004u, d(R, 4, 0x3), s(R, 1), s(C, 4), s(C, 4, 0x00),           // mad r4.xy, ndc, (.5,-.5), .5
         0x03000042u, d(R, 5, 0xf), s(R, 4), s(S, 0),                          // texld r5, r4, s0
-        0x02000001u, d(R, 5, 0x8), s(C, 4, 0xaa),                             // mov r5.w, 1
+        0x02000001u, d(R, 5, 0x8), s(C, 5, 0xff),                             // mov r5.w, blend
         0x02000001u, d(Out, 0, 0xf), s(R, 5),                                 // mov oC0, r5
         0x0000ffffu};
 }

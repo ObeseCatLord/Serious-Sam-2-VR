@@ -149,6 +149,8 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
             sp::patchVertexShader(words.data(), words.size(), patched, &probeInfo, WaterConstant, true) && probeInfo.eyeClip &&
             FAILED(d->CreateVertexShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.variant)))
             probe.variant = nullptr;
+        if (!probe.variant) log("Single pass: water vertex program %p has no environment-cube variant (%zu words)",
+                                static_cast<void *>(s), patched.size());
         shaderProbe.emplace(s, probe);
     }
     if (variant && info.eyeClip) log("Single pass: water vertex program %p looks its reflection up per eye", static_cast<void *>(s));
@@ -689,6 +691,8 @@ struct WaterConstantsScope {
     IDirect3DDevice9 *d;
     bool active = false, eyes = false, cube = false;
     float saved[20]{}, view[4]{}, offset[2][3]{};
+    // The cube's proxy sphere radius (env_probe), in the program's model units.
+    float proxy = water::ProxyRadius;
     ProbePixel pixel;
     IDirect3DBaseTexture9 *image = nullptr;
     DWORD sampling[4]{};
@@ -706,6 +710,10 @@ struct WaterConstantsScope {
         const bool turned = active && vertex != shaderProbe.end() &&
             SUCCEEDED(d->GetVertexShaderConstantF(vertex->second.clipMatrix, wvp, 4)) &&
             env_probe_math::modelRotation(wvp, engineView, engineProjection, rows);
+        if (turned) {
+            const float scale = std::sqrt(rows[0] * rows[0] + rows[1] * rows[1] + rows[2] * rows[2]);
+            if (std::isfinite(scale) && scale > 1e-4f) proxy = water::ProxyRadius / scale;
+        }
         if (eyes && turned) {
             float inverse[9];
             if (water::invert3(rows, inverse))
@@ -734,7 +742,7 @@ struct WaterConstantsScope {
         if (!active) return;
         const unsigned e = i & 1;
         const float c[8]{view[0] + (eyes ? offset[e][0] : 0.f), view[1] + (eyes ? offset[e][1] : 0.f),
-                         view[2] + (eyes ? offset[e][2] : 0.f), 0, water::DomeScale, 1, 0, 0};
+                         view[2] + (eyes ? offset[e][2] : 0.f), 0, water::DomeScale, 1, proxy * proxy, .9f * proxy};
         d->SetVertexShaderConstantF(WaterConstant, c, 2);
     }
     // A water draw whose constants could not be read: its stereo variant would

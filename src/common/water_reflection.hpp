@@ -13,6 +13,9 @@
 namespace ss2vr::water {
 // Scale of the dome lookup: 1 spreads the image once over the sky hemisphere.
 constexpr float DomeScale = 1.f;
+// The environment cube's surroundings are taken to lie on a sphere this far
+// (metres) around the viewer: reflections keep parallax for anything nearer.
+constexpr float ProxyRadius = 40.f;
 // The eye's offset from the centre camera in world space: `view` is the centre
 // camera's world -> view matrix (row-major 3x4), `change` the eye's EyeChange
 // (centre view -> eye view).

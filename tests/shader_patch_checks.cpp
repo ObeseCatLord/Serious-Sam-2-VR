@@ -95,8 +95,8 @@ int main() {
         assert(patchVertexShader(water.data(), water.size(), out, &probe, 30, true) && probe.eyeClip);
         bool turned = false, written = false, lookupLeft = false;
         for (size_t i = 0; i + 3 < out.size(); ++i) {
-            if (out[i] == 0x08 && out[i + 1] == dst(Temp, 10, 0x1) && out[i + 2] == src(Temp, 9) && out[i + 3] == src(Const, 32))
-                turned = true;
+            if (out[i] == 0x08 && out[i + 1] == dst(Temp, 10, 0x1) && out[i + 2] == src(Temp, 2) && out[i + 3] == src(Const, 32))
+                turned = true; // The parallax lookup L (in the lookup's register r2) turned to world.
             if (out[i] == 0x01 && out[i + 1] == dst(TexCrdOut, 2, 0xf) && out[i + 2] == src(Temp, 10)) written = true;
             if (out[i] == 0x01 && out[i + 1] == dst(TexCrdOut, 2, 0xf) && out[i + 2] == src(Temp, 2)) lookupLeft = true;
         }

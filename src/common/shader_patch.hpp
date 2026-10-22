@@ -207,10 +207,34 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
             // either the dome mapping or the world direction for the probe.
             result.insert(result.end(), std::begin(dome), probe ? std::begin(dome) + 28 : std::end(dome));
             if (probe) {
+                // Parallax: the cube shows the surroundings as a sphere of radius Rp
+                // around the viewer (cK.z = Rp^2, cK.w = 0.9 Rp, model units), not at
+                // infinity, where reflected trees and walls slid with every head move.
+                // The lookup is where the reflected ray from this point meets it:
+                // L = o + sR with o = P - eye (kept inside the sphere), s = sqrt(b^2 - c) - b,
+                // b = o.R, c = o.o - Rp^2. rX (the replaced lookup) and r10 are scratch.
+                const uint32_t X = clipReg;
+                const uint32_t parallax[] = {
+                    0x03u, dst(Temp, X, 0x7), src(Temp, positionReg), src(Const, e),            // sub rX.xyz, rP, cE (o)
+                    0x08u, dst(Temp, 10, 0x2), src(Temp, X), src(Temp, X),                      // dp3 r10.y, o, o
+                    0x07u, dst(Temp, 10, 0x8), src(Temp, 10, 0x55u),                            // rsq r10.w, |o|^2
+                    0x05u, dst(Temp, 10, 0x8), src(Temp, 10, 0xffu), src(Const, k, 0xffu),      // mul r10.w, 0.9Rp/|o|
+                    0x0au, dst(Temp, 10, 0x8), src(Temp, 10, 0xffu), src(Const, k, 0x55u),      // min r10.w, r10.w, 1
+                    0x05u, dst(Temp, X, 0x7), src(Temp, X), src(Temp, 10, 0xffu),               // mul o, o, r10.w
+                    0x08u, dst(Temp, X, 0x8), src(Temp, X), src(Temp, 9),                       // dp3 rX.w, o, R (b)
+                    0x08u, dst(Temp, 10, 0x2), src(Temp, X), src(Temp, X),                      // dp3 r10.y, o, o
+                    0x02u, dst(Temp, 10, 0x2), src(Temp, 10, 0x55u), src(Const, k, 0xaau) | neg, // add r10.y, o.o, -Rp^2 (c)
+                    0x04u, dst(Temp, 10, 0x4), src(Temp, X, 0xffu), src(Temp, X, 0xffu), src(Temp, 10, 0x55u) | neg, // mad r10.z, b, b, -c
+                    0x07u, dst(Temp, 10, 0x8), src(Temp, 10, 0xaau),                            // rsq r10.w, disc
+                    0x05u, dst(Temp, 10, 0x4), src(Temp, 10, 0xaau), src(Temp, 10, 0xffu),      // mul r10.z, sqrt(disc)
+                    0x02u, dst(Temp, 10, 0x4), src(Temp, 10, 0xaau), src(Temp, X, 0xffu) | neg, // add r10.z, -b (s)
+                    0x04u, dst(Temp, X, 0x7), src(Temp, 9), src(Temp, 10, 0xaau), src(Temp, X), // mad rX.xyz, R, s, o (L)
+                };
+                result.insert(result.end(), std::begin(parallax), std::end(parallax));
                 const uint32_t world[] = {
-                    0x08u, dst(Temp, 10, 0x1), src(Temp, 9), src(Const, e + 2), // dp3 r10.x, R, cE+2
-                    0x08u, dst(Temp, 10, 0x2), src(Temp, 9), src(Const, e + 3), // dp3 r10.y, R, cE+3
-                    0x08u, dst(Temp, 10, 0x4), src(Temp, 9), src(Const, e + 4), // dp3 r10.z, R, cE+4
+                    0x08u, dst(Temp, 10, 0x1), src(Temp, X), src(Const, e + 2), // dp3 r10.x, L, cE+2
+                    0x08u, dst(Temp, 10, 0x2), src(Temp, X), src(Const, e + 3), // dp3 r10.y, L, cE+3
+                    0x08u, dst(Temp, 10, 0x4), src(Temp, X), src(Const, e + 4), // dp3 r10.z, L, cE+4
                     0x01u, dst(Temp, 10, 0x8), src(Const, k, 0x55u),            // mov r10.w, 1
                 };
                 result.insert(result.end(), std::begin(world), std::end(world));
