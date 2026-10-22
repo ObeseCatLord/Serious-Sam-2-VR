@@ -32,7 +32,9 @@ extern "C" __declspec(dllexport) void __cdecl SS2VRServer_Startup_t(void *resour
     construct(beacon);
     declareBegin("SS2VRServer");
     declareEnd();
-    registerResource(resourceFile, 1, "SS2VRServer", beacon);
+    // As Sam2Game_Startup_t: the loader looks the beacon up by this reserved
+    // ID and name ("No resource with name Beacon" otherwise).
+    registerResource(resourceFile, 0x98967f, "Beacon", beacon);
     HMODULE self = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                             reinterpret_cast<LPCWSTR>(&SS2VRServer_Startup_t), &self))
