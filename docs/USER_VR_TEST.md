@@ -82,6 +82,24 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
    again). Throw it with the right hand; it flies where your left hand aims (the
    left laser's dot, or where the left controller points).
 
+## Dedicated server (2026-10-22)
+
+A VR dedicated server now works with today's Steam (lab: a simulated-VR client
+joined a server on an ARM host under FEX + Wine, negotiated VR, and its poses
+and voice reached the server). What it needs:
+
+1. `DedicatedServer.exe +mod SS2VR +port <port> +lan 0`, run from `Bin`. The
+   game's UDP ports (port and port+1) must be reachable from the internet.
+2. A current Windows `steamclient.dll`, `tier0_s.dll` and `vstdlib_s.dll` in
+   `Bin` (Steamworks SDK Redist, app 1007): the game's own copy only knows
+   retired Steam servers and never logs on.
+3. Join from the server list, or with `+connect <server SteamID>`.
+
+Every player needs their own Steam account: Steam networking holds one
+session per account, so a second game on the same account drops the first.
+Players and the server all need this build (it authenticates with current
+Steam session tickets; the game's own ticket check is refused by Steam).
+
 ## Voice chat (multiplayer, 2026-10-19)
 
 Players who all run SS2VR can talk. The server must run SS2VR too: a listen
