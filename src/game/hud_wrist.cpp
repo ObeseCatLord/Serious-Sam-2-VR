@@ -7,10 +7,12 @@
 namespace ss2vr::game::hud_wrist {
 namespace {
 
-// Left wrist: the player's own state (health, armor, lives, air, power-ups)
-// and the left hand's ammo. Right wrist: ammo, grenades and bombs, weapon
-// combos, vehicle ammo, score. Everything else (Netricsa's icon and screen,
-// messages, prompts, subtitles, boss bar) stays head-mounted.
+// Left wrist: the player's own state (health, armor, lives, air, power-ups).
+// Right wrist: grenades and bombs, weapon combos, vehicle ammo, score. Each
+// weapon's ammo goes on the wrist of the hand holding that weapon. Everything
+// else (Netricsa's icon and screen, messages, prompts, subtitles, boss bar)
+// stays head-mounted.
+constexpr int AmmoLone = 2, AmmoLeftHand = 3, AmmoRightHand = 4; // Resolved per hand (setAmmoSide).
 struct Element {
     const char *name;
     int side;
@@ -19,12 +21,12 @@ constexpr Element Elements[] = {
     {"CHealthSimpleHudElement", Left},       {"CArmorSimpleHudElement", Left},
     {"CLivesSimpleHudElement", Left},
     {"CAirSimpleHudElement", Left},          {"CAdrenalineSimpleHudElement", Left},
-    {"CFrozenSimpleHudElement", Left},       {"CLeftAmmoHudElement", Left},
+    {"CFrozenSimpleHudElement", Left},
     {"CSeriousDamageHudElement", Left},      {"CSeriousJumpHudElement", Left},
     {"CSeriousScoreHudElement", Left},       {"CSeriousSpeedHudElement", Left},
     {"CSeriousStrengthHudElement", Left},    {"CInvulnerabilityHudElement", Left},
-    {"CInvisibilityHudElement", Left},       {"CAmmoHudElement", Right},
-    {"CRightAmmoHudElement", Right},         {"CBombsSimpleHudElement", Right},
+    {"CInvisibilityHudElement", Left},       {"CAmmoHudElement", AmmoLone},
+    {"CLeftAmmoHudElement", AmmoLeftHand},    {"CRightAmmoHudElement", AmmoRightHand},         {"CBombsSimpleHudElement", Right},
     {"CComboWeaponsSimpleHudElement", Right}, {"CVehicleAmmoSimpleHudElement", Right},
     {"CVehicleSimpleHudElement", Right},     {"CPointsSimpleHudElement", Right},
     {"CCounterSimpleHudElement", Right},     {"CTimeSimpleHudElement", Right},
@@ -43,7 +45,14 @@ Patched patched[Count]{};
 thread_local int side = Head, index = -1;
 thread_local const char *element = nullptr;
 bool wristMode = true;
-float wristScale = .36f;
+AmmoSide ammoSide = nullptr;
+int sideOf(int code) noexcept {
+    if (code < AmmoLone) return code;
+    const int hand = code == AmmoLone ? -1 : code == AmmoLeftHand ? 0 : 1;
+    const int resolved = ammoSide ? ammoSide(hand) : -2;
+    return resolved == Left || resolved == Right ? resolved : (hand == 0 ? Left : Right);
+}
+float wristScale = .31f;
 // The engine's 2D vertex binding (a function pointer variable in Engine).
 using Bind = void(__cdecl *)(int, const void *, int, int, int);
 Bind *bindVariable = nullptr;
@@ -87,7 +96,7 @@ void __fastcall render(void *self, void *, void *a, void *b) {
         const char *previous = element;
         const int previousIndex = index;
         if (wristMode) keepBind();
-        side = wristMode ? Elements[i].side : Head;
+        side = wristMode ? sideOf(Elements[i].side) : Head;
         element = Elements[i].name;
         index = int(i);
         boundsValid = false;
@@ -142,6 +151,7 @@ void uninstall() noexcept {
 
 int currentSide() noexcept { return side; }
 int currentIndex() noexcept { return index; }
+void setAmmoSide(AmmoSide resolver) noexcept { ammoSide = resolver; }
 void configure(bool w, float sc) noexcept {
     wristMode = w;
     if (sc > .05f && sc < 2.f) wristScale = sc;

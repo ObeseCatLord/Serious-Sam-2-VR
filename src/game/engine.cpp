@@ -1057,7 +1057,9 @@ static void updateRideSteadying(void *player, const RiderIdentity &rider) {
     static float ballLift = .5f, ballHeading = 0;
     const bool ball = ballRide(rider);
     Vec3 centre{}, target = raw.p;
-    const bool fixedView = ball || creatureAimRide(rider);
+    // Rides aimed by head or hand keep the view's heading from boarding: the
+    // aim turning the ride must not turn the frame the aim is measured in.
+    const bool fixedView = ball || creatureAimRide(rider) || seatedInTurret(rider);
     if (fixedView && ride != rider.ride) ballHeading = rawHeading;
     if (ball && ballCentre(rider, centre)) {
         if (ride != rider.ride) ballLift = std::clamp(raw.p.y - centre.y, -.5f, 1.5f);
@@ -4956,8 +4958,47 @@ void setSinglePassWorld(bool on, const Request *real) noexcept {
     singlePassRealValid = on && real;
     if (singlePassRealValid) singlePassReal = *real;
 }
+static uintptr_t viewRayCameraReturn = 0; // CPlayerBrainEntity's view ray search (usable objects, auto-aim).
 static Pose *__fastcall camera(void *p, void *, Pose *out) {
+#ifdef _MSC_VER
+    const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+#else
+    const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#endif
     originalCamera(p, out);
+    if (caller && caller == viewRayCameraReturn) {
+        // The brain finds what Use acts on (switches, buttons, doors, the "Press
+        // Use" prompt) with a ray along the camera placement: the flat body view at
+        // eye height, which never met things above or below it (the prison's
+        // detonator switch). In VR the ray goes where the head looks.
+        const auto v = copySnapshot();
+        Pose body;
+        if (p == v.player && v.rider.handheld() && vrSession(v) && fresh(v.input) && v.input.headValid &&
+            nativeMainThread && nativeMainThread() && trackingAnchor(p, body)) {
+            const Pose head = worldHeadTracking(body, v.origin, v.turn, v.input.head);
+            if (finite(head)) *out = head;
+            // Lab (SS2VR_LAB_USE_TRACE=1): what the ray found last (brain +0x1f4).
+            static const bool trace = [] { wchar_t t[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_USE_TRACE", t, 2) == 1 && t[0] == L'1'; }();
+            static uint32_t lastUsable = ~0u;
+            static uint64_t lastRay = 0;
+            if (trace && GetTickCount64() - lastRay > 3000) {
+                lastRay = GetTickCount64();
+                log("Lab use ray from head at %.2f,%.2f,%.2f", head.p.x, head.p.y, head.p.z);
+            }
+            void *brain = resolve(primaryField(p, 0x38c));
+            const uint32_t usable = brain ? primaryField(brain, 0x1f4) : 0;
+            if (trace && usable != lastUsable) {
+                lastUsable = usable;
+                void *entity = usable ? resolve(usable) : nullptr;
+                const uintptr_t table = entity ? primaryField(entity, 0) : 0;
+                const Vec3 f = rotate(normalize(head.q), Vec3{0, 0, -1});
+                log("Lab use target=%u class=game+%lx head pitch=%.2f", usable,
+                    static_cast<unsigned long>(table ? table - reinterpret_cast<uintptr_t>(GetModuleHandleW(L"Sam2Game.dll")) : 0),
+                    std::asin(std::clamp(f.y, -1.f, 1.f)));
+            }
+        }
+        return out;
+    }
     auto s = copySnapshot();
     if (p == eyePlayer && scopeSource.active && eyeSnapshot.initialized)
         *out = scopeSource.view.camera;
@@ -6040,7 +6081,52 @@ static bool vehicleLaserMuzzle(const Snapshot &s, const Request &request, Vehicl
         return false;
     Vec3 direction;
     reinterpret_cast<ShootDirection>(table[0x5a4 / 4])(ride, &direction);
-    return vehicleLaserCurrent(s, request, source) && nativeLaserPose(origin, direction, muzzle, &rayDirection);
+    if (!vehicleLaserCurrent(s, request, source)) return false;
+    // The beam follows the barrel: from its firing attachment along its axis. The
+    // eye's shot direction keeps rising past the barrel's limit at the top of a
+    // turret's arc, where the old beam (cast from the eye) left the real line of
+    // fire. The attachment's forward axis is found once per ride class, against
+    // the shot direction while the two agree (mid-range aim).
+    {
+        static uintptr_t axisClass = 0;
+        static int axis = -1; // 2*column + (1: negated)
+        const uintptr_t rideClass = table ? reinterpret_cast<uintptr_t>(table) : 0;
+        if (rideClass != axisClass) { axisClass = rideClass; axis = -1; }
+        Vec3 columns[3]{{placement.m[0], placement.m[4], placement.m[8]}, {placement.m[1], placement.m[5], placement.m[9]},
+                        {placement.m[2], placement.m[6], placement.m[10]}};
+        const float shotLength = std::sqrt(dot(direction, direction));
+        bool columnsOk = std::isfinite(shotLength) && shotLength > 1e-6f;
+        for (auto &c : columns) {
+            const float n = std::sqrt(dot(c, c));
+            if (!(n > 1e-6f) || !std::isfinite(n)) columnsOk = false;
+            else c = c * (1 / n);
+        }
+        if (columnsOk && axis < 0) {
+            const Vec3 shot = direction * (1 / shotLength);
+            int best = -1;
+            float bestDot = .97f;
+            for (int c = 0; c < 3; ++c) {
+                const float d = dot(columns[c], shot);
+                if (std::abs(d) > bestDot) { bestDot = std::abs(d); best = 2 * c + (d < 0 ? 1 : 0); }
+            }
+            if (best >= 0) {
+                axis = best;
+                log("Vehicle laser barrel axis=%d (agreement %.3f)", axis, bestDot);
+            }
+        }
+        if (columnsOk && axis >= 0) {
+            const Vec3 barrel = columns[axis / 2] * (axis & 1 ? -1.f : 1.f);
+            const Pose at{origin.q, Vec3{placement.m[3], placement.m[7], placement.m[11]}};
+            static unsigned traced = 0;
+            if (traced++ % 200 == 0) {
+                const Vec3 shot = direction * (1 / shotLength);
+                log("Vehicle laser barrel=%.3f,%.3f,%.3f shot=%.3f,%.3f,%.3f apart=%.3f rad", barrel.x, barrel.y, barrel.z,
+                    shot.x, shot.y, shot.z, std::acos(std::clamp(dot(barrel, shot), -1.f, 1.f)));
+            }
+            if (finite(at) && nativeLaserPose(at, barrel, muzzle, &rayDirection)) return true;
+        }
+    }
+    return nativeLaserPose(origin, direction, muzzle, &rayDirection);
 }
 // Spatial audio occlusion: rays from the listener toward the sounds due a
 // trace (spatial_audio.hpp), in the same native query lifecycle as the lasers.
@@ -6452,19 +6538,6 @@ static void drawLasers() {
             log("Lab laser dispatch schema=1 order=%llu request=%llu input=%llu generation=%u owner=%u weapon=%u hand=%u eye=%d hit=%u muzzle=%.9g,%.9g,%.9g end=%.9g,%.9g,%.9g linesReturned=3 visible=unproved",
                 order,a.requestSequence,a.sequence,a.generation,a.owner,a.weapon,h,eyeIndex,unsigned(a.hit),
                 a.muzzle.p.x,a.muzzle.p.y,a.muzzle.p.z,a.end.x,a.end.y,a.end.z);
-        if (a.hit) {
-            // A filled red dot at the hit, a constant ~0.3 degrees wide.
-            const float distance = std::sqrt(dot(a.end - a.muzzle.p, a.end - a.muzzle.p));
-            const float radius = std::clamp(distance * .0028f, .004f, .25f);
-            const Vec3 center = a.end + rotate(a.muzzle.q, {0, 0, .005f});
-            for (unsigned k = 0; k != 24; ++k) {
-                const float angle = k * Pi / 12;
-                const Vec3 spoke = rotate(a.muzzle.q, {radius * std::cos(angle), radius * std::sin(angle), 0});
-                drawLine(center - spoke, center + spoke, color, UINT32_MAX);
-                drawLine(center + spoke * .5f, center + rotate(a.muzzle.q, {radius * std::cos(angle + Pi / 12),
-                    radius * std::sin(angle + Pi / 12), 0}), color, UINT32_MAX);
-            }
-        }
     }
     static const bool muzzleMark = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_MUZZLE_MARK", v, 2) == 1 && v[0] == L'1'; }();
     if (muzzleMark) {
@@ -9291,6 +9364,30 @@ static void drawWeaponWheels() {
     useSimpleShader(0);
     for(unsigned h=0;h!=2;++h)drawWeaponWheel(h,head);
     wheelBatch.flush();
+    // The opening hand's pointer laser, from its aim to where it meets the ring.
+    for(unsigned h=0;h!=2;++h) {
+        const auto &view=eyeWheels.wheel[h];
+        if(!eyeSnapshot.ui.wheel[h].open || !view.open || !view.ring.anchored || !eyeRequest.input.handValid[h] ||
+           !finite(eyeRequest.input.hand[h]))continue;
+        const Pose aim=worldHandTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head,eyeRequest.input.hand[h]);
+        const Pose frame=worldHandTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head,view.ring.frame);
+        if(!finite(aim) || !finite(frame))continue;
+        const Vec3 dir=rotate(normalize(aim.q),Vec3{0,0,-1}),normal=rotate(normalize(frame.q),Vec3{0,0,1});
+        const float facing=dot(dir,normal);
+        float length=.6f;
+        if(facing<-.1f) {
+            const float t=dot(frame.p-aim.p,normal)/facing;
+            if(std::isfinite(t) && t>0)length=std::min(t,WheelPointReach);
+        }
+        const Vec3 end=aim.p+dir*length;
+        const uint32_t colour=h ? 0x9040dfffu : 0x9060ff40u; // ARGB, the hand's wheel colour.
+        drawLine(aim.p,end,colour,UINT32_MAX);
+        for(unsigned k=0;k!=6;++k) {
+            const float a=k*Pi/3;
+            const Vec3 side=rotate(normalize(aim.q),Vec3{.001f*std::cos(a),.001f*std::sin(a),0});
+            drawLine(aim.p+side,end+side,colour,UINT32_MAX);
+        }
+    }
     (*unbindVertexBuffers)(); // Leave no client arrays bound to later native draws.
     if(renderModelInstance && stretchModelInstance) {
         // World-like opaque state for the meshes; their materials set the rest.
@@ -9319,7 +9416,7 @@ static void drawWeaponWheels() {
         else (*disableFog)();
     }
 }
-// The grenade waiting in the off hand: 9 cm across, its centre 4 cm in front of
+// The grenade waiting in the hand: the model's own size, its centre in front of
 // the grip point (in the palm), drawn like the wheel meshes.
 static void drawHeldGrenade() {
     const int hand=grenadeShownHand.load(std::memory_order_relaxed);
@@ -9330,10 +9427,11 @@ static void drawHeldGrenade() {
     const Pose grip=worldHandTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,eyeRequest.input.head,
                                       weaponTracking(eyeRequest.input,unsigned(hand)));
     if(!finite(grip))return;
-    const float scale=.09f/grenadeModel.extent;
-    if(!std::isfinite(scale) || !(scale>0))return;
+    // The model's own size, as the thrown grenade flies (V636: 9 cm in the hand
+    // looked far smaller than the same grenade in flight); held ahead of the palm.
+    const float scale=1.f;
     const Quat q=normalize(grip.q);
-    const Vec3 centre=grip.p+rotate(q,Vec3{0,-.01f,-.04f});
+    const Vec3 centre=grip.p+rotate(q,Vec3{0,-.01f,-(.02f+.3f*grenadeModel.extent)});
     const Pose placed{q,centre-rotate(q,grenadeModel.centre*scale)};
     ortho();
     activateView(rootView);
@@ -9559,52 +9657,6 @@ static float __fastcall mouseControlValue(void *device, void *, long control) {
     if (control >= 0x78 && control <= 0x7b && vrInputLive()) return 0.f; // Mouse X+, X-, Y+, Y-
     return originalMouseControl(device, control);
 }
-// Mounted guns by hand: while a grip is held in a turret (or a ride steered by
-// stick), the gun pivots about a point 0.5 m beyond the gripping hands (fixed
-// in the body frame at the grab), like handles behind a real mount's pivot:
-// hands right, muzzle left. Returns this step's heading and pitch change, added
-// to the native look as the mouse's deltas are.
-static Vec3 rideHandAimDelta(const ControlSample &c) {
-    static bool active = false;
-    static unsigned gripping = 0;
-    static Vec3 pivot{}, previous{};
-    Vec3 mid{};
-    unsigned count = 0, mask = 0;
-    for (unsigned h = 0; h < 2; ++h)
-        if ((c.input.buttons[h] & Wheel) && controllerTracked(c.input, h)) {
-            mid = mid + bodyHandTracking(c.origin, c.turn, c.input.head, weaponTracking(c.input, h)).p;
-            ++count;
-            mask |= 1u << h;
-        }
-    if (!count || !fresh(c.input)) { active = false; return {}; }
-    // The other hand taking hold or letting go moves the gripping hands' midpoint
-    // by half their spacing: the grab is anchored again there, no aim change
-    // (measured from the old anchor that swung the gun some 20 degrees at once).
-    if (mask != gripping) active = false;
-    gripping = mask;
-    mid = mid * (1.f / float(count));
-    const auto angles = [](Vec3 d, float &heading, float &pitch) {
-        const float n = std::sqrt(dot(d, d));
-        if (!(n > 1e-4f)) return false;
-        heading = std::atan2(-d.x, -d.z);
-        pitch = std::asin(std::clamp(d.y / n, -1.f, 1.f));
-        return std::isfinite(heading) && std::isfinite(pitch);
-    };
-    if (!active) {
-        const Vec3 f = rotate(bodyHeadTracking(c.origin, c.turn, c.input.head).q, Vec3{0, 0, -1});
-        const float n = std::sqrt(f.x * f.x + f.z * f.z);
-        if (!(n > 1e-3f)) return {};
-        pivot = mid + Vec3{f.x / n, 0, f.z / n} * .5f;
-        previous = pivot - mid;
-        active = true;
-        return {};
-    }
-    const Vec3 now = pivot - mid;
-    float h0, p0, h1, p1;
-    if (!angles(previous, h0, p0) || !angles(now, h1, p1)) return {};
-    previous = now;
-    return {std::remainder(h1 - h0, 2 * Pi), p1 - p0, 0};
-}
 static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -9636,54 +9688,40 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
         if (playerHandle == captured.rider.player && ownedBrain == brainHandle &&
             nativeTrackingAnchor(snapshot.player, anchor, &captured.rider)) {
             if (seatedInTurret(captured.rider) && fresh(captured.input)) {
-                // Right stick: heading and pitch rates (smooth-turn rate) added to
-                // the native look each control step, as the mouse's deltas are on
-                // the desktop: it turns only while pushed, whatever frame the look
-                // is kept in.
-                // The native look a turret reports is its actual aim, which only
-                // lerps toward the commanded look: per-step deltas on it mostly
-                // vanished (turning was very slow). A commanded look accumulates
-                // instead, kept within 0.6 rad heading / 0.4 rad pitch of the
-                // actual aim so the turret stops soon after the stick is released.
-                static Vec3 commanded{};
-                static uint32_t commandedRide = 0;
+                // Turrets aim where the head looks; the right stick adds an offset
+                // (at the smooth-turn rate) for aims beyond a comfortable head turn.
+                // The view keeps the heading it had on mounting (updateRideSteadying),
+                // so turning the turret never turns the head's frame. The native look
+                // is the commanded aim the turret lerps toward, within its limits.
+                static Vec3 offset{};
+                static uint32_t offsetRide = 0;
                 static uint64_t turretClock = 0;
                 const uint64_t now = GetTickCount64();
-                if (commandedRide != captured.rider.ride || now - turretClock > 500) {
-                    commanded = look;
-                    commandedRide = captured.rider.ride;
-                }
+                if (offsetRide != captured.rider.ride || now - turretClock > 2000) { offset = {}; offsetRide = captured.rider.ride; }
                 const float dt = turretClock && now > turretClock ? std::min(.1f, float(now - turretClock) / 1000.f) : 0.f;
                 turretClock = now;
-                // Reversing the stick (the commanded look ahead of the aim the other
-                // way, e.g. held against a turret's limit): start from the actual
-                // aim, so the turret turns back at once instead of unwinding the lead.
-                const Vec3 fromAim = advanceTurretLook(look, captured.input.axis[1][0], captured.input.axis[1][1],
-                                                       settings.smoothTurnRate, dt);
-                if (std::remainder(fromAim.x - look.x, 2 * Pi) * std::remainder(commanded.x - look.x, 2 * Pi) < 0) commanded.x = look.x;
-                if ((fromAim.y - look.y) * (commanded.y - look.y) < 0) commanded.y = look.y;
-                Vec3 turned = advanceTurretLook(commanded, captured.input.axis[1][0], captured.input.axis[1][1],
-                                                settings.smoothTurnRate, dt);
-                const Vec3 byHand = rideHandAimDelta(captured);
-                turned.x += byHand.x;
-                turned.y = std::clamp(turned.y + byHand.y, -1.4f, 1.4f);
-                const float lead = std::remainder(turned.x - look.x, 2 * Pi);
-                turned.x = look.x + std::clamp(lead, -.6f, .6f);
-                turned.y = std::clamp(turned.y, look.y - .4f, look.y + .4f);
-                // Idle (no stick, no hand motion): hold the actual aim, so nothing
-                // can keep it turning.
-                const bool idle = !turretStickRate(captured.input.axis[1][0]) && !turretStickRate(captured.input.axis[1][1]) &&
-                                  byHand.x == 0 && byHand.y == 0;
-                if (idle) turned = look;
-                commanded = turned;
-                if (labTurretMode()) {
-                    static unsigned calls = 0;
-                    if (calls++ % 25 == 0)
-                        log("Lab turret look heading=%.3f pitch=%.3f stick=%.2f,%.2f", turned.x, turned.y,
-                            captured.input.axis[1][0], captured.input.axis[1][1]);
+                const Vec3 step = advanceTurretLook(Vec3{}, captured.input.axis[1][0], captured.input.axis[1][1],
+                                                   settings.smoothTurnRate, dt);
+                if (std::isfinite(step.x) && std::isfinite(step.y)) {
+                    offset.x = std::remainder(offset.x + step.x, 2 * Pi);
+                    offset.y = std::clamp(offset.y + step.y, -1.2f, 1.2f);
                 }
-                if (std::isfinite(turned.x) && std::isfinite(turned.y)) { look.x = turned.x; look.y = turned.y; }
-                nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
+                const Pose head = worldHeadTracking(anchor, captured.origin, captured.turn, captured.input.head);
+                const Vec3 forward = rotate(normalize(head.q), Vec3{0, 0, -1});
+                const float pitch = std::asin(std::clamp(forward.y, -1.f, 1.f));
+                Vec3 converted;
+                void *candidateRideToken = nullptr;
+                if (finite(head) && std::isfinite(pitch) &&
+                    quaternionEuler(&converted, yaw(horizontalHeading(head.q))) == &converted && std::isfinite(converted.x) &&
+                    nativeRiderCurrent(snapshot.player, captured.rider, &candidateRideToken) && resolve(brainHandle) == brain) {
+                    look.x = converted.x + offset.x;
+                    look.y = std::clamp(pitch + offset.y, -1.4f, 1.4f);
+                    rideToken = candidateRideToken;
+                    static unsigned calls = 0;
+                    if (calls++ % 50 == 0)
+                        log("Turret head aim heading=%.3f pitch=%.3f offset=%.3f,%.3f", look.x, look.y, offset.x, offset.y);
+                }
+                if (!rideToken) nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (steeringWheelHeading(look)) {
                 nativeRiderCurrent(snapshot.player, captured.rider, &rideToken);
             } else if (creatureAimRide(captured.rider) && fresh(captured.input) && controllerTracked(captured.input, 1)) {
@@ -9751,9 +9789,7 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 Vec3 rideLook = advanceTurretLook(look, modelControls ? 0.f : captured.input.axis[1][0],
                                                   settings.rideHeadPitch ? 0.f : captured.input.axis[1][1],
                                                   settings.smoothTurnRate, dt);
-                const Vec3 byHand = modelControls ? Vec3{} : rideHandAimDelta(captured);
-                rideLook.x += byHand.x;
-                rideLook.y = std::clamp(rideLook.y + byHand.y, -1.4f, 1.4f);
+
                 // Guns pitch where the head looks (pitch up positive, as the native aim).
                 if (settings.rideHeadPitch) {
                     const Pose head = worldHeadTracking(anchor, captured.origin, captured.turn, captured.input.head);
@@ -10679,6 +10715,17 @@ static __attribute__((noinline)) void runPostSimulationSniper(SimulationInterval
 
 static std::vector<void *> ownedHooks;
 static bool attachPoisoned = false;
+// Wrist HUD: the physical hand holding the weapon an ammo element shows (game
+// hands: 0 left, 1 right; -1 the lone weapon). mountHand maps a lone weapon to
+// the controller actually holding it.
+static int hudAmmoSide(int hand) {
+    const auto s = copySnapshot();
+    if (hand < 0) {
+        if ((s.handle[0] != 0) == (s.handle[1] != 0)) return -2;
+        hand = s.handle[0] ? 0 : 1;
+    }
+    return int(mountHand(s, unsigned(hand) & 1u));
+}
 static bool rollbackNativeHooks() {
     hooksReady = false;
     hud_wrist::uninstall();
@@ -11202,6 +11249,13 @@ bool attach(bool headless) {
     mountedClampReturn = reinterpret_cast<uintptr_t>(g) + 0xf3255;
     boardingSeatReturn = reinterpret_cast<uintptr_t>(g) + 0xea4fe;
     useSeatReturn = reinterpret_cast<uintptr_t>(g) + 0xea465;
+    {
+        // The view ray search's camera call: call dword ptr [edx+0x5f4] at 0xef005.
+        static constexpr uint8_t expected[]{0xff, 0x92, 0xf4, 0x05, 0x00, 0x00};
+        viewRayCameraReturn = !memcmp(reinterpret_cast<const uint8_t *>(g) + 0xef005, expected, sizeof expected)
+                                  ? reinterpret_cast<uintptr_t>(g) + 0xef00b : 0;
+        if (!viewRayCameraReturn) log("View ray search not recognised; Use keeps the native camera ray");
+    }
     grenadeViewReturn = reinterpret_cast<uintptr_t>(g) + 0x1020cf; // Hand-grenade throw's GetViewOrigin(0)
     playerControlsReturn = reinterpret_cast<uintptr_t>(g) + 0xf35d3;
     inactivePlayerControlsReturn = reinterpret_cast<uintptr_t>(g) + 0xf2ddc;
@@ -11624,7 +11678,10 @@ bool attach(bool headless) {
       originalSetToHand);
     H(g, "?OnWeaponPutDown@CPlayerPuppetEntity@SeriousEngine@@UAEXV?$Handle@VCBaseWeaponEntity@SeriousEngine@@@2@@Z", weaponPutDownTraced,
       originalWeaponPutDown);
-    if (!headless) hud_wrist::install(g, e); // Wrist HUD element tags (no effect in [HUD] Mode=Head).
+    if (!headless) {
+        hud_wrist::install(g, e); // Wrist HUD element tags (no effect in [HUD] Mode=Head).
+        hud_wrist::setAmmoSide(&hudAmmoSide);
+    }
     if (labRideKind() >= 2) {
         H(g, "?ProcessViewRayCasting@CPlayerBrainEntity@SeriousEngine@@QAEXXZ", viewRayCasting, originalViewRayCasting);
         if (labRideKind() == 2) {

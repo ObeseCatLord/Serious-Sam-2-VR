@@ -24,5 +24,10 @@ float scale() noexcept;
 // The element's 2D vertex bounds bound since the last take (its positions in
 // the engine's 2D space, from _gfxBindVertexArray); false when none.
 bool takeBounds(float (&minimum)[3], float (&maximum)[3]) noexcept;
+// Which wrist shows an ammo element: `hand` -1 the lone weapon's ammo, 0 the
+// game's left-hand ammo, 1 its right-hand ammo; returns Left or Right (the
+// physical hand holding that weapon). Set by the engine.
+using AmmoSide = int (*)(int hand);
+void setAmmoSide(AmmoSide resolver) noexcept;
 
 } // namespace ss2vr::game::hud_wrist

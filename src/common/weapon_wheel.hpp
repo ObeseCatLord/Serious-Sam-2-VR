@@ -38,8 +38,9 @@ inline const wchar_t *wheelBubbleName(WheelBubble bubble) {
 // Arc length per weapon; the ring radius grows with the weapon count within reach.
 inline constexpr float WheelItemSpacing = .075f, WheelMinimumRadius = .12f, WheelMaximumRadius = .2f;
 // The ring centre sits this far ahead of the opening hand, along its pointing
-// direction, so the user points or reaches into the wheel.
-inline constexpr float WheelForwardOffset = .15f;
+// direction, and this far up, out where the hand's pointer laser selects on it
+// (at 15 cm the ring crowded the hand).
+inline constexpr float WheelForwardOffset = .32f, WheelUpOffset = .04f; // Up stays inside the cancel zone.
 // Action bubbles form a separate short arc beyond the ring on the hand's outer
 // side (right of a right-hand ring, left of a left-hand one), top to bottom.
 inline constexpr float WheelBubbleGap = .11f, WheelBubbleSpacing = .06f, WheelBubbleSize = .048f;
@@ -47,7 +48,7 @@ inline constexpr float WheelBubbleGap = .11f, WheelBubbleSpacing = .06f, WheelBu
 inline constexpr float WheelDeadZone = .4f, WheelOuterReach = .055f, WheelBubbleReach = .6f;
 // Reach mode: the hand within this depth of the ring plane hovers by position.
 // Nearer the user it points: its aim ray, up to WheelPointReach, hovers instead.
-inline constexpr float WheelDepthReach = .16f, WheelPointDepth = .04f, WheelPointReach = .8f;
+inline constexpr float WheelDepthReach = .16f, WheelPointDepth = .04f, WheelPointReach = 1.5f;
 // Stick fallback keeps the original thumbstick selection threshold.
 inline constexpr float WheelStickDeadZone = .3f;
 // Ring frame in tracking reference space: upright, local +Z facing the user's
@@ -204,7 +205,7 @@ inline Pose wheelRingFrame(const WheelPointer &pointer) {
     const Vec3 forward = rotate(pointer.aim.q, {0, 0, -1});
     const float length = std::sqrt(dot(forward, forward));
     const Vec3 ahead = std::isfinite(length) && length > .5f ? forward * (WheelForwardOffset / length) : Vec3{};
-    return wheelRingFrame(pointer.hand + ahead, pointer.head);
+    return wheelRingFrame(pointer.hand + ahead + Vec3{0, WheelUpOffset, 0}, pointer.head);
 }
 // Axis-aligned model-space box in the native Box3f layout (min, then max).
 struct WheelBox {

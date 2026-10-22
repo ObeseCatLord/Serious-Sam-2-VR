@@ -1179,25 +1179,46 @@ static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
                 if (r.used && r.side == int(side) && r.x1 > r.x0 && r.y1 > r.y0) order[count++] = e;
             }
             if (!count) continue;
-            std::sort(order,order+count,[&](unsigned a,unsigned b) { return uiFrame.wristRects[a].y0 < uiFrame.wristRects[b].y0; });
+            // Elements whose rectangles overlap (health beside the left hand's ammo)
+            // are one piece: separately each showed a slice of the other.
+            NativeUiFrame::WristRect pieces[hud_wrist::MaxElements];
+            unsigned pieceCount = 0;
+            for (unsigned k=0;k<count;++k) pieces[pieceCount++] = uiFrame.wristRects[order[k]];
+            for (bool merged=true; merged;) {
+                merged = false;
+                for (unsigned i=0;i<pieceCount && !merged;++i)
+                    for (unsigned j=i+1;j<pieceCount && !merged;++j) {
+                        auto &p = pieces[i]; const auto &q = pieces[j];
+                        const float pad = 6;
+                        if (p.x0-pad < q.x1 && q.x0-pad < p.x1 && p.y0-pad < q.y1 && q.y0-pad < p.y1) {
+                            p.x0 = std::min(p.x0,q.x0); p.y0 = std::min(p.y0,q.y0);
+                            p.x1 = std::max(p.x1,q.x1); p.y1 = std::max(p.y1,q.y1);
+                            pieces[j] = pieces[--pieceCount];
+                            merged = true;
+                        }
+                    }
+            }
+            count = pieceCount;
+            std::sort(pieces,pieces+count,[](const auto &a,const auto &b) { return a.y0 < b.y0; });
             // Metres per canvas pixel; pieces centred, top to bottom, with a gap.
             const float scale = hud_wrist::scale()/W, gap = .006f;
             float height = gap*float(count-1), width = 0;
             for (unsigned k=0;k<count;++k) {
-                const auto &r = uiFrame.wristRects[order[k]];
+                const auto &r = pieces[k];
                 height += (std::min(r.y1,H)-std::max(r.y0,0.f))*scale;
                 width = std::max(width,(std::min(r.x1,W)-std::max(r.x0,0.f))*scale);
             }
-            // The back of the wrist: behind the grip (toward the elbow), on the back of
-            // the hand's side; the face's right runs along the forearm, read across the body.
-            const float h = 1/std::sqrt(2.f);
-            const Quat face = side==0 ? Quat{h,0,-h,0} : Quat{h,0,h,0};
-            const Pose grip = input.grip[side];
-            const Pose watch{normalize(multiply(normalize(grip.q),face)),
-                             grip.p + rotate(normalize(grip.q),Vec3{side==0 ? -.05f : .05f,0,.15f})};
-            // Only the face's front: turned away, the watch shows nothing.
-            const Vec3 centre = (uiFrame.request.eye[0].p + uiFrame.request.eye[1].p)*.5f;
-            if (!(rotate(inverse(watch.q),centre-watch.p).z > .01f)) continue;
+            // Placed as EDuke32 VR places its wrist HUD: on top of the wrist behind the
+            // controller (aim pose: 3.5 cm up, 11 cm back toward the forearm), read like a
+            // watch with the arm across the chest: text along the forearm, its top edge
+            // away from you, the face tilted 35 degrees toward the eyes (mirrored per hand;
+            // panel axes in the aim frame: left X=-Z Y=-X, right X=+Z Y=+X, normal +Y).
+            if (!input.handValid[side] || !finite(input.hand[side])) continue;
+            const Pose aim{normalize(input.hand[side].q),input.hand[side].p};
+            const Quat face = side==0 ? Quat{-.5f,.5f,.5f,.5f} : Quat{-.5f,-.5f,-.5f,.5f};
+            const float half = Pi*35.f/360.f;
+            const Pose watch{normalize(multiply(multiply(aim.q,face),Quat{std::sin(half),0,0,std::cos(half)})),
+                             aim.p + rotate(aim.q,Vec3{0,.035f,.11f})};
             const auto project = [&](const float (&corner)[4][4],HudVertex (&out)[2][4]) {
                 for (unsigned i=0;i<2;++i) {
                     const Matrix34 panel = matrix(compose(inverse(uiFrame.request.eye[i]),watch));
@@ -1218,26 +1239,9 @@ static bool flushHudLayer(IDirect3DDevice9 *d) noexcept {
                 }
                 return true;
             };
-            // The watch: a grey bezel around a dark face, the elements on it.
-            const auto plate = [&](float halfWidth,float halfHeight,DWORD premultiplied) {
-                const float corner[4][4]{{-halfWidth,halfHeight,0,0},{halfWidth,halfHeight,0,0},
-                                         {halfWidth,-halfHeight,0,0},{-halfWidth,-halfHeight,0,0}};
-                HudVertex quad[2][4]{};
-                if (!project(corner,quad)) return true;
-                bool drawn = SUCCEEDED(d->SetRenderState(D3DRS_TEXTUREFACTOR,premultiplied)) &&
-                    SUCCEEDED(d->SetTextureStageState(0,D3DTSS_COLORARG1,D3DTA_TFACTOR)) &&
-                    SUCCEEDED(d->SetTextureStageState(0,D3DTSS_ALPHAARG1,D3DTA_TFACTOR));
-                for (unsigned i=0;i<2 && drawn;++i) drawn = draw(uiFrame.target[i],quad[i],true);
-                return SUCCEEDED(d->SetTextureStageState(0,D3DTSS_COLORARG1,D3DTA_TEXTURE)) &&
-                    SUCCEEDED(d->SetTextureStageState(0,D3DTSS_ALPHAARG1,D3DTA_TEXTURE)) &&
-                    SUCCEEDED(d->SetRenderState(D3DRS_TEXTUREFACTOR,0xffffffff)) && drawn;
-            };
-            const float inset = .008f, bezel = .004f;
-            ok = plate(width*.5f+inset+bezel,height*.5f+inset+bezel,0xf0383c42) &&
-                plate(width*.5f+inset,height*.5f+inset,0xd80a0c10);
             float top = height*.5f;
             for (unsigned k=0;k<count && ok;++k) {
-                const auto &r = uiFrame.wristRects[order[k]];
+                const auto &r = pieces[k];
                 const float x0 = std::max(r.x0,0.f), x1 = std::min(r.x1,W), y0 = std::max(r.y0,0.f), y1 = std::min(r.y1,H);
                 if (!(x1 > x0) || !(y1 > y0)) continue;
                 const float hw = (x1-x0)*scale*.5f, ph = (y1-y0)*scale;

@@ -15,8 +15,8 @@ const int Ids[]{5, 3, 12, 6, 13};
 constexpr uint32_t Count = sizeof(Ids) / sizeof(Ids[0]);
 // A pointer at this grip position, aiming straight ahead (-Z) from the grip.
 WheelPointer at(Vec3 hand) { return {true, hand, Head, {{}, hand}}; }
-// Ring centre for a ring opened at Hand: WheelForwardOffset ahead along the aim.
-const Vec3 Centre{Hand.x, Hand.y, Hand.z - WheelForwardOffset};
+// Ring centre for a ring opened at Hand: WheelForwardOffset ahead along the aim, WheelUpOffset up.
+const Vec3 Centre{Hand.x, Hand.y + WheelUpOffset, Hand.z - WheelForwardOffset};
 // World position of a slot for a ring opened at Hand.
 Vec3 slotPoint(const WeaponWheel &w, uint32_t slot, float scale = 1, float depth = 0) {
     Vec3 local = w.ring.slotPosition(slot) * scale;
@@ -113,7 +113,7 @@ void frame() {
     WheelPointer pitched = at(Hand);
     pitched.aim.q = {std::sin(-Pi / 8), 0, 0, std::cos(-Pi / 8)}; // Aiming 45 degrees down.
     const Pose low = wheelRingFrame(pitched);
-    assert(near(low.p.y, Hand.y - WheelForwardOffset * std::sin(Pi / 4)) && near(rotate(low.q, {0, 1, 0}).y, 1));
+    assert(near(low.p.y, Hand.y + WheelUpOffset - WheelForwardOffset * std::sin(Pi / 4)) && near(rotate(low.q, {0, 1, 0}).y, 1));
 }
 
 void hoverPick() {
@@ -391,7 +391,7 @@ void inputSample() {
     w.sample(input, 1, Ids, Count, true, WheelAllBubbles);
     input.buttons[1] = WheelOpen;
     w.sample(input, 1, Ids, Count, true, WheelAllBubbles);
-    assert(w.open && near(w.ring.frame.p.x, Hand.x) && near(w.ring.frame.p.y, Hand.y) && w.outer > 0);
+    assert(w.open && near(w.ring.frame.p.x, Hand.x) && near(w.ring.frame.p.y, Hand.y + WheelUpOffset) && w.outer > 0);
     const int menu = slotOf(w.ring, -1, WheelBubble::Menu);
     assert(w.ring.slotPosition(uint32_t(menu)).x > 0); // Right hand: bubbles on the right.
     input.grip[1].p = slotPoint(w, uint32_t(menu));
