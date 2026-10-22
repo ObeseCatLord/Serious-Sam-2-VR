@@ -1622,6 +1622,16 @@ static void logSteamVerdict(const char *verdict, const void *data, bool reason, 
 static void __fastcall steamClientDeny(void *self, void *, void *data) { logSteamVerdict("denied", data, true, true); originalSteamClientDeny(self, data); }
 static void __fastcall steamClientKick(void *self, void *, void *data) { logSteamVerdict("kicked", data, true, false); originalSteamClientKick(self, data); }
 static void __fastcall steamClientApprove(void *self, void *, void *data) { logSteamVerdict("approved", data, false, false); originalSteamClientApprove(self, data); }
+// A dedicated server has no player profile and draws no HUD, yet
+// CPlayerPuppetEntity::OnCreate initializes one for every joining player; its
+// elements look up the active profile's settings and crash on the missing one
+// (Sam2Game +0x1885b2). The server skips it.
+using PuppetMethod = void(__thiscall *)(void *);
+static PuppetMethod originalInitializeHud = nullptr;
+static void __fastcall serverInitializeHud(void *, void *) {
+    static bool logged = false;
+    if (!logged) { logged = true; log("Dedicated server: player HUD initialization skipped"); }
+}
 // CSteamOnlineInterface::ChallengeAuthenticate(client, CSteamID&, ticket, size):
 // a game server hands the ticket to SendUserConnectAndAuthenticate; the
 // client's state (+0xa4 + 4*client) is 1 pending, 2 approved, 3 failed.
@@ -11811,6 +11821,7 @@ bool attach(bool headless) {
           originalSteamClientApprove);
         H(e, "?ChallengeAuthenticate@CSteamOnlineInterface@SeriousEngine@@UAEXJAAVCSteamID@@PAEJ@Z", challengeAuthenticate,
           originalChallengeAuthenticate);
+        H(g, "?InitializeHeadUpDisplay@CPlayerPuppetEntity@SeriousEngine@@QAEXXZ", serverInitializeHud, originalInitializeHud);
         ok = symbol(g, "?GetCameraPlacement@CPuppetEntity@SeriousEngine@@UAE?AVQuatVect@2@XZ",
                     originalCamera) &&
              ok;
