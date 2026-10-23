@@ -35,7 +35,11 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 4. Serious Bomb: the forearms match the gloves (only their length shrinks).
 5. Rolling ball: no floating wheel; it rolls where you look and the right stick
    turns you.
-6. Not a bug: `Sam2.log`'s "Started simulation ... in N seconds" for a level
+6. Swamp start (canted displays): turn around and compare the eyes on distant
+   trees. Engine scissors now follow each eye's frustum. If the eyes still
+   differ, try `[Render] SinglePass=0` once: if that cures it, single pass is
+   the cause.
+7. Not a bug: `Sam2.log`'s "Started simulation ... in N seconds" for a level
    change counts the time the "press to continue" screen waited for you.
 
 ## Sprint (2026-10-22)
@@ -371,4 +375,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `fdb19ef`, version `0.2.11-dev.d50c80b79c4f` (2026-10-23).
+Installed candidate: commit `cb79c1d`, version `0.2.11-dev.560c83e61a57` (2026-10-23).
