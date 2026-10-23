@@ -46,15 +46,17 @@ the game loads that texture at runtime through its own immediate
 after the lasers in each eye with native simple-shader vertex arrays, with depth.
 
 Ride classes come from the Sam2Game vtable: wheeled/buggy/military car steer from
-move X (wheel replaces stick X while held); aircraft, rolling ball, air bike and
+move X (wheel replaces stick X while held); aircraft, air bike and
 hovercraft turn toward look heading (held wheel adds a yaw rate in the mounted
 look clamp instead of hand aim). Fighter/Saucer keep authored handles; a
 hovercraft-class ride waits 1.5 s for handle admission before showing the wheel.
 Grabbing reuses the squeeze availability/re-arm rules of the handle grasp; each
 hand keeps its own baseline, so joining/leaving never jumps, and the rim
 self-centres on release. A private capture rendered it in both eyes on foot
-(preview mode); grasp and steering are unit-tested only. Aircraft/rolling-ball
-route choice and feel are user acceptance items.
+(preview mode); grasp and steering are unit-tested only. Aircraft route
+choice and feel are user acceptance items. 2026-10-23: the rolling ball shows no
+wheel (owner: it needs no immersive controls); it rolls where you look and the
+stick turns you, as before.
 
 ## Current implementation boundary — 2026-10-10
 

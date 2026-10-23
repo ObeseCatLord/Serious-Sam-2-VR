@@ -9194,9 +9194,10 @@ static WheelSteering steeringWheelClass(void *ride) {
     switch(table-controlsGameBase) {
     // EnforcePuppetMoveLook 1563D0 with wheel-joint steering from move X.
     case 0x2a7ea0: case 0x2ba688: case 0x2aedd8: case 0x2af898: return WheelSteering::Axis;
-    // Aircraft, rolling ball, air bike and hovercraft turn toward look heading.
-    case 0x2b79b0: case 0x2b7348: case 0x2b9240: case 0x2b0760: case 0x2a8558: case 0x2b8420:
+    // Aircraft, air bike and hovercraft turn toward look heading.
+    case 0x2b79b0: case 0x2b7348: case 0x2b0760: case 0x2a8558: case 0x2b8420:
         return WheelSteering::Heading;
+    // The rolling ball (2B9240) has no controls to hold: it steers by the stick only.
     default: return WheelSteering::None; // Turrets, mounts and unknown classes.
     }
 }
