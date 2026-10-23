@@ -2825,11 +2825,11 @@ static void presentBody(IDirect3DDevice9 *d) {
             {
                 const auto sp = single_pass::takeStats();
                 if (singlePassEnabled)
-                    log("Perf single pass: passes=%u draws/pass=%.0f instanced/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f target switches/pass=%.1f up/pass=%.1f locked/pass=%.1f variants=%u failed=%u foveated=%u atlas=%ux%u",
+                    log("Perf single pass: passes=%u draws/pass=%.0f instanced/pass=%.0f unpatched/pass=%.0f matrix states/pass=%.1f target switches/pass=%.1f up/pass=%.1f locked/pass=%.1f scissored/pass=%.1f farExtended=%u variants=%u failed=%u foveated=%u atlas=%ux%u",
                         sp.passes, sp.passes ? double(sp.draws) / sp.passes : 0., sp.passes ? double(sp.instanced) / sp.passes : 0.,
                         sp.passes ? double(sp.unpatched) / sp.passes : 0.,
                         sp.passes ? double(sp.stateChanges) / sp.passes : 0., sp.passes ? double(sp.suspensions) / sp.passes : 0., sp.passes ? double(sp.userPointer) / sp.passes : 0., sp.passes ? double(sp.screenLocked) / sp.passes : 0.,
-                        sp.variants, sp.failedVariants, perf.foveatedPairs, atlasWidth, atlasHeight);
+                        sp.passes ? double(sp.scissors) / sp.passes : 0., sp.farExtended, sp.variants, sp.failedVariants, perf.foveatedPairs, atlasWidth, atlasHeight);
             }
             {
                 const auto r = replay::takeStats();

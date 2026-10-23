@@ -1,5 +1,6 @@
 #pragma once
 #include "math.hpp"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -227,5 +228,79 @@ inline void rewritePlane(const Rewrite &r, const float *in, float *out) noexcept
         for (unsigned k = 0; k < 4; ++k) v += double(in[k]) * inv[4*k+c];
         out[c] = float(v);
     }
+}
+// The far plane of an eye whose view is turned against the centre camera's
+// (canted displays): a point off to one side lies deeper along the eye turned
+// toward it than along the centre's axis, so what the engine kept inside its
+// far plane was clipped in that eye only (distant trees missing in one eye).
+// Given the eye's clip map rows (`clip`, centre clip -> eye clip) and the
+// centre's adjusted projection, rewrites the depth row so the eye's far plane
+// lies beyond the centre frustum's deepest point along the eye axis; the near
+// plane stays exactly where it was. False (unchanged) for a non-standard
+// projection or when no corner of the frustum lies deeper.
+inline bool extendFar(M4 &clip, const M4 &adjusted, const M4 &eyeView) noexcept {
+    const M4 &a = adjusted;
+    if (std::abs(a[8]) > 1e-9 || std::abs(a[9]) > 1e-9 || std::abs(a[12]) > 1e-9 || std::abs(a[13]) > 1e-9 ||
+        std::abs(a[15]) > 1e-9 || !(a[14] < 0) || std::abs(a[11]) < 1e-12)
+        return false;
+    // z_c = a22 z + a23, w = a32 z (z = -depth): near where z_c = 0, far where z_c = w.
+    const double nearPlane = a[11] / a[10], farPlane = a[11] / (a[10] - a[14]);
+    if (!(nearPlane > 0) || !(farPlane > nearPlane) || !std::isfinite(farPlane)) return false;
+    M4 inv;
+    if (!invert(a, inv)) return false;
+    double ratio = 1;
+    for (unsigned corner = 0; corner < 4; ++corner) {
+        const double n[4] = {corner & 1 ? 1. : -1., corner & 2 ? 1. : -1., .5, 1};
+        double p[4]{};
+        for (unsigned k = 0; k < 4; ++k) for (unsigned c = 0; c < 4; ++c) p[k] += inv[4 * k + c] * n[c];
+        if (!(std::abs(p[3]) > 1e-12)) return false;
+        const double d[3] = {p[0] / p[3], p[1] / p[3], p[2] / p[3]};
+        if (!(d[2] < 0)) return false;
+        const double eyeDepth = -(eyeView[8] * d[0] + eyeView[9] * d[1] + eyeView[10] * d[2]);
+        ratio = std::max(ratio, eyeDepth / -d[2]);
+    }
+    if (!(ratio > 1 + 1e-6) || !std::isfinite(ratio)) return false;
+    // A point at depth D (w = -a32 D): new z_c' = c' z + d' with the near plane
+    // kept and the far plane at ratio * far (1% more), as A z_c + B w.
+    const double far1 = farPlane * ratio * 1.01;
+    const double c1 = a[14] * far1 / (far1 - nearPlane), d1 = c1 * nearPlane;
+    const double A = d1 / a[11], B = (c1 - A * a[10]) / a[14];
+    for (unsigned c = 0; c < 4; ++c) clip[8 + c] = A * clip[8 + c] + B * clip[12 + c];
+    return true;
+}
+// A scissor rectangle (pixels l, t, r, b) of the camera whose adjusted
+// projection is `adjusted` (rows, clip = AP * view, view looks down -z), for
+// viewport x, y, w, h, as seen through `clip` (that camera's clip -> another
+// camera's clip, rows): the other camera's rectangle covering everything inside
+// it from `nearest` metres to 100 km away (the corner rays' bounding box, a
+// pixel of slack). The engine's scissors (portals) are the centre camera's; each
+// eye has its own frustum. False when a corner falls behind either camera.
+inline bool mapScissor(const M4 &clip, const M4 &adjusted, double x, double y, double w, double h,
+                       double (&rect)[4], double nearest = 1) noexcept {
+    const M4 &a = adjusted;
+    if (std::abs(a[12]) > 1e-9 || std::abs(a[13]) > 1e-9 || !(w > 0) || !(h > 0)) return false;
+    const double det = a[0] * a[5] - a[1] * a[4];
+    if (!std::isfinite(det) || std::abs(det) < 1e-12) return false;
+    double out[4] = {1e300, 1e300, -1e300, -1e300}; // left, top, right, bottom
+    for (double depth : {nearest, 1e5})
+        for (unsigned corner = 0; corner < 4; ++corner) {
+            const double px = corner & 1 ? rect[2] : rect[0], py = corner & 2 ? rect[3] : rect[1];
+            const double nx = 2 * (px - x) / w - 1, ny = 1 - 2 * (py - y) / h, z = -depth;
+            const double cw = a[14] * z + a[15];
+            if (!(cw > 0)) return false;
+            // The view point on this pixel's ray at that depth: solve the x, y rows.
+            const double bx = nx * cw - a[2] * z - a[3], by = ny * cw - a[6] * z - a[7];
+            const double vx = (bx * a[5] - by * a[1]) / det, vy = (a[0] * by - a[4] * bx) / det;
+            const double c[4] = {nx * cw, ny * cw, a[8] * vx + a[9] * vy + a[10] * z + a[11], cw};
+            double e[4];
+            for (unsigned r = 0; r < 4; ++r) e[r] = clip[4 * r] * c[0] + clip[4 * r + 1] * c[1] + clip[4 * r + 2] * c[2] + clip[4 * r + 3] * c[3];
+            if (!(e[3] > 1e-9) || !std::isfinite(e[0] + e[1])) return false;
+            const double ex = x + (e[0] / e[3] + 1) * .5 * w, ey = y + (1 - e[1] / e[3]) * .5 * h;
+            out[0] = std::min(out[0], ex); out[1] = std::min(out[1], ey);
+            out[2] = std::max(out[2], ex); out[3] = std::max(out[3], ey);
+        }
+    rect[0] = std::floor(out[0]) - 1; rect[1] = std::floor(out[1]) - 1;
+    rect[2] = std::ceil(out[2]) + 1; rect[3] = std::ceil(out[3]) + 1;
+    return true;
 }
 } // namespace ss2vr::replay

@@ -283,6 +283,25 @@ bool backgroundViewer(const float *v, const float *p) noexcept {
     const float d[3]{c[0] - mainCamera[0], c[1] - mainCamera[1], c[2] - mainCamera[2]};
     return d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 1.f;
 }
+// Each eye's clip map (records 0/1: centre clip -> eye clip), for scissors.
+M4 eyeClip[2]{};
+// The engine's scissor (portals and other partial-screen draws) is a rectangle
+// of the centre camera; each eye sees through its own frustum, so the same
+// pixels clipped a different part of the scene in each eye (the far end of the
+// swamp's start differed between the eyes). Mapped per eye from 1 m out; the
+// whole viewport when a corner falls behind a camera.
+RECT eyeScissor(unsigned eye, const RECT &centre) noexcept {
+    const D3DVIEWPORT9 &v = engineViewport;
+    const RECT full{LONG(v.X), LONG(v.Y), LONG(v.X + v.Width), LONG(v.Y + v.Height)};
+    if (!engineAdjusted || eye > 1) return full;
+    double rect[4] = {double(centre.left), double(centre.top), double(centre.right), double(centre.bottom)};
+    if (!mapScissor(eyeClip[eye], m4(engineAdjusted, 4), v.X, v.Y, v.Width, v.Height, rect)) return full;
+    RECT out{LONG(std::max(rect[0], double(full.left))), LONG(std::max(rect[1], double(full.top))),
+             LONG(std::min(rect[2], double(full.right))), LONG(std::min(rect[3], double(full.bottom)))};
+    if (out.right < out.left) out.right = out.left;
+    if (out.bottom < out.top) out.bottom = out.top;
+    return out;
+}
 bool writeRecords(IDirect3DDevice9 *d) noexcept {
     static bool lockedRecords = false;
     if (lockedRecords != screenLocked) { recordsValid = false; lockedRecords = screenLocked; }
@@ -327,9 +346,13 @@ bool writeRecords(IDirect3DDevice9 *d) noexcept {
         Rewrite r = rewrite(state, change);
         if (screenLocked) r.identity = true;
         recordsOrtho = recordsOrtho || !r.valid || r.identity;
+        // Canted displays: the far plane along this eye's axis covers the centre frustum.
+        static const bool labFarOff = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_FAR_EXTEND", v, 2) == 1 && v[0] == L'0'; }();
+        if (r.valid && !r.identity && !labFarOff && extendFar(r.clip, m4(engineAdjusted, 4), change.view)) ++stats.farExtended;
         for (unsigned row = 0; row < 4; ++row)
             for (unsigned c = 0; c < 4; ++c)
                 records[i].r[row][c] = r.valid && !r.identity ? float(r.clip[4 * row + c]) : (row == c ? 1.f : 0.f);
+        for (unsigned k = 0; k < 16; ++k) eyeClip[i][k] = records[i].r[k / 4][k % 4];
         auto &wide = records[2 + i];
         std::memcpy(wide.r, records[i].r, sizeof(wide.r));
         const float side = i ? .5f : -.5f;
@@ -890,6 +913,9 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
     return perHalf(d, call, stereo);
 }
 template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo, bool shifted) noexcept {
+    // Lab (SS2VR_LAB_WATER_HIDE=1): water is not drawn, to find it in a capture.
+    static const bool waterHidden = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_WATER_HIDE", v, 2) == 1 && v[0] == L'1'; }();
+    if (stereo && waterHidden && waterDraw()) return D3D_OK;
     static const bool wideOff = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_WIDEHALF", v, 2) == 1 && v[0] == L'0'; }();
     static const bool wideBisect = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_WIDEBISECT", v, 2) == 1 && v[0] == L'1'; }();
     if (wideBisect && stereo && !shifted && enginePixelShader) {
@@ -962,8 +988,13 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
         HRESULT hr = D3D_OK;
         WaterConstantsScope waterScope(d, stereo);
         if (stereo && waterScope.unusable()) return D3D_OK;
+        const bool partial = scissorEnabled && (clip.left > LONG(v.X) || clip.top > LONG(v.Y) ||
+                                                clip.right < LONG(v.X + v.Width) || clip.bottom < LONG(v.Y + v.Height));
+        const RECT eyeClipRect[2]{partial ? eyeScissor(0, clip) : clip, partial ? eyeScissor(1, clip) : clip};
+        if (partial) ++stats.scissors;
         for (unsigned j = 0; j < layout.count; ++j) {
-            const RECT r = regionRect(layout.region[j], clip.left, clip.top, clip.right, clip.bottom);
+            const RECT &c = eyeClipRect[layout.region[j].eye ? 1 : 0];
+            const RECT r = regionRect(layout.region[j], c.left, c.top, c.right, c.bottom);
             if (r.right <= r.left || r.bottom <= r.top) continue;
             applyScissor(d, r);
             applyPlanes(d, int(2 + j));
@@ -992,7 +1023,9 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
         D3DVIEWPORT9 placed{DWORD(r.left), DWORD(r.top), DWORD(r.right - r.left), DWORD(r.bottom - r.top), v.MinZ, v.MaxZ};
         oSetViewport(d, &placed);
         if (scissorEnabled) {
-            const RECT s = regionRect(g, engineScissor.left, engineScissor.top, engineScissor.right, engineScissor.bottom);
+            const RECT e = stereo ? eyeScissor(g.eye, engineScissor) : engineScissor;
+            if (stereo && g.eye == 0) ++stats.scissors;
+            const RECT s = regionRect(g, e.left, e.top, e.right, e.bottom);
             oSetScissor(d, &s);
         }
         if (stereo) { d->SetStreamSource(15, ring, eyeOffset[g.eye], RecordBytes); applyPlanes(d, int(g.eye)); }

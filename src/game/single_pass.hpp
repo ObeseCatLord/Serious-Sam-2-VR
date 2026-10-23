@@ -78,7 +78,7 @@ HRESULT drawIndexedUp(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT minimum, 
                       D3DFORMAT format, const void *data, UINT stride) noexcept;
 HRESULT clear(IDirect3DDevice9 *d, DWORD count, const D3DRECT *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) noexcept;
 struct Stats {
-    unsigned passes = 0, draws = 0, instanced = 0, unpatched = 0, stateChanges = 0, variants = 0, failedVariants = 0, suspensions = 0, userPointer = 0, screenLocked = 0;
+    unsigned passes = 0, draws = 0, instanced = 0, unpatched = 0, stateChanges = 0, variants = 0, failedVariants = 0, suspensions = 0, userPointer = 0, screenLocked = 0, scissors = 0, farExtended = 0;
 };
 Stats takeStats() noexcept;
 // Lab: instance only eligible draws with index in [lo, hi) (counted per pass);

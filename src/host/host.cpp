@@ -2115,6 +2115,23 @@ struct Host {
                     f = {-.8f, .8f, .8f, -.8f};
             }
         }
+        // Lab (SS2VR_LAB_CANT=<degrees>, private display only): each eye turned
+        // outward as on canted displays (Bigscreen Beyond), its field of view
+        // shifted to cover the same directions.
+        static const float labCant = [] {
+            wchar_t lab[2]{}, v[16]{};
+            if (GetEnvironmentVariableW(L"SS2VR_LAB_PRIVATE_DISPLAY", lab, 2) != 1 || lab[0] != L'1' ||
+                !GetEnvironmentVariableW(L"SS2VR_LAB_CANT", v, 16)) return 0.f;
+            return float(_wtof(v)) * Pi / 180.f;
+        }();
+        if (labCant != 0)
+            for (unsigned h = 0; h != 2; ++h) {
+                const float yawAngle = h ? -labCant : labCant; // Left eye turns left (+y), right eye right.
+                auto &q = views[h].pose.orientation;
+                const Quat turned = normalize(multiply(Quat{q.x, q.y, q.z, q.w}, Quat{0, std::sin(yawAngle / 2), 0, std::cos(yawAngle / 2)}));
+                q = {turned.x, turned.y, turned.z, turned.w};
+                views[h].fov.angleLeft += yawAngle; views[h].fov.angleRight += yawAngle;
+            }
         for (const auto &view : views) {
             const auto &f = view.fov;
             if (!validPose(pose(view.pose)) || !std::isfinite(f.angleLeft) || !std::isfinite(f.angleRight) ||
