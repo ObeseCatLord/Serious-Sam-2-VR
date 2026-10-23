@@ -100,13 +100,23 @@ DWORD WINAPI profile(void *) {
             // The nearest game code on the stack (who called into the wait or the
             // driver), and the first few game return addresses as a chain.
             std::vector<Spot> chain;
-            for (unsigned w = 0; w < copied / sizeof(DWORD) && chain.size() < 5; ++w) {
+            bool gameCaller = false;
+            for (unsigned w = 0; w < copied / sizeof(DWORD) && chain.size() < 12; ++w) {
                 const uintptr_t value = stack[w];
                 const auto range = std::find_if(modules.begin(), modules.end(),
                                                 [&](const Range &r) { return value >= r.begin + 0x1000 && value < r.end; });
-                if (range == modules.end()) continue;
-                if (chain.empty()) ++callers[id][{range->module, (value - range->begin) & ~uintptr_t(0xf)}];
-                chain.push_back({range->module, value - range->begin});
+                if (range != modules.end() && !gameCaller) {
+                    gameCaller = true;
+                    ++callers[id][{range->module, (value - range->begin) & ~uintptr_t(0xf)}];
+                }
+                // Any module's code address (system and runtime frames too).
+                HMODULE owner = range != modules.end() ? range->module : nullptr;
+                if (!owner && value > 0x10000 &&
+                    !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                        reinterpret_cast<LPCWSTR>(value), &owner))
+                    owner = nullptr;
+                if (owner && value - reinterpret_cast<uintptr_t>(owner) >= 0x1000)
+                    chain.push_back({owner, value - reinterpret_cast<uintptr_t>(owner)});
             }
             if (!chain.empty()) ++chains[id][chain];
         }
