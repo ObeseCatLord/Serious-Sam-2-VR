@@ -52,6 +52,7 @@ DWORD WINAPI profile(void *) {
     Spots hits;
     std::map<DWORD, uint64_t> cpuAt, cpuDelta; // 100 ns units of user+kernel time
     std::map<DWORD, Spots> perThread, callers;
+    std::map<DWORD, std::map<std::vector<Spot>, unsigned>> chains;
     std::vector<Range> modules = gameModules();
     unsigned samples = 0;
     uint64_t reported = GetTickCount64();
@@ -96,15 +97,18 @@ DWORD WINAPI profile(void *) {
             ++hits[{module, offset}];
             ++perThread[id][{module, offset}];
             ++samples;
-            // The nearest game code on the stack: who called into the wait or the driver.
-            for (unsigned w = 0; w < copied / sizeof(DWORD); ++w) {
+            // The nearest game code on the stack (who called into the wait or the
+            // driver), and the first few game return addresses as a chain.
+            std::vector<Spot> chain;
+            for (unsigned w = 0; w < copied / sizeof(DWORD) && chain.size() < 5; ++w) {
                 const uintptr_t value = stack[w];
                 const auto range = std::find_if(modules.begin(), modules.end(),
                                                 [&](const Range &r) { return value >= r.begin + 0x1000 && value < r.end; });
                 if (range == modules.end()) continue;
-                ++callers[id][{range->module, (value - range->begin) & ~uintptr_t(0xf)}];
-                break;
+                if (chain.empty()) ++callers[id][{range->module, (value - range->begin) & ~uintptr_t(0xf)}];
+                chain.push_back({range->module, value - range->begin});
             }
+            if (!chain.empty()) ++chains[id][chain];
         }
         CloseHandle(snapshot);
         const uint64_t now = GetTickCount64();
@@ -130,11 +134,23 @@ DWORD WINAPI profile(void *) {
                                   double(cpuDelta[c.first]) / 1e7);
             describe(line, m, sizeof line, c.second, 6);
             log("%s", line);
+            // Its most common chain (raw stack scan: may include stale addresses).
+            const auto &threadChains = chains[c.first];
+            const auto best = std::max_element(threadChains.begin(), threadChains.end(),
+                                               [](const auto &a, const auto &b) { return a.second < b.second; });
+            if (best == threadChains.end()) continue;
+            m = std::snprintf(line, sizeof line, "Lab profile chain thread %lu n=%u:", c.first, best->second);
+            for (const auto &spot : best->first) {
+                wchar_t path[MAX_PATH]{};
+                m += std::snprintf(line + m, sizeof line - m, " %ls+%x", moduleName(spot.first, path), unsigned(spot.second));
+            }
+            log("%s", line);
         }
         for (auto &c : cpuAt) c.second += cpuDelta[c.first];
         cpuDelta.clear();
         perThread.clear();
         callers.clear();
+        chains.clear();
         hits.clear();
         samples = 0;
     }
