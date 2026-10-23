@@ -743,7 +743,8 @@ def validate(cfg):
         'XRT_COMPOSITOR_DISABLE_DEFERRED'}
     if set(cfg['monado_environment'])-allowed_environment or cfg['monado_environment'].get('P_OVERRIDE_ACTIVE_CONFIG')!='remote':
         raise ValueError('Only process-local simulation settings are admitted')
-    budget=900 if cfg.get('multiplayer_connect') is not None else 180 # A session needs time to join and play.
+    # A multiplayer session, or an operator hold (a user's save can load for minutes), needs longer.
+    budget=900 if cfg.get('multiplayer_connect') is not None or cfg.get('interactive_hold_seconds') else 180
     if not 0<cfg.get('timeout',60)<=budget: raise ValueError('Runtime budget must be between zero and %d seconds'%budget)
     if cfg.get('native_input_probe') not in (None,'read-only-three-samples','owned-activation-three-samples'):
         raise ValueError('Unknown bounded native input probe')

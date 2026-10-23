@@ -42,6 +42,44 @@ void(__cdecl *alFilteri)(ALuint, ALenum, ALint) = nullptr;
 void(__cdecl *alFilterf)(ALuint, ALenum, ALfloat) = nullptr;
 int(__cdecl *alIsSource)(ALuint) = nullptr;
 void(__cdecl *originalSource3f)(ALuint, ALenum, ALfloat, ALfloat, ALfloat) = nullptr;
+// Lab (SS2VR_LAB_AUDIO_TRACE=1): every 5 s, each playing source's settings.
+void(__cdecl *alGetSourcei)(ALuint, ALenum, ALint *) = nullptr;
+void(__cdecl *alGetSourcef)(ALuint, ALenum, ALfloat *) = nullptr;
+void(__cdecl *alGetSource3f)(ALuint, ALenum, ALfloat *, ALfloat *, ALfloat *) = nullptr;
+void(__cdecl *alGetBufferi)(ALuint, ALenum, ALint *) = nullptr;
+void(__cdecl *alGetListener3f)(ALenum, ALfloat *, ALfloat *, ALfloat *) = nullptr;
+int(__cdecl *alGetInteger)(ALenum) = nullptr;
+void traceSources() {
+    if (!alGetSourcei || !alGetSourcef || !alGetSource3f || !alGetBufferi || !alIsSource) return;
+    float lx = 0, ly = 0, lz = 0;
+    if (alGetListener3f) alGetListener3f(0x1004, &lx, &ly, &lz); // AL_POSITION
+    log("Lab audio: listener %.1f,%.1f,%.1f distance model %x", lx, ly, lz, alGetInteger ? alGetInteger(0xD000) : -1);
+    for (ALuint id = 1; id < 512; ++id) {
+        if (!alIsSource(id)) continue;
+        ALint state = 0, looping = 0, relative = 0, buffer = 0, size = 0, frequency = 0, channels = 0, bits = 0;
+        alGetSourcei(id, 0x1010, &state); // AL_SOURCE_STATE
+        if (state != 0x1012) continue;     // AL_PLAYING
+        alGetSourcei(id, 0x1007, &looping);
+        alGetSourcei(id, 0x202, &relative);
+        alGetSourcei(id, 0x1009, &buffer);
+        if (buffer) {
+            alGetBufferi(ALuint(buffer), 0x2004, &size);
+            alGetBufferi(ALuint(buffer), 0x2001, &frequency);
+            alGetBufferi(ALuint(buffer), 0x2003, &channels);
+            alGetBufferi(ALuint(buffer), 0x2002, &bits);
+        }
+        float gain = 0, reference = 0, rolloff = 0, maximum = 0, x = 0, y = 0, z = 0;
+        alGetSourcef(id, 0x100A, &gain);
+        alGetSourcef(id, 0x1020, &reference);
+        alGetSourcef(id, 0x1021, &rolloff);
+        alGetSourcef(id, 0x1023, &maximum);
+        alGetSource3f(id, 0x1004, &x, &y, &z);
+        const float seconds = frequency && channels && bits ? float(size) / float(frequency * channels * bits / 8) : 0.f;
+        log("Lab audio: source %u loop=%d relative=%d gain=%.2f ref=%.1f rolloff=%.2f max=%.0f pos=%.1f,%.1f,%.1f "
+            "buffer=%d %.2fs %dHz ch=%d", id, looping, relative, gain, reference, rolloff, maximum, x, y, z, buffer,
+            seconds, frequency, channels);
+    }
+}
 void(__cdecl *originalDeleteSources)(ALsizei, const ALuint *) = nullptr;
 void(__cdecl *originalSourcePlay)(ALuint) = nullptr;
 
@@ -72,9 +110,15 @@ void __cdecl deleteSources(ALsizei count, const ALuint *sources) {
     originalDeleteSources(count, sources);
 }
 
+void traceSources();
 void __cdecl sourcePlay(ALuint source) {
     ++playCalls;
     originalSourcePlay(source);
+    // Lab trace from the game's own sound thread too (its context is current here).
+    static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_AUDIO_TRACE", v, 2) == 1 && v[0] == L'1'; }();
+    static std::atomic<uint64_t> traced{0};
+    const uint64_t now = GetTickCount64();
+    if (trace && now - traced.load() >= 5000) { traced = now; log("Lab audio (play thread %lu):", GetCurrentThreadId()); traceSources(); }
 }
 std::atomic<int> probeResult{0};
 DWORD WINAPI probeDevice(void *) {
@@ -209,7 +253,10 @@ bool prepare() {
     if (!openal || !resolve(alcOpenDevice, "alcOpenDevice") || !resolve(alcCloseDevice, "alcCloseDevice") ||
         !resolve(alcGetCurrentContext, "alcGetCurrentContext") || !resolve(alSourcei, "alSourcei") ||
         !resolve(alGenFilters, "alGenFilters") || !resolve(alFilteri, "alFilteri") ||
-        !resolve(alFilterf, "alFilterf") || !resolve(alIsSource, "alIsSource")) {
+        !resolve(alFilterf, "alFilterf") || !resolve(alIsSource, "alIsSource") || !resolve(alGetSourcei, "alGetSourcei") ||
+        !resolve(alGetSourcef, "alGetSourcef") || !resolve(alGetSource3f, "alGetSource3f") ||
+        !resolve(alGetBufferi, "alGetBufferi") || !resolve(alGetListener3f, "alGetListener3f") ||
+        !resolve(alGetInteger, "alGetInteger")) {
         log("Spatial audio: OpenAL32.dll did not load (%lu)", GetLastError());
         return false;
     }
@@ -279,6 +326,9 @@ void frame() {
             listenerCalls.exchange(0), listenerHead.exchange(0), traceCalls.exchange(0), blockedCalls.exchange(0), tracked, occluded);
     }
     if (!preparedOk || !hooked || !alcGetCurrentContext || !alcGetCurrentContext()) return;
+    static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_AUDIO_TRACE", v, 2) == 1 && v[0] == L'1'; }();
+    static uint64_t traced = 0;
+    if (trace && now - traced >= 5000) { traced = now; traceSources(); }
     struct Pending { ALuint source; float gain, gainHF; };
     Pending pending[::ss2vr::spatial_audio::MaxSources];
     unsigned count = 0;
