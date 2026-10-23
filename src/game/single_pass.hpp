@@ -71,6 +71,18 @@ void setInstancingSuspended(bool suspended) noexcept;
 // first, and suspends its stereo bindings while another target is bound.
 void beforeRenderTarget(IDirect3DDevice9 *device, DWORD index) noexcept;
 void afterRenderTarget(IDirect3DDevice9 *device, DWORD index, IDirect3DSurface9 *target) noexcept;
+// The engine state the pass tracks, for the water mirror pass (water_mirror.hpp):
+// the bound vertex program is water, the live engine matrices, the sky's own
+// camera, a program (not fixed function) bound, the engine's user plane mask,
+// and the device's clip plane/render state set past the pass's own tracking.
+bool waterBound() noexcept;
+bool engineCamera(const float *&adjusted, const float *&view) noexcept;
+const float *engineProjectionMatrix() noexcept;
+bool backgroundBound() noexcept;
+bool programBound() noexcept;
+DWORD engineClipPlanes() noexcept;
+void rawClipPlane(IDirect3DDevice9 *d, DWORD index, const float *plane) noexcept;
+void rawRenderState(IDirect3DDevice9 *d, D3DRENDERSTATETYPE state, DWORD value) noexcept;
 HRESULT draw(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT start, UINT count) noexcept;
 HRESULT drawIndexed(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, INT base, UINT minimum, UINT vertices, UINT start, UINT count) noexcept;
 HRESULT drawUp(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT count, const void *data, UINT stride) noexcept;

@@ -35,11 +35,18 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 4. Serious Bomb: the forearms match the gloves (only their length shrinks).
 5. Rolling ball: no floating wheel; it rolls where you look and the right stick
    turns you.
-6. Swamp start (canted displays): turn around and compare the eyes on distant
+6. Water reflections (Branchester, any level with water): reflections are now a
+   mirrored render of the world (`[Render] WaterMirror=1`, the default). Turn
+   your head and step sideways next to the water: reflected walkways, trunks and
+   sky should stay put in the world, with depth beyond the surface. Compare once
+   with `WaterMirror=0` (the old cube) and note the frame rate with each; the
+   mirror costs one extra world render while water is in view
+   (`WaterMirrorScale` sets its size).
+7. Swamp start (canted displays): turn around and compare the eyes on distant
    trees. Engine scissors now follow each eye's frustum. If the eyes still
    differ, try `[Render] SinglePass=0` once: if that cures it, single pass is
    the cause.
-7. Not a bug: `Sam2.log`'s "Started simulation ... in N seconds" for a level
+8. Not a bug: `Sam2.log`'s "Started simulation ... in N seconds" for a level
    change counts the time the "press to continue" screen waited for you.
 
 ## Sprint (2026-10-22)

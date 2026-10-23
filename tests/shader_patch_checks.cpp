@@ -103,6 +103,29 @@ int main() {
         assert(turned && written && !lookupLeft);
         // Probe mode needs constants up to c34 free and a texcoord fed by the lookup.
         assert(patchVertexShader(busyConstants.data(), busyConstants.size(), out, &w, 30, true) && !w.eyeClip);
+        // Mirror mode: the lookup's clip position becomes the point's position in
+        // the mirror camera (m4x4 r2, r4, c35) ahead of the game's ripple, which
+        // still reads r2; the texcoord stays the lookup's.
+        VertexInfo mirrored;
+        assert(patchVertexShader(water.data(), water.size(), out, &mirrored, 30, false, 35) && mirrored.eyeClip);
+        size_t matrix = 0, ripple = 0;
+        bool stillLookup = false, dome = false;
+        for (size_t i = 0; i + 3 < out.size(); ++i) {
+            if (out[i] == 0x14 && out[i + 1] == dst(Temp, 2, 0xf) && out[i + 2] == src(Temp, 10) && out[i + 3] == src(Const, 35)) matrix = i;
+            if (!ripple && out[i] == 0x04 && out[i + 1] == dst(Temp, 2, 0x3)) ripple = i;
+            if (out[i] == 0x01 && out[i + 1] == dst(TexCrdOut, 2, 0xf) && out[i + 2] == src(Temp, 2)) stillLookup = true;
+            if (out[i] == 0x0bu && out[i + 1] == dst(Temp, 10, 0x2)) dome = true; // The dome's |R.y| (not here).
+        }
+        // The reflected ray (eye in c30, normal r5), then the point cK.z along it into the mirror camera.
+        bool along = false;
+        for (size_t i = 0; i + 4 < out.size(); ++i)
+            if (out[i] == 0x04 && out[i + 1] == dst(Temp, 10, 0x7) && out[i + 2] == src(Temp, 9) &&
+                out[i + 3] == src(Const, 31, 0xaau) && out[i + 4] == src(Temp, 4)) along = true;
+        assert(matrix && ripple == matrix + 4 && stillLookup && !dome && along);
+        // Refused without the water site, in probe mode, or over the eye constants.
+        assert(!patchVertexShader(program.data(), program.size(), out, &w, 30, false, 35));
+        assert(!patchVertexShader(water.data(), water.size(), out, &w, 30, true, 35));
+        assert(!patchVertexShader(water.data(), water.size(), out, &w, 30, false, 32));
     }
     // Water pixel program: ripple offset + projective reflection lookup becomes a
     // cube lookup turned by the ripple.
@@ -137,6 +160,19 @@ int main() {
         }
         assert(cubeDcl && plainLookup && !projective && turnedX && turnedZ && cube.back() == 0x0000ffffu);
         assert(cube.size() == ps.size() + 18 + 6); // Three defs; mad+mov+texldp (12 words) -> mad+mad+texld+mul (18).
+        // Projective (mirror image): the 2D sampler, ripple and texldp stay; the gain follows.
+        std::vector<uint32_t> mirror;
+        sampler = 99;
+        assert(patchWaterPixelShader(ps.data(), ps.size(), mirror, sampler, .5f, true) && sampler == 2);
+        bool keptDcl = false, keptLookup = false, gained = false;
+        for (size_t i = 0; i + 4 < mirror.size(); ++i) {
+            if (mirror[i] == 0x0200001fu && mirror[i + 1] == 0x90000000u && mirror[i + 2] == (0x80000000u | reg(Smp, 2) | (0xfu << 16))) keptDcl = true;
+            if (mirror[i] == 0x03010042u && mirror[i + 1] == dst(Temp, 2, 0xf)) {
+                keptLookup = true;
+                gained = mirror[i + 4] == 0x03000005u && mirror[i + 5] == dst(Temp, 2, 0x7) && mirror[i + 7] == src(Const, 29);
+            }
+        }
+        assert(keptDcl && keptLookup && gained && mirror.size() == ps.size() + 18 + 4);
         // Programs already using c30 are left alone; so are programs without the sequence.
         std::vector<uint32_t> busy = ps;
         busy.insert(busy.end() - 1, {0x02000001u, dst(Temp, 3, 0xf), src(Const, 30)});

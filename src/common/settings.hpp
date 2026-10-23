@@ -17,6 +17,8 @@ struct VrSettings {
     bool eyeReplay = false; // Right eye replayed from the left eye's recorded D3D9 calls.
     bool singlePass = true; // Both eyes from one world traversal (double-wide target).
     bool singlePassInstancing = false; // One instanced draw per world draw (lab: artifacts).
+    bool waterMirror = true; // Water reflects a mirrored render of the world (else the surroundings cube).
+    float waterMirrorScale = .5f; // That render's size, as a fraction of an eye's.
     bool shadowReuse = true; // Dynamic shadow images rendered once per frame and reused for the second eye.
     bool desktopWorld = false; // Also draw the world into the desktop window on VR frames (costs a third render).
     float uiAspect = 16.f / 9; // Aspect the game lays out its 2D view (menus, HUD, movies) at in VR.

@@ -153,8 +153,15 @@ inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg, un
 // direction (model-space R turned by the rows in c<eyeClip+2..+4>) to the
 // texcoord set the reflection lookup wrote, for a cube map of the surroundings
 // (env_probe.cpp, and patchWaterPixelShader below).
+// With `mirror` (a free constant register, 4 rows: model -> mirror camera clip)
+// the water variant instead looks its reflection up in the mirror camera's
+// image ([Render] WaterMirror): the lookup's clip position is replaced by the
+// position, in that camera, of the point a distance (c<eyeClip+1>.z, model
+// units) along this eye's reflected ray (eye in c<eyeClip>): the one image
+// serves both eyes with the right stereo depth for reflections that far. The
+// game's own ripple, flip and bias apply as before.
 inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, VertexInfo *infoOut = nullptr,
-                              unsigned eyeClip = 0, bool probe = false) {
+                              unsigned eyeClip = 0, bool probe = false, unsigned mirror = 0) {
     using namespace detail;
     VertexInfo info;
     if (!inspect(words, count, info) || !info.positionWrites) return false;
@@ -165,6 +172,7 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
     unsigned clipReg = 0, normalReg = 0, positionReg = 0;
     size_t clipAt = eyeClip ? eyeClipSite(words, count, clipReg, &normalReg, &positionReg, &info.clipMatrix) : 0;
     if (clipAt && (info.temps > 9 || info.constants > eyeClip || eyeClip + (probe ? 5 : 2) > 96)) clipAt = 0; // r9, r10 and c<eyeClip..> must be free.
+    if (mirror && (!clipAt || probe || mirror < eyeClip + 5 || mirror + 4 > 96)) return false;
     bool reflectionWritten = !probe || !clipAt;
     info.eyeClip = clipAt != 0;
     std::vector<uint32_t> result;
@@ -186,7 +194,22 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
             continue;
         }
         const int n = operands(opcode);
-        if (clipAt && i == clipAt) {
+        if (clipAt && i == clipAt && mirror) {
+            const uint32_t neg = 1u << 24, e = eyeClip, k = eyeClip + 1;
+            const uint32_t reflected[] = {
+                0x03u, dst(Temp, 9, 0x7), src(Temp, positionReg), src(Const, e),              // sub r9.xyz, rP, cE
+                0x08u, dst(Temp, 9, 0x8), src(Temp, 9), src(Temp, 9),                        // dp3 r9.w, r9, r9
+                0x07u, dst(Temp, 9, 0x8), src(Temp, 9, 0xffu),                                // rsq r9.w, r9.w
+                0x05u, dst(Temp, 9, 0x7), src(Temp, 9), src(Temp, 9, 0xffu),                  // mul r9.xyz, r9, r9.w  (V)
+                0x08u, dst(Temp, 10, 0x1), src(Temp, 9), src(Temp, normalReg),                // dp3 r10.x, V, N
+                0x02u, dst(Temp, 10, 0x1), src(Temp, 10, 0x00u), src(Temp, 10, 0x00u),        // add r10.x, r10.x, r10.x
+                0x04u, dst(Temp, 9, 0x7), src(Temp, 10, 0x00u) | neg, src(Temp, normalReg), src(Temp, 9), // R = V - 2(V.N)N
+                0x04u, dst(Temp, 10, 0x7), src(Temp, 9), src(Const, k, 0xaau), src(Temp, positionReg), // mad r10.xyz, R, cK.z, rP
+                0x01u, dst(Temp, 10, 0x8), src(Const, k, 0x55u),                              // mov r10.w, cK.y (1)
+                0x14u, dst(Temp, clipReg, 0xf), src(Temp, 10), src(Const, mirror),             // m4x4 rX, r10, cMirror
+            };
+            result.insert(result.end(), std::begin(reflected), std::end(reflected));
+        } else if (clipAt && i == clipAt) {
             const uint32_t neg = 1u << 24, e = eyeClip, k = eyeClip + 1;
             const uint32_t dome[] = {
                 0x03u, dst(Temp, 9, 0x7), src(Temp, positionReg), src(Const, e),              // sub r9.xyz, rP, cE
@@ -389,8 +412,10 @@ inline bool patchPixelShader(const uint32_t *words, size_t count, unsigned k, st
 // scene). `sampler` returns N. False if no such sequence, or the program
 // already uses c29..c31.
 constexpr float WaterRipple = .15f; // Direction change for the ripple's texture offset.
+// With `projective` (the mirror image, [Render] WaterMirror) the game's own
+// ripple and projective lookup stay; only the gain follows the lookup.
 inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, unsigned &sampler,
-                                  float gain = 1) {
+                                  float gain = 1, bool projective = false) {
     using namespace detail;
     constexpr unsigned Sampler = 10;
     if (!words || count < 2 || words[0] != PsVersion20) return false;
@@ -445,8 +470,13 @@ inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vect
         const uint32_t token = words[i], opcode = token & 0xffffu;
         if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
         const size_t len = (token >> 24) & 0xfu;
-        if (i == dclAt) {
+        if (i == dclAt && !projective) {
             result.insert(result.end(), {token, (words[i + 1] & ~0x78000000u) | 0x18000000u, words[i + 2]});
+        } else if (i == site && projective) {
+            result.insert(result.end(), words + site, words + site + 12); // mad, mov, texldp as they were
+            result.insert(result.end(), {0x03000005u, dst(Temp, a, 0x7) | pp, src(Temp, a), src(Const, 29)});
+            i = site + 12;
+            continue;
         } else if (i == site) {
             result.insert(result.end(), {
                 0x04000004u, dst(Temp, a, 0x7) | pp, src(Temp, b, 0x00u), src(Const, 30), src(Texture, c),

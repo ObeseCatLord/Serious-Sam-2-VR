@@ -47,6 +47,8 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.foveation.mode = int(number(L"Render", L"Foveation", 1, 0, 2) + .5f);
     settings.desktopWorld = number(L"Render", L"DesktopWorld", 0, 0, 1) >= .5f;
     settings.shadowReuse = number(L"Render", L"ShadowReuse", 1, 0, 1) >= .5f;
+    settings.waterMirror = number(L"Render", L"WaterMirror", 1, 0, 1) >= .5f;
+    settings.waterMirrorScale = number(L"Render", L"WaterMirrorScale", .5f, .25f, 1);
     settings.eyeReplay = number(L"Render", L"EyeReplay", 0, 0, 1) >= .5f;
     settings.singlePass = number(L"Render", L"SinglePass", 1, 0, 1) >= .5f;
     settings.instantRides = number(L"Rides", L"InstantTransitions", 1, 0, 1) >= .5f;

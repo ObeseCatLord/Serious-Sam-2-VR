@@ -58,6 +58,15 @@ inline bool sameProjectionXY(const Matrix44 &a, const Matrix44 &b) {
     }
     return true;
 }
+// The water mirror's projection: its whole depth row is the oblique near
+// plane at the water (common/water_mirror.hpp); x, y and w identify it.
+inline bool sameProjectionXYW(const Matrix44 &a, const Matrix44 &b) {
+    for (unsigned i = 0; i != 16; ++i) {
+        if (i >= 8 && i < 12) continue;
+        if (!std::isfinite(a.m[i]) || !std::isfinite(b.m[i]) || std::abs(a.m[i] - b.m[i]) > .00001f) return false;
+    }
+    return true;
+}
 inline WeaponWorldView executedWeaponView(const WeaponWorldView &prepared,
                                           const Matrix34 &view, const Matrix44 &projection,
                                           float nearDepth, float farDepth) {

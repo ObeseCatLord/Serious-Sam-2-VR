@@ -14,6 +14,7 @@
 #include "eye_replay.hpp"
 #include "hud_wrist.hpp"
 #include "single_pass.hpp"
+#include "water_mirror.hpp"
 #include "env_probe.hpp"
 #include "scope_gpu.hpp"
 #include "scope_source_gpu.hpp"
@@ -1723,6 +1724,7 @@ static HRESULT WINAPI draw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT start,
         countDraw();
         replay::recordDraw(type,start,count);
         if(single_pass::drawing(d)) return single_pass::draw(d,type,start,count);
+        if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDraw(d,type,start,count); });
         return originalDraw(d,type,start,count);
     });
 }
@@ -1735,6 +1737,7 @@ static HRESULT forwardIndexed(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
         countDraw();
         replay::recordDrawIndexed(type,base,minimum,vertices,start,count);
         if(single_pass::drawing(d)) return single_pass::drawIndexed(d,type,base,minimum,vertices,start,count);
+        if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDrawIndexed(d,type,base,minimum,vertices,start,count); });
         return originalDrawIndexed(d,type,base,minimum,vertices,start,count);
     });
 }
@@ -1804,6 +1807,7 @@ static HRESULT WINAPI drawUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT coun
     replay::invalidate("user-pointer draw");
     return observeUiOutput(d,[&]{ traceWorldDraw(d,count);
         if(single_pass::drawing(d)) return single_pass::drawUp(d,type,count,vertices,stride);
+        if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDrawUp(d,type,count,vertices,stride); });
         return originalDrawUp(d,type,count,vertices,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawIndexedUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT minimum,UINT vertices,UINT count,
@@ -1812,6 +1816,7 @@ static HRESULT WINAPI drawIndexedUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UI
     replay::invalidate("user-pointer draw");
     return observeUiOutput(d,[&]{ traceWorldDraw(d,count);
         if(single_pass::drawing(d)) return single_pass::drawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride);
+        if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); });
         return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawRect(IDirect3DDevice9 *d,UINT handle,const float *segments,const D3DRECTPATCH_INFO *info) {
@@ -2040,7 +2045,7 @@ static bool composeFovea(IDirect3DDevice9 *d, const FoveaFrame &f, unsigned k, I
 }
 static void releaseTargets() {
     ++resourceGeneration;
-    env_probe::release();
+    env_probe::release(); water_mirror::release();
     releaseScopeCache();
     releaseHudLayer();
     releaseMenuScaled();
@@ -2830,6 +2835,13 @@ static void presentBody(IDirect3DDevice9 *d) {
                         sp.passes ? double(sp.unpatched) / sp.passes : 0.,
                         sp.passes ? double(sp.stateChanges) / sp.passes : 0., sp.passes ? double(sp.suspensions) / sp.passes : 0., sp.passes ? double(sp.userPointer) / sp.passes : 0., sp.passes ? double(sp.screenLocked) / sp.passes : 0.,
                         sp.passes ? double(sp.scissors) / sp.passes : 0., sp.farExtended, sp.variants, sp.failedVariants, perf.foveatedPairs, atlasWidth, atlasHeight);
+            }
+            {
+                const auto m = water_mirror::takeStats();
+                if (m.passes || m.used)
+                    log("Perf water mirror: passes=%u captured=%u published=%u draws=%u clipped=%u water skipped=%u flat=%u sky=%u "
+                        "noCamera=%u planeBusy=%u water draws reflecting it=%u",
+                        m.passes, m.captured, m.published, m.draws, m.clipped, m.skippedWater, m.flat, m.sky, m.noCamera, m.busy, m.used);
             }
             {
                 const auto r = replay::takeStats();
@@ -3772,6 +3784,63 @@ static void noteScopeViews(void *puppet,const Request &request) noexcept {
         observedScopeValid[hand] = needed && copyScopeSourceView(hand,observedScopeView[hand]);
     observedScopeGeneration = graphicsResourceGeneration();
 }
+// Water mirror ([Render] WaterMirror, water_mirror.hpp): the world from the
+// centre camera mirrored about the water, before the eyes, through the native
+// source path the scopes use; its pre-bloom image is copied (scaled) into the
+// mirror image that this frame's water on that plane reflects.
+struct MirrorCaptureFrame { uint64_t generation = 0; bool active = false, copied = false; unsigned calls = 0; };
+static MirrorCaptureFrame mirrorCaptureFrame;
+static bool mirrorCaptureCurrent(void *opaque) noexcept {
+    const auto *capture = static_cast<MirrorCaptureFrame *>(opaque);
+    return !scopeSourcesHalted && capture == &mirrorCaptureFrame && capture->active && scopeScratch && activeEye == -1 &&
+        uiFrame.slot >= 0 && !uiFrame.fault && !eyeInvalid && !uiHalted && !stopping &&
+        capture->generation == graphicsResourceGeneration() && uiFrame.generation == capture->generation;
+}
+static __attribute__((force_align_arg_pointer)) void __cdecl captureNativeMirror(void *opaque) noexcept {
+    if (!mirrorCaptureCurrent(opaque) || !scopeSourceExecuting() || mirrorCaptureFrame.calls++) return;
+    withNativeFinally([&] {
+        mirrorCaptureFrame.copied = water_mirror::capture(uiFrame.device,uiFrame.target[0],originalStretch);
+    },[&](bool aborted) noexcept { if (aborted) { scopeSourcesHalted = true; mirrorCaptureFrame.copied = false; } });
+}
+static bool renderWaterMirror(void *puppet,void(__thiscall *original)(void *),const Request &request) {
+    water_mirror::frameStart();
+    double plane[4];
+    Pose camera{}; Fov fov{};
+    if (!waterMirrorEnabled() || scopeSourcesHalted || !single_pass::installed() || !water_mirror::framePlane(plane) ||
+        !waterMirrorView(request,plane,camera,fov)) return true;
+    const auto generation = graphicsResourceGeneration();
+    auto *d = uiFrame.device;
+    D3DSURFACE_DESC eyeDesc{};
+    if (!uiFrame.target[0] || FAILED(uiFrame.target[0]->GetDesc(&eyeDesc))) return true;
+    const float scale = std::clamp(waterMirrorScale(),.25f,1.f);
+    if (!water_mirror::prepare(d,std::max(64u,UINT(float(request.width)*scale)),std::max(64u,UINT(float(request.height)*scale)),
+                               eyeDesc.Format)) return true;
+    activeEye = -1; eyeInvalid = false; renderRequest = request;
+    mirrorCaptureFrame = {uiFrame.generation,true,false,0};
+    scopeScratch = true;
+    bool ok = true;
+    static unsigned traced = 0;
+    const bool trace = traced < 3;
+    if (trace) ++traced;
+    if (trace) log("Water mirror pass request=%llu plane=%.3f,%.3f,%.3f,%.3f camera=%.2f,%.2f,%.2f size=%ux%u",
+        static_cast<unsigned long long>(request.sequence),plane[0],plane[1],plane[2],plane[3],camera.p.x,camera.p.y,camera.p.z,
+        request.width,request.height);
+    if (beginMirrorSource(puppet,request,camera,fov,plane,captureNativeMirror,mirrorCaptureCurrent,&mirrorCaptureFrame)) {
+        ok = prepareScopeScratch();
+        water_mirror::beginPass(d,uiFrame.target[0],plane,camera.p);
+        if (trace) log("Water mirror pass scratch=%u",unsigned(ok));
+        if (ok) original(puppet);
+        water_mirror::endPass();
+        if (trace) log("Water mirror pass rendered copied=%u calls=%u source=%x",unsigned(mirrorCaptureFrame.copied),mirrorCaptureFrame.calls,scopeSourceFlags());
+        if (generation != graphicsResourceGeneration()) { mirrorCaptureFrame.active = false; scopeScratch = false; return false; }
+        const bool finished = endScopeSource(ok && !eyeInvalid);
+        water_mirror::publish(finished && mirrorCaptureFrame.copied && mirrorCaptureCurrent(&mirrorCaptureFrame) &&
+                              nativeUiFrameCurrent(puppet,request));
+    }
+    mirrorCaptureFrame.active = false;
+    scopeScratch = false;
+    return ok && !eyeInvalid && !uiFrame.fault && !scopeSourcesHalted;
+}
 static bool renderScopeSources(void *puppet,void(__thiscall *original)(void *),const Request &request) {
     const auto generation = graphicsResourceGeneration();
     if (scopeSourcesHalted || !scopePreviewNeeded(puppet,request)) {
@@ -4212,6 +4281,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         }
         if(traceDepth) traceStereoDepth(d,request,-1,"entry");
         if (ok) ok = renderScopeSources(puppet,original,request);
+        if (ok) ok = renderWaterMirror(puppet,original,request);
         if(admitted) noteStage(1);
         if (generation != graphicsResourceGeneration()) { original(puppet); return; }
         static const bool labAlternateEyes=[] {

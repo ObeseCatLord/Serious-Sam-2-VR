@@ -1,6 +1,8 @@
 #include "single_pass.hpp"
 #include "common/shader_patch.hpp"
 #include "common/water_reflection.hpp"
+#include "common/water_mirror.hpp"
+#include "water_mirror.hpp"
 #include "common/env_probe.hpp"
 #include "env_probe.hpp"
 #include "game.hpp"
@@ -92,9 +94,12 @@ std::unordered_map<IDirect3DVertexShader9 *, bool> shaderEyeClip;
 // variant writing the world reflection direction (model -> world rows in
 // c32..c34, from the program's model -> clip rows), the pixel variant sampling
 // the cube on the reflection image's sampler.
-struct ProbeVertex { IDirect3DVertexShader9 *variant = nullptr; unsigned clipMatrix = 0; };
+struct ProbeVertex { IDirect3DVertexShader9 *variant = nullptr, *mirror = nullptr; unsigned clipMatrix = 0; };
+// The mirror variants ([Render] WaterMirror): model -> mirror camera clip in
+// c35..c38; the pixel program keeps its projective lookup, then the gain.
+constexpr unsigned MirrorConstant = 35;
 std::unordered_map<IDirect3DVertexShader9 *, ProbeVertex> shaderProbe;
-struct ProbePixel { IDirect3DPixelShader9 *variant = nullptr; unsigned sampler = 0; };
+struct ProbePixel { IDirect3DPixelShader9 *variant = nullptr, *mirror = nullptr; unsigned sampler = 0; };
 std::unordered_map<IDirect3DPixelShader9 *, ProbePixel> pixelProbe;
 // The cube holds the scene's own brightness; the water program scales its
 // painted image (dark) up by 8.
@@ -114,6 +119,10 @@ ProbePixel probePixelOf(IDirect3DDevice9 *d, IDirect3DPixelShader9 *s) noexcept 
             sp::patchWaterPixelShader(words.data(), words.size(), patched, probe.sampler, waterGain()) &&
             FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.variant)))
             probe.variant = nullptr;
+        unsigned sampler = 0;
+        if (probe.variant && sp::patchWaterPixelShader(words.data(), words.size(), patched, sampler, waterGain(), true) &&
+            (sampler != probe.sampler || FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.mirror))))
+            probe.mirror = nullptr;
     }
     s->AddRef();
     pixelProbe.emplace(s, probe);
@@ -141,7 +150,7 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
     shaderTexcoords.emplace(s, info.texcoordsWritten);
     shaderEyeClip.emplace(s, variant && info.eyeClip);
     if (variant && info.eyeClip) {
-        ProbeVertex probe{nullptr, info.clipMatrix};
+        ProbeVertex probe{nullptr, nullptr, info.clipMatrix};
         std::vector<uint32_t> words(bytes / 4), patched;
         UINT got = bytes;
         sp::VertexInfo probeInfo;
@@ -151,6 +160,11 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
             probe.variant = nullptr;
         if (!probe.variant) log("Single pass: water vertex program %p has no environment-cube variant (%zu words)",
                                 static_cast<void *>(s), patched.size());
+        sp::VertexInfo mirrorInfo;
+        if (SUCCEEDED(s->GetFunction(words.data(), &got)) &&
+            sp::patchVertexShader(words.data(), words.size(), patched, &mirrorInfo, WaterConstant, false, MirrorConstant) &&
+            mirrorInfo.eyeClip && FAILED(d->CreateVertexShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.mirror)))
+            probe.mirror = nullptr;
         shaderProbe.emplace(s, probe);
     }
     if (variant && info.eyeClip) log("Single pass: water vertex program %p looks its reflection up per eye", static_cast<void *>(s));
@@ -712,10 +726,11 @@ bool waterDraw() noexcept {
 // program's view position (c4, in its model space) plus the eye's offset.
 struct WaterConstantsScope {
     IDirect3DDevice9 *d;
-    bool active = false, eyes = false, cube = false;
-    float saved[20]{}, view[4]{}, offset[2][3]{};
+    bool active = false, eyes = false, cube = false, mirrored = false;
+    float saved[20]{}, view[4]{}, offset[2][3]{}, savedMirror[16]{};
     // The cube's proxy sphere radius (env_probe), in the program's model units.
     float proxy = water::ProxyRadius;
+    float mirrorDistance = 10; // How far along each eye's reflected ray the mirror is looked up, model units.
     ProbePixel pixel;
     IDirect3DBaseTexture9 *image = nullptr;
     DWORD sampling[4]{};
@@ -735,7 +750,12 @@ struct WaterConstantsScope {
             env_probe_math::modelRotation(wvp, engineView, engineProjection, rows);
         if (turned) {
             const float scale = std::sqrt(rows[0] * rows[0] + rows[1] * rows[1] + rows[2] * rows[2]);
-            if (std::isfinite(scale) && scale > 1e-4f) proxy = water::ProxyRadius / scale;
+            if (std::isfinite(scale) && scale > 1e-4f) {
+                proxy = water::ProxyRadius / scale;
+                // Lab (SS2VR_LAB_MIRROR_DISTANCE=<metres>): the reflections' assumed distance (10 m).
+                static const float metres = [] { wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_MIRROR_DISTANCE", v, 16) ? float(_wtof(v)) : 10.f; }();
+                mirrorDistance = metres / scale;
+            }
         }
         if (eyes && turned) {
             float inverse[9];
@@ -744,6 +764,42 @@ struct WaterConstantsScope {
                     const float w[3]{o[0], o[1], o[2]};
                     for (unsigned r = 0; r < 3; ++r) o[r] = inverse[3 * r] * w[0] + inverse[3 * r + 1] * w[1] + inverse[3 * r + 2] * w[2];
                 }
+        }
+        // The water's plane (its mesh is flat at model y = 0), for the next frame's
+        // mirror; this frame's mirror image when it was rendered for this plane.
+        if (active && turned && engineAdjusted && !labWaterUnpatched()) {
+            M4 inv, model;
+            double plane[4];
+            if (invert(multiply(m4(engineAdjusted, 4), m4(engineView, 3)), inv) &&
+                ss2vr::water_mirror::modelPlane(model = multiply(inv, m4(wvp, 4)), plane)) {
+                const float *v = engineView;
+                water_mirror::noteWater(plane, Vec3{-(v[0] * v[3] + v[4] * v[7] + v[8] * v[11]),
+                                                    -(v[1] * v[3] + v[5] * v[7] + v[9] * v[11]),
+                                                    -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11])});
+                IDirect3DTexture9 *reflection = nullptr;
+                M4 worldToClip;
+                if (vertex->second.mirror && water_mirror::image(plane, reflection, worldToClip)) {
+                    pixel = probePixelOf(d, enginePixelShader);
+                    if (pixel.mirror && SUCCEEDED(d->GetTexture(pixel.sampler, &image))) {
+                        const M4 toMirror = multiply(worldToClip, model);
+                        float rows[16];
+                        for (unsigned k = 0; k < 16; ++k) rows[k] = float(toMirror[k]);
+                        const D3DSAMPLERSTATETYPE kinds[4]{D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_SRGBTEXTURE};
+                        for (unsigned k = 0; k < 4; ++k) d->GetSamplerState(pixel.sampler, kinds[k], &sampling[k]);
+                        d->GetVertexShaderConstantF(MirrorConstant, savedMirror, 4);
+                        mirrored = cube = true; // Restored like the cube's bindings.
+                        d->SetVertexShaderConstantF(MirrorConstant, rows, 4);
+                        oSetVertexShader(d, vertex->second.mirror);
+                        oSetPixelShader(d, pixel.mirror);
+                        appliedPixelShader = pixel.mirror;
+                        d->SetTexture(pixel.sampler, reflection);
+                        for (unsigned k = 0; k < 3; ++k) d->SetSamplerState(pixel.sampler, kinds[k], D3DTADDRESS_CLAMP);
+                        d->SetSamplerState(pixel.sampler, D3DSAMP_SRGBTEXTURE, FALSE);
+                        return;
+                    }
+                    if (image) { image->Release(); image = nullptr; }
+                }
+            }
         }
         // The environment cube once it holds something, with both programs' variants.
         IDirect3DCubeTexture9 *environment = active ? env_probe::cube(d) : nullptr;
@@ -765,7 +821,8 @@ struct WaterConstantsScope {
         if (!active) return;
         const unsigned e = i & 1;
         const float c[8]{view[0] + (eyes ? offset[e][0] : 0.f), view[1] + (eyes ? offset[e][1] : 0.f),
-                         view[2] + (eyes ? offset[e][2] : 0.f), 0, water::DomeScale, 1, proxy * proxy, .9f * proxy};
+                         view[2] + (eyes ? offset[e][2] : 0.f), 0, water::DomeScale, 1,
+                         mirrored ? mirrorDistance : proxy * proxy, .9f * proxy};
         d->SetVertexShaderConstantF(WaterConstant, c, 2);
     }
     // A water draw whose constants could not be read: its stereo variant would
@@ -776,6 +833,7 @@ struct WaterConstantsScope {
             const D3DSAMPLERSTATETYPE kinds[4]{D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_SRGBTEXTURE};
             for (unsigned k = 0; k < 4; ++k) d->SetSamplerState(pixel.sampler, kinds[k], sampling[k]);
             d->SetTexture(pixel.sampler, image);
+            if (mirrored) d->SetVertexShaderConstantF(MirrorConstant, savedMirror, 4);
             oSetVertexShader(d, variantOf(d, engineShader));
             oSetPixelShader(d, enginePixelShader);
             appliedPixelShader = enginePixelShader;
@@ -850,6 +908,51 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
             };
             hex("vs", engineShader, engineShader);
             hex("ps", enginePixelShader, enginePixelShader);
+            {
+                // The first vertices' positions, in model and world space (planar water?).
+                IDirect3DVertexBuffer9 *vb = nullptr; UINT offset = 0, stride = 0;
+                IDirect3DVertexDeclaration9 *decl = nullptr;
+                D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1]{}; UINT count = 0;
+                int positionOffset = -1, positionType = -1;
+                if (SUCCEEDED(d->GetVertexDeclaration(&decl)) && decl && SUCCEEDED(decl->GetDeclaration(nullptr, &count)) &&
+                    count <= MAXD3DDECLLENGTH + 1 && SUCCEEDED(decl->GetDeclaration(elements, &count)))
+                    for (UINT e = 0; e < count && elements[e].Stream != 0xff; ++e)
+                        if (elements[e].Usage == D3DDECLUSAGE_POSITION && elements[e].Stream == 0) { positionOffset = elements[e].Offset; positionType = elements[e].Type; }
+                if (decl) decl->Release();
+                D3DVERTEXBUFFER_DESC desc{};
+                if (SUCCEEDED(d->GetStreamSource(0, &vb, &offset, &stride)) && vb && SUCCEEDED(vb->GetDesc(&desc))) {
+                    log("Lab water vb pool=%u usage=%lx size=%u stride=%u offset=%u position=%d type=%d", unsigned(desc.Pool),
+                        desc.Usage, desc.Size, stride, offset, positionOffset, positionType);
+                    void *data = nullptr;
+                    const auto vertex = shaderProbe.find(engineShader);
+                    float wvp[16]{};
+                    const bool haveWvp = vertex != shaderProbe.end() && SUCCEEDED(d->GetVertexShaderConstantF(vertex->second.clipMatrix, wvp, 4));
+                    M4 model{};
+                    bool haveModel = false;
+                    if (haveWvp && engineAdjusted) {
+                        M4 apv = multiply(m4(engineAdjusted, 4), m4(engineView, 3)), inv;
+                        if (invert(apv, inv)) { model = multiply(inv, m4(wvp, 4)); haveModel = true; }
+                    }
+                    if (positionOffset < 0 && stride == 12) { positionOffset = 0; positionType = D3DDECLTYPE_FLOAT3; } // Positions only.
+                    if (positionOffset >= 0 && positionType == D3DDECLTYPE_FLOAT3 && stride &&
+                        SUCCEEDED(vb->Lock(0, 0, &data, D3DLOCK_READONLY)) && data) {
+                        const UINT total = (desc.Size - offset) / stride;
+                        for (UINT k = 0; k < 8 && total; ++k) {
+                            const UINT at = k * (total - 1) / 7;
+                            float p3[3];
+                            std::memcpy(p3, static_cast<const uint8_t *>(data) + offset + at * stride + positionOffset, sizeof p3);
+                            double w[3]{};
+                            if (haveModel) for (unsigned r = 0; r < 3; ++r) w[r] = model[4*r]*p3[0] + model[4*r+1]*p3[1] + model[4*r+2]*p3[2] + model[4*r+3];
+                            log("Lab water vertex %u model=%.3f,%.3f,%.3f world=%.3f,%.3f,%.3f", k, p3[0], p3[1], p3[2], w[0], w[1], w[2]);
+                        }
+                        vb->Unlock();
+                    } else log("Lab water vb not readable");
+                    if (haveModel) log("Lab water model row0 %.4f %.4f %.4f %.4f row1 %.4f %.4f %.4f %.4f row2 %.4f %.4f %.4f %.4f row3 %.4f %.4f %.4f %.4f",
+                        model[0], model[1], model[2], model[3], model[4], model[5], model[6], model[7], model[8], model[9], model[10], model[11],
+                        model[12], model[13], model[14], model[15]);
+                }
+                if (vb) vb->Release();
+            }
             float vc[16 * 4]{}, pc[8 * 4]{};
             d->GetVertexShaderConstantF(0, vc, 16);
             d->GetPixelShaderConstantF(0, pc, 8);
@@ -1094,6 +1197,17 @@ void releaseDeviceResources() noexcept {
 void setEngineMatrices(const float *adjusted, const float *projection, const float *view) noexcept {
     engineAdjusted = adjusted; engineProjection = projection; engineView = view;
 }
+bool waterBound() noexcept { return waterDraw(); }
+bool engineCamera(const float *&adjusted, const float *&view) noexcept {
+    adjusted = engineAdjusted; view = engineView;
+    return engineAdjusted && engineView && engineProjection;
+}
+const float *engineProjectionMatrix() noexcept { return engineProjection; }
+bool backgroundBound() noexcept { return engineView && engineProjection && backgroundViewer(engineView, engineProjection); }
+bool programBound() noexcept { return engineShader != nullptr; }
+DWORD engineClipPlanes() noexcept { return clipPlanes; }
+void rawClipPlane(IDirect3DDevice9 *d, DWORD index, const float *plane) noexcept { if (oSetClipPlane) oSetClipPlane(d, index, plane); }
+void rawRenderState(IDirect3DDevice9 *d, D3DRENDERSTATETYPE state, DWORD value) noexcept { if (oSetRenderState) oSetRenderState(d, state, value); }
 Layout wideLayoutOf(UINT width, UINT height) noexcept {
     Layout l;
     l.width = width * 2; l.height = height; l.count = 2;
