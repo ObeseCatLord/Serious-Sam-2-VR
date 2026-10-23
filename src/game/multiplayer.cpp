@@ -655,7 +655,14 @@ void setVoiceSink(VoiceSink sink) { voiceSink = sink; }
 bool voiceSession() {
     if (!hooksReady.load(std::memory_order_acquire) || !nativeInputHealthy() || !isServer || !isClient)
         return false;
-    if (isClient()) return negotiatedLocal();
+    // A client's voice session lasts while its capability with this server
+    // does (cleared on disconnect or a new capability), not only while pose
+    // acknowledgements flow: cutscenes and intermissions send no poses.
+    if (isClient()) {
+        bool held = false;
+        withPeerLock<false>([&] { held = local.serverNonce && local.clientNonce && local.net == currentNet(); });
+        return held;
+    }
     if (!isServer()) return false;
     bool any = false;
     withPeerLock<false>([&] {

@@ -2419,8 +2419,8 @@ struct Host {
             eye[0].uploadWaited(context.p, source[0]);
             eye[1].uploadWaited(context.p, source[1]);
         }
-        // Lab: a driver's zc-capture-<name> file beside the host asks for the left
-        // eye image just given to the headset, as <name>-zc-left.ppm (the
+        // Lab: a driver's zc-capture-<name> file beside the host asks for the eye
+        // images just given to the headset, as <name>-zc-left/right.ppm (the
         // observer's pixel-pair captures go stale once pairs arrive zero-copy).
         if (++capturePolls % 15 == 0) {
             wchar_t lab[2]{};
@@ -2435,7 +2435,10 @@ struct Host {
                     const std::wstring name = request.substr(11);
                     bool safe = !name.empty() && name.size() < 40;
                     for (wchar_t ch : name) safe = safe && (iswalnum(ch) || ch == L'-');
-                    if (safe) probeZeroCopy(eye[0].lastTexture(), (name + L"-zc-left.ppm").c_str());
+                    if (safe) {
+                        probeZeroCopy(eye[0].lastTexture(), (name + L"-zc-left.ppm").c_str());
+                        probeZeroCopy(eye[1].lastTexture(), (name + L"-zc-right.ppm").c_str());
+                    }
                 }
             }
         }
@@ -2978,10 +2981,16 @@ struct Host {
             menuSequence = sequence;
             // Lab (SS2VR_LAB_MENU_DUMP=1): the menu image and where the pointer hits
             // it, once a second, to compare the game's own cursor with the hit.
-            static const bool dump = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_MENU_DUMP", v, 2) == 1 && v[0] == L'1'; }();
+            // SS2VR_LAB_MENU_DUMP=2: every flat frame shown (cutscenes, loading),
+            // pointer or not, every 2 s.
+            static const int dump = [] {
+                wchar_t v[2]{};
+                return GetEnvironmentVariableW(L"SS2VR_LAB_MENU_DUMP", v, 2) == 1 && (v[0] == L'1' || v[0] == L'2') ? int(v[0] - L'0') : 0;
+            }();
             static unsigned dumps = 0;
             static uint64_t lastDump = 0;
-            if (dump && hit.valid && dumps < 16 && GetTickCount64() - lastDump > 1000) {
+            if (dump && (hit.valid || dump == 2) && dumps < (dump == 2 ? 60u : 16u) &&
+                GetTickCount64() - lastDump > (dump == 2 ? 2000u : 1000u)) {
                 lastDump = GetTickCount64();
                 wchar_t name[64];
                 std::swprintf(name, 64, L"menu-%u-u%03d-v%03d.ppm", dumps++, int(hit.u * 1000), int(hit.v * 1000));

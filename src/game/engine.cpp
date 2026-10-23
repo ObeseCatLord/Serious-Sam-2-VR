@@ -2125,13 +2125,21 @@ static void *labFindTurret();
 static bool labPlacement(void *puppet, Pose &out);
 // Voice chat (voice.hpp): the scene for positional voices and push-to-talk,
 // then the local player's queued packets onto the network.
+// Voice runs every frame, not only on gameplay steps: cutscenes, intermissions
+// and loads skip the player's input step (update), and voice keeps talking
+// through them. p may be null (no local player during a world change); then
+// voices are still heard at the last listener place, and nothing is sent.
+static uint64_t lastVoiceTick = 0;
+static voice::Scene lastVoiceListener;
 static void voiceTick(void *p, const Snapshot &s) {
+    lastVoiceTick = GetTickCount64();
     voice::configure(settings.voice);
     voice::Scene scene;
     scene.session = !singlePlayer() && multiplayer::voiceSession();
-    scene.self = pointerHandle(p);
+    scene.self = p ? pointerHandle(p) : 0;
     Pose body;
-    if (s.initialized && fresh(s.input) && s.input.headValid && trackingAnchor(p, body)) {
+    if (!p) {
+    } else if (s.initialized && fresh(s.input) && s.input.headValid && trackingAnchor(p, body)) {
         const Pose head = worldHeadTracking(body, s.origin, s.turn, s.input.head);
         if (finite(head)) {
             scene.listener = true;
@@ -2145,7 +2153,7 @@ static void voiceTick(void *p, const Snapshot &s) {
             const Vec3 d = hand.p - mouth;
             if (controllerTracked(s.input, h) && finite(hand) && dot(d, d) < .15f * .15f) scene.pushToTalk = true;
         }
-    } else if (baseViewOrigin) {
+    } else if (baseViewOrigin && !cinematicCameraActive()) {
         Pose view{};
         baseViewOrigin(p, &view, 0);
         if (finite(view)) {
@@ -2154,7 +2162,16 @@ static void voiceTick(void *p, const Snapshot &s) {
             scene.right = rotate(normalize(view.q), Vec3{1, 0, 0});
         }
     }
-    if (scene.session && baseViewOrigin) {
+    if (scene.listener) {
+        lastVoiceListener.listener = true;
+        lastVoiceListener.head = scene.head;
+        lastVoiceListener.right = scene.right;
+    } else if (lastVoiceListener.listener) {
+        scene.listener = true; // Cutscene cameras and loads keep the last place.
+        scene.head = lastVoiceListener.head;
+        scene.right = lastVoiceListener.right;
+    }
+    if (scene.session && baseViewOrigin && p) {
         unsigned count = 0;
         for (void *player : multiplayer::activePlayers()) {
             if (!player || player == p || count >= 18) continue;
@@ -2165,7 +2182,18 @@ static void voiceTick(void *p, const Snapshot &s) {
     }
     voice::publish(scene);
     network::VoicePacket packet;
-    for (unsigned i = 0; i < 8 && voice::takeOutbound(packet); ++i) multiplayer::sendVoice(p, packet);
+    for (unsigned i = 0; i < 8 && voice::takeOutbound(packet); ++i)
+        if (p) multiplayer::sendVoice(p, packet);
+}
+// Main thread, once a frame (appForeground): when no gameplay step ran the
+// voice tick lately, run it here.
+static void voiceFrame() {
+    if (!hooksReady.load(std::memory_order_acquire) || !nativeMainThread || !nativeMainThread() ||
+        GetTickCount64() - lastVoiceTick < 100)
+        return;
+    const auto s = copySnapshot();
+    void *p = s.playerHandle && resolve ? resolve(s.playerHandle) : nullptr;
+    voiceTick(p && local(p) ? p : nullptr, s);
 }
 static void update(void *p) {
     validateLabOnlineIsolation(false);
@@ -9881,6 +9909,7 @@ static void maintainSpatialAudio() {
 }
 static int __cdecl appForeground() {
     maintainSpatialAudio();
+    voiceFrame();
     if (labLoadPending.exchange(false) && labLoadGame) {
         log("Lab load of Temp/SS2VR/user.sav issued");
         labLoadGame("Temp/SS2VR/user.sav");
@@ -9890,6 +9919,20 @@ static int __cdecl appForeground() {
     if (vrInputLive())
         return 1;
     return originalAppForeground ? originalAppForeground() : 0;
+}
+// The loading screen's "Please press Start or A to continue" (the game's
+// gamepad text) or "press a key" names no VR control. While VR input is live
+// it names what continues in VR: the Use button (menu Confirm) or a trigger.
+using Translate = const char *(__cdecl *)(const char *);
+static Translate originalTranslate = nullptr;
+static const char *__cdecl translate(const char *id) {
+    if (id && id[0] == 'E' && vrInputLive() &&
+        (!std::strcmp(id, "ETRSLoadingFinished.MessageXbox") || !std::strcmp(id, "ETRSLoadingFinished.MessagePC"))) {
+        const auto latest = copySnapshot().input;
+        const bool jumpButton = ((latest.buttons[0] | latest.buttons[1]) & Button::JumpBound) != 0;
+        return jumpButton ? "Press B or a trigger to continue" : "Press A or a trigger to continue";
+    }
+    return originalTranslate(id);
 }
 // Native prompts ("Press {plcmdUse} to enter") name the bound keyboard key.
 // While VR input is live the commands the controllers drive name their VR
@@ -11798,8 +11841,10 @@ bool attach(bool headless) {
     }
 #define H(module, name, fn, orig)                                                                            \
     ok = hook(module, name, reinterpret_cast<void *>(fn), reinterpret_cast<void **>(&orig)) && ok
-    if (!headless)
+    if (!headless) {
         H(c, "?sysIsAppForeground@SeriousEngine@@YAHXZ", appForeground, originalAppForeground);
+        H(c, "?strTranslate@SeriousEngine@@YAPBDPBD@Z", translate, originalTranslate);
+    }
     if (!headless) {
         H(e, "?ChallengeCalculateResponse@CSteamOnlineInterface@SeriousEngine@@UAEXPAEJAAPAEAAJ@Z", challengeResponse,
           originalChallengeResponse);
