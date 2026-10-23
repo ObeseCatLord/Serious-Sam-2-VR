@@ -221,6 +221,10 @@ static __attribute__((force_align_arg_pointer)) void __fastcall labOpenScene(voi
     const bool candidate=readMode&&labNameMatches(filename,labSceneName);
     const unsigned resource=readMode?labGripResourceKey(filename):0;
     bool owns=false;
+    // SS2VR_LAB_OPEN_TRACE=1: every native file open (thread, time), for a stalled load.
+    static const bool traceOpens=[] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_OPEN_TRACE",v,2)==1&&v[0]==L'1'; }();
+    if (traceOpens) log("Lab open thread=%lu tick=%llu mode=%s file=%s",GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()),mode?mode:"",filename?filename:"");
     withNativeFinally([&] {
         labOriginalOpen(stream,filename,mode); // Exactly once, including unrelated opens.
         if (!candidate && !resource) return;
