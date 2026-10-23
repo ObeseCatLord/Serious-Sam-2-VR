@@ -22,6 +22,8 @@ bool nativeModuleFingerprint(HMODULE,const char *);
 void installLabOnlineIsolation();
 void validateLabOnlineIsolation(bool gameplay);
 bool labOnlineIsolationInstalled() noexcept;
+// Lab (SS2VR_LAB_PROFILE=1): sampling profiler of every game thread, logged each 5 s.
+void startLabProfiler() noexcept;
 bool foregroundGame();
 bool vrInputLive() noexcept;
 // Native eye canvas at the runtime's recommended size (installed before the

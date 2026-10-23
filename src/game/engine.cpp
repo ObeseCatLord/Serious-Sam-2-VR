@@ -11478,6 +11478,7 @@ void shadowReuseStats(unsigned &created, unsigned &reused, unsigned &missed, dou
     missed = std::exchange(shadow_reuse::missed, 0u);
 }
 bool attach(bool headless) {
+    if (!headless) startLabProfiler();
     if (hooksReady)
         return true;
     if (attachPoisoned) {
