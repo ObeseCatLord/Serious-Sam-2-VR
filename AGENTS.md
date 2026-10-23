@@ -1,5 +1,7 @@
 # Serious Sam 2 OpenXR VR — active instructions
 
+Always refer to the user as **ObeseCatLord** (see [CLAUDE.md](CLAUDE.md)).
+
 ## Resumed — 2026-10-10
 
 The user resumed development after the pause recorded in
