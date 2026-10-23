@@ -48,14 +48,16 @@ chat and Interface.
      controller pointing straight up or down, or untracked, it follows your
      head.
    - Snap turn angle: 15 to 90 degrees (`[Comfort] SnapTurnDegrees`).
-4. Also in the menu now: arm-stroke swimming, instant mounting, creature hand
-   aim, ride head pitch, vehicle grips, water reflections (mirrored world or
+4. Also in the menu now: arm-stroke swimming, vehicle turn rate, water reflections (mirrored world or
    surroundings) and their resolution, scope magnification, showing the game on
    the monitor, spatial audio, sound occlusion, and every voice chat setting
    (hear others, microphone mode and device, sensitivity, boost, voice and radio
    volume, proximity range, talking indicators), plus HUD, lasers and menu size.
-5. Everything applies at once, in a level or in the menus, except spatial audio
-   and vehicle grips: those rows turn amber and say a restart is needed. The HUD
+5. Everything applies at once, in a level or in the menus, except spatial audio:
+   its row turns amber and says a restart is needed. Instant mounting, creature
+   hand aim, ride guns following head pitch and grabbing vehicle controls are
+   not in the menu; they stay on by default and remain `SS2VR.ini` options
+   (`[Rides]`, `[Vehicles] ImmersiveGrips`). The HUD
    (wrist or head) and its size now also switch without a restart.
 6. Please check:
    - walking with Walk direction set to each hand;

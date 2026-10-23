@@ -2814,8 +2814,7 @@ struct Host {
     // --- VR options panel ---
     enum OptionsItem : unsigned {
         // Movement
-        OptMoveDirection, OptTurning, OptTurnSpeed, OptSnapAngle, OptSwimming, OptInstantRides, OptCreatureAim, OptRidePitch,
-        OptGripTurn, OptVehicleGrips,
+        OptMoveDirection, OptTurning, OptTurnSpeed, OptSnapAngle, OptSwimming, OptGripTurn,
         // Graphics
         OptScale, OptFoveation, OptInset, OptPeriphery, OptWaterMirror, OptMirrorScale, OptScopeLive, OptScopeZoom,
         OptDesktopWorld, OptInstancing,
@@ -2835,9 +2834,7 @@ struct Host {
     struct OptionKey { const wchar_t *section, *key; };
     static constexpr OptionKey OptionKeys[OptCount] = {
         {L"Comfort", L"MoveDirection"}, {L"Comfort", L"SnapTurn"}, {L"Comfort", L"SmoothTurnDegreesPerSecond"},
-        {L"Comfort", L"SnapTurnDegrees"}, {L"Swimming", L"Immersive"}, {L"Rides", L"InstantTransitions"},
-        {L"Rides", L"HandAimCreatures"}, {L"Rides", L"HeadPitchAim"}, {L"Vehicles", L"GripTurnRateDegrees"},
-        {L"Vehicles", L"ImmersiveGrips"},
+        {L"Comfort", L"SnapTurnDegrees"}, {L"Swimming", L"Immersive"}, {L"Vehicles", L"GripTurnRateDegrees"},
         {L"Render", L"Scale"}, {L"Render", L"Foveation"}, {L"Render", L"FoveationInset"}, {L"Render", L"FoveationPeriphery"},
         {L"Render", L"WaterMirror"}, {L"Render", L"WaterMirrorScale"}, {L"Scope", L"AlwaysLive"}, {L"Scope", L"IdleMagnification"},
         {L"Render", L"DesktopWorld"}, {L"Render", L"SinglePassInstancing"},
@@ -2878,24 +2875,11 @@ struct Host {
         case OptSwimming:
             return {L"Arm-stroke swimming", onOff(settings.immersiveSwimming),
                     L"Swim by pulling both arms through the water like a breaststroke (the stick still swims too)."};
-        case OptInstantRides:
-            return {L"Instant mount and dismount", onOff(settings.instantRides),
-                    L"Get on and off vehicles and creatures at once instead of watching the animation."};
-        case OptCreatureAim:
-            return {L"Creatures aim with your hand", onOff(settings.creatureHandAim),
-                    L"A ridden dinosaur's weapons aim where your right hand points."};
-        case OptRidePitch:
-            return {L"Ride guns follow head pitch", onOff(settings.rideHeadPitch),
-                    L"Looking up and down pitches a ride's guns (otherwise the right stick does)."};
         case OptGripTurn:
             return {L"Vehicle control turn rate",
                     settings.gripTurnRateDegrees > 0 ? format(L"%.0f°/s", double(settings.gripTurnRateDegrees)) : std::wstring(L"1:1 with hands"),
                     L"Holding a vehicle's own controls turned steers it like a control stick at up to this rate; 1:1 turns it with your hands.",
                     L"", fraction(settings.gripTurnRateDegrees, 0, 360)};
-        case OptVehicleGrips:
-            return {L"Grab vehicle controls", onOff(settings.immersiveVehicleGrips),
-                    L"Steer rides by gripping their own handles and wheels with your hands.",
-                    restart(settings.immersiveVehicleGrips != startup.immersiveVehicleGrips)};
         case OptScale:
             return {L"Render resolution", format(L"%.0f%%", double(std::lround(settings.renderScale * 100))),
                     L"Each eye's resolution as a share of what the headset recommends. Lower is faster, higher is sharper.", L"",
@@ -3036,11 +3020,7 @@ struct Host {
         }
         case OptSnapAngle: number(settings.snapTurnDegrees, 15, 15, 90); break;
         case OptSwimming: toggle(settings.immersiveSwimming); break;
-        case OptInstantRides: toggle(settings.instantRides); break;
-        case OptCreatureAim: toggle(settings.creatureHandAim); break;
-        case OptRidePitch: toggle(settings.rideHeadPitch); break;
         case OptGripTurn: number(settings.gripTurnRateDegrees, 30, 0, 360); break;
-        case OptVehicleGrips: toggle(settings.immersiveVehicleGrips); break;
         case OptScale: number(settings.renderScale, .1f, .5f, 2.f); break; // Applies at once: the eye size is republished every loop.
         case OptFoveation: cycle(f.mode, 3); break;
         case OptInset: number(f.inset, .05f, .25f, .7f); break;
