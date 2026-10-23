@@ -99,7 +99,7 @@ DWORD WINAPI profile(void *) {
             ++samples;
             // The nearest game code on the stack (who called into the wait or the
             // driver), and the first few game return addresses as a chain.
-            std::vector<Spot> chain;
+            std::vector<Spot> chain{{module, module ? uintptr_t(context.Eip) - uintptr_t(module) : uintptr_t(context.Eip)}};
             bool gameCaller = false;
             for (unsigned w = 0; w < copied / sizeof(DWORD) && chain.size() < 12; ++w) {
                 const uintptr_t value = stack[w];
@@ -118,7 +118,7 @@ DWORD WINAPI profile(void *) {
                 if (owner && value - reinterpret_cast<uintptr_t>(owner) >= 0x1000)
                     chain.push_back({owner, value - reinterpret_cast<uintptr_t>(owner)});
             }
-            if (!chain.empty()) ++chains[id][chain];
+            ++chains[id][chain];
         }
         CloseHandle(snapshot);
         const uint64_t now = GetTickCount64();
@@ -138,18 +138,17 @@ DWORD WINAPI profile(void *) {
             describe(line, m, sizeof line, perThread[id], 10);
             log("%s", line);
         }
-        // Every thread waiting in or running game code, by its nearest game caller.
-        for (const auto &c : callers) {
-            int m = std::snprintf(line, sizeof line, "Lab profile caller thread %lu cpu=%.2fs:", c.first,
-                                  double(cpuDelta[c.first]) / 1e7);
-            describe(line, m, sizeof line, c.second, 6);
+        // Every thread: its nearest game caller, if any, and its most common
+        // chain of code addresses (raw stack scan: may include stale ones).
+        for (const auto &t : chains) {
+            int m = std::snprintf(line, sizeof line, "Lab profile caller thread %lu cpu=%.2fs:", t.first,
+                                  double(cpuDelta[t.first]) / 1e7);
+            describe(line, m, sizeof line, callers[t.first], 6);
             log("%s", line);
-            // Its most common chain (raw stack scan: may include stale addresses).
-            const auto &threadChains = chains[c.first];
-            const auto best = std::max_element(threadChains.begin(), threadChains.end(),
+            const auto best = std::max_element(t.second.begin(), t.second.end(),
                                                [](const auto &a, const auto &b) { return a.second < b.second; });
-            if (best == threadChains.end()) continue;
-            m = std::snprintf(line, sizeof line, "Lab profile chain thread %lu n=%u:", c.first, best->second);
+            if (best == t.second.end()) continue;
+            m = std::snprintf(line, sizeof line, "Lab profile chain thread %lu n=%u:", t.first, best->second);
             for (const auto &spot : best->first) {
                 wchar_t path[MAX_PATH]{};
                 m += std::snprintf(line + m, sizeof line - m, " %ls+%x", moduleName(spot.first, path), unsigned(spot.second));
