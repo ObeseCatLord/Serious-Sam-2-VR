@@ -1641,10 +1641,12 @@ static void applySplitModel() {
     if (paletteInvalidated) return;
     // The model's arms reach back to the flat view's shoulders; held at the
     // controllers they swung about rigidly. The arm bones above each palm
-    // (Arm_* down to the palm) shrink toward the palm, leaving a short forearm
-    // behind the glove's cuff, as the revolvers' hands have.
+    // (Arm_* down to the palm) shorten toward the palm along the arm, leaving a
+    // short forearm behind the glove's cuff, as the revolvers' hands have. Only
+    // the length shrinks: a uniform shrink also made the forearm a third as
+    // thick as the glove.
     std::vector<uint8_t> shrink(bones.size(), 0);
-    std::array<Vec3, 2> palmAt{};
+    std::array<Vec3, 2> palmAt{}, armAxis{};
     for (unsigned side = 0; side < 2; ++side) {
         const uint32_t armId = side ? splitArmRightName : splitArmName, palmId = side ? splitPalmRightName : splitPalmName;
         size_t sidePalm = bones.size();
@@ -1668,6 +1670,16 @@ static void applySplitModel() {
             node = size_t(bones[node].parent);
         }
         if (!reached) continue;
+        // The arm's direction: from the palm to Arm_* (the chain's last bone).
+        const size_t armBone = chain.back();
+        if (!readableMemory(static_cast<const uint8_t *>(bones[armBone].definition) + 0x48, sizeof(Matrix34))) continue;
+        Matrix34 armInverseBind, armBind;
+        std::memcpy(&armInverseBind, static_cast<const uint8_t *>(bones[armBone].definition) + 0x48, sizeof(Matrix34));
+        if (!affineInverse(armInverseBind, armBind)) continue;
+        const Vec3 along = matrixTranslation(affineMultiply(canonical[armBone], armBind)) - palmAt[side];
+        const float length = std::sqrt(dot(along, along));
+        if (!(length > 1e-3f) || !std::isfinite(length)) continue;
+        armAxis[side] = along * (1 / length);
         for (size_t b : chain) shrink[b] = uint8_t(side + 1);
         static unsigned traced = 0;
         if (traced++ < 2) log("Bomb arm side=%u chain=%zu palm=%.3f,%.3f,%.3f", side, chain.size(), palmAt[side].x,
@@ -1679,10 +1691,20 @@ static void applySplitModel() {
         if (map.bone < 0 || size_t(map.bone) >= bones.size() || map.draw < 0 || size_t(map.draw) >= drawOwners.size() ||
             drawOwners[size_t(map.draw)] != int32_t(owner) || !shrink[size_t(map.bone)])
             continue;
-        const Vec3 c = palmAt[shrink[size_t(map.bone)] - 1u];
+        const Vec3 c = palmAt[shrink[size_t(map.bone)] - 1u], a = armAxis[shrink[size_t(map.bone)] - 1u];
+        // Scale ArmKept along a about c, unchanged across it: I + (k-1) a a^T.
+        const float k = ArmKept - 1;
+        const float axis[3]{a.x, a.y, a.z}, centre[3]{c.x, c.y, c.z};
         Matrix34 scale{};
-        scale.m[0] = scale.m[5] = scale.m[10] = ArmKept;
-        scale.m[3] = c.x * (1 - ArmKept); scale.m[7] = c.y * (1 - ArmKept); scale.m[11] = c.z * (1 - ArmKept);
+        for (int r = 0; r < 3; ++r) {
+            float offset = centre[r];
+            for (int col = 0; col < 3; ++col) {
+                const float m = (r == col ? 1.f : 0.f) + k * axis[r] * axis[col];
+                scale.m[r * 4 + col] = m;
+                offset -= m * centre[col];
+            }
+            scale.m[r * 4 + 3] = offset;
+        }
         const Matrix34 next = affineMultiply(scale, palette[i]);
         if (finiteMatrix(next)) palette[i] = next;
     }

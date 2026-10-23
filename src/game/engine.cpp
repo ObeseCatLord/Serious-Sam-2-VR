@@ -1860,7 +1860,7 @@ static void __fastcall carryJointPlacements(void *joint, void *, const Pose &a, 
     if (carryTargetValid && joint && joint == carryJoint) { jointPlacements(joint, carryTargetA, carryTargetB); return; }
     jointPlacements(joint, a, b);
 }
-static void(__thiscall *jointMaxLinVel)(void *, float) = nullptr;
+static void(__thiscall *jointMaxLinVel)(void *, float) = nullptr, (__thiscall *jointMaxAngVel)(void *, float) = nullptr;
 // A carried object does not collide with its carrier (CMechanism ignore list,
 // symmetric: each mechanism lists the other). Without it the player's capsule
 // pushed an object held near the body up and over the head. After the drop the
@@ -1887,6 +1887,7 @@ template <class R, class... A> static R virtualCall(void *object, unsigned offse
     memcpy(&function, reinterpret_cast<void *>(table + offset), sizeof(function));
     return function(object, args...);
 }
+constexpr float CarryEaseRate = 10, CarryMaxTurn = 8; // Per second; radians per second.
 struct GripCarry {
     int requestHand = -1, hand = -1;
     uint32_t requestHull = 0, joint = 0, carriedHull = 0;
@@ -1936,7 +1937,11 @@ static std::atomic<bool> gripCarrying{false};
 // hand's pointing ray out to GripPointReach (it then comes to the hand).
 // 0.2 m alone missed nearly every box: the reach was tighter than a box's own
 // size and boxes on the floor sit below a relaxed hand.
-static constexpr float GripReach = .35f, GripPointReach = 3.f, ThrowBoost = 1.25f;
+// The game's props fall at about 28 m/s^2 (V704: a thrown ball's arc), nearly
+// 3x real gravity, so a throw at the hand's own speed fell short of where it
+// was aimed. Scaling by sqrt(28 / 9.81) keeps the arc a real throw would have
+// (same apex and range), so a basketball goes where it is thrown.
+static constexpr float GripReach = .35f, GripPointReach = 3.f, ThrowBoost = 1.69f;
 static bool gripCarryAuthority(void *player) {
     return hooksReady.load(std::memory_order_acquire) && hullsInRange && hullOwner && hullBody && jointPlacements &&
         deleteArray && preDeleteArray && postDeleteArray && player && local(player) &&
@@ -1989,6 +1994,20 @@ static double carryClock() {
     QueryPerformanceCounter(&now);
     return double(now.QuadPart) / double(frequency.QuadPart);
 }
+// Lab (SS2VR_LAB_SHOT_LOG=1): a released object's flight for 2 s.
+static struct { uint32_t hull = 0; uint64_t at = 0; } labThrown;
+static void traceThrown() {
+    static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SHOT_LOG", v, 2) == 1 && v[0] == L'1'; }();
+    static uint64_t last = 0;
+    const uint64_t now = GetTickCount64();
+    if (!trace || !labThrown.hull || now - labThrown.at > 2000 || now - last < 100) return;
+    last = now;
+    void *hull = resolve(labThrown.hull);
+    void *objectBody = hull ? hullBody(hull) : nullptr;
+    Pose placed{};
+    if (objectBody) memcpy(&placed, static_cast<uint8_t *>(objectBody) + 0x2c, sizeof(placed));
+    log("Lab thrown t=%llu object=%.2f,%.2f,%.2f", (unsigned long long)(now - labThrown.at), placed.p.x, placed.p.y, placed.p.z);
+}
 static Vec3 carryVelocity() {
     // Average over the last ~80 ms of carry ticks; the latest sample alone is noisy.
     const auto &g = gripCarry;
@@ -2013,6 +2032,7 @@ static void releaseGripCarry(void *puppet, bool throwIt) {
         }
     }
     log("Grip carry released hand=%d velocity=%.2f,%.2f,%.2f", gripCarry.hand, velocity.x, velocity.y, velocity.z);
+    labThrown = {gripCarry.carriedHull, GetTickCount64()};
     if (carryIgnore.active && !carryIgnore.releasedAt) carryIgnore.releasedAt = GetTickCount64();
     gripCarry.hand = -1;
     gripCarry.joint = 0;
@@ -2027,6 +2047,7 @@ static void __fastcall carryStep(void *puppet, void *) {
         originalCarrying(puppet);
         return;
     }
+    traceThrown();
     auto &g = gripCarry;
     const bool live = vrSession(s) && fresh(s.input) && s.ui.gameplay && !recenterHeld(s.input);
     if (g.hand >= 0) {
@@ -2068,6 +2089,7 @@ static void __fastcall carryStep(void *puppet, void *) {
     if (jointHandle != g.joint) {
         g.joint = jointHandle;
         if (jointMaxLinVel) jointMaxLinVel(joint, 12.f); // Keep up with a hand without flinging the object.
+        if (jointMaxAngVel) jointMaxAngVel(joint, CarryMaxTurn);
     }
     // The joint holds the grab frame (object space) at the hand (player-body space).
     // The hand is often inside the player's collision capsule; an object pulled
@@ -2088,6 +2110,26 @@ static void __fastcall carryStep(void *puppet, void *) {
             const float k = CarryClearance / reach;
             hand.p.x = own.p.x + out.x * k;
             hand.p.z = own.p.z + out.z * k;
+        }
+    }
+    // Ease in: the joint chases the hand at up to 12 m/s and a light object
+    // (a match) overshot and shook about the hand. Its speed limit follows the
+    // remaining gap (CarryEaseRate per second), so it settles without bouncing
+    // and still keeps up with a moving hand.
+    if (jointMaxLinVel) {
+        void *hull = g.carriedHull ? resolve(g.carriedHull) : nullptr;
+        void *objectBody = hull ? hullBody(hull) : nullptr;
+        Pose placed{};
+        if (objectBody) memcpy(&placed, static_cast<uint8_t *>(objectBody) + 0x2c, sizeof(placed));
+        if (objectBody && finite(placed)) {
+            const Vec3 gap = hand.p - compose(placed, grab).p;
+            const float distance = std::sqrt(dot(gap, gap));
+            // A swinging hand (a throw) must not leave the object trailing: the
+            // limit is never below 1.5x the hand's own speed.
+            const Vec3 handVelocity = carryVelocity();
+            const float handSpeed = std::sqrt(dot(handVelocity, handVelocity));
+            const float limit = std::max(distance * CarryEaseRate + .3f, std::isfinite(handSpeed) ? handSpeed * 1.5f : 0.f);
+            if (std::isfinite(distance)) jointMaxLinVel(joint, std::clamp(limit, .3f, 12.f));
         }
     }
     carryJoint = joint;
@@ -11675,6 +11717,7 @@ bool attach(bool headless) {
         symbol(e, "?GetOwner@CAspect@SeriousEngine@@QAEPAVCEntity@2@XZ", hullOwner);
         symbol(e, "?GetBody@CHull@SeriousEngine@@QAEPAVCBody@2@XZ", hullBody);
         symbol(e, "?SetMaxLinVel@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxLinVel);
+        symbol(e, "?SetMaxAngVel@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxAngVel);
         symbol(e, "?GetMechanism@CHull@SeriousEngine@@QAEPAVCMechanism@2@XZ", hullMechanism);
         symbol(e, "?AddToIgnoreList@CMechanism@SeriousEngine@@QAEXPAV12@@Z", mechanismIgnore);
         symbol(e, "?RemoveFromIgnoreList@CMechanism@SeriousEngine@@QAEXPAV12@@Z", mechanismUnignore);
