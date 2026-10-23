@@ -641,13 +641,28 @@ static void pollSettingsFile() {
     settings.laserDistance = fresh.laserDistance;
     settings.snapTurn = fresh.snapTurn;
     settings.smoothTurnRate = fresh.smoothTurnRate;
+    settings.snapTurnDegrees = fresh.snapTurnDegrees;
+    settings.moveDirection = fresh.moveDirection;
     settings.singlePassInstancing = fresh.singlePassInstancing;
     settings.waterMirror = fresh.waterMirror;
     settings.waterMirrorScale = fresh.waterMirrorScale;
+    settings.desktopWorld = fresh.desktopWorld;
+    settings.scopeAlwaysLive = fresh.scopeAlwaysLive;
+    settings.scopeIdleMagnification = fresh.scopeIdleMagnification;
+    settings.immersiveSwimming = fresh.immersiveSwimming;
+    settings.instantRides = fresh.instantRides;
+    settings.creatureHandAim = fresh.creatureHandAim;
+    settings.rideHeadPitch = fresh.rideHeadPitch;
+    settings.gripTurnRateDegrees = fresh.gripTurnRateDegrees;
+    settings.audioOcclusion = fresh.audioOcclusion; // [Audio] Spatial picks the sound backend at startup.
+    settings.hudMode = fresh.hudMode;
+    settings.hudWristScale = fresh.hudWristScale;
     settings.voice = fresh.voice;
     single_pass::setInstancing(fresh.singlePassInstancing);
-    log("Settings reloaded: lasers=%d snapTurn=%d turnRate=%.0f instancing=%d", int(fresh.lasers), int(fresh.snapTurn),
-        double(fresh.smoothTurnRate * 180 / Pi), int(fresh.singlePassInstancing));
+    setDesktopWorld(fresh.desktopWorld);
+    log("Settings reloaded: lasers=%d snapTurn=%d turnRate=%.0f snap=%.0f move=%d instancing=%d mirror=%d hud=%d", int(fresh.lasers),
+        int(fresh.snapTurn), double(fresh.smoothTurnRate * 180 / Pi), double(fresh.snapTurnDegrees), fresh.moveDirection,
+        int(fresh.singlePassInstancing), int(fresh.waterMirror), fresh.hudMode);
 }
 // One-shot actions chosen on a wheel bubble, by WheelBubble value. Simulation
 // stores the release tick; the player input poll (or the presentation, for the
@@ -2159,11 +2174,20 @@ static void __fastcall carryStep(void *puppet, void *) {
     g.history[g.samples % 16] = {carryClock(), hand.p};
     ++g.samples;
 }
-// Stick walking follows where the head faces: snap/smooth turn plus the head's
-// yaw relative to the tracking origin's heading.
+// Stick walking follows where the head faces ([Comfort] MoveDirection 0), or
+// where a controller points (1 left, 2 right; the head while that controller is
+// untracked or points straight up or down): snap/smooth turn plus that yaw
+// relative to the tracking origin's heading.
 static float moveHeading(const Input &input, const Pose &origin, float turn) {
-    const float head = yawAngle(input.head.q) - yawAngle(origin.q);
-    return std::isfinite(head) && input.headValid ? turn + head : turn;
+    float source = std::numeric_limits<float>::quiet_NaN();
+    const int hand = settings.moveDirection - 1;
+    if ((hand == 0 || hand == 1) && controllerTracked(input, unsigned(hand)) && finite(input.hand[hand])) {
+        const Vec3 forward = rotate(normalize(input.hand[hand].q), Vec3{0, 0, -1});
+        if (forward.x * forward.x + forward.z * forward.z > .04f) source = std::atan2(-forward.x, -forward.z);
+    }
+    if (!std::isfinite(source) && input.headValid) source = yawAngle(input.head.q);
+    const float offset = source - yawAngle(origin.q);
+    return std::isfinite(offset) ? turn + offset : turn;
 }
 static float moveHeading(const Snapshot &s) { return moveHeading(s.input, s.origin, s.turn); }
 static int labRideKind();
@@ -2366,7 +2390,9 @@ static void update(void *p) {
         turnLatched = false;
     if (settings.snapTurn) {
         if (turningAllowed && std::abs(ax) > .75f && !turnLatched) {
-            s.turn += (ax > 0 ? -1 : 1) * Pi / 6;
+            s.turn += (ax > 0 ? -1 : 1) * settings.snapTurnDegrees * Pi / 180;
+            if (s.turn > Pi) s.turn -= 2 * Pi;
+            if (s.turn < -Pi) s.turn += 2 * Pi;
             turnLatched = true;
             s.networkGeneration = networkGenerations.advance();
             advanceGeneration(s);
@@ -10000,6 +10026,7 @@ static void maintainSpatialAudio() {
     spatial_audio::frame();
 }
 static int __cdecl appForeground() {
+    pollSettingsFile(); // Menus too: the options panel opens over the game's menus.
     maintainSpatialAudio();
     voiceFrame();
     if (labLoadPending.exchange(false) && labLoadGame) {

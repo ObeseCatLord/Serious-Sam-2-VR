@@ -14,6 +14,10 @@ struct VrSettings {
     FoveationSettings foveation;
     bool snapTurn = false;                 // Smooth stick turning unless enabled.
     float smoothTurnRate = 150 * Pi / 180; // Radians per second at full deflection.
+    float snapTurnDegrees = 30;            // [Comfort] SnapTurnDegrees: one snap turn.
+    // [Comfort] MoveDirection: the left stick walks where 0 the head faces,
+    // 1 the left controller points, 2 the right controller points.
+    int moveDirection = 0;
     bool eyeReplay = false; // Right eye replayed from the left eye's recorded D3D9 calls.
     bool singlePass = true; // Both eyes from one world traversal (double-wide target).
     bool singlePassInstancing = false; // One instanced draw per world draw (lab: artifacts).

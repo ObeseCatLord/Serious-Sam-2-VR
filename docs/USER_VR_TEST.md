@@ -23,6 +23,46 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## New: VR options menu (2026-10-23)
+
+The VR options panel is now a tabbed menu: Movement, Graphics, Sound, Voice
+chat and Interface.
+
+1. Open it two ways:
+   - a "VR options" button under the game's own menus (the main menu and the
+     pause menu), so it works before a level is loaded;
+   - the weapon-wheel bubble, as before.
+2. Point either controller at it and pull the trigger:
+   - on a tab to switch pages;
+   - on a row's left or right arrow to step its value down or up (clicking the
+     rest of the row steps it up);
+   - on Reset page or Close.
+
+   Pointing at a row selects it and shows what it does at the bottom. Without
+   pointing: the stick moves between the tabs, rows and buttons and changes
+   values; the Use button (Index right B, Touch A) steps the selected row; the
+   Menu button (Index left B) closes the panel. Right A no longer closes it.
+3. New settings:
+   - Walk direction: Head, Left hand or Right hand (`[Comfort] MoveDirection`).
+     With a hand, the left stick walks where that controller points; with the
+     controller pointing straight up or down, or untracked, it follows your
+     head.
+   - Snap turn angle: 15 to 90 degrees (`[Comfort] SnapTurnDegrees`).
+4. Also in the menu now: arm-stroke swimming, instant mounting, creature hand
+   aim, ride head pitch, vehicle grips, water reflections (mirrored world or
+   surroundings) and their resolution, scope magnification, showing the game on
+   the monitor, spatial audio, sound occlusion, and every voice chat setting
+   (hear others, microphone mode and device, sensitivity, boost, voice and radio
+   volume, proximity range, talking indicators), plus HUD, lasers and menu size.
+5. Everything applies at once, in a level or in the menus, except spatial audio
+   and vehicle grips: those rows turn amber and say a restart is needed. The HUD
+   (wrist or head) and its size now also switch without a restart.
+6. Please check:
+   - walking with Walk direction set to each hand;
+   - picking your microphone from the device list;
+   - that the click which closes the panel neither fires nor clicks the game's
+     menu.
+
 ## Changed after the cutscene and carry report (2026-10-23)
 
 1. Multiplayer voice keeps working through intermissions and cutscenes (you hear
