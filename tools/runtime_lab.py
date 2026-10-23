@@ -1047,7 +1047,11 @@ def interactive_hold(cfg,env,token,deadline,run_dir,owned_game):
                     if error.code==4:
                         time.sleep(.05);continue
                     raise
-                except (TimeoutError,subprocess.TimeoutExpired):break
+                except (TimeoutError,subprocess.TimeoutExpired):
+                    # A loading game (a user's save) stops answering for a while;
+                    # the hold ends only at its end, a stop request or the game's exit.
+                    if time.monotonic()>=end:break
+                    time.sleep(1);continue
                 out.write(json.dumps(state)+'\n');out.flush();samples+=1
                 # Operator capture requests: run_dir/capture-request-<name> -> <name>-left/right.ppm
                 # of the next eye pair at the commanded baseline head pose.
