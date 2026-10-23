@@ -23,6 +23,21 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the cutscene and carry report (2026-10-23)
+
+1. Multiplayer voice keeps working through intermissions and cutscenes (you hear
+   others where you last stood while the camera is cinematic).
+2. The end-of-load prompt names a VR control: "Press B or a trigger to continue"
+   on Index (A or a trigger on Touch), the buttons that do continue.
+3. Carried physics objects ease into your hand instead of overshooting: in
+   Land of Giants, carry the match to the TNT. Throws are scaled to the game's
+   own gravity (about 2.9x Earth's): toss a basketball at the Jungle court hoop.
+4. Serious Bomb: the forearms match the gloves (only their length shrinks).
+5. Rolling ball: no floating wheel; it rolls where you look and the right stick
+   turns you.
+6. Not a bug: `Sam2.log`'s "Started simulation ... in N seconds" for a level
+   change counts the time the "press to continue" screen waited for you.
+
 ## Sprint (2026-10-22)
 
 1. Click the left stick while walking forward: you sprint (the game's own sprint,
@@ -356,4 +371,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `92b0c3b`, version `0.2.11-dev.badc50751104` (2026-10-22).
+Installed candidate: commit `fdb19ef`, version `0.2.11-dev.d50c80b79c4f` (2026-10-23).
