@@ -276,6 +276,13 @@ bool located(const XrSpaceLocation &location) {
                             XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
     return (location.locationFlags & needed) == needed && validPose(pose(location.pose));
 }
+// The head: a pose the runtime calls valid is used even while it is not
+// actively tracked (inferred, e.g. lighthouses briefly out of view or tracking
+// still starting); requiring tracked bits left the headset blank.
+bool headLocated(const XrSpaceLocation &location) {
+    constexpr auto needed = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    return (location.locationFlags & needed) == needed && validPose(pose(location.pose));
+}
 
 struct Swapchain {
     Api *api = nullptr;
@@ -2245,10 +2252,20 @@ struct Host {
         XrViewState validity{XR_TYPE_VIEW_STATE};
         uint32_t count = 0;
         api.check(api.LocateViews(session, &locate, &validity, 2, &count, views.data()), "xrLocateViews");
-        constexpr auto needed = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT |
-                                XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT;
+        // Valid views are shown even when not actively tracked (see headLocated).
+        constexpr auto needed = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
         if (count != 2)
             throw std::runtime_error("Runtime returned a non-stereo view count");
+        static XrViewStateFlags loggedFlags = ~XrViewStateFlags(0);
+        static unsigned flagLogs = 0;
+        if (validity.viewStateFlags != loggedFlags && flagLogs < 32) {
+            loggedFlags = validity.viewStateFlags;
+            ++flagLogs;
+            char line[96];
+            std::snprintf(line, sizeof line, "View state flags %llx (orientation/position valid=1/2, tracked=4/8)",
+                          static_cast<unsigned long long>(validity.viewStateFlags));
+            log.write(line);
+        }
         if ((validity.viewStateFlags & needed) != needed) {
             ++invalidViews;
             if (!settings.labFixedPose)
@@ -2297,7 +2314,7 @@ struct Host {
         input.focused = state == XR_SESSION_STATE_FOCUSED ? 1 : 0;
         XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
         api.check(api.LocateSpace(viewSpace, local, time, &head), "xrLocateSpace head VIEW");
-        if (located(head)) {
+        if (headLocated(head)) {
             input.head = pose(head.pose);
             input.headValid = 1;
         } else if (validViews) {
