@@ -809,6 +809,17 @@ struct WaterConstantsScope {
         }
         // The environment cube once it holds something, with both programs' variants.
         IDirect3DCubeTexture9 *environment = active ? env_probe::cube(d) : nullptr;
+        {
+            // Why a water draw keeps the engine's screen-mapped reflection (bounded, on change).
+            static unsigned traced = 0, previous = ~0u;
+            const unsigned why = unsigned(!environment) | unsigned(!turned) << 1 | unsigned(labWaterUnpatched()) << 2 |
+                unsigned(vertex == shaderProbe.end() || !vertex->second.variant) << 3 | unsigned(!engineAdjusted) << 4;
+            if (why != previous && traced < 24) {
+                ++traced;
+                previous = why;
+                log("Single pass water cube use reasons=%x (1 no cube, 2 no rotation, 4 lab, 8 no variant, 16 no camera)", why);
+            }
+        }
         if (!environment || !turned || labWaterUnpatched() || !vertex->second.variant || !engineAdjusted) return;
         // The cube's anchor in the water's model space (its sphere is centred there).
         float anchorWorld[3], anchorModel[4]{0, 0, 0, 1};

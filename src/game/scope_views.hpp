@@ -27,5 +27,10 @@ float waterMirrorScale() noexcept;
 bool waterMirrorView(const Request &request, const double (&plane)[4], unsigned eye, Pose &camera, Fov &fov) noexcept;
 bool beginMirrorSource(void *player, const Request &request, const Pose &camera, const Fov &fov, const double (&plane)[4],
                        ScopeCaptureCallback callback, ScopeCaptureCurrent current, void *context);
+// A face of the water's environment cube (env_probe): the world from `camera`
+// with a square 90-degree view; and where the viewer is this request (world).
+bool beginCubeSource(void *player, const Request &request, const Pose &camera, ScopeCaptureCallback callback,
+                     ScopeCaptureCurrent current, void *context);
+bool waterCubeViewer(const Request &request, float (&out)[3]) noexcept;
 bool endScopeSource(bool normalCompletion) noexcept;
 } // namespace ss2vr::game

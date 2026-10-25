@@ -1,4 +1,5 @@
 #pragma once
+#include "math.hpp"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -16,7 +17,7 @@
 // world as the head turns and moves. Matrices are row-major: view is world ->
 // view 3x4, projection 4x4 with clip = P * view (w = -z).
 namespace ss2vr::env_probe {
-constexpr unsigned FaceSize = 128;
+constexpr unsigned FaceSize = 256;
 // D3D cube face order +X, -X, +Y, -Y, +Z, -Z; s, t in [-1, 1] across the face
 // (t grows down the face image). The direction the hardware samples there.
 inline void faceDirection(unsigned face, float s, float t, float (&out)[3]) {
@@ -29,6 +30,41 @@ inline void faceDirection(unsigned face, float s, float t, float (&out)[3]) {
     default: out[0] = -s; out[1] = -t; out[2] = -1; break;
     }
 }
+// Rendered faces: the world is rendered from the cube's anchor, one face per
+// frame, with a square 90-degree field of view, and copied into that face.
+// The camera (-Z forward, +Y up, +X right) looks along the face's centre
+// direction with up = -t; D3D's faces are left-handed, so its right is -s and
+// the image goes into the face mirrored left to right.
+inline constexpr unsigned RenderedFaces = 5; // All but -Y (straight down): water reflects upward.
+inline unsigned renderedFace(unsigned k) { return k < 3 ? k : k + 1; } // +X, -X, +Y, +Z, -Z.
+inline Quat basisQuat(Vec3 right, Vec3 up, Vec3 back) {
+    // Rotation matrix columns right, up, back (a right-handed orthonormal basis).
+    const float m00 = right.x, m11 = up.y, m22 = back.z, trace = m00 + m11 + m22;
+    Quat q;
+    if (trace > 0) {
+        const float s = std::sqrt(trace + 1) * 2;
+        q = {(up.z - back.y) / s, (back.x - right.z) / s, (right.y - up.x) / s, .25f * s};
+    } else if (m00 > m11 && m00 > m22) {
+        const float s = std::sqrt(1 + m00 - m11 - m22) * 2;
+        q = {.25f * s, (up.x + right.y) / s, (back.x + right.z) / s, (up.z - back.y) / s};
+    } else if (m11 > m22) {
+        const float s = std::sqrt(1 + m11 - m00 - m22) * 2;
+        q = {(up.x + right.y) / s, .25f * s, (back.y + up.z) / s, (back.x - right.z) / s};
+    } else {
+        const float s = std::sqrt(1 + m22 - m00 - m11) * 2;
+        q = {(back.x + right.z) / s, (back.y + up.z) / s, .25f * s, (right.y - up.x) / s};
+    }
+    return normalize(q);
+}
+inline Pose faceCamera(unsigned face, const float (&anchor)[3]) {
+    float f[3], s[3], t[3];
+    faceDirection(face, 0, 0, f);
+    faceDirection(face, 1, 0, s);
+    faceDirection(face, 0, 1, t);
+    const Vec3 forward{f[0], f[1], f[2]}, sAxis = Vec3{s[0], s[1], s[2]} - forward, tAxis = Vec3{t[0], t[1], t[2]} - forward;
+    return {basisQuat(sAxis * -1, tAxis * -1, forward * -1), Vec3{anchor[0], anchor[1], anchor[2]}};
+}
+inline Fov faceFov() { return {-Pi / 4, Pi / 4, Pi / 4, -Pi / 4}; }
 // Capture constants c0..c3: clip x, y, (unused), w, as a dot product with
 // (n, 1), of the point anchor + radius * n (n a unit direction from the
 // anchor, world) seen by the camera.

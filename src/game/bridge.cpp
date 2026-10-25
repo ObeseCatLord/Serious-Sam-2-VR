@@ -16,6 +16,7 @@
 #include "single_pass.hpp"
 #include "water_mirror.hpp"
 #include "env_probe.hpp"
+#include "common/env_probe.hpp"
 #include "scope_gpu.hpp"
 #include "scope_source_gpu.hpp"
 #include "common/scope_capture_command.hpp"
@@ -1725,6 +1726,7 @@ static HRESULT WINAPI draw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT start,
         replay::recordDraw(type,start,count);
         if(single_pass::drawing(d)) return single_pass::draw(d,type,start,count);
         if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDraw(d,type,start,count); });
+        if(env_probe::facePass(d) && single_pass::waterBound()) return D3D_OK; // A cube face leaves the water out.
         return originalDraw(d,type,start,count);
     });
 }
@@ -1738,6 +1740,7 @@ static HRESULT forwardIndexed(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
         replay::recordDrawIndexed(type,base,minimum,vertices,start,count);
         if(single_pass::drawing(d)) return single_pass::drawIndexed(d,type,base,minimum,vertices,start,count);
         if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDrawIndexed(d,type,base,minimum,vertices,start,count); });
+        if(env_probe::facePass(d) && single_pass::waterBound()) return D3D_OK; // A cube face leaves the water out.
         return originalDrawIndexed(d,type,base,minimum,vertices,start,count);
     });
 }
@@ -1808,6 +1811,7 @@ static HRESULT WINAPI drawUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT coun
     return observeUiOutput(d,[&]{ traceWorldDraw(d,count);
         if(single_pass::drawing(d)) return single_pass::drawUp(d,type,count,vertices,stride);
         if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDrawUp(d,type,count,vertices,stride); });
+        if(env_probe::facePass(d) && single_pass::waterBound()) return D3D_OK; // A cube face leaves the water out.
         return originalDrawUp(d,type,count,vertices,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawIndexedUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT minimum,UINT vertices,UINT count,
@@ -1817,6 +1821,7 @@ static HRESULT WINAPI drawIndexedUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UI
     return observeUiOutput(d,[&]{ traceWorldDraw(d,count);
         if(single_pass::drawing(d)) return single_pass::drawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride);
         if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); });
+        if(env_probe::facePass(d) && single_pass::waterBound()) return D3D_OK; // A cube face leaves the water out.
         return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); },nullptr,true);
 }
 static HRESULT WINAPI drawRect(IDirect3DDevice9 *d,UINT handle,const float *segments,const D3DRECTPATCH_INFO *info) {
@@ -3923,6 +3928,58 @@ static bool renderWaterMirror(void *puppet,void(__thiscall *original)(void *),co
     }
     return ok;
 }
+// Water cube (env_probe, the default reflections): one face a frame, rendered
+// from the cube's anchor through the same native source path, its pre-bloom
+// image copied into the face. Water itself is left out of these renders.
+static MirrorCaptureFrame cubeCaptureFrame;
+static bool cubeCaptureCurrent(void *opaque) noexcept {
+    const auto *capture = static_cast<MirrorCaptureFrame *>(opaque);
+    return !scopeSourcesHalted && capture == &cubeCaptureFrame && capture->active && scopeScratch && activeEye == -1 &&
+        uiFrame.slot >= 0 && !uiFrame.fault && !eyeInvalid && !uiHalted && !stopping &&
+        capture->generation == graphicsResourceGeneration() && uiFrame.generation == capture->generation;
+}
+static __attribute__((force_align_arg_pointer)) void __cdecl captureNativeCube(void *opaque) noexcept {
+    if (!cubeCaptureCurrent(opaque) || !scopeSourceExecuting() || cubeCaptureFrame.calls++) return;
+    withNativeFinally([&] {
+        const env_probe::Device device{originalSetRT,originalDrawUp,originalStretch};
+        cubeCaptureFrame.copied = env_probe::captureFace(uiFrame.device,device,uiFrame.target[0]);
+    },[&](bool aborted) noexcept { if (aborted) { scopeSourcesHalted = true; cubeCaptureFrame.copied = false; } });
+}
+static bool renderWaterCube(void *puppet,void(__thiscall *original)(void *),const Request &request) {
+    if (waterMirrorEnabled() || scopeSourcesHalted || !single_pass::installed() || !env_probe::wanted()) return true;
+    const auto generation = graphicsResourceGeneration();
+    auto *d = uiFrame.device;
+    D3DSURFACE_DESC eyeDesc{};
+    float viewer[3], anchor[3];
+    unsigned face = 0;
+    const env_probe::Device device{originalSetRT,originalDrawUp,originalStretch};
+    if (!uiFrame.target[0] || FAILED(uiFrame.target[0]->GetDesc(&eyeDesc)) || !waterCubeViewer(request,viewer) ||
+        !env_probe::nextFace(d,device,eyeDesc.Format,viewer,face,anchor)) return true;
+    const Pose camera = ss2vr::env_probe::faceCamera(face,anchor);
+    static unsigned traced = 0;
+    activeEye = -1; eyeInvalid = false; renderRequest = request;
+    cubeCaptureFrame = {uiFrame.generation,true,false,0};
+    scopeScratch = true;
+    bool ok = true;
+    if (beginCubeSource(puppet,request,camera,captureNativeCube,cubeCaptureCurrent,&cubeCaptureFrame)) {
+        ok = prepareScopeScratch();
+        env_probe::beginFace(uiFrame.target[0],face);
+        if (ok) original(puppet);
+        if (generation != graphicsResourceGeneration()) { env_probe::endFace(false); cubeCaptureFrame.active = false; scopeScratch = false; return false; }
+        const bool finished = endScopeSource(ok && !eyeInvalid);
+        const bool complete = finished && cubeCaptureFrame.copied && cubeCaptureCurrent(&cubeCaptureFrame) &&
+                              nativeUiFrameCurrent(puppet,request);
+        env_probe::endFace(complete);
+        if (traced < 12) {
+            ++traced;
+            log("Water cube face %u from %.2f,%.2f,%.2f complete=%u copied=%u calls=%u source=%x",face,anchor[0],anchor[1],anchor[2],
+                unsigned(complete),unsigned(cubeCaptureFrame.copied),cubeCaptureFrame.calls,scopeSourceFlags());
+        }
+    }
+    cubeCaptureFrame.active = false;
+    scopeScratch = false;
+    return ok && !eyeInvalid && !uiFrame.fault && !scopeSourcesHalted;
+}
 static bool renderScopeSources(void *puppet,void(__thiscall *original)(void *),const Request &request) {
     const auto generation = graphicsResourceGeneration();
     if (scopeSourcesHalted || !scopePreviewNeeded(puppet,request)) {
@@ -4364,6 +4421,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         if(traceDepth) traceStereoDepth(d,request,-1,"entry");
         if (ok) ok = renderScopeSources(puppet,original,request);
         if (ok) ok = renderWaterMirror(puppet,original,request);
+        if (ok) ok = renderWaterCube(puppet,original,request);
         if(admitted) noteStage(1);
         if (generation != graphicsResourceGeneration()) { original(puppet); return; }
         static const bool labAlternateEyes=[] {
@@ -4532,7 +4590,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                             SUCCEEDED(originalStretch(d,wideColor,&half,uiFrame.target[k],nullptr,D3DTEXF_NONE));
                     }
                     if(foveated) ++perf.foveatedPairs;
-                    if(centreReady && env_probe::wanted()) {
+                    if(centreReady && env_probe::wanted() && !env_probe::rendered()) {
                         // Water reflections: this frame's left eye (world only) into the environment cube.
                         float eyeView[12], eyeProjection[16];
                         if(singlePassEyeView(request,0,eyeView,eyeProjection)) {

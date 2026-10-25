@@ -39,6 +39,7 @@
 #include "common/win_settings.hpp"
 #include "common/winproc.hpp"
 #include "desktop_options.hpp"
+#include "common/env_probe.hpp"
 #include "common/winpath.hpp"
 #include "common/weapon_view.hpp"
 #include "common/water_mirror.hpp"
@@ -5146,6 +5147,7 @@ struct NativeScopeSource {
     void *context = nullptr;
     bool active = false, prepared = false, attempted = false, queued = false, executed = false, fault = false;
     bool mirror = false; // The water mirror's source render ([Render] WaterMirror), not a scope's.
+    bool cube = false;   // A face of the water's environment cube (env_probe), not a scope's.
     double plane[4]{};   // Its water plane (world): the projection's oblique near plane.
 };
 static thread_local NativeScopeSource scopeSource;
@@ -5232,10 +5234,11 @@ static void __fastcall viewPrepare(void *command, void *, const Matrix34 &view, 
             scopeSource.prepared = finiteMatrix(view) && finiteProjection(projection) &&
                 validDepthRange(depthRange.min,depthRange.max) &&
                 sameWeaponView(view,matrix(inverse(scopeSource.view.camera))) &&
-                (scopeSource.mirror ? sameProjectionXYW(projection,ss2vr::projection(scopeSource.view.fov)) :
+                (scopeSource.mirror || scopeSource.cube ? sameProjectionXYW(projection,ss2vr::projection(scopeSource.view.fov)) :
                                       sameProjectionXY(projection,ss2vr::projection(scopeSource.view.fov)));
             if (!scopeSource.prepared) scopeSource.fault = true;
-            identifier ^= scopeSource.mirror ? 0xc0000000u : scopeSource.view.hand == 0 ? 0xa0000000u : 0xe0000000u;
+            identifier ^= scopeSource.cube ? 0x90000000u : scopeSource.mirror ? 0xc0000000u :
+                          scopeSource.view.hand == 0 ? 0xa0000000u : 0xe0000000u;
         }
     }
     if (eyeIndex >= 0 && eyePlayer && caller == rootPrepareReturn) {
@@ -8170,6 +8173,30 @@ bool beginMirrorSource(void *player, const Request &request, const Pose &camera,
     scopeSource.active = true;
     return true;
 }
+bool waterCubeViewer(const Request &request, float (&out)[3]) noexcept {
+    if (!eyeAnchorReady || !eyeSnapshot.initialized) return false;
+    const Pose head = worldHeadTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, request.input.head);
+    if (!finite(head)) return false;
+    out[0] = head.p.x; out[1] = head.p.y; out[2] = head.p.z;
+    return true;
+}
+// One face of the water's environment cube: the world from the cube's anchor
+// (common/env_probe.hpp faceCamera), square 90 degrees, through the same native
+// source path (no clip plane).
+bool beginCubeSource(void *player, const Request &request, const Pose &camera, ScopeCaptureCallback callback,
+                     ScopeCaptureCurrent currentSource, void *context) {
+    if (!callback || !currentSource || !context || !finite(camera) || player != eyeSnapshot.player ||
+        !nativeUiFrameCurrent(player, request)) return false;
+    beginEye(player, request, -1);
+    scopeSource.view = {};
+    scopeSource.view.camera = camera;
+    scopeSource.view.fov = ss2vr::env_probe::faceFov();
+    scopeSource.view.hand = 2;
+    scopeSource.cube = true;
+    scopeSource.callback = callback; scopeSource.current = currentSource; scopeSource.context = context;
+    scopeSource.active = true;
+    return true;
+}
 unsigned scopeSourceFlags() noexcept {
     return unsigned(scopeSource.active) | unsigned(scopeSource.prepared) << 1 | unsigned(scopeSource.attempted) << 2 |
         unsigned(scopeSource.queued) << 3 | unsigned(scopeSource.executed) << 4 | unsigned(scopeSource.fault) << 5;
@@ -8179,7 +8206,7 @@ bool scopeSourceExecuting() noexcept {
         !scopeSource.executed && eyePlayer && eyeIndex == -1 && rootView && executingView == rootView &&
         !weaponPairFault && nativeCurrentView && nativeCurrentProjection &&
         sameWeaponView(*nativeCurrentView,matrix(inverse(scopeSource.view.camera))) &&
-        (scopeSource.mirror ? sameProjectionXYW(*nativeCurrentProjection,ss2vr::projection(scopeSource.view.fov)) :
+        (scopeSource.mirror || scopeSource.cube ? sameProjectionXYW(*nativeCurrentProjection,ss2vr::projection(scopeSource.view.fov)) :
                               sameProjectionXY(*nativeCurrentProjection,ss2vr::projection(scopeSource.view.fov)));
 }
 bool endScopeSource(bool normalCompletion) noexcept {

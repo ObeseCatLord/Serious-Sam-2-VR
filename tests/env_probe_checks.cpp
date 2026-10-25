@@ -1,4 +1,5 @@
 #include "common/env_probe.hpp"
+#include <utility>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -20,6 +21,26 @@ int main() {
     faceDirection(3, 0, 0, d); assert(d[1] == -1);
     faceDirection(5, 0, 0, d); assert(d[2] == -1);
     faceDirection(2, 0, -1, d); assert(d[1] == 1 && d[2] == -1);
+    // Rendered faces: each camera looks along its face's centre, and a face texel
+    // (s, t) lands at clip (-s, -t) of that camera's square 90-degree image.
+    const float origin[3]{1, 2, 3};
+    for (unsigned k = 0; k < RenderedFaces; ++k) {
+        const unsigned face = renderedFace(k);
+        assert(face != 3);
+        const ss2vr::Pose cam = faceCamera(face, origin);
+        float centre[3], texel[3];
+        faceDirection(face, 0, 0, centre);
+        const ss2vr::Vec3 forward = ss2vr::rotate(cam.q, {0, 0, -1});
+        assert(std::abs(forward.x - centre[0]) < 1e-5f && std::abs(forward.y - centre[1]) < 1e-5f && std::abs(forward.z - centre[2]) < 1e-5f);
+        assert(cam.p.x == 1 && cam.p.y == 2 && cam.p.z == 3);
+        for (const auto [fs, ft] : {std::pair{.5f, -.25f}, std::pair{-.7f, .6f}}) {
+            faceDirection(face, fs, ft, texel);
+            const ss2vr::Vec3 local = ss2vr::rotate(ss2vr::inverse(cam.q), {texel[0], texel[1], texel[2]});
+            const ss2vr::Matrix44 proj = ss2vr::projection(faceFov());
+            const float w = -local.z, x = (proj.m[0] * local.x + proj.m[2] * local.z) / w, y = (proj.m[5] * local.y + proj.m[6] * local.z) / w;
+            assert(std::abs(x + fs) < 1e-4f && std::abs(y + ft) < 1e-4f);
+        }
+    }
     // An asymmetric projection (w = -z) and a camera turned 0.4 rad about y.
     const float P[16]{1.2f, 0, .1f, 0, 0, 1.1f, -.05f, 0, 0, 0, -1, -.1f, 0, 0, -1, 0};
     const float c = std::cos(.4f), s = std::sin(.4f);

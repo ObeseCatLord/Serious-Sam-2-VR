@@ -1269,6 +1269,10 @@ struct Host {
     bool cursorUploaded = false;
     std::vector<uint8_t> menuSourcePixels;
     uint64_t menuSequence = 0;
+    uint32_t shownMenuGeneration = 0; // The interaction generation of the panel image shown.
+    uint32_t menuStripRows = 0;       // The uploaded panel's button strip (over a held world frame).
+    bool menuStripHover = false;
+    std::vector<uint8_t> menuComposite;
     MenuPointer presentedPointer;
     int cursorX = -1, cursorY = -1;
     PendingRequest outstanding[2];
@@ -3075,33 +3079,54 @@ struct Host {
         uint64_t sequence = 0;
         uint32_t width = 0, height = 0;
         uint32_t menuGeneration = 0;
+        bool fresh = false;
         {
             Mutex lock(channel, 1);
-            if (!lock)
-                return;
-            const auto &menu = channel.shared->menu;
-            if (!menu.visible || GetTickCount64() - menu.tickMs > MenuHoldMs || !menu.width || !menu.height ||
-                menu.width > MaxDimension || menu.height > MaxDimension)
-                return;
-            width = menu.width;
-            height = menu.height;
-            sequence = menu.sequence;
-            menuGeneration = menu.interactionGeneration;
-            if (!currentPixels(channel.shared->pixels) || !pixels.holds(menu.pixelGeneration, width, height))
-                return;
-            if (sequence != menuSequence || menuChain.width != width || menuChain.height != height) {
-                menuSourcePixels.resize(size_t(width) * height * 4);
-                std::memcpy(menuSourcePixels.data(), pixels.buffer(MenuPixelBuffer), menuSourcePixels.size());
+            if (lock) {
+                const auto &menu = channel.shared->menu;
+                if (!menu.visible || GetTickCount64() - menu.tickMs > MenuHoldMs || !menu.width || !menu.height ||
+                    menu.width > MaxDimension || menu.height > MaxDimension)
+                    return;
+                if (currentPixels(channel.shared->pixels) && pixels.holds(menu.pixelGeneration, menu.width, menu.height)) {
+                    width = menu.width;
+                    height = menu.height;
+                    sequence = menu.sequence;
+                    menuGeneration = menu.interactionGeneration;
+                    if (sequence != menuSequence || menuChain.width != width || menuChain.height != height) {
+                        menuSourcePixels.resize(size_t(width) * height * 4);
+                        std::memcpy(menuSourcePixels.data(), pixels.buffer(MenuPixelBuffer), menuSourcePixels.size());
+                    }
+                    fresh = true;
+                }
             }
         }
-        if (menuChain.width != width || menuChain.height != height) {
+        // The IPC busy for a moment or the pixel sections being replaced (a canvas
+        // resize): the last panel image stays up. Leaving the panel out showed a
+        // black frame in cutscenes and intermissions.
+        if (!fresh) {
+            if (!menuSequence || !menuChain.width || !menuChain.height) return;
+            width = menuChain.width;
+            height = menuChain.height;
+            sequence = menuSequence;
+            menuGeneration = shownMenuGeneration;
+        }
+        shownMenuGeneration = menuGeneration;
+        // Over the held world frame only this one panel may be submitted (Proton,
+        // below): the "VR options" button is painted into a strip under the menu
+        // in the panel's own image, at the place the separate button sits elsewhere.
+        const float panelHeight = settings.menuWidth * float(height) / width;
+        const float buttonHeight = OptionsButtonWidth * OptionsButtonAspect;
+        const bool strip = backdropValid && menuGeneration && !options.open;
+        const uint32_t stripRows = strip ? uint32_t(std::ceil((OptionsButtonGap + buttonHeight + .02f) / panelHeight * float(height))) : 0;
+        const uint32_t imageHeight = height + stripRows;
+        if (menuChain.width != width || menuChain.height != imageHeight) {
             const auto &limits = systemProperties.graphicsProperties;
             if (width > limits.maxSwapchainImageWidth || height > limits.maxSwapchainImageHeight)
                 return;
             if (!drainGpu())
                 throw std::runtime_error("GPU drain before menu resize failed");
             menuChain.destroy();
-            menuChain.create(api, session, width, height);
+            menuChain.create(api, session, width, imageHeight);
             menuSequence = 0;
             cursorX = cursorY = -1;
         }
@@ -3112,7 +3137,11 @@ struct Host {
             menuAnchor.reset();
             return;
         }
-        const float panelHeight = settings.menuWidth * float(height) / width;
+        auto &stripButton = optionsButton;
+        if (strip) { // Where optionsButtonInput looks for it.
+            stripButton.pose = compose(panel, Pose{{0, 0, 0, 1}, {0, -(panelHeight + buttonHeight) * .5f - OptionsButtonGap, 0}});
+            stripButton.shownTick = GetTickCount64();
+        }
         PanelHit hit;
         unsigned hand = 2;
         if (menuGeneration && !recenterHeld(input) && !options.open) // The options panel over the menu takes the pointer.
@@ -3126,9 +3155,29 @@ struct Host {
                 }
         const int x = hit.valid ? std::min(int(width) - 1, int(hit.u * width)) : -1;
         const int y = hit.valid ? std::min(int(height) - 1, int(hit.v * height)) : -1;
-        if (sequence != menuSequence) {
-            if (!menuChain.upload(context.p, menuSourcePixels.data()))
-                return;
+        // A failed upload keeps the previous image (still in the swapchain).
+        const bool redraw = sequence != menuSequence || stripRows != menuStripRows || (strip && stripButton.hover != menuStripHover);
+        const uint8_t *image = menuSourcePixels.data();
+        if (redraw && stripRows) {
+            menuComposite.assign(size_t(width) * imageHeight * 4, 0);
+            std::memcpy(menuComposite.data(), menuSourcePixels.data(), size_t(width) * height * 4);
+            if (!menuKeyed)
+                for (size_t i = 0; i < size_t(width) * height; ++i) menuComposite[i * 4 + 3] = 255;
+            auto &bm = stripButton.bitmap;
+            bm.drawButton(stripButton.hover);
+            const float bw = OptionsButtonWidth / settings.menuWidth * float(width), bh = bw * OptionsButtonAspect;
+            const float x0 = (float(width) - bw) * .5f, y0 = float(height) + OptionsButtonGap / panelHeight * float(height);
+            for (uint32_t y = uint32_t(std::max(0.f, y0)); y < imageHeight && float(y) < y0 + bh; ++y)
+                for (uint32_t x = uint32_t(std::max(0.f, x0)); x < width && float(x) < x0 + bw; ++x) {
+                    const uint32_t sx = std::min(bm.width - 1, uint32_t((float(x) - x0) / bw * float(bm.width)));
+                    const uint32_t sy = std::min(bm.height - 1, uint32_t((float(y) - y0) / bh * float(bm.height)));
+                    std::memcpy(&menuComposite[(size_t(y) * width + x) * 4], bm.bits + (size_t(sy) * bm.width + sx) * 4, 4);
+                }
+            image = menuComposite.data();
+        }
+        if (redraw && menuChain.upload(context.p, image)) {
+            menuStripRows = stripRows;
+            menuStripHover = stripButton.hover;
             menuSequence = sequence;
             // Lab (SS2VR_LAB_MENU_DUMP=1): the menu image and where the pointer hits
             // it, once a second, to compare the game's own cursor with the hit.
@@ -3165,13 +3214,17 @@ struct Host {
         if (!menuChain.ownership.previousImageAvailable())
             return;
         layer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-        // A keyed menu (the world left out) blends over the held world frame.
-        if (menuKeyed) layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+        // A keyed menu (the world left out) blends over the held world frame, as
+        // does the button strip's clear background.
+        const uint32_t shownStrip = menuChain.height > height ? menuChain.height - height : 0;
+        if (menuKeyed || shownStrip)
+            layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
         layer.space = local;
         layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
         layer.subImage = menuChain.subimage();
-        layer.pose = xrPose(panel);
-        layer.size = {settings.menuWidth, panelHeight};
+        const float stripHeight = panelHeight * float(shownStrip) / float(height);
+        layer.pose = xrPose(compose(panel, Pose{{0, 0, 0, 1}, {0, -stripHeight * .5f, 0}})); // The menu part stays put.
+        layer.size = {settings.menuWidth, panelHeight + stripHeight};
         output.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&layer));
         // Over the held world frame only this one panel: Proton's OpenXR bridge
         // corrupts a second quad after a projection layer (V747, V783). The game
