@@ -14,4 +14,8 @@ bool queueCommand(int command);
 // A movie (the title attract demo, Extras, in-level films) plays in front of the
 // menus: the main menu stays current but its dispatcher does not run.
 bool movieOnTop();
+// A menu over a level in VR (the pause menu): the game is told the menu hides
+// the world, so it draws the menu alone (over black, which the bridge keys out)
+// while the headset keeps the last world frame behind it.
+bool worldHidden();
 } // namespace ss2vr::game::menus

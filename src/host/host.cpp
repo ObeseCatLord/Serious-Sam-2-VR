@@ -1422,6 +1422,11 @@ struct Host {
     Fov currentFov[2];
     bool recenterWasHeld = false, recenterUi = false;
     Swapchain menuChain, cursorChain;
+    // A pause menu or Netricsa over a level: the last world frame the headset was
+    // given, held world-locked behind it (the paused world does not change).
+    Swapchain backdrop[2];
+    Request backdropRequest{};
+    bool backdropValid = false, menuKeyed = false;
     // Foveated readback: eye[] carries the downsampled full view, inset[] the
     // full-resolution crop submitted as a second projection layer.
     Swapchain inset[2];
@@ -1487,6 +1492,7 @@ struct Host {
             optionsButton.chain.abandon();
             menuChain.abandon();
             cursorChain.abandon();
+            for (auto &chain : backdrop) chain.abandon();
             for (auto &chain : inset)
                 chain.abandon();
             drainQuery.abandon();
@@ -1510,6 +1516,7 @@ struct Host {
         optionsButton.chain.destroy();
         menuChain.destroy();
         cursorChain.destroy();
+        for (auto &chain : backdrop) chain.destroy();
         for (auto &chain : inset)
             chain.destroy();
         actions.destroy(api);
@@ -2032,6 +2039,7 @@ struct Host {
         bool renderer = false;
         Ui ui{};
         bool menuVisible = false;
+        uint32_t menuOverlay = 0; // MenuOverlay flags of the visible menu frame.
     };
     bool prepareHudAnchor(const Snapshot &snapshot, const Input &input) {
         const ULONGLONG now = GetTickCount64();
@@ -2069,7 +2077,7 @@ struct Host {
         openSharedImages(shared.images);
         reapLocked();
         snapshot = {shared.width, shared.height, shared.rendererReady != 0, shared.ui,
-                    shared.menu.visible && GetTickCount64() - shared.menu.tickMs < MenuHoldMs};
+                    shared.menu.visible && GetTickCount64() - shared.menu.tickMs < MenuHoldMs, shared.menu.overlay};
         return true;
     }
     void publishWorldSubmission() {
@@ -2439,6 +2447,7 @@ struct Host {
             retiredAll = optionsButton.chain.releaseAcquired() && retiredAll;
             retiredAll = menuChain.releaseAcquired() && retiredAll;
             retiredAll = cursorChain.releaseAcquired() && retiredAll;
+            for (auto &chain : backdrop) retiredAll = chain.releaseAcquired() && retiredAll;
             for (auto &chain : inset)
                 retiredAll = chain.releaseAcquired() && retiredAll;
             if (retiredAll)
@@ -3445,6 +3454,43 @@ struct Host {
         cursorUploaded = true;
         return cursorChain.ownership.previousImageAvailable();
     }
+    // The cached pair (the last world frame given to the headset) into the backdrop.
+    bool captureBackdrop() {
+        if (!cachedValid || !eye[0].lastTexture() || !eye[1].lastTexture()) return false;
+        for (unsigned h = 0; h != 2; ++h)
+            if (backdrop[h].width != eye[h].width || backdrop[h].height != eye[h].height || !backdrop[h].handle) {
+                if (!drainGpu()) return false;
+                backdrop[h].destroy();
+                backdrop[h].create(api, session, eye[h].width, eye[h].height);
+            }
+        for (unsigned h = 0; h != 2; ++h) {
+            if (!backdrop[h].waitImage()) return false;
+            backdrop[h].copyWaited(context.p, eye[h].lastTexture());
+            context->Flush();
+            backdrop[h].releaseWaited();
+        }
+        backdropRequest = cachedRequest;
+        backdropValid = true;
+        log.write("Menu over the level: last world frame held behind it");
+        return true;
+    }
+    void backdropLayer(XrCompositionLayerProjection &layer, std::array<XrCompositionLayerProjectionView, 2> &views,
+                       std::vector<const XrCompositionLayerBaseHeader *> &output) {
+        if (!backdropValid || !backdrop[0].ownership.previousImageAvailable() || !backdrop[1].ownership.previousImageAvailable())
+            return;
+        layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        layer.space = local;
+        for (unsigned h = 0; h != 2; ++h) {
+            views[h] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+            views[h].pose = xrPose(backdropRequest.eye[h]);
+            const auto &f = backdropRequest.fov[h];
+            views[h].fov = {f.left, f.right, f.up, f.down};
+            views[h].subImage = backdrop[h].subimage();
+        }
+        layer.viewCount = 2;
+        layer.views = views.data();
+        output.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&layer));
+    }
     void menuLayer(const Input &input, XrCompositionLayerQuad &layer, XrCompositionLayerQuad &cursor,
                    XrCompositionLayerQuad &button, std::vector<const XrCompositionLayerBaseHeader *> &output) {
         if (!input.focused || !input.headValid)
@@ -3542,12 +3588,25 @@ struct Host {
         if (!menuChain.ownership.previousImageAvailable())
             return;
         layer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+        // A keyed menu (the world left out) blends over the held world frame.
+        if (menuKeyed) layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
         layer.space = local;
         layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
         layer.subImage = menuChain.subimage();
         layer.pose = xrPose(panel);
         layer.size = {settings.menuWidth, panelHeight};
         output.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&layer));
+        // Over the held world frame only this one panel: Proton's OpenXR bridge
+        // corrupts a second quad after a projection layer (V747, V783). The game
+        // draws its own cursor in the menu; the VR options button waits for the
+        // weapon wheel's bubble there.
+        if (backdropValid) {
+            if (hit.valid)
+                presentedPointer = {input.sequence, GetTickCount64(), sequence, input.session, input.reference,
+                                    menuGeneration, 1, hand, hit.u, hit.v, input.trigger[hand],
+                                    input.primaryInputGeneration[hand]};
+            return;
+        }
         if (menuGeneration && !options.open) optionsButtonLayer(panel, panelHeight, button, output); // Interactive menus only.
         if (hit.valid && cursorImage()) {
             const float diameter = sizeAtAngle(.7f * Pi / 180, settings.menuDistance);
@@ -3707,7 +3766,14 @@ struct Host {
             XrCompositionLayerProjection insetLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             std::array<XrCompositionLayerQuad, 2> quadLayers;
             XrCompositionLayerQuad menuQuad{}, cursorQuad{}, optionsQuad{}, optionsButtonQuad{};
+            XrCompositionLayerProjection backdropProjection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+            std::array<XrCompositionLayerProjectionView, 2> backdropViews{};
             presentedPointer = {};
+            // A menu over a level: hold the last world frame before the world path
+            // below drops it.
+            if (published && snapshot.menuVisible && (snapshot.menuOverlay & MenuOverLevel) && !backdropValid &&
+                !api.lossPending)
+                captureBackdrop();
             if (published && !quit && !api.lossPending && frameState.shouldRender) {
                 if (snapshot.renderer && !snapshot.menuVisible && validViews && input.focused &&
                     input.headValid) {
@@ -3793,11 +3859,18 @@ struct Host {
                         hudAnchor.reset();
                         for (auto &wheel : wheels)
                             wheel.reset();
+                        // Over a level: keep the last world frame behind the menu.
+                        if (snapshot.menuOverlay & MenuOverLevel) {
+                            if (!backdropValid) captureBackdrop();
+                            backdropLayer(backdropProjection, backdropViews, layers);
+                        } else backdropValid = false;
+                        menuKeyed = backdropValid && (snapshot.menuOverlay & MenuKeyed);
                         invalidateCachedPair();
                         cancelRequests();
-                        menuLayer(input, menuQuad, cursorQuad, optionsButtonQuad, layers);
+                        if (!(backdropValid && options.open)) menuLayer(input, menuQuad, cursorQuad, optionsButtonQuad, layers);
                     } else {
                         menuAnchor.reset();
+                        backdropValid = false;
                         wheelLayers(snapshot.ui, input, quadLayers, layers);
                     }
                     optionsLayer(input, optionsQuad, layers);

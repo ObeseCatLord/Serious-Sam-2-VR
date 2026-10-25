@@ -264,6 +264,26 @@ bool movieOnTop() {
     const uintptr_t front = readable(queue, 4) ? read32(queue) : 0;
     return readable(front, 4) && read32(front) == base + 0x2e2488;
 }
+bool worldHidden() {
+    return base && vrInputLive() && levelActive() && current() && !movieOnTop();
+}
+// Sam2Game 19E010: whether a menu on the stack hides the world (cdecl, no args).
+static int(__cdecl *originalHidesWorld)() = nullptr;
+static int __cdecl hidesWorld() {
+    const bool hide = worldHidden();
+    static unsigned traced = 0;
+    static int previous = -1;
+    if (int(hide) != previous && traced < 16) {
+        previous = int(hide); ++traced;
+        log("Menu hides world=%d (vr=%d level=%d menu=%d movie=%d)", int(hide), int(vrInputLive()), int(levelActive()),
+            int(current() != 0), int(movieOnTop()));
+    }
+    if (hide) {
+        clearCanvasTarget(); // The last world frame would stay behind the menu otherwise.
+        return 1;
+    }
+    return originalHidesWorld();
+}
 bool queueCommand(int command) {
     // A movie in front never reads menu commands; one queued now would fire on
     // the menu after it (a stray selection). The bridge posts a key instead.
@@ -282,6 +302,8 @@ bool initialize(HMODULE sam, HookInstaller install) {
     motion = reinterpret_cast<decltype(motion)>(base + 0x19e210);
     press = reinterpret_cast<decltype(press)>(base + 0x19e0e0);
     release = reinterpret_cast<decltype(release)>(base + 0x19e170);
+    if (!install(sam, 0x19e010, reinterpret_cast<void *>(hidesWorld), reinterpret_cast<void **>(&originalHidesWorld)))
+        log("Menu world hiding hook unavailable: the pause menu shows over its flat world copy");
     return install(sam, 0x192550, reinterpret_cast<void *>(poll), reinterpret_cast<void **>(&originalPoll));
 }
 } // namespace ss2vr::game::menus

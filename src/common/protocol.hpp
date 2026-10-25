@@ -113,8 +113,12 @@ struct Slot {
 struct MenuFrame {
     uint64_t sequence = 0, tickMs = 0;
     uint32_t visible = 0, width = 0, height = 0, interactionGeneration = 0;
-    uint32_t pixelGeneration = 0, pixelReserved = 0;
+    // overlay: MenuOverLevel (a pause menu or Netricsa over a level: the host
+    // keeps the last world frame behind it) | MenuKeyed (its alpha is set: the
+    // world was left out and black is transparent).
+    uint32_t pixelGeneration = 0, overlay = 0;
 };
+enum MenuOverlay : uint32_t { MenuOverLevel = 1, MenuKeyed = 2 };
 // The game creates one section per buffer for its current canvas extent and
 // publishes it here; readers reopen when the generation changes.
 struct PixelSections {

@@ -2589,6 +2589,9 @@ static void keyTap(WORD key) {
 std::atomic<uint64_t> vrInputTick{0};
 // While the headset is actively driving the game, the engine treats itself as
 // the foreground application (full frame rate, live input) regardless of focus.
+void clearCanvasTarget() noexcept {
+    if (device) device->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(0, 0, 0, 0), 1.f, 0);
+}
 bool vrInputLive() noexcept {
     const uint64_t tick = vrInputTick.load(std::memory_order_relaxed), now = GetTickCount64();
     return hooksReady.load(std::memory_order_acquire) && tick && now >= tick && now - tick < 1000;
@@ -3050,6 +3053,13 @@ static void presentBody(IDirect3DDevice9 *d) {
     // band below only when everything outside the band is black (letterbox bars).
     const UiBand source{0, 0, copyWidth, copyHeight};
     const UiBand letterbox = nativeMenu ? source : uiBand(copyWidth, copyHeight);
+    // Over a level (the pause menu, Netricsa) the headset keeps the last world
+    // frame behind this panel. The pause menu was drawn without the world
+    // (menus::worldHidden): its black is transparent. Netricsa is drawn over the
+    // world: its panel alone is shown (its layout spans 8-92% x 14-86% y of the canvas).
+    const bool netricsaPanel = !nativeMenu && netricsa && levelActive();
+    const bool keyed = nativeMenu && menus::worldHidden();
+    const uint32_t overlay = (keyed || netricsaPanel ? MenuOverLevel : 0u) | (keyed ? MenuKeyed : 0u);
     const auto scaled = [&](float sourceWidth, uint32_t &w, uint32_t &h) {
         const float fit = std::min({1.f, 1920.f / std::max(1.f, sourceWidth), 1080.f / float(std::max(1u, source.height))});
         w = std::max(2u, uint32_t(sourceWidth * fit)) & ~1u;
@@ -3087,7 +3097,11 @@ static void presentBody(IDirect3DDevice9 *d) {
             pixelStore.buffer(MenuPixelBuffer) : nullptr;
         if (!target) return;
         UiBand band{0, 0, outWidth, outHeight};
-        if (!nativeMenu && letterbox.height < copyHeight) {
+        if (netricsaPanel) {
+            band = {uint32_t(outWidth * .06f) & ~1u, uint32_t(outHeight * .12f) & ~1u, 0, 0};
+            band.width = (uint32_t(outWidth * .94f) - band.x) & ~1u;
+            band.height = (uint32_t(outHeight * .88f) - band.y) & ~1u;
+        } else if (!nativeMenu && letterbox.height < copyHeight) {
             // The band in the scaled image; kept only if the rows outside it are black.
             const uint32_t top = uint32_t(uint64_t(letterbox.y) * outHeight / copyHeight),
                            rows = uint32_t(uint64_t(letterbox.height) * outHeight / copyHeight);
@@ -3109,9 +3123,10 @@ static void presentBody(IDirect3DDevice9 *d) {
             memcpy(target + size_t(y) * band.width * 4,
                 static_cast<uint8_t *>(pixels.pBits) + size_t(y + band.y) * pixels.Pitch + size_t(band.x) * 4,
                 band.width * 4);
-        for (size_t pixel = 3; pixel < size_t(band.width) * band.height * 4; pixel += 4) target[pixel] = 255;
+        for (size_t pixel = 3; pixel < size_t(band.width) * band.height * 4; pixel += 4)
+            target[pixel] = keyed && target[pixel - 3] < 12 && target[pixel - 2] < 12 && target[pixel - 1] < 12 ? 0 : 255;
         m.width = band.width; m.height = band.height; m.tickMs = now;
-        m.pixelGeneration = pixelStore.generation; m.pixelReserved = 0;
+        m.pixelGeneration = pixelStore.generation; m.overlay = overlay;
         m.sequence = ++menuSequence; m.interactionGeneration = menuGeneration; m.visible = 1;
     }, [&](bool aborted) noexcept {
         if (held) { channel.unlock(); held = false; }
