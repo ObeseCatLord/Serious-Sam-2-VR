@@ -91,6 +91,26 @@ int main() {
     input.axis[0][1] = 1;
     check(menu.sample(input, true, true) == MenuAction::Back,
           "Simultaneous menu actions produce one deterministic Back tap");
+    // Index (a jump button): right A confirms, right B goes back, as the prompts say.
+    input = {};
+    input.buttons[1] = JumpBound;
+    menu.sample(input, true, true);
+    input.buttons[1] = JumpBound | Jump;
+    check(menu.sample(input, true, true) == MenuAction::Confirm, "Index right A confirms");
+    input.buttons[1] = JumpBound;
+    menu.sample(input, true, true);
+    input.buttons[1] = JumpBound | Use;
+    check(menu.sample(input, true, true) == MenuAction::Back, "Index right B goes back");
+    // In play B is Use (Index) and must not pause the game.
+    input.buttons[1] = JumpBound;
+    menu.sample(input, false, true);
+    input.buttons[1] = JumpBound | Use;
+    check(menu.sample(input, false, true) == MenuAction::None, "Index right B in play is not Back");
+    // Touch: right B (wheel-open) goes back.
+    input = {};
+    menu.sample(input, true, true);
+    input.buttons[1] = WheelOpen;
+    check(menu.sample(input, true, true) == MenuAction::Back, "Touch right B goes back");
     input = {};
     menu.sample(input, true, true);
     input.axis[0][0] = 1;

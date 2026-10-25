@@ -295,8 +295,15 @@ struct MenuNavigation {
                 triggerDown = false;
             }
         const auto buttons = input.buttons[0] | input.buttons[1];
-        bool goBack = back.pressed((buttons & Menu) != 0, allowed);
-        bool confirm = use.pressed((buttons & Use) != 0, allowed && menuVisible);
+        // The game shows gamepad prompts (A select, B back): the physical A and
+        // B do that. Index (it has a jump button): right A jumps, right B uses;
+        // Touch: right A uses, right B opens the wheel. Menu goes back too.
+        const bool jumpProfile = (buttons & JumpBound) != 0;
+        const bool aButton = jumpProfile ? (input.buttons[1] & Jump) != 0 : (buttons & Use) != 0;
+        const bool bButton = jumpProfile ? (input.buttons[1] & Use) != 0 : (input.buttons[1] & WheelOpen) != 0;
+        // B is Back only on a menu (in play it is Use or the wheel); Menu also pauses.
+        bool goBack = back.pressed((buttons & Menu) != 0 || (bButton && menuVisible), allowed);
+        bool confirm = use.pressed(aButton, allowed && menuVisible);
         const bool leftActive = primaryActionEligible(input, 0), rightActive = primaryActionEligible(input, 1);
         bool fire = trigger.update(std::max(leftActive ? input.trigger[0] : 0.f,
                                            rightActive ? input.trigger[1] : 0.f),

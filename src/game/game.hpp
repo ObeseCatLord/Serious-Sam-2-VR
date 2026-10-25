@@ -30,6 +30,7 @@ bool vrInputLive() noexcept;
 // engine creates its window canvas; applied on the main thread's input poll).
 void installEyeCanvas() noexcept;
 void setDesktopWorld(bool render) noexcept;
+bool netricsaShown() noexcept; // engine.cpp: Netricsa is open (its controls are player commands).
 void setSinglePass(bool enabled) noexcept;
 void setEyeReplay(bool enabled) noexcept;
 void setSinglePassWorld(bool on, const Request *real = nullptr) noexcept;

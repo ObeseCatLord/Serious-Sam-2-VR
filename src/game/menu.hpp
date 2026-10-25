@@ -11,4 +11,7 @@ bool pointerAvailable();
 // Right/Up/Down 0x0D-0x10, F1/F2 0x15/0x16) for the next menu poll. No OS input,
 // so it works without window focus. Returns false when no native menu is open.
 bool queueCommand(int command);
+// A movie (the title attract demo, Extras, in-level films) plays in front of the
+// menus: the main menu stays current but its dispatcher does not run.
+bool movieOnTop();
 } // namespace ss2vr::game::menus

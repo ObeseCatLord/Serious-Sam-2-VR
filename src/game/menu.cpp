@@ -40,6 +40,13 @@ static float readFloat(uintptr_t address) {
 static uintptr_t current() {
     return base ? uintptr_t(read32(base + 0x40a270)) : 0;
 }
+// The game instance's process queue (game+0x11C): its front process is a movie
+// when its vtable is the movie process's (Sam2Game 0x2E2488).
+static bool readable(uintptr_t at, size_t bytes) {
+    MEMORY_BASIC_INFORMATION m{};
+    return at && VirtualQuery(reinterpret_cast<void *>(at), &m, sizeof m) && m.State == MEM_COMMIT &&
+           !(m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && at + bytes <= uintptr_t(m.BaseAddress) + m.RegionSize;
+}
 static bool nativePointerReady() {
     float sensitivity = readFloat(base + 0x3fe200);
     // Driven through the native dispatcher, not OS input: window focus is not required.
@@ -250,7 +257,17 @@ bool pointerAvailable() {
     ReleaseSRWLockShared(&stateLock);
     return same && sourceEligible && nativePointerReady();
 }
+bool movieOnTop() {
+    if (!base) return false;
+    const uintptr_t game = readable(base + 0x403350, 4) ? read32(base + 0x403350) : 0;
+    const uintptr_t queue = readable(game + 0x11c, 4) ? read32(game + 0x11c) : 0;
+    const uintptr_t front = readable(queue, 4) ? read32(queue) : 0;
+    return readable(front, 4) && read32(front) == base + 0x2e2488;
+}
 bool queueCommand(int command) {
+    // A movie in front never reads menu commands; one queued now would fire on
+    // the menu after it (a stray selection). The bridge posts a key instead.
+    if (movieOnTop()) { queuedCommand.store(0); return false; }
     if (!command || !active())
         return false;
     queuedCommand.store(command);

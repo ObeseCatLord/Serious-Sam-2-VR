@@ -1,6 +1,7 @@
 #include "eye_replay.hpp"
 #include "single_pass.hpp"
 #include "env_probe.hpp"
+#include "common/hand_wheel.hpp"
 #include "common/turret_look.hpp"
 #include "common/two_hand.hpp"
 #include "common/grenade_throw.hpp"
@@ -8806,6 +8807,7 @@ static float values[CommandCount]{}, priorValues[CommandCount]{};
 // A dead local player has no tracked gameplay, but native respawn/reload prompts
 // still wait for Fire/Use. Forward only those presses while dead (main thread).
 static float respawnValues[CommandCount]{}, respawnPrior[CommandCount]{};
+
 static uint64_t respawnTick = 0;
 // Provenance of the existing cached command values, not an admission policy.
 struct ControlSample {
@@ -9197,6 +9199,7 @@ static void rideGripDiagnose(const RideGripFrame &frame,const Input &input,const
             grip.p.x,grip.p.y,grip.p.z,h,centre.x,centre.y,centre.z,std::sqrt(nearest));
     }
 }
+static bool handleRide(uint32_t rideHandle);
 static void applyRideGrip(void *ride,Vec3 &look,const RideControlScalars &row) {
     auto *borrow=activeRideGrip;
     if(!borrow || !borrow->eligible) {rideGripFail(borrow?1:0);return;}
@@ -9207,6 +9210,9 @@ static void applyRideGrip(void *ride,Vec3 &look,const RideControlScalars &row) {
     const auto now=GetTickCount64();
     auto fail=[&](unsigned reason) {rideGripFail(reason);borrow->eligible=false;rideGrasp.cancel(c.input,c.producer);};
     if(!settings.immersiveVehicleGrips || row.mode!=2 || !(row.movementAbilities&8u)) {fail(2);return;}
+    // Squeezing the handles no longer steers: the hands steer as a wheel without
+    // grabbing (mountedLookClamp, common/hand_wheel.hpp).
+    if(handleRide(c.rider.ride)) {fail(17);return;}
     if(row.classRva!=frame.render.classRva || row.parameterToken!=frame.parameter ||
        row.renderableToken!=frame.render.renderableHandle) {fail(3);return;}
     if(!nativeMainThread || !nativeMainThread() || !vrSession(s) || !livePlayer(s)) {fail(4);return;}
@@ -9494,6 +9500,14 @@ static void loadSteeringWheelTexture() {
         "Content/SeriousSam2/Models/Vehicles/HoverFighter/Textures/Fighter.tex");
     log("Steering wheel texture %s",ready ? "loaded" : "unavailable; using plain wheel");
 }
+// The hoverbike (Fighter) and the UFO (Saucer): rides whose own handles the
+// hands steer as a wheel (common/hand_wheel.hpp).
+static bool handleRide(uint32_t rideHandle) {
+    void *ride = rideHandle && controlsGameBase ? resolve(rideHandle) : nullptr;
+    uintptr_t table = 0;
+    if (ride && readableMemory(ride, 4)) std::memcpy(&table, ride, 4);
+    return table && (table == controlsGameBase + 0x2a8558 || table == controlsGameBase + 0x2b8420);
+}
 static void updateSteeringWheel(const Snapshot &s) {
     auto &w=steeringWheel;
     if(!nativeMainThread || !nativeMainThread())return;
@@ -9505,18 +9519,9 @@ static void updateSteeringWheel(const Snapshot &s) {
     if(config.enabled && s.rider.seated() && livePlayer(s) && s.ui.gameplay) {
         steering=steeringWheelClass(resolve(s.rider.ride));
         if(w.ride!=s.rider.ride) {w.ride=s.rider.ride;w.rideSince=now;w.grasp.reset();}
-        // Rides with admitted authored handles keep them; wait for that admission first.
-        const bool hover=steering==WheelSteering::Heading && controlsGameBase && [&] {
-            void *ride=resolve(s.rider.ride);uintptr_t table=0;
-            if(ride && readableMemory(ride,4))std::memcpy(&table,ride,4);
-            return table==controlsGameBase+0x2a8558 || table==controlsGameBase+0x2b8420;
-        }();
-        if(hover && settings.immersiveVehicleGrips) {
-            AcquireSRWLockShared(&controlsLock);
-            const bool handles=handleFrameRide==s.rider.ride && now-handleFrameTick<1500;
-            ReleaseSRWLockShared(&controlsLock);
-            if(handles || now-w.rideSince<1500)steering=WheelSteering::None;
-        }
+        // The hoverbike (Fighter) and UFO (Saucer) have their own handles and the
+        // right stick: never a mod-made wheel (ObeseCatLord, 2026-10-24).
+        if(steering==WheelSteering::Heading && handleRide(s.rider.ride))steering=WheelSteering::None;
     } else w.ride=0;
     w.steering=steering;
     w.preview=steering==WheelSteering::None && config.enabled && config.previewOnFoot && s.rider.handheld() &&
@@ -10219,16 +10224,18 @@ static int __cdecl appForeground() {
 }
 // The loading screen's "Please press Start or A to continue" (the game's
 // gamepad text) or "press a key" names no VR control. While VR input is live
-// it names what continues in VR: the Use button (menu Confirm) or a trigger.
+// it names what continues in VR: the A button (menu Confirm) or a trigger.
+// The game asks by "ID=default text", not the bare ID.
 using Translate = const char *(__cdecl *)(const char *);
 static Translate originalTranslate = nullptr;
+static bool translationId(const char *text, const char *id) {
+    const size_t n = std::strlen(id);
+    return !std::strncmp(text, id, n) && (text[n] == '=' || text[n] == 0);
+}
 static const char *__cdecl translate(const char *id) {
     if (id && id[0] == 'E' && vrInputLive() &&
-        (!std::strcmp(id, "ETRSLoadingFinished.MessageXbox") || !std::strcmp(id, "ETRSLoadingFinished.MessagePC"))) {
-        const auto latest = copySnapshot().input;
-        const bool jumpButton = ((latest.buttons[0] | latest.buttons[1]) & Button::JumpBound) != 0;
-        return jumpButton ? "Press B or a trigger to continue" : "Press A or a trigger to continue";
-    }
+        (translationId(id, "ETRSLoadingFinished.MessageXbox") || translationId(id, "ETRSLoadingFinished.MessagePC")))
+        return "Press A or a trigger to continue";
     return originalTranslate(id);
 }
 // Native prompts ("Press {plcmdUse} to enter") name the bound keyboard key.
@@ -10393,11 +10400,18 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 const uint64_t now = GetTickCount64();
                 const float dt = lookClock && now > lookClock ? std::min(.1f, float(now - lookClock) / 1000.f) : 0.f;
                 lookClock = now;
-                // A ride with its own controls in the model (Vehicles ImmersiveGrips)
-                // is turned by them alone; the right stick turns the others.
-                const bool modelControls = settings.immersiveVehicleGrips && handleFrameRide == captured.rider.ride &&
-                                           now - handleFrameTick < 1500;
-                Vec3 rideLook = advanceTurretLook(look, modelControls ? 0.f : captured.input.axis[1][0],
+                // The right stick turns every ride. On the hoverbike and the UFO
+                // (Vehicles ImmersiveGrips) the hands also steer as on a wheel, no
+                // grabbing: tilting it (the right hand lower) turns right, as the
+                // stick does; the two add up.
+                float steer = captured.input.axis[1][0];
+                float wheel = 0;
+                const bool modelControls = settings.immersiveVehicleGrips && handleRide(captured.rider.ride) &&
+                    controllerTracked(captured.input, 0) && controllerTracked(captured.input, 1) &&
+                    captured.input.gripValid[0] && captured.input.gripValid[1] &&
+                    handWheelDeflection(captured.input.grip[0].p, captured.input.grip[1].p, wheel, .03f, .6f); // The stick rate adds its own dead zone.
+                if (modelControls) steer = std::clamp(steer + wheel, -1.f, 1.f);
+                Vec3 rideLook = advanceTurretLook(look, steer,
                                                   settings.rideHeadPitch ? 0.f : captured.input.axis[1][1],
                                                   settings.smoothTurnRate, dt);
 
@@ -10412,7 +10426,7 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 {
                     static unsigned traced = 0;
                     if (traced++ % 200 == 0)
-                        log("Ride aim heading=%.3f pitch=%.3f modelControls=%d", rideLook.x, rideLook.y, modelControls);
+                        log("Ride aim heading=%.3f pitch=%.3f handWheel=%d wheel=%.2f", rideLook.x, rideLook.y, modelControls, wheel);
                 }
                 void *candidateRideToken=nullptr;
                 if (std::isfinite(rideLook.x) && std::isfinite(rideLook.y) &&
@@ -10529,9 +10543,6 @@ static void __fastcall poll(void *b, void *) {
             respawnValues[6] = primaryActionEligible(s.input, 0) && s.input.trigger[0] > .5f ? 1 : 0;
             respawnValues[7] = ((s.input.buttons[0] | s.input.buttons[1]) & Use) ? 1 : 0;
         }
-        if (netricsa)
-            // The wheel-open button (Netricsa's old Touch Y / Index trackpad) also closes it.
-            respawnValues[15] = ((s.input.buttons[0] | s.input.buttons[1]) & (Netricsa | WheelOpen)) ? 1 : 0;
         respawnTick = GetTickCount64();
     } else {
         std::fill(std::begin(respawnPrior), std::end(respawnPrior), 0);
@@ -10618,12 +10629,77 @@ static bool netricsaOpen(const Snapshot &s) {
     return livePlayer(s) && s.initialized && local(s.player) && isNetricsa && isNetricsa(s.player) &&
            fresh(s.input) && !recenterHeld(s.input) && !menus::active();
 }
+bool netricsaShown() noexcept;
+static bool latestInput(Input &out);
+// Netricsa with the latest controller state (see latestInput).
+static bool netricsaLive(Input &in) {
+    return netricsaShown() && latestInput(in) && fresh(in) && !recenterHeld(in);
+}
 static bool respawnCommand(int i, const Snapshot &s) {
     if (!respawnTick || GetTickCount64() - respawnTick >= 200) return false;
-    if (i == 15) return netricsaOpen(s);
     return (i == 5 || i == 6 || i == 7) && respawnRoute(s);
 }
+// Netricsa reads player commands (its handler in CPlayerPuppetEntity's controls):
+// Z-/Z+ scroll its text, P+/P- its second axis (held: it repeats at its own
+// rate), Use switches Description/Statistic, DisplayNetricsa closes it. The game
+// pauses while it is open, and the player input poll with it, so its commands
+// come straight from the latest controller state: the left stick scrolls, the
+// right stick the second axis, A (or a trigger) switches pages, B, Menu, the
+// wheel button or the Netricsa bubble close it, as its gamepad prompts say.
+static bool netricsaCommand(int i) { return i == 2 || i == 3 || i == 7 || i == 12 || i == 13 || i == 15; }
+static float netricsaValue(int i, const Input &in) {
+    const uint32_t buttons = in.buttons[0] | in.buttons[1];
+    const bool jumpProfile = (buttons & JumpBound) != 0;
+    const bool aButton = jumpProfile ? (in.buttons[1] & Jump) != 0 : (buttons & Use) != 0;
+    const bool bButton = jumpProfile ? (in.buttons[1] & Use) != 0 : (in.buttons[1] & WheelOpen) != 0;
+    switch (i) {
+    case 3: return in.axis[0][1] > .5f ? 1.f : 0.f;   // plcmdZ-: up
+    case 2: return in.axis[0][1] < -.5f ? 1.f : 0.f;  // plcmdZ+: down
+    case 12: return in.axis[1][1] > .5f ? 1.f : 0.f;  // plcmdP+
+    case 13: return in.axis[1][1] < -.5f ? 1.f : 0.f; // plcmdP-
+    case 7: return aButton || (primaryActionEligible(in, 1) && in.trigger[1] > .75f) ||
+                   (primaryActionEligible(in, 0) && in.trigger[0] > .75f) ? 1.f : 0.f;
+    case 15: return bButton || (buttons & (Menu | Netricsa | WheelOpen)) ? 1.f : 0.f;
+    default: return 0.f;
+    }
+}
+// Each command's value at its previous query (a press is a change since then).
+static float netricsaPrior[CommandCount]{};
+// The latest controller state (the snapshot's only refreshes in the player step,
+// which the game pauses while Netricsa is open).
+static bool latestInput(Input &out) {
+    Lock l(channel);
+    if (!l) return false;
+    out = channel.shared->latest;
+    return true;
+}
+bool netricsaShown() noexcept {
+    const auto s = copySnapshot();
+    // The snapshot's player is the local one (update() publishes only that);
+    // local() itself answers per thread (false on the render thread).
+    const bool live = livePlayer(s) != nullptr, init = s.initialized, mine = live,
+               open = mine && isNetricsa && isNetricsa(s.player), menu = menus::active();
+    static unsigned traced = 0, previous = ~0u;
+    const unsigned state = unsigned(open) | unsigned(menu) << 1;
+    if (state != previous && traced < 32) { previous = state; ++traced; log("Netricsa state live=%d init=%d local=%d open=%d menu=%d", live, init, mine, open, menu); }
+    return init && open && !menu;
+}
+static void traceNetricsaQuery(int i, int mode) {
+    static unsigned seen = 0;
+    if (netricsaCommand(i) && !(seen & (1u << (i * 4 % 32 + mode % 4)))) {
+        seen |= 1u << (i * 4 % 32 + mode % 4);
+        log("Netricsa query command=%d mode=%d live=%d", i, mode, int(netricsaShown()));
+    }
+}
 static float __fastcall commandValue(void *b, void *, uint32_t id) {
+    {
+        AcquireSRWLockShared(&controlsLock);
+        const int i = commandIndex(b, id);
+        ReleaseSRWLockShared(&controlsLock);
+        Input latest;
+        if (netricsaCommand(i) && netricsaShown()) traceNetricsaQuery(i, 3);
+        if (netricsaCommand(i) && netricsaLive(latest)) return netricsaValue(i, latest);
+    }
     auto snapshot = copySnapshot();
     if (!vrSession(snapshot))
         return originalValue(b, id);
@@ -10648,6 +10724,25 @@ static float __fastcall commandValue(void *b, void *, uint32_t id) {
 }
 static int query(void *b, uint32_t id, int mode, CommandInt original) {
     auto snapshot = copySnapshot();
+    {
+        AcquireSRWLockShared(&controlsLock);
+        const int i = commandIndex(b, id);
+        ReleaseSRWLockShared(&controlsLock);
+        Input latest;
+        if (netricsaCommand(i) && netricsaShown()) traceNetricsaQuery(i, mode);
+        if (netricsaCommand(i)) {
+            if (netricsaLive(latest)) {
+                const float v = netricsaValue(i, latest), prev = netricsaPrior[i];
+                netricsaPrior[i] = v;
+                static unsigned traced = 0;
+                if (v != prev && traced < 64) { ++traced; log("Netricsa command %d %s", i, v > 0 ? "down" : "up"); }
+                return nativeCommandQuery(v, prev, mode, true);
+            }
+            // Its real state outside Netricsa: no false release (which closed it at once)
+            // and a button held into Netricsa needs a fresh press.
+            netricsaPrior[i] = netricsaValue(i, snapshot.input);
+        }
+    }
     if (!vrSession(snapshot))
         return original(b, id);
     {

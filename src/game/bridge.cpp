@@ -2941,6 +2941,21 @@ static void presentBody(IDirect3DDevice9 *d) {
     // The weapon wheel's menu bubble opens the pause menu exactly as Menu does.
     if (wheelMenuRequested(now) && action == MenuAction::None && valid && !menuVisible)
         action = MenuAction::Back;
+    // Netricsa takes its controls as player commands (engine poll): no menu keys,
+    // Escape would open the pause menu over it.
+    const bool netricsa = netricsaShown();
+    // A movie (the title demo, in-level films) stops on Enter, Space, Escape or a
+    // click (its own bindings), never on menu commands: A or B posts Enter.
+    const bool movie = menus::movieOnTop();
+    if (action != MenuAction::None) {
+        static unsigned traced = 0;
+        if (traced < 64) {
+            ++traced;
+            log("Menu action %d nativeMenu=%d netricsa=%d movie=%d", int(action), int(nativeMenu), int(netricsa), int(movie));
+        }
+    }
+    if (netricsa) action = MenuAction::None;
+    if (movie && action != MenuAction::Back && action != MenuAction::Confirm) action = MenuAction::None;
     WORD key = 0;
     int command = 0; // Sam2Game menu system commands (syscmdOk, syscmdBack, ...).
     switch (action) {
@@ -2969,8 +2984,11 @@ static void presentBody(IDirect3DDevice9 *d) {
     // Touch X/Y, Index left A / left trackpad.
     {
         static uint32_t previousExtras = 0;
-        // The wheel-open button took over Touch Y / Index left trackpad: still F2 here.
-        const uint32_t extras = valid ? ((input.buttons[0] | input.buttons[1]) & (Reload | Netricsa | WheelOpen)) : 0;
+        // The wheel-open button took over Touch Y / Index left trackpad: still F2 here
+        // (Touch's right B, also wheel-open, is the menus' B: Back).
+        const bool jumpProfile = ((input.buttons[0] | input.buttons[1]) & JumpBound) != 0;
+        const uint32_t right = jumpProfile ? input.buttons[1] : input.buttons[1] & ~uint32_t(WheelOpen);
+        const uint32_t extras = valid ? ((input.buttons[0] | right) & (Reload | Netricsa | WheelOpen)) : 0;
         const uint32_t pressed = extras & ~previousExtras;
         previousExtras = extras;
         if (nativeMenu && !key && pressed)
@@ -2979,6 +2997,7 @@ static void presentBody(IDirect3DDevice9 *d) {
     // Native menus take commands through their own dispatcher. Other screens
     // (gameplay pause, loading prompts, movies) get a key posted to the game
     // window; neither path needs window focus.
+    if (movie && key) key = VK_RETURN;
     if (key && !(nativeMenu && menus::queueCommand(command)))
         keyTap(key);
     if (!valid && pendingKey) {
