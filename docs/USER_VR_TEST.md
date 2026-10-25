@@ -46,8 +46,11 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
    to continue". A or B skips the title screen's attract video.
 4. Netricsa: the left stick scrolls, the right stick changes page, A uses, and
    B or the menu button closes.
-5. The pause menu and Netricsa float in front of the last game view instead of
-   switching to the projected 2D menu.
+5. The pause menu floats in front of the live game world: look around while
+   paused and the world turns with your head. Single player pauses as on the
+   desktop; in multiplayer the game runs on for everyone, as the game's own
+   pause menu does. The HUD and lasers are hidden while it's open. Netricsa
+   still floats in front of the last game view.
 6. The title screen uses a 4:3 image. Cutscenes are no longer cut off at the
    top and bottom.
 7. Desktop play (no headset): a "VR options" button sits at the bottom of the

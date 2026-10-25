@@ -1248,6 +1248,9 @@ struct Host {
     Swapchain backdrop[2];
     Request backdropRequest{};
     bool backdropValid = false, menuKeyed = false;
+    // A pause menu over the level with the world rendered live behind it (the game's
+    // GameplayMenuView): stereo pairs go on, the keyed menu panel over them.
+    bool liveBehindMenu = false;
     // Foveated readback: eye[] carries the downsampled full view, inset[] the
     // full-resolution crop submitted as a second projection layer.
     Swapchain inset[2];
@@ -1832,7 +1835,7 @@ struct Host {
                 shared.width,
                 shared.height,
                 shared.rendererReady != 0,
-                shared.ui.gameplay != 0 && !shared.menu.visible,
+                (shared.ui.gameplay != 0 && !shared.menu.visible) || shared.ui.gameplay == GameplayMenuView,
                 shared.latest.focused != 0,
                 shared.latest.headValid != 0 && viewsTracked};
     }
@@ -2980,7 +2983,7 @@ struct Host {
         const bool fresh = ui.tickMs && now >= ui.tickMs && now - ui.tickMs <= UiFreshMs;
         for (unsigned h = 0; h != 2; ++h) {
             auto &wheel = wheels[h];
-            const bool open = fresh && ui.gameplay && ui.wheel[h].open;
+            const bool open = fresh && ui.gameplay && ui.gameplay != GameplayMenuView && ui.wheel[h].open;
             if (!open) {
                 wheel.reset();
                 continue;
@@ -3119,7 +3122,7 @@ struct Host {
         // in the panel's own image, at the place the separate button sits elsewhere.
         const float panelHeight = settings.menuWidth * float(height) / width;
         const float buttonHeight = OptionsButtonWidth * OptionsButtonAspect;
-        const bool strip = backdropValid && menuGeneration && !options.open;
+        const bool strip = (backdropValid || liveBehindMenu) && menuGeneration && !options.open;
         const uint32_t stripRows = strip ? uint32_t(std::ceil((OptionsButtonGap + buttonHeight + .02f) / panelHeight * float(height))) : 0;
         const uint32_t imageHeight = height + stripRows;
         if (menuChain.width != width || menuChain.height != imageHeight) {
@@ -3233,7 +3236,7 @@ struct Host {
         // corrupts a second quad after a projection layer (V747, V783). The game
         // draws its own cursor in the menu; the VR options button waits for the
         // weapon wheel's bubble there.
-        if (backdropValid) {
+        if (backdropValid || liveBehindMenu) {
             if (hit.valid)
                 presentedPointer = {input.sequence, GetTickCount64(), sequence, input.session, input.reference,
                                     menuGeneration, 1, hand, hit.u, hit.v, input.trigger[hand],
@@ -3416,11 +3419,14 @@ struct Host {
             presentedPointer = {};
             // A menu over a level: hold the last world frame before the world path
             // below drops it.
+            liveBehindMenu = published && snapshot.menuVisible && (snapshot.menuOverlay & MenuOverLevel) &&
+                             snapshot.ui.gameplay == GameplayMenuView;
+            if (liveBehindMenu) backdropValid = false;
             if (published && snapshot.menuVisible && (snapshot.menuOverlay & MenuOverLevel) && !backdropValid &&
-                !api.lossPending)
+                !liveBehindMenu && !api.lossPending)
                 captureBackdrop();
             if (published && !quit && !api.lossPending && frameState.shouldRender) {
-                if (snapshot.renderer && !snapshot.menuVisible && validViews && input.focused &&
+                if (snapshot.renderer && (!snapshot.menuVisible || liveBehindMenu) && validViews && input.focused &&
                     input.headValid) {
                     const auto &f = settings.foveation;
                     const uint32_t lowWidth = foveationExtent(snapshot.width, f.periphery),
@@ -3504,15 +3510,21 @@ struct Host {
                         hudAnchor.reset();
                         for (auto &wheel : wheels)
                             wheel.reset();
-                        // Over a level: keep the last world frame behind the menu.
-                        if (snapshot.menuOverlay & MenuOverLevel) {
-                            if (!backdropValid) captureBackdrop();
-                            backdropLayer(backdropProjection, backdropViews, layers);
-                        } else backdropValid = false;
-                        menuKeyed = backdropValid && (snapshot.menuOverlay & MenuKeyed);
-                        invalidateCachedPair();
-                        cancelRequests();
-                        if (!(backdropValid && options.open)) menuLayer(input, menuQuad, cursorQuad, optionsButtonQuad, layers);
+                        if (liveBehindMenu) {
+                            // The live world (the projection above) behind the keyed menu.
+                            menuKeyed = (snapshot.menuOverlay & MenuKeyed) != 0;
+                        } else {
+                            // Over a level: keep the last world frame behind the menu.
+                            if (snapshot.menuOverlay & MenuOverLevel) {
+                                if (!backdropValid) captureBackdrop();
+                                backdropLayer(backdropProjection, backdropViews, layers);
+                            } else backdropValid = false;
+                            menuKeyed = backdropValid && (snapshot.menuOverlay & MenuKeyed);
+                            invalidateCachedPair();
+                            cancelRequests();
+                        }
+                        if (!((backdropValid || liveBehindMenu) && options.open))
+                            menuLayer(input, menuQuad, cursorQuad, optionsButtonQuad, layers);
                     } else {
                         menuAnchor.reset();
                         backdropValid = false;

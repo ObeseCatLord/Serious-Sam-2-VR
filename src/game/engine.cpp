@@ -479,6 +479,9 @@ struct Snapshot {
     bool selecting[2]{}, zoom[2]{};
     uint32_t generation = 0, networkGeneration = 0;
     Ui ui;
+    // A pause menu over a live level (menuViewFrame): the world goes on rendering in
+    // stereo behind it, head tracked, with every control off (ui.gameplay 0).
+    bool menuView = false;
 };
 // Stationary input-consumption ownership lives beside the copied pose payload.
 // Snapshot publication/reset cannot copy or discard an accounted native level.
@@ -857,11 +860,12 @@ bool cinematicCameraActive() noexcept {
     uint32_t camera=0;std::memcpy(&camera,static_cast<uint8_t*>(info)+0x6c,4);
     return camera && resolve(camera);
 }
-static bool trackingEligible(void *p) {
+// pausedView: a menu may be open (the stereo view behind a pause menu, no controls).
+static bool trackingEligible(void *p, bool pausedView = false) {
     RiderIdentity rider;
     return nativeInputHealthy() && hooksReady.load(std::memory_order_acquire) && local(p) &&
            (singlePlayer() || multiplayer::server() || multiplayer::negotiatedLocal()) && isAlive(p) &&
-           !isNetricsa(p) && !menus::active() && !cinematicCameraActive() && readNativeRider(p, rider) &&
+           !isNetricsa(p) && (pausedView || !menus::active()) && !cinematicCameraActive() && readNativeRider(p, rider) &&
            (rider.seated() || (rider.handheld() && !thirdPerson(p)));
 }
 static bool trackingAnchor(void *p, Pose &out) {
@@ -1850,7 +1854,8 @@ static void publishSnapshot(const Snapshot &s) {
     Lock l(channel);
     if (l && trackingEpoch(*channel.shared) == s.generation) {
         channel.shared->ui = s.ui;
-        if (!s.ui.gameplay && rideTransitionHold) channel.shared->ui.gameplay = 2; // Host: hold the world.
+        if (!s.ui.gameplay && rideTransitionHold) channel.shared->ui.gameplay = GameplayHold; // Host: hold the world.
+        if (s.menuView) channel.shared->ui.gameplay = GameplayMenuView; // Host: the world behind the menu.
         for (int h = 0; h < 2; ++h)
             channel.shared->ui.fireSequence[h] = fireFeedback[h].load(std::memory_order_relaxed);
         channel.shared->ui.damageSequence = damageFeedback.load(std::memory_order_relaxed);
@@ -2405,10 +2410,21 @@ static void voiceFrame() {
     void *p = s.playerHandle && resolve ? resolve(s.playerHandle) : nullptr;
     voiceTick(p && local(p) ? p : nullptr, s);
 }
+// A pause menu over a live level in VR: the world keeps rendering in stereo behind it,
+// so the headset can look around, while the menu keeps every control (ui.gameplay 0).
+// The game itself decides what the menu pauses: single player stops, multiplayer runs on.
+static bool menuViewEligible(void *p, const Snapshot &s, const Input &input, const RiderIdentity &rider,
+                             bool riderValid) {
+    return riderValid && s.initialized && menus::worldHidden() && fresh(input) &&
+           s.interruption.permits(input, GetTickCount64(), s.inputProducer) && trackingEligible(p, true) &&
+           nativeRiderCurrent(p, rider) && validTrackingEpoch(s.generation);
+}
+static uint64_t lastUpdateTick = 0; // Main thread: the simulation's last snapshot update.
 static void update(void *p) {
     validateLabOnlineIsolation(false);
     if (rigMutationActive || !hooksReady.load(std::memory_order_acquire) || !channel.shared || !local(p))
         return;
+    lastUpdateTick = GetTickCount64();
     simulationThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
     auto s = copySnapshot();
     Input input = s.input;
@@ -2482,6 +2498,7 @@ static void update(void *p) {
     s.ui = {};
     s.ui.tickMs = GetTickCount64();
     s.ui.gameplay = enabled ? 1 : 0;
+    s.menuView = !enabled && menuViewEligible(p, s, input, rider, riderValid);
     s.ui.health = health(p);
     s.ui.armor = armor(p);
     if (enabled && hadHealth && s.ui.health < previousHealth)
@@ -3321,6 +3338,51 @@ static void update(void *p) {
     }
     voiceTick(p, s);
     publishSnapshot(s);
+}
+// Main thread, every frame a menu hides the world (menus hidesWorld): whether the
+// world renders live behind it. A single-player pause stops the simulation and with
+// it update(), so the snapshot's input and freshness are refreshed here; in
+// multiplayer the simulation runs on and update() keeps them.
+bool menuViewFrame() noexcept {
+    if (rigMutationActive || !hooksReady.load(std::memory_order_acquire) || !channel.shared) return false;
+    auto s = copySnapshot();
+    void *p = s.player;
+    if (!p || !s.playerHandle || !resolve || resolve(s.playerHandle) != p || !local(p)) return false;
+    const uint64_t now = GetTickCount64();
+    if (now >= lastUpdateTick && now - lastUpdateTick < 100) return s.menuView;
+    Input input = s.input;
+    uint32_t producer = s.inputProducer;
+    {
+        Lock l(channel);
+        if (!l) return s.menuView;
+        input = channel.shared->latest;
+        producer = channel.shared->hostPid;
+        if (!channel.shared->rendererReady) input.session = input.focused = 0;
+    }
+    RiderIdentity rider;
+    const bool riderValid = readNativeRider(p, rider);
+    const bool view = producer == s.inputProducer && input.session == s.input.session &&
+                      input.reference == s.input.reference && rider == s.rider &&
+                      menuViewEligible(p, s, input, rider, riderValid);
+    if (!view && !s.menuView) return false;
+    if (view && s.ui.gameplay) {
+        // Paused before the simulation saw the menu: controls off now, as update()
+        // does when a menu opens (the frames of tracked play are retired).
+        s.networkGeneration = networkGenerations.advance();
+        advanceGeneration(s);
+        s.ui.gameplay = 0;
+        s.ui.trackingGeneration = s.generation;
+        s.fire[0] = s.fire[1] = s.zoom[0] = s.zoom[1] = false;
+        s.use = s.jump = s.sprint = s.grenade = false;
+        if (!validTrackingEpoch(s.generation)) return false;
+    }
+    s.menuView = view;
+    if (view) {
+        s.input = input;
+        s.ui.tickMs = now;
+    }
+    publishSnapshot(s);
+    return view;
 }
 struct PreparedPlayer {
     uint32_t handle = 0;
@@ -4424,6 +4486,7 @@ static void invalidateInterruptedInput() noexcept {
     current.fire[0] = current.fire[1] = false;
     current.zoom[0] = current.zoom[1] = false;
     current.ui.gameplay = 0;
+    current.menuView = false;
     ReleaseSRWLockExclusive(&snapshotLock);
 }
 static void __fastcall simulationStep(void *simulation, void *) {
@@ -5302,7 +5365,7 @@ static void __fastcall viewPrepare(void *command, void *, const Matrix34 &view, 
 }
 bool headFramePrepared(void* player,const Request& request) noexcept {
     const auto snapshot=copySnapshot();
-    if(!settings.headFade||(!snapshot.rider.handheld()&&!snapshot.rider.seated()))return true;
+    if(!settings.headFade||snapshot.menuView||(!snapshot.rider.handheld()&&!snapshot.rider.seated()))return true;
     if(player!=snapshot.player||simulationThread.load()!=GetCurrentThreadId())return false;
     AcquireSRWLockShared(&laserLock);
     const auto& h=headVolumeObservation;
@@ -5322,7 +5385,8 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
     eyeHeadClearance={};headVolumeDrawSafe=true;pairHeadNearBits=0;
     eyeSnapshot = copySnapshot();
     if (!nativeFrameIdentity(request, eyeSnapshot.input, eyeSnapshot.generation, eyeSnapshot.initialized,
-                             eyeSnapshot.ui.gameplay, p == eyeSnapshot.player && livePlayer(eyeSnapshot)) ||
+                             eyeSnapshot.ui.gameplay || eyeSnapshot.menuView,
+                             p == eyeSnapshot.player && livePlayer(eyeSnapshot)) ||
         !vrSession(eyeSnapshot))
         return false;
     originalCamera(p, &eyeNativeCamera);
@@ -5356,7 +5420,7 @@ bool beginStereo(void *p, const Request &request, uint32_t &remoteOwner) {
     }
     if (ready) {
         freezeLasers(request);
-        if (settings.headFade && (eyeSnapshot.rider.handheld()||eyeSnapshot.rider.seated())) {
+        if (settings.headFade && !eyeSnapshot.menuView && (eyeSnapshot.rider.handheld()||eyeSnapshot.rider.seated())) {
             const Pose head = worldHeadTracking(eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn,request.input.head);
             HeadVolumeObservation diagnosticSample;
             HeadQueryDiagnostic diagnosticQuery;
@@ -5440,9 +5504,9 @@ bool commitStereo(void *p,const Request &request,Slot &slot,uint32_t remoteOwner
         ++snapshotNativeReadDepth;counted=true;
         AcquireSRWLockShared(&snapshotLock);held=true;
         const bool eligible=nativeFrameIdentity(request,current.input,current.generation,current.initialized,
-            current.ui.gameplay,p==current.player && livePlayer(current)) && vrSession(current) &&
+            current.ui.gameplay || current.menuView,p==current.player && livePlayer(current)) && vrSession(current) &&
             eyeSnapshot.rigRevision==current.rigRevision &&
-            fresh(current.input) && trackingEligible(p) && nativeRiderCurrent(p,current.rider) && !weaponPairFault && headVolumeDrawSafe;
+            fresh(current.input) && trackingEligible(p,current.menuView) && nativeRiderCurrent(p,current.rider) && !weaponPairFault && headVolumeDrawSafe;
         if(eligible)slot.headClearance=eyeHeadClearance;
         const RideGripRig rig{eyeSnapshot.rider,eyeSnapshot.inputProducer,eyeSnapshot.generation,
             eyeSnapshot.rigRevision,graphicsResourceGeneration(),eyeAnchor,eyeSnapshot.origin,eyeSnapshot.turn};
@@ -8565,7 +8629,7 @@ static bool markerFrameCurrent(void *player, const Request &request, int index) 
     const auto live = copySnapshot();
     return live.rigRevision==eyeSnapshot.rigRevision &&
            live.rider == eyeSnapshot.rider && nativeRiderCurrent(player, eyeSnapshot.rider) &&
-           nativeFrameIdentity(request, live.input, live.generation, live.initialized, live.ui.gameplay,
+           nativeFrameIdentity(request, live.input, live.generation, live.initialized, live.ui.gameplay || live.menuView,
                                live.player == player && livePlayer(live)) && vrSession(live) && fresh(live.input);
 }
 static bool markerDrawPortCurrent(void *drawPort, const Request &request, WorldMarkerDimensions &out) {
@@ -8769,6 +8833,9 @@ static void __fastcall brainRender(void *brain,void *) {
     });
 }
 static void __fastcall overlayRender(void *player,void *,int flag) {
+    // Behind a pause menu (menuViewFrame) the HUD is left out, as with the world
+    // hidden: it would be drawn into the flat menu panel.
+    if(menus::worldHidden() && copySnapshot().menuView) return;
     const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     const bool outer=uiOverlayDepth==0;
     ++uiOverlayDepth;
@@ -8838,15 +8905,19 @@ static void __fastcall render(void *p,void *) {
         // never acquire a native player/rider getter merely for diagnostics.
         const bool extent = nativeRenderExtentCurrent(), samePlayer = extent && p == s.player;
         const bool eligible = samePlayer && trackingEligible(p);
-        const bool session = eligible && vrSession(s), currentInput = session && fresh(s.input);
+        // A pause menu over the level (menuViewFrame): the stereo view without controls.
+        const bool menuView = samePlayer && !eligible && s.menuView && menus::worldHidden();
+        const bool view = menuView && trackingEligible(p, true);
+        const bool session = (eligible || view) && vrSession(s), currentInput = session && fresh(s.input);
         static unsigned renderDiagnostics = 0;
         if (s.ui.gameplay && renderDiagnostics < 4) {
             ++renderDiagnostics;
             log("Native world render gate extent=%u player=%u eligible=%u session=%u fresh=%u gameplay=%u marker=%u",
                 extent,samePlayer,eligible,session,currentInput,s.ui.gameplay,caller==markerParentReturn);
         }
-        if(extent && samePlayer && eligible && session && currentInput && s.ui.gameplay)
+        if(extent && samePlayer && session && currentInput && ((eligible && s.ui.gameplay) || view))
             stereo(p,presentedRender,caller==markerParentReturn ? nativeMarkerPostlude : nullptr);
+        else if(menuView) clearCanvasTarget(); // As a hidden world: no flat world in the keyed menu.
         else presentedRender(p);
     },[&](bool aborted) noexcept {
         if(aborted) {
@@ -11266,7 +11337,7 @@ static void finishRoomscaleRevision(LocalRoomscaleAttempt& c,bool moved,bool set
             roomscaleFaulted.store(true);nativeInputFailed();
             current.generation=advanceEpochUnlocked();
             current.ui.trackingGeneration=current.generation;
-            current.ui.gameplay=0;
+            current.ui.gameplay=0;current.menuView=false;
         }
     }
     ReleaseSRWLockExclusive(&snapshotLock);

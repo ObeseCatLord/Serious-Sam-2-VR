@@ -282,6 +282,9 @@ static int __cdecl hidesWorld() {
             int(current() != 0), int(movieOnTop()));
     }
     if (hide) {
+        // The world renders live in stereo behind the menu (engine render: the desktop
+        // canvas is left black, so the menu's capture stays keyed).
+        if (menuViewFrame()) return originalHidesWorld();
         clearCanvasTarget(); // The last world frame would stay behind the menu otherwise.
         return 1;
     }

@@ -77,6 +77,10 @@ struct WheelUi {
     // ABI15: a bit per native weapon id the game would fire now (CanBeUsedForFiring).
     uint32_t usable = 0;
 };
+// Ui::gameplay: tracked play with controls (On); a ride transition, the host holding the
+// last world frame (Hold); a pause menu over a live level, the world rendered in stereo
+// behind the menu with every control off (MenuView).
+enum GameplayState : uint32_t { GameplayOff = 0, GameplayOn = 1, GameplayHold = 2, GameplayMenuView = 3 };
 struct Ui {
     uint64_t tickMs = 0;
     uint32_t gameplay = 0, trackingGeneration = 0;

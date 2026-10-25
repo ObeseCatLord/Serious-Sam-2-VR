@@ -4861,8 +4861,12 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             // The desktop window mirrors the left eye; the native mono render is
             // skipped (a third full scene traversal), keeping its bookkeeping.
             monoPresentationWithoutRender(puppet);
-            if (generation == graphicsResourceGeneration() && uiFrame.color)
-                originalStretch(d,uiFrame.target[0],nullptr,uiFrame.color,nullptr,D3DTEXF_NONE);
+            // Behind a pause menu (menus::worldHidden) the canvas stays black: the
+            // menu drawn over it is captured keyed, its black transparent.
+            if (generation == graphicsResourceGeneration() && uiFrame.color) {
+                if (menus::worldHidden()) d->ColorFill(uiFrame.color, nullptr, D3DCOLOR_ARGB(0, 0, 0, 0));
+                else originalStretch(d,uiFrame.target[0],nullptr,uiFrame.color,nullptr,D3DTEXF_NONE);
+            }
         }
         perf.desktopCpu+=PerfClock::seconds(desktopStart,PerfClock::now());
         if (generation != graphicsResourceGeneration()) return;

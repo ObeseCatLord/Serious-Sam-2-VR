@@ -33,6 +33,9 @@ void installEyeCanvas() noexcept;
 void setDesktopWorld(bool render) noexcept;
 bool netricsaShown() noexcept; // engine.cpp: Netricsa is open (its controls are player commands).
 bool levelActive() noexcept;
+// engine.cpp, main thread, a frame a menu hides the world: whether the world renders
+// live in stereo behind it (a pause menu over a level in VR, controls off).
+bool menuViewFrame() noexcept;
 void clearCanvasTarget() noexcept; // bridge.cpp: the current render target to black (a world-hidden menu frame).   // engine.cpp: a level with a live local player (else the front end or a load).
 void setSinglePass(bool enabled) noexcept;
 void setEyeReplay(bool enabled) noexcept;
