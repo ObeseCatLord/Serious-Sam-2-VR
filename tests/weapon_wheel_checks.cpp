@@ -191,6 +191,32 @@ void releaseSelect() {
     assert(w.update(false, 0, 0, Ids, Count, true, at(Hand), WheelAllBubbles) == -1 && w.selected == -1);
 }
 
+// A weapon the game would not fire (no ammo for one shot) hovers but is never chosen.
+void unusable() {
+    const uint32_t usable = ~(1u << 6);
+    WeaponWheel w;
+    w.update(false, 0, 0, Ids, Count, true, at(Hand), 0, usable);
+    w.update(true, 0, 0, Ids, Count, true, at(Hand), 0, usable);
+    const int slot = slotOf(w.ring, 6);
+    const Vec3 target = slotPoint(w, uint32_t(slot));
+    w.update(true, 0, 0, Ids, Count, true, at(target), 0, usable);
+    assert(w.hoverSlot == slot && w.hover == slot); // Still shown as hovered.
+    assert(w.update(false, 0, 0, Ids, Count, true, at(target), 0, usable) == -1);
+    assert(w.selected == -1 && w.refused == 6 && !w.open && w.action == WheelBubble::None);
+    // The mask does not move slots, and a usable neighbour is still chosen.
+    w.update(true, 0, 0, Ids, Count, true, at(Hand), 0, usable);
+    assert(slotOf(w.ring, 6) == slot && slotOf(w.ring, 13) >= 0);
+    const Vec3 sniper = slotPoint(w, uint32_t(slotOf(w.ring, 13)));
+    w.update(true, 0, 0, Ids, Count, true, at(sniper), 0, usable);
+    assert(w.update(false, 0, 0, Ids, Count, true, at(sniper), 0, usable) == 13 && w.refused == -1);
+    // Ring colours and sweep.
+    assert(wheelAmmoColour(1) == 0x3cdc50ffu && wheelAmmoColour(.5f) == 0xf2c230ffu &&
+           wheelAmmoColour(.2f) == 0xe8443cffu && wheelAmmoColour(-1) == 0x5aa8ff90u);
+    assert(near(wheelAmmoSweep(-1, -1), 1) && near(wheelAmmoSweep(0, 0), 0) && near(wheelAmmoSweep(.001f, 1), .03f) &&
+           near(wheelAmmoSweep(.5f, 25), .5f) && near(wheelAmmoSweep(2, 99), 1));
+    assert(wheelWeaponUsable(1u << 16, 16) && !wheelWeaponUsable(~0u, -1) && !wheelWeaponUsable(~0u, 40));
+}
+
 void cancel() {
     WeaponWheel w;
     w.update(true, 0, 0, Ids, Count, true, at(Hand), WheelAllBubbles);
@@ -430,6 +456,7 @@ int main() {
     hoverPick();
     pointing();
     releaseSelect();
+    unusable();
     cancel();
     bubbles();
     wheelOpenGate();
@@ -439,5 +466,5 @@ int main() {
     meshPlacement();
     meshBounds();
     inputSample();
-    std::puts("Weapon wheel layout, hover, release, cancel, bubble, wheel-button gate, grip jump, mesh placement and mesh bounds checks passed");
+    std::puts("Weapon wheel layout, hover, release, unusable weapon, ammo ring, cancel, bubble, wheel-button gate, grip jump, mesh placement and mesh bounds checks passed");
 }

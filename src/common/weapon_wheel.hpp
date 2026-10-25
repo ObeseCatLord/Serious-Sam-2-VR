@@ -36,6 +36,22 @@ inline const wchar_t *wheelBubbleName(WheelBubble bubble) {
     }
 }
 // Arc length per weapon; the ring radius grows with the weapon count within reach.
+inline constexpr bool wheelWeaponUsable(uint32_t usable, int32_t weapon) {
+    return weapon >= 0 && uint32_t(weapon) < 32 && ((usable >> uint32_t(weapon)) & 1u) != 0;
+}
+// Ammo ring colour (0xRRGGBBAA) for a weapon's ammo fraction, as Fusion's VR
+// wheel: green, yellow below two thirds, red below one third; a weapon without
+// ammunition (fraction < 0) shows a full translucent blue ring.
+inline constexpr uint32_t wheelAmmoColour(float fraction) {
+    return !(fraction >= 0) ? 0x5aa8ff90u : fraction < 1.f / 3 ? 0xe8443cffu : fraction < 2.f / 3 ? 0xf2c230ffu : 0x3cdc50ffu;
+}
+// The filled part of the ring, in turns clockwise from 12 o'clock: a sliver
+// stays while any ammo is left, so "almost empty" never reads as empty.
+inline float wheelAmmoSweep(float fraction, int32_t rounds) {
+    if (!(fraction >= 0)) return 1;
+    const float sweep = std::min(fraction, 1.f);
+    return rounds > 0 ? std::max(sweep, .03f) : rounds == 0 ? 0 : sweep;
+}
 inline constexpr float WheelItemSpacing = .075f, WheelMinimumRadius = .12f, WheelMaximumRadius = .2f;
 // The ring centre sits this far ahead of the opening hand, along its pointing
 // direction, and this far up, out where the hand's pointer laser selects on it

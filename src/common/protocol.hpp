@@ -5,7 +5,7 @@
 namespace ss2vr {
 // MaxDimension only bounds sanity checks: images travel in pixel sections sized
 // to the current canvas, which follows the runtime's recommended eye size.
-constexpr uint32_t Magic = 0x32565253, Abi = 14, MaxDimension = 16384, WeaponCount = 17;
+constexpr uint32_t Magic = 0x32565253, Abi = 15, MaxDimension = 16384, WeaponCount = 17;
 // Pixel sections: slot0 left/right, slot1 left/right, then the mono menu frame.
 constexpr unsigned PixelBufferCount = 5, MenuPixelBuffer = 4;
 constexpr unsigned slotPixelBuffer(unsigned slot, unsigned eye) { return slot * 2 + eye; }
@@ -74,6 +74,8 @@ struct WheelUi {
     int32_t hover = -1;
     int32_t weapon[WeaponCount]{};
     int32_t ammo[WeaponCount]{};
+    // ABI15: a bit per native weapon id the game would fire now (CanBeUsedForFiring).
+    uint32_t usable = 0;
 };
 struct Ui {
     uint64_t tickMs = 0;
@@ -174,5 +176,5 @@ static_assert(offsetof(Shared, latest) == 48);
 static_assert(sizeof(Input) == 272 && sizeof(Request) == 480);
 static_assert(sizeof(MenuPointer) == 64);
 static_assert(sizeof(WorldSubmission)==40 && sizeof(PixelSections)==16 && sizeof(SharedImages)==40);
-static_assert(sizeof(Shared) == 2056 && offsetof(Shared, pixels) == 1992 && offsetof(Shared, images) == 2016); // Same on x86 and x64.
+static_assert(sizeof(Shared) == 2064 && offsetof(Shared, pixels) == 2000 && offsetof(Shared, images) == 2024); // Same on x86 and x64.
 } // namespace ss2vr

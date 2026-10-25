@@ -1048,8 +1048,8 @@ struct WheelBitmap {
         if (!result)
             throw std::runtime_error("GDI wheel label drawing failed");
     }
-    // Compact card at the centre of the in-world ring (drawn by the game): the
-    // hovered item's name and ammunition, or how to choose and cancel.
+    // Compact card above the in-world ring (drawn by the game, with the ammo
+    // icon and count at its centre): the hovered item's name, or how to choose.
     void draw(const WheelUi &ui, unsigned hand) {
         if (!GdiFlush())
             throw std::runtime_error("GDI flush failed");
@@ -1072,10 +1072,8 @@ struct WheelBitmap {
         if (weapon) {
             // Stock names are verified against the native parameter-path switch.
             std::swprintf(heading, 64, L"%ls", weaponName(ui.weapon[ui.hover]));
-            if (ui.ammo[ui.hover] > 0)
-                std::swprintf(line, 64, L"Ammo %d", ui.ammo[ui.hover]);
-            else
-                std::swprintf(line, 64, ui.ammo[ui.hover] == 0 ? L"Out of ammo" : L"Release to equip");
+            std::swprintf(line, 64, wheelWeaponUsable(ui.usable, ui.weapon[ui.hover]) ? L"Release to equip"
+                                                                                       : L"Out of ammo");
         } else if (bubble != WheelBubble::None) {
             std::swprintf(heading, 64, L"%ls", wheelBubbleName(bubble));
             std::swprintf(line, 64, bubble == WheelBubble::QuickSave   ? L"Release to save"
@@ -1086,8 +1084,10 @@ struct WheelBitmap {
             std::swprintf(line, 64, L"Reach to an item, release to choose");
         }
         text(heading, size * .5f, height * .08f, title, RGB(255, 255, 255), size * .92f, height * .44f);
-        text(line, size * .5f, height * .58f, detail, hovered ? RGB(235, 240, 250) : RGB(190, 200, 210),
-             size * .92f, height * .32f);
+        const bool refused = weapon && !wheelWeaponUsable(ui.usable, ui.weapon[ui.hover]);
+        text(line, size * .5f, height * .58f, detail,
+             refused ? RGB(255, 110, 100) : hovered ? RGB(235, 240, 250) : RGB(190, 200, 210), size * .92f,
+             height * .32f);
         if (!GdiFlush())
             throw std::runtime_error("GDI wheel draw flush failed");
         // GDI clears text alpha; keep the whole card's straight alpha predictable.
@@ -1097,13 +1097,20 @@ struct WheelBitmap {
 };
 
 bool sameWheel(const WheelUi &a, const WheelUi &b) {
-    return a.open == b.open && a.count == b.count && a.hover == b.hover &&
+    return a.open == b.open && a.count == b.count && a.hover == b.hover && a.usable == b.usable &&
            !std::memcmp(a.weapon, b.weapon, sizeof(a.weapon)) && !std::memcmp(a.ammo, b.ammo, sizeof(a.ammo));
 }
 // The game draws the ring in the world; the host only labels it. The card sits
-// at the ring centre, slightly toward the user, captured from this host's own
-// sample of the hand when the game first reports that wheel open.
-constexpr float WheelCardWidth = .17f, WheelCardLift = .04f;
+// just above the ring (clear of its top item, even hovered), slightly toward
+// the user, captured from this host's own sample of the hand when the game
+// first reports that wheel open. The ring's centre keeps the game's ammo readout.
+constexpr float WheelCardWidth = .17f, WheelCardLift = .01f;
+inline float wheelCardHeight(uint32_t weapons) {
+    WheelRing ring;
+    int ids[WeaponCount]{};
+    ring.layout(ids, std::min(weapons, WeaponCount), 0);
+    return ring.radius + .65f * ring.itemSize + .012f + WheelCardWidth / 8;
+}
 struct WheelLayer {
     Swapchain chain;
     WheelBitmap bitmap;
@@ -3404,7 +3411,8 @@ struct Host {
             }
             const WheelPointer pointer = wheelPointer(input, h);
             if (!wheel.anchored && pointer.valid) {
-                wheel.anchor = compose(wheelRingFrame(pointer), Pose{{}, {0, 0, WheelCardLift}});
+                wheel.anchor = compose(wheelRingFrame(pointer),
+                                       Pose{{}, {0, wheelCardHeight(ui.wheel[h].count), WheelCardLift}});
                 wheel.anchored = true;
                 wheel.uploaded = false;
             }

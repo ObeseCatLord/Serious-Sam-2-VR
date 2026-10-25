@@ -389,12 +389,20 @@ static SetWeapon setWeapon = nullptr;
 static Toggle toggleDual = nullptr;
 static HandInt canChange = nullptr;
 static InventoryInt inInventory = nullptr, ammo = nullptr;
+// Weapon wheel ammo (optional pinned exports): CPlayerInventory's own "would fire
+// now" test (enough ammo for one shot) and its ammo fraction (float in ST0,
+// -1 for weapons without ammunition), plus the ammo type and its HUD icon.
+static InventoryInt canFire = nullptr;
+using AmmoFraction = float(__thiscall *)(void *, int);
+static AmmoFraction ammoFraction = nullptr;
+using AmmoForWeapon = int32_t(__cdecl *)(int);
+static AmmoForWeapon nativeAmmoForWeapon = nullptr;
 // Hand weapon wheel presentation (optional pinned exports): Sam2Game weapon
 // icons and native weapon-menu order, plus the gfx blend state it restores.
 using WeaponIcon = void *(__cdecl *)(int);
 using WeaponMenuSlot = int32_t(__cdecl *)(int);
 using BlendFunction = void(__cdecl *)(int, int);
-static WeaponIcon nativeWeaponIcon = nullptr;
+static WeaponIcon nativeWeaponIcon = nullptr, nativeAmmoIcon = nullptr;
 static WeaponMenuSlot nativeWeaponMenuDirection = nullptr, nativeWeaponMenuOrder = nullptr;
 static int *blendSource = nullptr, *blendDestination = nullptr;
 static BlendFunction *setBlendFunction = nullptr;
@@ -591,7 +599,9 @@ struct WheelPresentation {
     WheelRing ring;
     int32_t hoverSlot = -1;
     bool open = false;
+    float fraction[WeaponCount]{}; // Ammo fraction by native weapon id; -1 without ammunition.
 };
+static float wheelAmmoFraction[WeaponCount]{}; // Game thread: this poll's fractions.
 static SRWLOCK wheelPresentationLock = SRWLOCK_INIT;
 static WheelPresentation wheelPresentation[2];
 static void publishWheelPresentation(unsigned hand, const WeaponWheel &wheel) {
@@ -601,6 +611,7 @@ static void publishWheelPresentation(unsigned hand, const WeaponWheel &wheel) {
     if (out.open) {
         out.ring = wheel.ring;
         out.hoverSlot = wheel.hoverSlot;
+        std::copy_n(wheelAmmoFraction, WeaponCount, out.fraction);
     }
     ReleaseSRWLockExclusive(&wheelPresentationLock);
 }
@@ -2593,9 +2604,16 @@ static void update(void *p) {
         auto &ui = s.ui.wheel[h];
         for (int id = 0; id < int(WeaponCount); id++)
             if (id != 14 && inInventory(static_cast<uint8_t *>(p) + 0x8f8, id)) {
+                void *inventory = static_cast<uint8_t *>(p) + 0x8f8;
+                const int32_t rounds = ammo(inventory, id);
                 ui.weapon[ui.count] = id;
-                ui.ammo[ui.count] = ammo(static_cast<uint8_t *>(p) + 0x8f8, id);
+                ui.ammo[ui.count] = rounds;
                 ui.count++;
+                // Not enough for one shot (a double shotgun with one shell) counts as empty.
+                if (canFire ? canFire(inventory, id) != 0 : rounds != 0)
+                    ui.usable |= 1u << id;
+                const float fraction = ammoFraction ? ammoFraction(inventory, id) : rounds < 0 ? -1.f : rounds > 0;
+                wheelAmmoFraction[id] = std::isfinite(fraction) ? std::min(fraction, 1.f) : -1.f;
             }
         orderWheelWeapons(ui);
         bool valid = enabled && !resettingControls && input.handValid[h] && finite(input.hand[h]);
@@ -2685,7 +2703,22 @@ static void update(void *p) {
         // Carry wins over jump; in vehicles the grip grasps instead.
         gripJumps[h].update(gripDown, (input.wheelAdmissionMask & (1u << h)) != 0, rider.handheld(),
                             gripCarry.requestHand == h || gripCarry.hand == h);
-        int selected = wheels[h].sample(input, unsigned(h), ui.weapon, ui.count, wheelAllowed, wheelBubbles());
+        int selected = wheels[h].sample(input, unsigned(h), ui.weapon, ui.count, wheelAllowed, wheelBubbles(), ui.usable);
+        if (wheels[h].refused >= 0)
+            log("Weapon wheel hand=%d refused id=%d: not enough ammo to fire", h, wheels[h].refused);
+        {
+            static int previousHover[2]{-1, -1};
+            static unsigned traced = 0;
+            if (wheels[h].hover != previousHover[h] && traced < 240) {
+                previousHover[h] = wheels[h].hover;
+                ++traced;
+                const int i = wheels[h].hover;
+                if (i >= 0 && uint32_t(i) < ui.count)
+                    log("Weapon wheel hover hand=%d slot=%d id=%d usable=%d rounds=%d fraction=%.2f", h,
+                        wheels[h].hoverSlot, ui.weapon[i], int(wheelWeaponUsable(ui.usable, ui.weapon[i])),
+                        ui.ammo[i], wheelAmmoFraction[ui.weapon[i]]);
+            }
+        }
         ui.open = wheels[h].open;
         ui.hover = wheels[h].hover;
         publishWheelPresentation(unsigned(h), wheels[h]);
@@ -2734,6 +2767,20 @@ static void update(void *p) {
             static bool held = false;
             if (given && settings.labHoldWeapon >= 0 && !held && GetTickCount64() >= next && pendingSelection[h] < 0) {
                 held = true;
+                // SS2VR_LAB_WHEEL_AMMO="type:count,...": native ammo counts (CPlayerInventory+14
+                // by AmmoIndex, as GetAmmoQuantity reads them) for the wheel's ring checks.
+                if (const char *spec = std::getenv("SS2VR_LAB_WHEEL_AMMO")) {
+                    for (const char *at = spec; *at;) {
+                        int type = -1, count = -1, used = 0;
+                        if (std::sscanf(at, "%d:%d%n", &type, &count, &used) != 2) break;
+                        if (type >= 0 && type < 12 && count >= 0) {
+                            reinterpret_cast<int32_t *>(static_cast<uint8_t *>(p) + 0x8f8 + 0x14)[type] = count;
+                            log("Lab wheel ammo type=%d count=%d", type, count);
+                        }
+                        at += used;
+                        if (*at == ',') ++at;
+                    }
+                }
                 pendingSelection[h] = settings.labHoldWeapon;
                 selectionTick[h] = GetTickCount64();
                 log("Weapon audit hold id=%d hand=%d", settings.labHoldWeapon, h);
@@ -9592,7 +9639,7 @@ static void drawSteeringWheel() {
     if(textured)currentTexture(0,w.texture,0);
     (*unbindVertexBuffers)();
     useSimpleShader(textured?3:0);
-    if(!textured)constantColor(0x8a8f96ffu);
+    if(!textured)constantColor(0xff8a8f96u); // 0xAARRGGBB: opaque grey.
     // Bounded batches of whole triangles keep each client array small.
     constexpr size_t Batch=900;
     for(size_t first=0;first<Count*2;first+=Batch) {
@@ -9614,8 +9661,8 @@ static void drawSteeringWheel() {
 // Hand weapon wheels, drawn in each eye after the root world like the lasers.
 // Translucent bubbles face the head and carry the stock weapon display meshes,
 // slowly spinning; a weapon whose mesh is unavailable shows the game's own icon
-// (samGetWeaponIcon). Colours are native constant RGBA; icon tint is only grey
-// and alpha. Bubbles ignore depth so an open wheel stays readable over the held
+// (samGetWeaponIcon). Colours are written 0xRRGGBBAA and converted for the
+// native constant colour when drawn; icon tint is only grey and alpha. Bubbles ignore depth so an open wheel stays readable over the held
 // weapon; meshes are depth tested like world models. Main thread only; gfx
 // state is restored after.
 struct WeaponWheelTextures {
@@ -9623,12 +9670,58 @@ struct WeaponWheelTextures {
     bool tried=false;
 };
 static WeaponWheelTextures weaponWheelTextures;
+// The HUD's own font (Serious Zurich; the HD cut from patch 2.090) for the
+// wheel's ammo count. A process-lifetime CFontInstance (0x40 bytes) built by
+// the exported constructor; glyphs are drawn as textured quads from its
+// texture: GetCharTexPos gives each glyph's texel box (x, y, w, h over the
+// texture size), GetCellHeight (CFont+38) the line height in texels.
+struct WheelBox2 {float x0,y0,x1,y1;};
+using FontInstanceConstruct=void *(__thiscall *)(void *,void *);
+using FontTexture=void *(__thiscall *)(void *);
+using FontGlyph=WheelBox2 *(__thiscall *)(void *,WheelBox2 *,long); // Hidden-return Box2f, ret 8.
+using FontCellHeight=long(__thiscall *)(void *);
+static void **fontDataType=nullptr;
+static FontInstanceConstruct constructFontInstance=nullptr;
+static FontTexture fontTexture=nullptr;
+static FontGlyph fontGlyph=nullptr;
+static FontCellHeight fontCellHeight=nullptr;
+static struct {
+    void *font=nullptr,*texture=nullptr;
+    alignas(8) uint8_t instance[0x40]{};
+    float texels[2]{},cell=0;
+    bool tried=false,ready=false;
+} wheelFont;
+static void loadWheelFont() {
+    auto &f=wheelFont;
+    f.tried=true;
+    if(!fontDataType || !*fontDataType || !constructFontInstance || !fontTexture || !fontGlyph || !fontCellHeight)return;
+    const char *loaded=nullptr;
+    for(const char *path:{"Content/SeriousSam2/Fonts/SeriousZurich_HD.fnt","Content/SeriousSam2/Fonts/SeriousZurich.fnt"})
+        if(obtainNativeResource(f.font,*fontDataType,path) && f.font) {loaded=path;break;}
+    if(!loaded) {log("Weapon wheel font unavailable; ammo count not drawn");return;}
+    withNativeFinally([&] {
+        constructFontInstance(f.instance,f.font);
+        f.texture=fontTexture(f.instance);
+        f.cell=float(fontCellHeight(f.instance));
+    },[](bool) noexcept {});
+    int32_t size[2]{};
+    if(steeringWheelTextureReady(f.texture) && readableMemory(f.texture,0x38))
+        std::memcpy(size,static_cast<const uint8_t*>(f.texture)+0x30,sizeof(size));
+    f.texels[0]=float(size[0]);f.texels[1]=float(size[1]);
+    WheelBox2 zero{};
+    f.ready=size[0]>0 && size[1]>0 && size[0]<=8192 && size[1]<=8192 && f.cell>0 && f.cell<1024 &&
+        withNativeFinally([&] {fontGlyph(f.instance,&zero,'0');},[](bool) noexcept {}) && zero.x1>zero.x0;
+    log("Weapon wheel font %s %s texture=%dx%d cell=%.0f digit0=%.0f,%.0f %.0fx%.0f",loaded,f.ready ? "ready" : "unusable",
+        size[0],size[1],f.cell,zero.x0*f.texels[0],zero.y0*f.texels[1],(zero.x1-zero.x0)*f.texels[0],
+        (zero.y1-zero.y0)*f.texels[1]);
+}
 static void loadWeaponWheelTextures(const Snapshot &s) {
     auto &t=weaponWheelTextures;
     if(t.tried || !nativeMainThread || !nativeMainThread() || (!s.ui.wheel[0].open && !s.ui.wheel[1].open))return;
     t.tried=true;
     const bool ready=obtainStaticTexture(t.netricsa,"Content/SeriousSam2/Textures/Interface/Hud/netricsa.tex");
     log("Weapon wheel Netricsa icon %s",ready ? "loaded" : "unavailable; using a drawn symbol");
+    loadWheelFont();
 }
 // Stock weapon display meshes: the per-weapon pickups the combo-weapons item
 // shows (ComboWeapons_Item.mdl children). The flamer has no pickup model and
@@ -9738,7 +9831,7 @@ struct WheelBatch {
     uint32_t color=0;
     void flush() {
         if(!count)return;
-        constantColor(color);
+        constantColor(color>>8|color<<24); // gfuConstantColor takes 0xAARRGGBB (lab V790).
         (*bindVertexArray)(0,position,0x87,int(count*12),12);
         (*drawVertices)(0x99,int(count/3),0);
         count=0;
@@ -9761,6 +9854,18 @@ struct WheelBatch {
             const Vec3 o0=b.at(c0*outer,s0*outer),o1=b.at(c1*outer,s1*outer);
             if(inner<=0) {triangle(rgba,b.centre,o0,o1);continue;}
             const Vec3 i0=b.at(c0*inner,s0*inner),i1=b.at(c1*inner,s1*inner);
+            triangle(rgba,i0,o0,o1);triangle(rgba,i0,o1,i1);
+        }
+    }
+    // Part of an annulus: `sweep` turns clockwise (as the viewer sees it) from 12 o'clock.
+    void arc(uint32_t rgba,const WheelBillboard &b,float inner,float outer,float sweep,unsigned segments=48) {
+        if(!(sweep>0))return;
+        const unsigned n=std::max(1u,unsigned(std::ceil(float(segments)*std::min(sweep,1.f))));
+        for(unsigned i=0;i!=n;++i) {
+            const float a0=2*Pi*sweep*float(i)/float(n),a1=2*Pi*sweep*float(i+1)/float(n);
+            const float s0=std::sin(a0),c0=std::cos(a0),s1=std::sin(a1),c1=std::cos(a1);
+            const Vec3 i0=b.at(s0*inner,c0*inner),o0=b.at(s0*outer,c0*outer);
+            const Vec3 i1=b.at(s1*inner,c1*inner),o1=b.at(s1*outer,c1*outer);
             triangle(rgba,i0,o0,o1);triangle(rgba,i0,o1,i1);
         }
     }
@@ -9802,6 +9907,55 @@ static void drawWheelIcon(void *texture,const WheelBillboard &b,float halfWidth,
     (*drawVertices)(0x99,4,0);
     (*unbindVertexBuffers)();
     useSimpleShader(0); // GFU_SHD_POS with gfuConstantColor
+}
+// A short line of text in the wheel font, `height` metres per text line, its
+// left edge at u and its line centred on v; 0 if the font is not ready.
+static constexpr unsigned WheelTextLength=8;
+static bool wheelGlyph(char c,WheelBox2 &box) {
+    return withNativeFinally([&] {fontGlyph(wheelFont.instance,&box,long(uint8_t(c)));},[](bool) noexcept {}) &&
+           std::isfinite(box.x0) && std::isfinite(box.x1) && box.x1>=box.x0 && box.y1>=box.y0;
+}
+static float wheelTextWidth(const char *text,float height) {
+    if(!wheelFont.ready)return 0;
+    const float scale=height/wheelFont.cell;
+    float width=0;
+    for(unsigned i=0;text[i] && i!=WheelTextLength;++i) {
+        WheelBox2 box{};
+        if(wheelGlyph(text[i],box))width+=(box.x1-box.x0)*wheelFont.texels[0]*scale;
+    }
+    return width;
+}
+static void drawWheelText(const char *text,const WheelBillboard &b,float u,float v,float height,uint32_t tint) {
+    if(!wheelFont.ready || !steeringWheelTextureReady(wheelFont.texture))return;
+    wheelBatch.flush();
+    static Vec3 position[WheelTextLength*12];
+    static float uv[WheelTextLength*12][2];
+    static uint32_t color[WheelTextLength*12];
+    const float scale=height/wheelFont.cell,top=v+.5f*height;
+    unsigned n=0;
+    for(unsigned i=0;text[i] && i!=WheelTextLength;++i) {
+        WheelBox2 box{};
+        if(!wheelGlyph(text[i],box))continue;
+        const float w=(box.x1-box.x0)*wheelFont.texels[0]*scale,h=(box.y1-box.y0)*wheelFont.texels[1]*scale;
+        const Vec3 corner[4]{b.at(u,top),b.at(u+w,top),b.at(u+w,top-h),b.at(u,top-h)};
+        const float cornerUv[4][2]{{box.x0,box.y0},{box.x1,box.y0},{box.x1,box.y1},{box.x0,box.y1}};
+        constexpr unsigned order[12]{0,1,2,0,2,3,0,2,1,0,3,2};
+        for(unsigned k=0;k!=12;++k,++n) {
+            position[n]=corner[order[k]];
+            uv[n][0]=cornerUv[order[k]][0];uv[n][1]=cornerUv[order[k]][1];
+            color[n]=tint;
+        }
+        u+=w;
+    }
+    if(!n)return;
+    useSimpleShader(3); // GFU_SHD_POS_TEX_COL
+    currentTexture(0,wheelFont.texture,0);
+    (*bindVertexArray)(0,position,0x87,int(n*12),12);
+    (*bindVertexArray)(2,uv,0x86,int(n*8),8);
+    (*bindVertexArray)(3,color,0x82,int(n*4),4);
+    (*drawVertices)(0x99,int(n/3),0);
+    (*unbindVertexBuffers)();
+    useSimpleShader(0);
 }
 // Bubble symbols in units of the symbol half-extent: menu bars, save/load
 // arrows into/out of a tray and an information mark for Netricsa.
@@ -9871,11 +10025,13 @@ static void drawWeaponWheel(unsigned hand,const Pose &head) {
     const auto drawItem=[&](uint32_t i) {
         const auto &slot=ring.slot[i];
         const bool hovered=int(i)==view.hoverSlot;
+        const bool usable=slot.bubble!=WheelBubble::None || wheelWeaponUsable(ui.usable,slot.weapon);
         const float radius=ring.slotSize(i)*(hovered ? .65f : .5f);
         const auto b=billboard(frame.p+rotate(frame.q,ring.slotPosition(i)));
-        if(hovered)
+        if(hovered) // Gold glow; dull red over a weapon that cannot be chosen.
             for(unsigned g=0;g!=3;++g)
-                wheelBatch.ring((gold&~0xffu)|(0x70u>>g),b,radius*(1+.15f*float(g)),radius*(1.15f+.15f*float(g)));
+                wheelBatch.ring(((usable ? gold : 0xb83c3cffu)&~0xffu)|(0x70u>>g),b,radius*(1+.15f*float(g)),
+                                radius*(1.15f+.15f*float(g)));
         if(slot.bubble!=WheelBubble::None) {
             const uint32_t kind=uint32_t(slot.bubble);
             wheelBatch.ring(bubbleFill[kind<WheelBubbleCount ? kind : 0],b,0,radius);
@@ -9892,19 +10048,56 @@ static void drawWeaponWheel(unsigned hand,const Pose &head) {
         if(slot.index>=0 && uint32_t(slot.index)<ui.count && uint32_t(slot.index)<WeaponCount &&
            ui.weapon[slot.index]==slot.weapon)
             rounds=ui.ammo[slot.index];
-        const bool empty=rounds==0,held=eyeSnapshot.ui.currentWeapon[hand]==slot.weapon;
-        const bool mesh=wheelModelReady(slot.weapon); // Drawn after this pass.
-        wheelBatch.ring(hovered ? (mesh ? 0x3a2c1490u : 0x3a2c14e8u) : (mesh ? 0x161d2770u : 0x161d27d0u),b,0,radius);
-        wheelBatch.ring(hovered ? gold : held ? handColour : empty ? 0xb83c3cffu : 0x8c99a8e0u,b,radius*.9f,radius);
+        const bool held=eyeSnapshot.ui.currentWeapon[hand]==slot.weapon;
+        // A weapon that cannot fire is greyed out: a dim disc and its grey icon, no mesh.
+        const bool mesh=usable && wheelModelReady(slot.weapon); // Drawn after this pass.
+        wheelBatch.ring(!usable ? (hovered ? 0x2a2026c8u : 0x1a1c20a8u)
+                        : hovered ? (mesh ? 0x3a2c1490u : 0x3a2c14e8u) : (mesh ? 0x161d2770u : 0x161d27d0u),b,0,radius);
+        if(held && !hovered)wheelBatch.ring(handColour,b,radius*1.04f,radius*1.14f); // The weapon in this hand.
+        // Ammo ring (as Fusion's VR wheel): a faint track, filled clockwise from 12 o'clock.
+        const float fraction=uint32_t(slot.weapon)<WeaponCount ? view.fraction[slot.weapon] : -1.f;
+        wheelBatch.ring(0xffffff26u,b,radius*.8f,radius,40);
+        wheelBatch.arc(usable ? wheelAmmoColour(fraction) : 0x8a8f96c0u,b,radius*.8f,radius,wheelAmmoSweep(fraction,rounds));
         if(mesh)return;
         void *icon=nativeWeaponIcon ? nativeWeaponIcon(slot.weapon) : nullptr;
         float halfWidth=0,halfHeight=0;
-        if(wheelIconExtent(icon,radius*1.8f,radius*1.2f,halfWidth,halfHeight))
-            drawWheelIcon(icon,b,halfWidth,halfHeight,empty ? wheelTint(0x80,0xa0) : wheelTint(0xff,0xff));
+        if(wheelIconExtent(icon,radius*1.5f,radius*1.0f,halfWidth,halfHeight))
+            drawWheelIcon(icon,b,halfWidth,halfHeight,usable ? wheelTint(0xff,0xff) : wheelTint(0x98,0xc8));
     };
     for(uint32_t i=0;i!=ring.count;++i)
         if(int(i)!=view.hoverSlot)drawItem(i);
     if(view.hoverSlot>=0 && uint32_t(view.hoverSlot)<ring.count)drawItem(uint32_t(view.hoverSlot));
+    // Ammo readout in the centre, as the HUD shows it: the ammo icon and the
+    // count in the HUD font, for the hovered weapon (else the one in this hand).
+    int32_t weapon=-1,rounds=-1;
+    for(uint32_t i=0;i!=ui.count && i!=WeaponCount;++i) {
+        const bool hovered=view.hoverSlot>=0 && uint32_t(view.hoverSlot)<ring.weapons && ring.slot[view.hoverSlot].index==int32_t(i);
+        if(hovered || (view.hoverSlot<0 && ui.weapon[i]==eyeSnapshot.ui.currentWeapon[hand])) {
+            weapon=ui.weapon[i];rounds=ui.ammo[i];
+            if(hovered)break;
+        }
+    }
+    if(weapon<0 || rounds<0 || !nativeAmmoForWeapon || !nativeAmmoIcon)return; // Chainsaw, zap gun, Colt: none.
+    const int32_t type=nativeAmmoForWeapon(weapon);
+    void *icon=type>=0 ? nativeAmmoIcon(type) : nullptr;
+    char count[WheelTextLength];
+    std::snprintf(count,sizeof count,"%d",int(std::min<int32_t>(rounds,9999999)));
+    const float height=std::clamp(.3f*cancel,.02f,.03f),gap=.2f*height;
+    float halfWidth=0,halfHeight=0;
+    const bool iconReady=wheelIconExtent(icon,2.4f*height,1.5f*height,halfWidth,halfHeight);
+    const float textWidth=wheelTextWidth(count,height);
+    const float total=(iconReady ? 2*halfWidth+gap : 0)+textWidth;
+    if(!(total>0))return;
+    const auto b=billboard(frame.p);
+    float u=-.5f*total;
+    if(iconReady) {
+        drawWheelIcon(icon,WheelBillboard{b.at(u+halfWidth,0),b.right,b.up},halfWidth,halfHeight,wheelTint(0xff,0xff));
+        u+=2*halfWidth+gap;
+    }
+    const bool usable=wheelWeaponUsable(ui.usable,weapon);
+    const float shadow=.06f*height;
+    drawWheelText(count,b,u+shadow,-shadow,height,0xa0000000u); // Drop shadow, as the HUD font's.
+    drawWheelText(count,b,u,0,height,usable ? 0xffffffffu : 0xffff5a5au); // Vertex colours are 0xAARRGGBB.
 }
 // Second pass: the floating meshes, each scaled by its unit-stretch box about
 // the slot centre and spinning about the ring's (upright) axis. Stretch is set
@@ -9919,7 +10112,8 @@ static void drawWeaponWheelModels(unsigned hand) {
     if(!finite(frame))return;
     for(uint32_t i=0;i!=ring.count;++i) {
         const auto &slot=ring.slot[i];
-        if(slot.bubble!=WheelBubble::None || !wheelModelReady(slot.weapon))continue;
+        if(slot.bubble!=WheelBubble::None || !wheelModelReady(slot.weapon) ||
+           !wheelWeaponUsable(eyeSnapshot.ui.wheel[hand].usable,slot.weapon))continue;
         const auto &model=wheelModels[slot.weapon];
         const float spin=2*Pi*float(eyeWheels.tick%6000)/6000.f+.9f*float(i); // One turn per 6 s.
         const auto placed=wheelModelPlacement(frame,ring.slotPosition(i),model.centre,model.extent,
@@ -12064,6 +12258,9 @@ bool attach(bool headless) {
     S(g, "?CanChangeWeapon@CPlayerPuppetEntity@SeriousEngine@@QAEHW4PlayerHand@2@@Z", canChange);
     S(g, "?IsWeaponInInventory@CPlayerInventory@SeriousEngine@@QAEHW4WeaponIndex@2@@Z", inInventory);
     S(g, "?GetAmmoQuantityForWeapon@CPlayerInventory@SeriousEngine@@QAEJW4WeaponIndex@2@@Z", ammo);
+    // Optional: without them the wheel treats only a zero count as empty.
+    symbol(g, "?CanBeUsedForFiring@CPlayerInventory@SeriousEngine@@QAEHW4WeaponIndex@2@@Z", canFire);
+    symbol(g, "?GetAmmoRatioForWeapon@CPlayerInventory@SeriousEngine@@QAEMW4WeaponIndex@2@@Z", ammoFraction);
     patchSprintForward(g); // Servers too: a VR avatar sprints in its own forward.
     if (!headless) {
         S(e, "?GetModelInstance@CModelRenderable@SeriousEngine@@QAEPAVCModelInstance@2@XZ", laserModelInstance);
@@ -12145,6 +12342,14 @@ bool attach(bool headless) {
         WEAPON_WHEEL(e, "?_gfx_eBlendDst@SeriousEngine@@3W4GfxBlend@1@A", blendDestination);
         WEAPON_WHEEL(e, "?_gfxBlendFunc@SeriousEngine@@3P6AXW4GfxBlend@1@0@ZA", setBlendFunction);
 #undef WEAPON_WHEEL
+        // The centre ammo readout (icon and HUD-font count) is optional again.
+        symbol(g, "?samGetAmmoForWeapon@SeriousEngine@@YA?AW4AmmoIndex@1@W4WeaponIndex@1@@Z", nativeAmmoForWeapon);
+        symbol(g, "?samGetAmmoIcon@SeriousEngine@@YAPAVCTexture@1@W4AmmoIndex@1@@Z", nativeAmmoIcon);
+        symbol(e, "?md_pdtDataType@CFont@SeriousEngine@@2PAVCDataType@2@A", fontDataType);
+        symbol(e, "??0CFontInstance@SeriousEngine@@QAE@PAVCFont@1@@Z", constructFontInstance);
+        symbol(e, "?GetFontTexture@CFontInstance@SeriousEngine@@QAEPAVCTexture@2@XZ", fontTexture);
+        symbol(e, "?GetCharTexPos@CFontInstance@SeriousEngine@@QAE?AVBox2f@2@J@Z", fontGlyph);
+        symbol(e, "?GetCellHeight@CFontInstance@SeriousEngine@@QBEJXZ", fontCellHeight);
         if (!weaponWheelSymbols) {
             setBlendFunction = nullptr;
             log("Weapon wheel drawing disabled: native icon/blend entries unavailable");

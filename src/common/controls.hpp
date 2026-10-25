@@ -374,6 +374,7 @@ struct WeaponWheel {
     bool open = false, previousHold = false;
     int hover = -1;    // WheelUi encoding: weapon list index or wheelBubbleHover().
     int selected = -1; // Weapon id committed by this update, else -1.
+    int refused = -1;  // Weapon id released on but unusable (no ammo to fire) in this update, else -1.
     WheelBubble action = WheelBubble::None; // Bubble committed by this update.
     int hoverSlot = -1;
     float outer = 1; // Bubble side: +1 right hand, -1 left hand.
@@ -385,17 +386,19 @@ struct WeaponWheel {
         action = WheelBubble::None;
         ring.anchored = false;
     }
+    // `usable`: a bit per native weapon id the game would fire now. Others still
+    // hover (their name and empty ring show) but releasing on them picks nothing.
     int sample(const Input &input, unsigned hand, const int *ids, uint32_t count, bool allowed,
-               uint32_t bubbles = 0) {
+               uint32_t bubbles = 0, uint32_t usable = ~0u) {
         if (hand >= 2) { cancel(); return -1; }
         outer = hand ? 1.f : -1.f;
         return update((input.buttons[hand] & WheelOpen) != 0, input.axis[hand][0], input.axis[hand][1],
                       ids, count, allowed && !(input.blockedWheels & (1u << hand)), wheelPointer(input, hand),
-                      bubbles);
+                      bubbles, usable);
     }
     int update(bool held, float x, float y, const int *ids, uint32_t count, bool allowed,
-               const WheelPointer &pointer = {}, uint32_t bubbles = 0) {
-        selected = -1;
+               const WheelPointer &pointer = {}, uint32_t bubbles = 0, uint32_t usable = ~0u) {
+        selected = refused = -1;
         action = WheelBubble::None;
         if (!allowed || !std::isfinite(x) || !std::isfinite(y) || count > WeaponCount) {
             cancel();
@@ -435,7 +438,7 @@ struct WeaponWheel {
                 if (slot.bubble != WheelBubble::None)
                     action = slot.bubble;
                 else if (slot.index >= 0 && uint32_t(slot.index) < count && ids[slot.index] == slot.weapon)
-                    selected = slot.weapon;
+                    (wheelWeaponUsable(usable, slot.weapon) ? selected : refused) = slot.weapon;
             }
             open = false;
             hover = hoverSlot = -1;

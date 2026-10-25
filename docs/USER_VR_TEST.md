@@ -23,6 +23,34 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the hoverbike, menus and weapon wheel report (2026-10-25)
+
+1. Weapon wheel, styled after Serious Sam Fusion's VR wheel:
+   - Each weapon has an ammo ring that empties clockwise from 12 o'clock as its
+     ammo runs out. The ring is green, turns yellow below two thirds and red
+     below one third. Weapons without ammo (chainsaw, zap gun, Colt) have a
+     blue ring.
+   - Weapons that can't fire are greyed out: grey disc, grey icon, no 3D model.
+     That includes a double shotgun with a single shell. Hovering one shows a
+     red glow and "Out of ammo". Releasing on one selects nothing.
+   - The ring's centre shows the hovered weapon's ammo icon and count in the
+     game's HUD font. With nothing hovered, it shows the weapon in that hand.
+   - The weapon's name now sits on a card above the ring.
+   - The weapon in that hand has a halo in the hand's laser colour.
+   - The wheel's colours were also fixed. The menu, save and load bubbles now
+     show their intended colours (purple menu, green save, orange load).
+2. Hoverbike and UFO: the right stick turns them again. Both hands now steer
+   like a wheel (right hand on the right, left on the left): tilt your hands to
+   turn. You don't need to grab anything, and there's no floating wheel.
+3. Menus: A selects and B goes back. Loading screens say "Press A or a trigger
+   to continue". A or B skips the title screen's attract video.
+4. Netricsa: the left stick scrolls, the right stick changes page, A uses, and
+   B or the menu button closes.
+5. The pause menu and Netricsa float in front of the last game view instead of
+   switching to the projected 2D menu.
+6. The title screen uses a 4:3 image. Cutscenes are no longer cut off at the
+   top and bottom.
+
 ## Changed after the junkyard water and match report (2026-10-24)
 
 1. Held objects (the match, crates, balls) are held rigidly at your hand. The
@@ -457,4 +485,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `4186c4e`, version `0.2.11-dev.dbef62a92b80` (2026-10-25).
+Installed candidate: commit `cdf243c`, version `0.2.11-dev.958c1d88291d` (2026-10-25).
