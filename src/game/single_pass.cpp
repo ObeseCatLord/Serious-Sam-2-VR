@@ -218,6 +218,21 @@ PixelInfo &pixelInfo(IDirect3DPixelShader9 *ps) noexcept {
             uint32_t h = 2166136261u;
             for (uint32_t w : it->second.words) { h ^= w; h *= 16777619u; }
             it->second.hash = h;
+            // Lab (SS2VR_LAB_SP_DUMPPS=hash[,hash...]): those pixel programs' bytecode as Bin/ps-<hash>.bin.
+            static const std::wstring dumpList = [] { wchar_t v[128]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_DUMPPS", v, 128) ? std::wstring(v) : std::wstring(); }();
+            wchar_t hex[16];
+            std::swprintf(hex, 16, L"%08x", h);
+            if (!dumpList.empty() && dumpList.find(hex) != std::wstring::npos) {
+                wchar_t path[MAX_PATH]{};
+                DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+                while (n && path[n - 1] != L'\\' && path[n - 1] != L'/') --n;
+                path[n] = 0;
+                if (FILE *f = _wfopen((std::wstring(path) + L"ps-" + hex + L".bin").c_str(), L"wb")) {
+                    std::fwrite(it->second.words.data(), 4, it->second.words.size(), f);
+                    std::fclose(f);
+                    log("Lab pixel program %08x dumped (%zu words)", h, it->second.words.size());
+                }
+            }
         }
     }
     return it->second;
@@ -283,6 +298,7 @@ bool invert4(const double *m, double *out) noexcept {
 }
 bool fullEye(const D3DVIEWPORT9 &v) noexcept { return !v.X && !v.Y && v.Width == eyeWidth && v.Height == eyeHeight; }
 bool recordsValid = false;
+unsigned labPassCount = 0; // Stereo passes since start (lab draw logs).
 bool recordsOrtho = false; // The current matrices are not a perspective view (fills, 2D).
 bool screenLocked = false; // Records built for the centre view in every eye.
 bool engineScreenLock = false; // setScreenLocked: inside a camera-attached effect.
@@ -814,6 +830,17 @@ struct WaterConstantsScope {
             static unsigned traced = 0, previous = ~0u;
             const unsigned why = unsigned(!environment) | unsigned(!turned) << 1 | unsigned(labWaterUnpatched()) << 2 |
                 unsigned(vertex == shaderProbe.end() || !vertex->second.variant) << 3 | unsigned(!engineAdjusted) << 4;
+            // Lab (SS2VR_LAB_WATER_TRACE=1): every water draw of a few stereo passes in the level.
+            static const bool every = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_WATER_TRACE", v, 2) == 1 && v[0] == L'1'; }();
+            static unsigned everyTraced = 0;
+            if (every && labPassCount > 900 && everyTraced < 60) {
+                ++everyTraced;
+                DWORD cull = 0, zfunc = 0, blend = 0;
+                d->GetRenderState(D3DRS_CULLMODE, &cull); d->GetRenderState(D3DRS_ZFUNC, &zfunc); d->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+                log("Lab water draw pass=%u vs=%p ps=%08x reasons=%x cull=%lu zfunc=%lu blend=%lu probeVariant=%d", labPassCount,
+                    static_cast<void *>(engineShader), enginePixelShader ? pixelInfo(enginePixelShader).hash : 0u, why, cull, zfunc, blend,
+                    int(vertex != shaderProbe.end() && vertex->second.variant));
+            }
             if (why != previous && traced < 24) {
                 ++traced;
                 previous = why;
@@ -897,6 +924,15 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
     // Lab (SS2VR_LAB_SP_SKIP=1): the allowed pixel programs (0 = fixed function)
     // are not drawn at all; with the region sweep this finds a program by its effect.
     static const bool labSkip = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_SKIP", v, 2) == 1 && v[0] == L'1'; }();
+    {
+        // Lab (SS2VR_LAB_SP_SKIPPS=hash[,hash...]): those pixel programs are never drawn in the stereo pass.
+        static const std::wstring skipList = [] { wchar_t v[128]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_SKIPPS", v, 128) ? std::wstring(v) : std::wstring(); }();
+        if (!skipList.empty() && enginePixelShader) {
+            wchar_t hex[16];
+            std::swprintf(hex, 16, L"%08x", pixelInfo(enginePixelShader).hash);
+            if (skipList.find(hex) != std::wstring::npos) return D3D_OK;
+        }
+    }
     if (labSkip) {
         const uint32_t hash = enginePixelShader ? pixelInfo(enginePixelShader).hash : 0u;
         if (std::find(labPixelSeen.begin(), labPixelSeen.end(), hash) == labPixelSeen.end() && labPixelSeen.size() < 64)
@@ -1081,7 +1117,9 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
         {
             static const uint32_t logHash = [] { wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_LOGDRAW", v, 16) ? uint32_t(wcstoul(v, nullptr, 16)) : 0u; }();
             static unsigned logged = 0;
-            if (logHash && enginePixelShader && pixelInfo(enginePixelShader).hash == logHash && logged < 3) {
+            // SS2VR_LAB_SP_LOGDRAW_AFTER=<passes>: only draws after that many stereo passes (in the level).
+            static const unsigned after = [] { wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SP_LOGDRAW_AFTER", v, 16) ? unsigned(wcstoul(v, nullptr, 10)) : 0u; }();
+            if (logHash && labPassCount >= after && enginePixelShader && pixelInfo(enginePixelShader).hash == logHash && logged < 3) {
                 ++logged;
                 DWORD blend = 0, src = 0, dst = 0, z = 0, cull = 0, fog = 0, alphaRef = 0, alphaTest = 0;
                 d->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend); d->GetRenderState(D3DRS_SRCBLEND, &src); d->GetRenderState(D3DRS_DESTBLEND, &dst);
@@ -1292,6 +1330,7 @@ bool begin(IDirect3DDevice9 *d, IDirect3DSurface9 *target, UINT width, UINT heig
         });
     }
     ++stats.passes;
+    ++labPassCount;
     return true;
 }
 void end(IDirect3DDevice9 *d) noexcept {

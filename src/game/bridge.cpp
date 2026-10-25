@@ -1849,6 +1849,20 @@ static HRESULT WINAPI stretch(IDirect3DDevice9 *d, IDirect3DSurface9 *source, co
                               IDirect3DSurface9 *target, const RECT *targetRect,
                               D3DTEXTUREFILTERTYPE filter) {
     scopeGpuOutput(d);
+    // The engine's whole-screen copies (bloom's source, the water's screen image)
+    // during the single pass come from the double-wide target: both eyes side by
+    // side, which every eye then showed squeezed into its own view (a faint
+    // second scene split at each eye's centre, fixed to the head). One eye's
+    // half is copied instead; blurred glow tolerates the other eye's image.
+    RECT half{};
+    if (activeEye >= 0 && !sourceRect && width && height) {
+        D3DSURFACE_DESC desc{};
+        IDirect3DSurface9 *resolved = eyeSurface(source);
+        if (resolved && SUCCEEDED(resolved->GetDesc(&desc)) && desc.Width == 2 * width && desc.Height == height) {
+            half = {0, 0, LONG(width), LONG(height)};
+            sourceRect = &half;
+        }
+    }
     HRESULT result =
         observeUiOutput(d, [&] {
             replay::recordStretch(eyeSurface(source), sourceRect, eyeSurface(target), targetRect, filter);

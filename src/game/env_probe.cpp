@@ -164,6 +164,25 @@ bool facePass(IDirect3DDevice9 *d) noexcept {
 }
 bool captureFace(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *target) noexcept {
     if (!passActive || passCaptured || d != owner || !target || !device.setRT || !device.drawUp || !device.stretch) return false;
+    // Lab (SS2VR_LAB_CUBE_COLORS=1): each face a solid colour (+X red, -X green,
+    // +Y blue, -Y black, +Z yellow, -Z magenta), to see where the water looks.
+    static const bool colours = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_CUBE_COLORS", v, 2) == 1 && v[0] == L'1'; }();
+    if (colours) {
+        static const D3DCOLOR face[6]{D3DCOLOR_XRGB(220, 40, 40), D3DCOLOR_XRGB(40, 200, 40), D3DCOLOR_XRGB(40, 60, 230),
+                                      D3DCOLOR_XRGB(0, 0, 0), D3DCOLOR_XRGB(230, 220, 40), D3DCOLOR_XRGB(220, 40, 220)};
+        IDirect3DSurface9 *previous = nullptr, *surface = nullptr;
+        bool ok = SUCCEEDED(d->GetRenderTarget(0, &previous)) && SUCCEEDED(cubeTexture->GetCubeMapSurface(D3DCUBEMAP_FACES(passFace), 0, &surface)) &&
+                  SUCCEEDED(device.setRT(d, 0, surface)) && SUCCEEDED(d->Clear(0, nullptr, D3DCLEAR_TARGET, face[passFace], 1, 0));
+        // A white cross through the face centre (s = 0 and t = 0) for orientation.
+        const D3DRECT bars[2]{{LONG(probe::FaceSize / 2 - 2), 0, LONG(probe::FaceSize / 2 + 2), LONG(probe::FaceSize)},
+                              {0, LONG(probe::FaceSize / 2 - 2), LONG(probe::FaceSize), LONG(probe::FaceSize / 2 + 2)}};
+        ok = ok && SUCCEEDED(d->Clear(2, bars, D3DCLEAR_TARGET, D3DCOLOR_XRGB(255, 255, 255), 1, 0));
+        drop(surface);
+        if (previous) device.setRT(d, 0, previous);
+        drop(previous);
+        passCaptured = ok;
+        return ok;
+    }
     // The square view (rendered into the whole eye target) down to the face size,
     // then into the face mirrored left to right (D3D's faces are left-handed).
     if (FAILED(device.stretch(d, target, nullptr, faceSourceSurface, nullptr, D3DTEXF_LINEAR))) return false;
@@ -291,10 +310,11 @@ void capture(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *eye, 
 }
 
 IDirect3DCubeTexture9 *cube(IDirect3DDevice9 *d) noexcept {
-    // Rendered faces: once each has been rendered (until then, the old look).
-    constexpr unsigned all = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5);
-    if (rendered() && (faceEver & all) != all) return nullptr;
-    return d == owner && filled && anchored ? cubeTexture : nullptr;
+    // Whenever the cube exists (its unrendered faces hold a neutral sky): without
+    // it the water fell back to the engine's reflection, a flipped copy of the
+    // screen, which in single pass is both eyes side by side (a band split at
+    // each eye's centre, fixed to the head; lab V799-V830).
+    return d == owner ? cubeTexture : nullptr;
 }
 void setSurroundings(float metres) noexcept {
     if (std::isfinite(metres)) surroundings = std::clamp(metres, RadiusMin, RadiusMax);
