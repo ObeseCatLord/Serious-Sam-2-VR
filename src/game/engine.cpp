@@ -10210,6 +10210,7 @@ static void maintainSpatialAudio() {
 }
 static int __cdecl appForeground() {
     pollSettingsFile(); // Menus too: the options panel opens over the game's menus.
+    applyEyeCanvas();   // In play too: the canvas changes between the front end (4:3) and a level (eye size).
     maintainSpatialAudio();
     voiceFrame();
     if (labLoadPending.exchange(false) && labLoadGame) {
@@ -10672,6 +10673,10 @@ static bool latestInput(Input &out) {
     if (!l) return false;
     out = channel.shared->latest;
     return true;
+}
+bool levelActive() noexcept {
+    const auto s = copySnapshot();
+    return s.initialized && livePlayer(s) != nullptr;
 }
 bool netricsaShown() noexcept {
     const auto s = copySnapshot();

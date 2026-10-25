@@ -2176,8 +2176,11 @@ void installEyeCanvas() noexcept {
         MH_EnableHook(clientRect) == MH_OK && MH_EnableHook(metrics) == MH_OK;
     log("Eye canvas hooks=%d cached=%ux%u", ok, canvasWidth.load(), canvasHeight.load());
 }
-// Adopt the runtime's recommended eye size: remember it for the next launch and
-// let the main thread resize the native canvas at its next input poll.
+// The front end's canvas (4:3; see the presentation's canvas choice).
+constexpr uint32_t MenuCanvasWidth = 1440, MenuCanvasHeight = 1080;
+// Adopt the runtime's recommended eye size (or the front end's 4:3): remember it
+// for the next launch and let the main thread resize the native canvas at its
+// next input poll.
 static void requestEyeCanvas(uint32_t w, uint32_t h) {
     if (!w || !h || w > MaxDimension || h > MaxDimension || !originalClientRect ||
         (w == canvasWidth.load() && h == canvasHeight.load())) return;
@@ -2189,7 +2192,7 @@ static void requestEyeCanvas(uint32_t w, uint32_t h) {
         WritePrivateProfileStringW(L"View", L"Height", std::to_wstring(h).c_str(), cache.c_str());
     }
     canvasResizePending = true;
-    log("Eye canvas requested %ux%u (OpenXR recommended)", w, h);
+    log("Eye canvas requested %ux%u (%s)", w, h, w == MenuCanvasWidth && h == MenuCanvasHeight ? "front end, 4:3" : "OpenXR recommended");
 }
 void applyEyeCanvas() noexcept {
     if (!canvasResizePending.exchange(false) || !canvasExe) return;
@@ -2917,7 +2920,23 @@ static void presentBody(IDirect3DDevice9 *d) {
         recommendedWidth = channel.shared->recommendedWidth;
         recommendedHeight = channel.shared->recommendedHeight;
     }
-    requestEyeCanvas(recommendedWidth, recommendedHeight);
+    {
+        // The front end (title, main menu, loading) renders no eyes: its menus lay
+        // out 640x480 over the whole canvas and its backgrounds draw at the
+        // canvas's own aspect, so a 4:3 canvas shows both true. A level gets the
+        // eye-sized canvas. Switched after a second in the new state (no flapping
+        // through a load).
+        static bool level = false;
+        static uint64_t since = 0;
+        const uint64_t now = GetTickCount64();
+        const bool active = levelActive();
+        if (active != level) {
+            if (!since) since = now;
+            if (now - since > 1000) { level = active; since = 0; }
+        } else since = 0;
+        if (level) requestEyeCanvas(recommendedWidth, recommendedHeight);
+        else requestEyeCanvas(MenuCanvasWidth, MenuCanvasHeight);
+    }
     uint64_t now = GetTickCount64();
     bool gameplay = ui.gameplay && now >= ui.tickMs && now - ui.tickMs < 250;
     const bool nativeMenu = menus::active();
@@ -3025,7 +3044,12 @@ static void presentBody(IDirect3DDevice9 *d) {
     // Native menus lay out a 640x480 (4:3) space stretched over the whole canvas
     // (V481/V482: the cursor spans its full width and height), so on the square
     // eye canvas they looked squeezed: their image is the canvas scaled to 4:3.
-    const UiBand source = nativeMenu ? UiBand{0, 0, copyWidth, copyHeight} : uiBand(copyWidth, copyHeight);
+    // Other flat frames (Netricsa, in-engine cutscenes, loading) are drawn over
+    // the whole canvas too (V780: the HUD, Netricsa and subtitles reach its
+    // edges; the 16:9 band cut them): all of it is copied, and cropped to that
+    // band below only when everything outside the band is black (letterbox bars).
+    const UiBand source{0, 0, copyWidth, copyHeight};
+    const UiBand letterbox = nativeMenu ? source : uiBand(copyWidth, copyHeight);
     const auto scaled = [&](float sourceWidth, uint32_t &w, uint32_t &h) {
         const float fit = std::min({1.f, 1920.f / std::max(1.f, sourceWidth), 1080.f / float(std::max(1u, source.height))});
         w = std::max(2u, uint32_t(sourceWidth * fit)) & ~1u;
@@ -3062,7 +3086,22 @@ static void presentBody(IDirect3DDevice9 *d) {
         uint8_t *target = pixelStore.matches(pixelStore.generation, copyWidth, copyHeight) ?
             pixelStore.buffer(MenuPixelBuffer) : nullptr;
         if (!target) return;
-        const UiBand band{0, 0, outWidth, outHeight};
+        UiBand band{0, 0, outWidth, outHeight};
+        if (!nativeMenu && letterbox.height < copyHeight) {
+            // The band in the scaled image; kept only if the rows outside it are black.
+            const uint32_t top = uint32_t(uint64_t(letterbox.y) * outHeight / copyHeight),
+                           rows = uint32_t(uint64_t(letterbox.height) * outHeight / copyHeight);
+            const auto rowBlack = [&](uint32_t y) {
+                const auto *row = static_cast<const uint8_t *>(pixels.pBits) + size_t(y) * pixels.Pitch;
+                for (uint32_t x = 0; x < outWidth; x += 7)
+                    if (row[x * 4] >= 10 || row[x * 4 + 1] >= 10 || row[x * 4 + 2] >= 10) return false;
+                return true;
+            };
+            bool black = rows >= 2 && top + rows <= outHeight;
+            for (uint32_t y = 0; black && y < top; y += 2) black = rowBlack(y);
+            for (uint32_t y = top + rows; black && y < outHeight; y += 2) black = rowBlack(y);
+            if (black) band = {0, top, outWidth, rows & ~1u};
+        }
         held = channel.lock(5);
         if (!held) return;
         auto &m = channel.shared->menu;

@@ -31,6 +31,7 @@ bool vrInputLive() noexcept;
 void installEyeCanvas() noexcept;
 void setDesktopWorld(bool render) noexcept;
 bool netricsaShown() noexcept; // engine.cpp: Netricsa is open (its controls are player commands).
+bool levelActive() noexcept;   // engine.cpp: a level with a live local player (else the front end or a load).
 void setSinglePass(bool enabled) noexcept;
 void setEyeReplay(bool enabled) noexcept;
 void setSinglePassWorld(bool on, const Request *real = nullptr) noexcept;
