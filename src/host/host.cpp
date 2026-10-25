@@ -8,7 +8,9 @@
 #include "common/frame_policy.hpp"
 #include "common/head_clearance.hpp"
 #include "common/native_ui_finish.hpp"
+#include "common/options_bitmap.hpp"
 #include "common/options_layout.hpp"
+#include "common/options_model.hpp"
 #include "common/ipc.hpp"
 #include "common/math.hpp"
 #include "common/rider.hpp"
@@ -38,6 +40,7 @@
 // controls, inventory, and wheel selection; this process owns OpenXR presentation.
 namespace {
 using namespace ss2vr;
+using namespace ss2vr::options_model;
 static_assert(sizeof(void *) == 8, "The OpenXR host must be built for x64");
 constexpr XrDuration ImageWaitNs = 2'000'000;
 constexpr ULONGLONG UiFreshMs = 250;
@@ -971,13 +974,7 @@ struct Actions {
     }
 };
 
-// GDI renders labels into a top-down DIB as straight-alpha BGRA cards.
-// Panel text: Segoe UI on Windows; Tahoma under Wine and Proton, which ship it
-// but not Segoe UI (whose substitute there is a serif).
-inline const wchar_t *uiFontFace() {
-    static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
-    return wine ? L"Tahoma" : L"Segoe UI";
-}
+// GDI renders labels into a top-down DIB as straight-alpha BGRA cards (font: options_bitmap.hpp).
 struct WheelBitmap {
     HDC dc = nullptr;
     HBITMAP dib = nullptr;
@@ -1130,189 +1127,6 @@ struct WheelLayer {
 // changes values, the Use button steps them, the Menu button closes it. Game input is
 // held neutral while it is open. Values apply at once and are written to
 // SS2VR.user.ini; the game re-reads its settings when it changes.
-struct OptionsRow {
-    std::wstring label, value;
-    const wchar_t *help = L"";
-    std::wstring note; // Shown in amber (e.g. a restart is needed).
-    float fraction = -1; // A numeric value's place between its limits (slider), or -1.
-    bool dim = false;    // Not in effect with the other settings (e.g. snap angle while smooth).
-};
-struct OptionsBitmap {
-    HDC dc = nullptr;
-    HBITMAP dib = nullptr;
-    HGDIOBJ oldBitmap = nullptr;
-    HFONT title = nullptr, row = nullptr, small = nullptr, button = nullptr;
-    uint8_t *bits = nullptr;
-    uint32_t width = 0, height = 0;
-    ~OptionsBitmap() {
-        if (oldBitmap) SelectObject(dc, oldBitmap);
-        for (HGDIOBJ o : {HGDIOBJ(dib), HGDIOBJ(title), HGDIOBJ(row), HGDIOBJ(small), HGDIOBJ(button)})
-            if (o) DeleteObject(o);
-        if (dc) DeleteDC(dc);
-    }
-    // `buttonImage`: the small "VR options" button image under the game's menus.
-    void create(uint32_t w, uint32_t h, bool buttonImage = false) {
-        width = w; height = h;
-        dc = CreateCompatibleDC(nullptr);
-        if (!dc) throw std::runtime_error("GDI options memory DC unavailable");
-        BITMAPINFO info{};
-        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = LONG(w);
-        info.bmiHeader.biHeight = -LONG(h);
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-        void *data = nullptr;
-        dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &data, nullptr, 0);
-        if (!dib || !data) throw std::runtime_error("GDI options DIB unavailable");
-        bits = static_cast<uint8_t *>(data);
-        oldBitmap = SelectObject(dc, dib);
-        const auto font = [&](float size, int weight) {
-            return CreateFontW(-int(size), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                               CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, uiFontFace());
-        };
-        if (buttonImage) {
-            button = font(h * .46f, FW_BOLD);
-            if (!oldBitmap || oldBitmap == HGDI_ERROR || !button) throw std::runtime_error("GDI options button resources unavailable");
-        } else {
-            title = font(h * .055f, FW_BOLD); row = font(h * .034f, FW_SEMIBOLD); small = font(h * .026f, FW_NORMAL);
-            if (!oldBitmap || oldBitmap == HGDI_ERROR || !title || !row || !small)
-                throw std::runtime_error("GDI options resources unavailable");
-        }
-        SetBkMode(dc, TRANSPARENT);
-    }
-    RECT pixels(const options_layout::Box &b) const {
-        return {LONG(b.left * width), LONG(b.top * height), LONG(b.right * width), LONG(b.bottom * height)};
-    }
-    void text(const std::wstring &value, RECT r, HFONT font, COLORREF color, UINT align) {
-        const HGDIOBJ old = SelectObject(dc, font);
-        SetTextColor(dc, color);
-        DrawTextW(dc, value.c_str(), -1, &r, align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
-        SelectObject(dc, old);
-    }
-    void paragraph(const std::wstring &value, RECT r, HFONT font, COLORREF color) {
-        const HGDIOBJ old = SelectObject(dc, font);
-        SetTextColor(dc, color);
-        DrawTextW(dc, value.c_str(), -1, &r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
-        SelectObject(dc, old);
-    }
-    void box(RECT r, COLORREF fill, COLORREF edge = CLR_INVALID, int radius = 0) {
-        const HBRUSH brush = CreateSolidBrush(fill);
-        const HPEN pen = CreatePen(PS_SOLID, edge == CLR_INVALID ? 1 : 2, edge == CLR_INVALID ? fill : edge);
-        const HGDIOBJ oldBrush = SelectObject(dc, brush), oldPen = SelectObject(dc, pen);
-        if (radius) RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
-        else Rectangle(dc, r.left, r.top, r.right, r.bottom);
-        SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
-        DeleteObject(brush); DeleteObject(pen);
-    }
-    // A step arrow (left or right) centred in `r`.
-    void arrow(RECT r, bool right, COLORREF color) {
-        const LONG cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, s = (r.bottom - r.top) / 4;
-        const LONG d = right ? s : -s;
-        const POINT p[3] = {{cx - d, cy - s}, {cx + d, cy}, {cx - d, cy + s}};
-        const HBRUSH brush = CreateSolidBrush(color);
-        const HPEN pen = CreatePen(PS_SOLID, 1, color);
-        const HGDIOBJ oldBrush = SelectObject(dc, brush), oldPen = SelectObject(dc, pen);
-        Polygon(dc, p, 3);
-        SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
-        DeleteObject(brush); DeleteObject(pen);
-    }
-    // The pointer: a ring on the panel image itself (centre x, y in pixels).
-    void pointer(int x, int y) {
-        const int r = int(height * .014f) + 2;
-        for (int dy = -r - 1; dy <= r + 1; ++dy)
-            for (int dx = -r - 1; dx <= r + 1; ++dx) {
-                const int px = x + dx, py = y + dy;
-                if (px < 0 || py < 0 || px >= int(width) || py >= int(height)) continue;
-                const float d = std::sqrt(float(dx * dx + dy * dy));
-                uint8_t *p = bits + (size_t(py) * width + px) * 4;
-                if (d <= r - 2.5f) { p[0] = 40; p[1] = 235; p[2] = 255; }      // Fill (BGR): yellow.
-                else if (d <= r + .5f) { p[0] = 20; p[1] = 20; p[2] = 20; }    // Outline.
-                else continue;
-                p[3] = 255;
-            }
-    }
-    void opaque(uint8_t alpha) {
-        GdiFlush();
-        for (size_t i = 0; i < size_t(width) * height; ++i) bits[i * 4 + 3] = alpha;
-    }
-    void draw(const wchar_t *const *tabs, unsigned tabCount, unsigned page, const std::vector<OptionsRow> &rows,
-              const options_layout::Focus &focus, const options_layout::Hit &hover) {
-        namespace L = options_layout;
-        using L::Target;
-        const unsigned count = unsigned(std::min<size_t>(rows.size(), L::MaxRows));
-        const LONG W = LONG(width), H = LONG(height);
-        box({0, 0, W, H}, RGB(16, 20, 26));
-        box({0, 0, W, LONG(L::TitleBottom * H)}, RGB(24, 40, 60));
-        text(L"VR options", {LONG(L::Margin * W), 0, W / 2, LONG(L::TitleBottom * H)}, title, RGB(255, 255, 255), DT_LEFT);
-        text(L"Point and pull the trigger, or use the stick", {W / 2, 0, LONG((1 - L::Margin) * W), LONG(L::TitleBottom * H)}, small,
-             RGB(150, 170, 190), DT_RIGHT);
-        for (unsigned i = 0; i < tabCount; ++i) {
-            RECT r = pixels(L::tab(i, tabCount));
-            r.left += 3; r.right -= 3;
-            const bool current = i == page, hovered = hover.target == Target::Tab && hover.index == i;
-            box(r, current ? RGB(40, 120, 190) : hovered ? RGB(52, 64, 80) : RGB(30, 36, 46),
-                focus.tabs() && current ? RGB(255, 236, 160) : CLR_INVALID, 12);
-            text(tabs[i], r, row, current ? RGB(255, 255, 255) : RGB(190, 200, 214), DT_CENTER);
-        }
-        int helpRow = -1;
-        for (unsigned i = 0; i < count; ++i) {
-            const OptionsRow &o = rows[i];
-            const RECT r = pixels(L::row(i)), down = pixels(L::decrease(i)), up = pixels(L::increase(i));
-            const bool focused = focus.isRow(count) && focus.rowIndex() == i, hovered = hover.target == Target::Row && hover.index == i;
-            if (focused || hovered) helpRow = int(i);
-            if (focused || hovered)
-                box({r.left, r.top + 2, r.right, r.bottom - 2}, focused ? RGB(34, 82, 128) : RGB(38, 46, 58),
-                    focused ? RGB(90, 160, 220) : CLR_INVALID, 10);
-            const COLORREF ink = o.dim ? RGB(110, 118, 128) : focused ? RGB(255, 255, 255) : RGB(214, 222, 232);
-            text(o.label, {LONG(L::Margin * W), r.top, down.left - 8, r.bottom}, row, ink, DT_LEFT);
-            const bool downHot = hovered && hover.direction < 0, upHot = hovered && hover.direction > 0;
-            arrow(down, false, downHot ? RGB(255, 236, 160) : RGB(120, 150, 180));
-            arrow(up, true, upHot ? RGB(255, 236, 160) : RGB(120, 150, 180));
-            const RECT value{down.right, r.top, up.left, r.bottom};
-            if (o.fraction >= 0) {
-                const LONG y = r.bottom - LONG(H * .005f), left = value.left + 10, right = value.right - 10;
-                box({left, y - 2, right, y + 2}, RGB(44, 54, 68));
-                box({left, y - 2, left + LONG((right - left) * o.fraction), y + 2}, o.dim ? RGB(80, 90, 100) : RGB(90, 170, 230));
-            }
-            text(o.value, {value.left, value.top, value.right, value.bottom - (o.fraction >= 0 ? LONG(H * .008f) : 0)}, row, o.dim ? RGB(110, 118, 128) : !o.note.empty() ? RGB(255, 190, 90)
-                                       : focused ? RGB(255, 236, 160) : RGB(170, 205, 235), DT_CENTER);
-        }
-        const RECT help{LONG(L::Margin * W), LONG(L::HelpTop * H), LONG((1 - L::Margin) * W), LONG(L::HelpBottom * H)};
-        box({help.left - 6, help.top, help.right + 6, help.bottom}, RGB(22, 28, 36), CLR_INVALID, 10);
-        if (helpRow >= 0) {
-            const OptionsRow &o = rows[size_t(helpRow)];
-            std::wstring words = o.help;
-            if (!o.note.empty()) words += (words.empty() ? L"" : L"  ") + o.note + L".";
-            paragraph(words, {help.left + 6, help.top + 4, help.right - 6, help.bottom - 2}, small,
-                      o.note.empty() ? RGB(180, 192, 206) : RGB(255, 205, 130));
-        } else if (focus.reset(count) || hover.target == Target::Reset)
-            paragraph(L"Puts every setting on this page back to its default.", {help.left + 6, help.top + 4, help.right - 6, help.bottom - 2},
-                      small, RGB(180, 192, 206));
-        const auto button = [&](const L::Box &b, const wchar_t *label, bool focused, bool hovered) {
-            const RECT r = pixels(b);
-            box(r, hovered ? RGB(60, 120, 180) : RGB(36, 46, 60), focused ? RGB(255, 236, 160) : RGB(70, 90, 110), 14);
-            text(label, r, row, RGB(240, 244, 250), DT_CENTER);
-        };
-        button(L::resetButton(), L"Reset page", focus.reset(count), hover.target == Target::Reset);
-        button(L::closeButton(), L"Close", focus.close(count), hover.target == Target::Close);
-        text(L"Use: change    Menu: close", {LONG(L::ResetRight * W), LONG(L::FooterTop * H), LONG(L::CloseLeft * W),
-             LONG(L::FooterBottom * H)}, small, RGB(130, 145, 160), DT_CENTER);
-        opaque(240);
-    }
-    void drawButton(bool hovered) {
-        const LONG W = LONG(width), H = LONG(height);
-        box({0, 0, W, H}, RGB(0, 0, 0));
-        box({2, 2, W - 2, H - 2}, hovered ? RGB(40, 120, 190) : RGB(24, 40, 60), hovered ? RGB(255, 236, 160) : RGB(90, 150, 210), H / 2);
-        text(L"VR options", {0, 0, W, H}, button, RGB(255, 255, 255), DT_CENTER);
-        GdiFlush();
-        // Transparent outside the rounded button (the black corners).
-        for (size_t i = 0; i < size_t(width) * height; ++i) {
-            uint8_t *p = bits + i * 4;
-            p[3] = p[0] || p[1] || p[2] ? 235 : 0;
-        }
-    }
-};
 struct OptionsPanel {
     Swapchain chain;
     OptionsBitmap bitmap;
@@ -2844,262 +2658,26 @@ struct Host {
             layers.erase(std::remove(layers.begin(), layers.end(), insetWorld), layers.end());
         return false;
     }
-    // --- VR options panel ---
-    enum OptionsItem : unsigned {
-        // Movement
-        OptMoveDirection, OptTurning, OptTurnSpeed, OptSnapAngle, OptSwimming, OptGripTurn,
-        // Graphics
-        OptScale, OptFoveation, OptInset, OptPeriphery, OptWaterMirror, OptMirrorScale, OptScopeLive, OptScopeZoom,
-        OptDesktopWorld, OptInstancing,
-        // Sound
-        OptSpatial, OptOcclusion, OptFireHaptic, OptDamageHaptic,
-        // Voice chat
-        OptVoiceReceive, OptMicrophone, OptMicDevice, OptMicSensitivity, OptMicGain, OptVoiceVolume, OptRadioVolume,
-        OptVoiceRange, OptVoiceIndicators,
-        // Interface
-        OptHud, OptHudSize, OptLasers, OptLaserRange, OptMenuDistance, OptMenuSize,
-        OptCount
-    };
-    static constexpr unsigned OptionsPageCount = 5;
-    static constexpr unsigned OptionsPageStart[OptionsPageCount + 1] = {OptMoveDirection, OptScale, OptSpatial, OptVoiceReceive, OptHud,
-                                                                        OptCount};
-    static constexpr const wchar_t *OptionsPages[OptionsPageCount] = {L"Movement", L"Graphics", L"Sound", L"Voice chat", L"Interface"};
-    struct OptionKey { const wchar_t *section, *key; };
-    static constexpr OptionKey OptionKeys[OptCount] = {
-        {L"Comfort", L"MoveDirection"}, {L"Comfort", L"SnapTurn"}, {L"Comfort", L"SmoothTurnDegreesPerSecond"},
-        {L"Comfort", L"SnapTurnDegrees"}, {L"Swimming", L"Immersive"}, {L"Vehicles", L"GripTurnRateDegrees"},
-        {L"Render", L"Scale"}, {L"Render", L"Foveation"}, {L"Render", L"FoveationInset"}, {L"Render", L"FoveationPeriphery"},
-        {L"Render", L"WaterMirror"}, {L"Render", L"WaterMirrorScale"}, {L"Scope", L"AlwaysLive"}, {L"Scope", L"IdleMagnification"},
-        {L"Render", L"DesktopWorld"}, {L"Render", L"SinglePassInstancing"},
-        {L"Audio", L"Spatial"}, {L"Audio", L"Occlusion"}, {L"Feedback", L"FireStrength"}, {L"Feedback", L"DamageStrength"},
-        {L"Voice", L"Receive"}, {L"Voice", L"Microphone"}, {L"Voice", L"InputDevice"}, {L"Voice", L"Sensitivity"},
-        {L"Voice", L"InputGain"}, {L"Voice", L"Volume"}, {L"Voice", L"RadioVolume"}, {L"Voice", L"SpatialDistanceMeters"},
-        {L"Voice", L"Indicators"},
-        {L"HUD", L"Mode"}, {L"HUD", L"WristScale"}, {L"Laser", L"Enabled"}, {L"Laser", L"MaxDistanceMeters"},
-        {L"Comfort", L"MenuDistanceMeters"}, {L"Comfort", L"MenuWidthMeters"}};
+    // --- VR options panel (pages, rows and steps: options_model.hpp) ---
     VrSettings startup; // As the game started: some settings apply only after a restart.
-    unsigned pageItems(unsigned page) const { return OptionsPageStart[page + 1] - OptionsPageStart[page]; }
+    unsigned pageItems(unsigned page) const { return options_model::pageItems(page); }
+    options_model::OptionsContext optionsContext() const { return {true, actions.gazeEnabled || metaFoveation}; }
     void applyLabFoveation() {
         wchar_t lab[2]{}; // Lab: SS2VR_LAB_FOVEATION=0/1/2 overrides [Render] Foveation.
         if (GetEnvironmentVariableW(L"SS2VR_LAB_FOVEATION", lab, 2) == 1 && lab[0] >= L'0' && lab[0] <= L'2')
             settings.foveation.mode = int(lab[0] - L'0');
     }
-    OptionsRow optionRow(unsigned item) const {
-        const auto onOff = [](bool v) { return std::wstring(v ? L"On" : L"Off"); };
-        const auto format = [](const wchar_t *pattern, double v) { wchar_t b[32]; std::swprintf(b, 32, pattern, v); return std::wstring(b); };
-        const auto percent = [&](float v) { return format(L"%.0f%%", double(std::lround(v * 100))); };
-        const auto restart = [](bool changed) { return std::wstring(changed ? L"Restart the game to apply this" : L""); };
-        const auto &f = settings.foveation;
-        const auto &v = settings.voice;
-        using options_layout::fraction;
-        switch (item) {
-        case OptMoveDirection:
-            return {L"Walk direction", settings.moveDirection == 1 ? L"Left hand" : settings.moveDirection == 2 ? L"Right hand" : L"Head",
-                    L"The left stick walks where your head faces, or where a controller points (head-relative while it is untracked)."};
-        case OptTurning:
-            return {L"Turning", settings.snapTurn ? L"Snap" : L"Smooth", L"The right stick turns you smoothly or in snap steps."};
-        case OptTurnSpeed:
-            return {L"Smooth turn speed", format(L"%.0f°/s", double(std::lround(settings.smoothTurnRate * 180 / Pi))),
-                    L"How fast smooth turning turns at full stick.", L"",
-                    fraction(settings.smoothTurnRate * 180 / Pi, 30, 360), settings.snapTurn};
-        case OptSnapAngle:
-            return {L"Snap turn angle", format(L"%.0f°", double(settings.snapTurnDegrees)), L"How far one snap turn turns you.", L"",
-                    fraction(settings.snapTurnDegrees, 15, 90), !settings.snapTurn};
-        case OptSwimming:
-            return {L"Arm-stroke swimming", onOff(settings.immersiveSwimming),
-                    L"Swim by pulling both arms through the water like a breaststroke (the stick still swims too)."};
-        case OptGripTurn:
-            return {L"Vehicle control turn rate",
-                    settings.gripTurnRateDegrees > 0 ? format(L"%.0f°/s", double(settings.gripTurnRateDegrees)) : std::wstring(L"1:1 with hands"),
-                    L"Holding a vehicle's own controls turned steers it like a control stick at up to this rate; 1:1 turns it with your hands.",
-                    L"", fraction(settings.gripTurnRateDegrees, 0, 360)};
-        case OptScale:
-            return {L"Render resolution", format(L"%.0f%%", double(std::lround(settings.renderScale * 100))),
-                    L"Each eye's resolution as a share of what the headset recommends. Lower is faster, higher is sharper.", L"",
-                    fraction(settings.renderScale, .5f, 2)};
-        case OptFoveation:
-            return {L"Foveated rendering", f.mode == 0 ? L"Off" : f.mode == 1 ? L"Eye-tracked" : L"Fixed (centre)",
-                    L"Renders the edges of the view at lower resolution: where you look (eye tracking) or at the centre.",
-                    f.mode == 1 && !actions.gazeEnabled && !metaFoveation ? L"No eye tracking found: off" : L""};
-        case OptInset:
-            return {L"Sharp region size", percent(f.inset), L"How much of the view stays at full resolution.", L"", fraction(f.inset, .25f, .7f),
-                    f.mode == 0};
-        case OptPeriphery:
-            return {L"Edge resolution", percent(f.periphery), L"The resolution outside the sharp region.", L"",
-                    fraction(f.periphery, .25f, .8f), f.mode == 0};
-        case OptWaterMirror:
-            return {L"Water reflections", settings.waterMirror ? L"Mirror" : L"Cubemap",
-                    L"Mirror: the world rendered mirrored for each eye (exact, costs two extra renders). Cubemap: a captured picture of the surroundings (cheap, no close-up detail)."};
-        case OptMirrorScale:
-            return {L"Reflection resolution", percent(settings.waterMirrorScale),
-                    L"The mirrored render's size as a share of an eye's. Lower is faster.", L"",
-                    fraction(settings.waterMirrorScale, .25f, 1), !settings.waterMirror};
-        case OptScopeLive:
-            return {L"Scopes always magnify", onOff(settings.scopeAlwaysLive),
-                    L"A held sniper's scope shows the magnified view even when you are not zoomed."};
-        case OptScopeZoom:
-            return {L"Unzoomed scope magnification", format(L"%.1fx", double(settings.scopeIdleMagnification)),
-                    L"The scope's magnification while you are not zoomed.", L"", fraction(settings.scopeIdleMagnification, 1.5f, 10),
-                    !settings.scopeAlwaysLive};
-        case OptDesktopWorld:
-            return {L"Show the game on the monitor", onOff(settings.desktopWorld),
-                    L"Also draws the game in its desktop window, for others watching or streaming. Costs a third render."};
-        case OptInstancing:
-            return {L"Instanced single pass", onOff(settings.singlePassInstancing),
-                    L"Experimental: both eyes in one draw call each. Can show artifacts."};
-        case OptSpatial:
-            return {L"Spatial audio", onOff(settings.spatialAudio),
-                    L"3D sound (HRTF) heard from your tracked head: sounds come from where they are around you.",
-                    restart(settings.spatialAudio != startup.spatialAudio)};
-        case OptOcclusion:
-            return {L"Sound occlusion", onOff(settings.audioOcclusion), L"Sounds behind walls are muffled (with spatial audio).",
-                    L"", -1, !settings.spatialAudio};
-        case OptFireHaptic:
-            return {L"Fire vibration", percent(settings.fireHaptic), L"Controller vibration when you shoot.", L"",
-                    fraction(settings.fireHaptic, 0, 1)};
-        case OptDamageHaptic:
-            return {L"Damage vibration", percent(settings.damageHaptic), L"Controller vibration when you are hurt.", L"",
-                    fraction(settings.damageHaptic, 0, 1)};
-        case OptVoiceReceive:
-            return {L"Hear other players", onOff(v.receive), L"Hear the voices of other VR players in multiplayer."};
-        case OptMicrophone:
-            return {L"Microphone", v.microphone == 0 ? L"Off" : v.microphone == 1 ? L"Open mic" : L"Hand to mouth",
-                    v.microphone == 1 ? L"Sends your voice while you speak."
-                    : v.microphone == 2 ? L"Push to talk: hold either controller to your mouth while you speak."
-                                        : L"Others cannot hear you."};
-        case OptMicDevice:
-            return {L"Microphone device", v.device[0] ? std::wstring(v.device) : std::wstring(L"System default"),
-                    L"Which microphone voice chat records from.", L"", -1, v.microphone == 0};
-        case OptMicSensitivity:
-            return {L"Microphone sensitivity", format(L"%.0f", double(v.sensitivity)),
-                    L"How readily open mic starts sending: raise it if your voice is cut off, lower it if noise gets through.", L"",
-                    fraction(v.sensitivity, 0, 100), v.microphone != 1};
-        case OptMicGain:
-            return {L"Microphone boost", percent(v.inputGain), L"Amplifies your microphone before sending.", L"",
-                    fraction(v.inputGain, 0, 4), v.microphone == 0};
-        case OptVoiceVolume:
-            return {L"Voice volume", percent(v.volume), L"How loud other players' voices are.", L"", fraction(v.volume, 0, 2), !v.receive};
-        case OptRadioVolume:
-            return {L"Radio voice volume", percent(v.radioVolume),
-                    L"Players far away or out of sight are heard over the radio, centred, at this volume.", L"",
-                    fraction(v.radioVolume, 0, 1), !v.receive};
-        case OptVoiceRange:
-            return {L"Proximity voice range", format(L"%.0f m", double(v.spatialDistance)),
-                    L"Within this distance voices come from the player; beyond it they are all radio.", L"",
-                    fraction(v.spatialDistance, 2, 200), !v.receive};
-        case OptVoiceIndicators:
-            return {L"Talking indicators", onOff(v.indicators),
-                    L"Rings over players who are talking, and a dot at your hand while you are sending."};
-        case OptHud:
-            return {L"HUD", settings.hudMode == 1 ? L"Wrist watches" : L"Head-mounted",
-                    L"Health and armor on the left wrist, ammo on the right; or the whole HUD in front of you."};
-        case OptHudSize:
-            return {L"Wrist HUD size", format(L"%.0f cm", double(std::lround(settings.hudWristScale * 100))),
-                    L"The width the full HUD spans on a wrist.", L"", fraction(settings.hudWristScale, .2f, .6f), settings.hudMode != 1};
-        case OptLasers:
-            return {L"Aim lasers", onOff(settings.lasers), L"A laser from each weapon shows where it aims."};
-        case OptLaserRange:
-            return {L"Laser length", format(L"%.0f m", double(settings.laserDistance)), L"How far the aim lasers reach.", L"",
-                    fraction(settings.laserDistance, 10, 200), !settings.lasers};
-        case OptMenuDistance:
-            return {L"Menu distance", format(L"%.1f m", double(settings.menuDistance)),
-                    L"How far away the game's menus (and the head-mounted HUD) float.", L"", fraction(settings.menuDistance, 1.5f, 3)};
-        case OptMenuSize:
-            return {L"Menu size", format(L"%.1f m", double(settings.menuWidth)), L"How wide the game's menus (and the head-mounted HUD) are.",
-                    L"", fraction(settings.menuWidth, 1.4f, 2.8f)};
-        default: return {};
-        }
-    }
     std::vector<OptionsRow> optionRows() const {
-        std::vector<OptionsRow> rows;
-        for (unsigned item = OptionsPageStart[options.page]; item < OptionsPageStart[options.page + 1]; ++item)
-            rows.push_back(optionRow(item));
-        return rows;
-    }
-    // Into SS2VR.user.ini (see userSettingsFile), which the game watches.
-    void saveText(unsigned item, const wchar_t *text) {
-        const OptionKey &k = OptionKeys[item];
-        if (!WritePrivateProfileStringW(k.section, k.key, text, userSettingsFile(settingsFile).c_str())) {
-            char line[160];
-            std::snprintf(line, sizeof line, "VR options: could not save %ls/%ls", k.section, k.key);
-            log.write(line);
-        }
-    }
-    void saveSetting(unsigned item, double value) {
-        wchar_t text[32];
-        std::swprintf(text, 32, L"%g", value);
-        saveText(item, text);
-    }
-    static float stepped(float value, int direction, float step, float low, float high) {
-        return options_layout::stepped(value, direction, step, low, high);
+        return options_model::optionRows(options.page, settings, startup, optionsContext());
     }
     void changeOption(unsigned item, int direction) {
-        auto &f = settings.foveation;
-        auto &v = settings.voice;
-        const auto toggle = [&](bool &value) { value = !value; saveSetting(item, value); };
-        const auto number = [&](float &value, float step, float low, float high) {
-            value = stepped(value, direction, step, low, high);
-            saveSetting(item, value);
-        };
-        const auto cycle = [&](int &value, int count) { value = (value + count + direction) % count; saveSetting(item, value); };
-        switch (item) {
-        case OptMoveDirection: cycle(settings.moveDirection, 3); break;
-        case OptTurning: toggle(settings.snapTurn); break;
-        case OptTurnSpeed: {
-            float degrees = settings.smoothTurnRate * 180 / Pi;
-            number(degrees, 30, 30, 360);
-            settings.smoothTurnRate = degrees * Pi / 180;
-            break;
+        if (!options_model::changeOption(item, direction, settings, options.microphones, settingsFile, optionsContext())) {
+            char line[160];
+            std::snprintf(line, sizeof line, "VR options: could not save %ls/%ls", OptionKeys[item].section, OptionKeys[item].key);
+            log.write(line);
+            return;
         }
-        case OptSnapAngle: number(settings.snapTurnDegrees, 15, 15, 90); break;
-        case OptSwimming: toggle(settings.immersiveSwimming); break;
-        case OptGripTurn: number(settings.gripTurnRateDegrees, 30, 0, 360); break;
-        case OptScale: number(settings.renderScale, .1f, .5f, 2.f); break; // Applies at once: the eye size is republished every loop.
-        case OptFoveation: cycle(f.mode, 3); break;
-        case OptInset: number(f.inset, .05f, .25f, .7f); break;
-        case OptPeriphery: number(f.periphery, .05f, .25f, .8f); break;
-        case OptWaterMirror: toggle(settings.waterMirror); break;
-        case OptMirrorScale: number(settings.waterMirrorScale, .25f, .25f, 1); break;
-        case OptScopeLive: toggle(settings.scopeAlwaysLive); break;
-        case OptScopeZoom: number(settings.scopeIdleMagnification, .5f, 1.5f, 10); break;
-        case OptDesktopWorld: toggle(settings.desktopWorld); break;
-        case OptInstancing: toggle(settings.singlePassInstancing); break;
-        case OptSpatial: toggle(settings.spatialAudio); break;
-        case OptOcclusion: toggle(settings.audioOcclusion); break;
-        case OptFireHaptic: number(settings.fireHaptic, .1f, 0, 1); break;
-        case OptDamageHaptic: number(settings.damageHaptic, .1f, 0, 1); break;
-        case OptVoiceReceive: toggle(v.receive); break;
-        case OptMicrophone: cycle(v.microphone, 3); break;
-        case OptMicDevice: {
-            // "System default", then each capture device.
-            const size_t count = options.microphones.size() + 1;
-            size_t at = 0;
-            for (size_t i = 0; i < options.microphones.size(); ++i)
-                if (!std::wcsncmp(options.microphones[i].c_str(), v.device, 31)) at = i + 1;
-            at = (at + count + size_t(direction > 0 ? 1 : count - 1)) % count;
-            std::fill(std::begin(v.device), std::end(v.device), L'\0');
-            if (at) std::wcsncpy(v.device, options.microphones[at - 1].c_str(), 63);
-            saveText(item, v.device);
-            break;
-        }
-        case OptMicSensitivity: number(v.sensitivity, 5, 0, 100); break;
-        case OptMicGain: number(v.inputGain, .25f, 0, 4); break;
-        case OptVoiceVolume: number(v.volume, .1f, 0, 2); break;
-        case OptRadioVolume: number(v.radioVolume, .05f, 0, 1); break;
-        case OptVoiceRange: {
-            const float step = v.spatialDistance + direction * 1.f >= 40 ? 10.f : 2.f; // Finer when close.
-            number(v.spatialDistance, step, 2, 200);
-            break;
-        }
-        case OptVoiceIndicators: toggle(v.indicators); break;
-        case OptHud: settings.hudMode = settings.hudMode == 1 ? 0 : 1; saveSetting(item, settings.hudMode); break;
-        case OptHudSize: number(settings.hudWristScale, .02f, .2f, .6f); break;
-        case OptLasers: toggle(settings.lasers); break;
-        case OptLaserRange: number(settings.laserDistance, 10, 10, 200); break;
-        case OptMenuDistance: number(settings.menuDistance, .1f, 1.5f, 3); menuAnchor.reset(); break;
-        case OptMenuSize: number(settings.menuWidth, .1f, 1.4f, 2.8f); break;
-        default: return;
-        }
+        if (item == OptMenuDistance) menuAnchor.reset();
         char line[128];
         std::snprintf(line, sizeof line, "VR options: %ls/%ls changed (direction %d)", OptionKeys[item].section, OptionKeys[item].key,
                       direction);
@@ -3107,8 +2685,7 @@ struct Host {
     }
     // Reset page: its keys leave SS2VR.user.ini, so SS2VR.ini's values (the defaults) apply again.
     void resetPage() {
-        for (unsigned item = OptionsPageStart[options.page]; item < OptionsPageStart[options.page + 1]; ++item)
-            WritePrivateProfileStringW(OptionKeys[item].section, OptionKeys[item].key, nullptr, userSettingsFile(settingsFile).c_str());
+        options_model::resetPage(options.page, settingsFile, optionsContext());
         settings = loadSettings(settingsFile);
         applyLabFoveation();
         menuAnchor.reset();
@@ -3116,15 +2693,7 @@ struct Host {
         std::snprintf(line, sizeof line, "VR options: page %ls reset", OptionsPages[options.page]);
         log.write(line);
     }
-    void listMicrophones() {
-        options.microphones.clear();
-        const UINT count = waveInGetNumDevs();
-        for (UINT i = 0; i < count && i < 32; ++i) {
-            WAVEINCAPSW caps{};
-            if (waveInGetDevCapsW(i, &caps, sizeof caps) == MMSYSERR_NOERROR && caps.szPname[0])
-                options.microphones.emplace_back(caps.szPname, wcsnlen(caps.szPname, 32));
-        }
-    }
+    void listMicrophones() { options.microphones = options_model::microphones(); }
     void openOptions(const Input &input) {
         const float heading = horizontalHeading(input.head.q);
         const Quat facing = yaw(heading);

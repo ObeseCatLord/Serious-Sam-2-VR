@@ -50,6 +50,13 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
    switching to the projected 2D menu.
 6. The title screen uses a 4:3 image. Cutscenes are no longer cut off at the
    top and bottom.
+7. Desktop play (no headset): a "VR options" button sits at the bottom of the
+   game window under the game's menus. It opens the same options panel as a
+   window: click a tab, click the arrows or use the mouse wheel over a value,
+   and press Esc or Close to close it. Sound and voice chat settings can be
+   changed there. Settings that only apply in VR are greyed out, with grey
+   arrows. In VR, the pause menu over a level has no "VR options" button
+   (the Proton runtime can't show it there); use the wheel's options bubble.
 
 ## Changed after the junkyard water and match report (2026-10-24)
 

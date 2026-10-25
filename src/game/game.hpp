@@ -10,6 +10,7 @@ namespace ss2vr::game {
 extern Channel channel;
 extern std::atomic<bool> hooksReady;
 void log(const char *fmt, ...);
+HWND gameWindow() noexcept; // The game's focus window once its device exists.
 bool attach(bool headless = false);
 // Metadata only; reentered input boundaries contain GNU errors before crossing
 // native frames. The enclosing simulation finally owns interval retirement.

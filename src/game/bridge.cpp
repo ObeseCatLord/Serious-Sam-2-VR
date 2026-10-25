@@ -2596,6 +2596,10 @@ bool vrInputLive() noexcept {
     const uint64_t tick = vrInputTick.load(std::memory_order_relaxed), now = GetTickCount64();
     return hooksReady.load(std::memory_order_acquire) && tick && now >= tick && now - tick < 1000;
 }
+HWND gameWindow() noexcept {
+    D3DDEVICE_CREATION_PARAMETERS params{};
+    return device && SUCCEEDED(device->GetCreationParameters(&params)) ? params.hFocusWindow : nullptr;
+}
 bool foregroundGame() {
     if (!device)
         return false;

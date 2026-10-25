@@ -18,4 +18,6 @@ bool movieOnTop();
 // the world, so it draws the menu alone (over black, which the bridge keys out)
 // while the headset keeps the last world frame behind it.
 bool worldHidden();
+// A menu that takes input is up (not a loading screen or a movie). Main thread.
+bool interactiveMenu();
 } // namespace ss2vr::game::menus

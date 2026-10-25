@@ -38,6 +38,7 @@
 #include "common/attachment_observation.hpp"
 #include "common/win_settings.hpp"
 #include "common/winproc.hpp"
+#include "desktop_options.hpp"
 #include "common/winpath.hpp"
 #include "common/weapon_view.hpp"
 #include "common/water_mirror.hpp"
@@ -10407,6 +10408,10 @@ static int __cdecl appForeground() {
     applyEyeCanvas();   // In play too: the canvas changes between the front end (4:3) and a level (eye size).
     maintainSpatialAudio();
     voiceFrame();
+    // Desktop play (no headset driving the game): VR options from under the game's menus.
+    // Lab (SS2VR_LAB_DESKTOP_OPTIONS=1): as on the desktop while the headset plays.
+    static const bool labDesktop = [] { const char *v = std::getenv("SS2VR_LAB_DESKTOP_OPTIONS"); return v && *v == '1'; }();
+    desktop_options::frame((labDesktop || !vrInputLive()) && menus::interactiveMenu(), gameWindow());
     if (labLoadPending.exchange(false) && labLoadGame) {
         log("Lab load of Temp/SS2VR/user.sav issued");
         labLoadGame("Temp/SS2VR/user.sav");
@@ -12041,6 +12046,7 @@ bool attach(bool headless) {
         settingsFile=settingsDirectory+L"SS2VR\\SS2VR.ini";
         settings=loadSettings(settingsFile);
         settingsWritten(settingsSeen);
+        if (!headless) desktop_options::start(settingsFile, settings);
     }
     setDesktopWorld(settings.desktopWorld);
     setEyeReplay(settings.eyeReplay);

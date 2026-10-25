@@ -210,6 +210,9 @@ static void __cdecl poll() {
     }
 }
 } // namespace
+bool interactiveMenu() {
+    return active() && interactive && interactive() && !movieOnTop();
+}
 bool active() {
     bool result = hooksReady.load(std::memory_order_acquire) && current() != 0;
     if (!result) {
