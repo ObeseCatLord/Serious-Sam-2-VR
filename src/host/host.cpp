@@ -1866,6 +1866,9 @@ struct Host {
         bool menuVisible = false;
         uint32_t menuOverlay = 0; // MenuOverlay flags of the visible menu frame.
     };
+    Snapshot lastSnapshot;            // The last published frame state, for a frame the IPC was busy.
+    ULONGLONG lastSnapshotTick = 0;
+    unsigned heldSnapshots = 0;
     bool prepareHudAnchor(const Snapshot &snapshot, const Input &input) {
         const ULONGLONG now = GetTickCount64();
         if (!snapshot.ui.gameplay || snapshot.menuVisible || !input.focused || !input.headValid ||
@@ -3386,7 +3389,19 @@ struct Host {
                     currentFov[h] = {f.angleLeft, f.angleRight, f.angleUp, f.angleDown};
                 }
             Snapshot snapshot;
-            const bool published = publish(input, snapshot);
+            bool published = publish(input, snapshot);
+            // The IPC busy for a moment (the game copying a flat frame): this frame
+            // shows what the last one did. Skipping it submitted no layers, a black
+            // frame (74 in a 40 s clip of menus and the options panel).
+            const ULONGLONG snapshotNow = GetTickCount64();
+            if (published) {
+                lastSnapshot = snapshot;
+                lastSnapshotTick = snapshotNow;
+            } else if (lastSnapshotTick && snapshotNow - lastSnapshotTick < 250) {
+                snapshot = lastSnapshot;
+                published = true;
+                ++heldSnapshots;
+            }
             if (published && !api.lossPending)
                 feedback(snapshot.ui, input, snapshot.menuVisible);
             if (published) watchOptionsBubble(snapshot.ui, input);

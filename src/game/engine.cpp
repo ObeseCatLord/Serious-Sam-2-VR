@@ -5168,6 +5168,7 @@ float frozenWorldVisibility() {
 }
 static void freezeLasers(const Request &request);
 static void drawLasers();
+static bool drivenVehicle(void *ride);
 static void drawVoiceIndicators();
 static void drawSteeringWheel();
 static void drawWeaponWheels();
@@ -6841,6 +6842,10 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
         // (last pose, untracked) and drew a stale, skewed beam.
         if ((!settings.lasers && !(s.rider.handheld() && s.zoom[h])) || !s.input.handValid[m] ||
             (!s.rider.seated() && !s.input.gripValid[m]))
+            { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,1);continue; }
+        // Driven vehicles (hoverbike, UFO, cars) show no beam; turrets and
+        // hand-aimed creatures keep theirs.
+        if (s.rider.seated() && drivenVehicle(resolve(s.rider.ride)))
             { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,1);continue; }
         Pose muzzle, local{};
         bool relative = false;
@@ -9535,6 +9540,7 @@ static WheelSteering steeringWheelClass(void *ride) {
     default: return WheelSteering::None; // Turrets, mounts and unknown classes.
     }
 }
+static bool drivenVehicle(void *ride) { return steeringWheelClass(ride) != WheelSteering::None; }
 static bool steeringWheelTextureReady(void *texture) {
     // Only a loaded CStaticTexture may reach gfuCurrentTexture.
     if(!texture || !staticTextureVtable || !readableMemory(texture,8))return false;
