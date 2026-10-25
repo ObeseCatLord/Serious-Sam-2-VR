@@ -13,6 +13,7 @@
 #include "common/scope_shader_constants.hpp"
 #include "common/scope_position_program.hpp"
 #include "common/ride_position.hpp"
+#include "common/ride_handles.hpp"
 #include <bcrypt.h>
 #include <atomic>
 #include <algorithm>
@@ -727,6 +728,7 @@ static bool rideGpuBookend(IDirect3DDevice9 *d) {
     now.api=probe.rideBefore.api;
     return now==probe.rideBefore && rideGpuOwnerCurrent(d);
 }
+static bool learnHandleRig(const RideHandleGeometry &handles) noexcept;
 static bool beginRideGpu(IDirect3DDevice9 *d) {
     auto &g=probe.rideGpu;g.copied=false;g.handles={};g.handleWorld={};g.handlePositionAgrees=false;
     probe.rideCameraCaptured=copyExecutedRideCamera(probe.rideBefore.identity.player,
@@ -763,6 +765,27 @@ static bool beginRideGpu(IDirect3DDevice9 *d) {
         Matrix34 world{},main{};
         std::memcpy(world.m,probe.rideBefore.world.data(),sizeof(world.m));
         std::memcpy(main.m,probe.rideBefore.actualPalette.data(),sizeof(main.m));
+        learnHandleRig(g.handles);
+        // Lab (SS2VR_LAB_RIDE_HANDLES=1): each handle's extent in mesh space, once per profile.
+        static const bool handleTrace=[] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_RIDE_HANDLES",v,2)==1 && v[0]==L'1'; }();
+        static unsigned handleTraced=0;
+        if(handleTrace && !(handleTraced&(1u<<unsigned(profile)))) {
+            handleTraced|=1u<<unsigned(profile);
+            for(unsigned hand=0;hand<2;++hand) {
+                const auto &h=g.handles.handles[hand];
+                Vec3 lo=h.positions[0],hi=h.positions[0],sum{};
+                for(unsigned v=0;v<h.vertices;++v) {
+                    const auto q=h.positions[v];sum=sum+q;
+                    lo={std::min(lo.x,q.x),std::min(lo.y,q.y),std::min(lo.z,q.z)};
+                    hi={std::max(hi.x,q.x),std::max(hi.y,q.y),std::max(hi.z,q.z)};
+                }
+                sum=sum*(1.f/float(h.vertices));
+                log("Lab ride handle profile=%u hand=%u min=%.3f,%.3f,%.3f max=%.3f,%.3f,%.3f mean=%.3f,%.3f,%.3f start=%u primitives=%u indexOffset=%u main=%u palette=%u/%u",
+                    unsigned(profile),hand,lo.x,lo.y,lo.z,hi.x,hi.y,hi.z,sum.x,sum.y,sum.z,draw.start,draw.primitives,
+                    probe.rideBefore.layout.channels[1].offset,probe.rideBefore.localMainSlot,probe.rideBefore.paletteFirst,
+                    probe.rideBefore.paletteCount);
+            }
+        }
         g.handlePositionAgrees=rideHandlesPosition(g.handles,probe.rideBefore.paletteCount,probe.rideBefore.localMainSlot,
             std::span(g.program).first(g.programWords),std::span(b.constants).first(b.constantCount),layout,
             world,main,probe.rideCamera.view,probe.rideCamera.projection,g.handleWorld) ||
@@ -977,6 +1000,101 @@ static bool drawImage(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base,UINT mi
     ok = restoreImageState(d) && ok;
     return ok && imageCurrent(d);
 }
+// The hoverbike's and UFO's handles turn with the steering (rideHandlePose):
+// the ride's mesh is drawn without its handle triangles, then each handle with
+// its bone's palette rows turned about the handle's pivot; held handles get a
+// faint additive glow. Each handle profile's rig is learned once from the copied
+// handle meshes (learnHandleRig). Anything unexpected draws the mesh as is.
+static RideHandleRig handleRigs[3];
+static IDirect3DPixelShader9 *glowShader=nullptr;
+static IDirect3DDevice9 *glowDevice=nullptr;
+static IDirect3DPixelShader9 *handleGlowShader(IDirect3DDevice9 *d) noexcept {
+    if(glowDevice!=d) {glowShader=nullptr;glowDevice=d;} // A new device: the old shader went with the old one.
+    if(!glowShader) {
+        // ps_2_0: mov oC0, c0
+        static const DWORD code[]{0xffff0200,0x02000001,0x800f0800,0xa0e40000,0x0000ffff};
+        if(FAILED(d->CreatePixelShader(code,&glowShader)))glowShader=nullptr;
+    }
+    return glowShader;
+}
+static HRESULT drawRideHandlesTurned(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base,UINT minimum,UINT vertices,
+        UINT start,UINT primitives,ScopeIndexedForward forward) noexcept {
+    const auto full=[&]{ return forward(d,type,base,minimum,vertices,start,primitives); };
+    const auto &draw=probe.rideBefore;
+    const auto profile=rideHandleLayoutProfile(draw.layout.vertices,draw.layout.triangles);
+    const auto &rig=handleRigs[unsigned(profile)];
+    float steer=0;bool held=false;
+    if(profile==RideHandleProfile::Unknown || !rig.valid || type!=D3DPT_TRIANGLELIST ||
+       primitives!=UINT(draw.layout.triangles) || !rideHandlePose(draw.identity.ride,steer,held) ||
+       (std::abs(steer)<.01f && !held))return full();
+    // The main bone's palette rows among the bound constants (its world placement
+    // is applied separately or folded in: both are tried).
+    D3DCAPS9 caps{};
+    std::array<std::array<float,4>,256> rows{};
+    if(FAILED(d->GetDeviceCaps(&caps)))return full();
+    const UINT count=std::min<UINT>(caps.MaxVertexShaderConst,256);
+    if(FAILED(d->GetVertexShaderConstantF(0,rows[0].data(),count)))return full();
+    Matrix34 main{},world{};
+    std::memcpy(main.m,draw.actualPalette.data(),sizeof(main.m));
+    std::memcpy(world.m,draw.world.data(),sizeof(world.m));
+    const std::span<const std::array<float,4>> bound(rows.data(),count);
+    int row=findPaletteRows(bound,main);
+    Matrix34 palette=main;
+    if(row<0) {palette=affineMultiply(world,main);row=findPaletteRows(bound,palette);}
+    static unsigned traced=0;
+    if(traced<6) {++traced;log("Ride handles turned: profile=%u palette row=%d steer=%.2f held=%d",unsigned(profile),row,steer,int(held));}
+    if(row<0)return full();
+    const uint32_t first=rideHandleFirstTriangle(profile);
+    constexpr uint32_t PerHandle=30;
+    if(first+2*PerHandle>primitives)return full();
+    // The handles' roll at full steering: about 23 degrees (more swung them through the console).
+    const float angle=steer*.4f;
+    HRESULT result=forward(d,type,base,minimum,vertices,start,first);
+    const auto drawHandles=[&]() {
+        for(unsigned hand=0;hand<2 && SUCCEEDED(result);++hand) {
+            const Matrix34 turned=turnedPalette(palette,rig.pivot[hand],rig.axis[hand],angle);
+            float values[12];std::memcpy(values,turned.m,sizeof(values));
+            d->SetVertexShaderConstantF(UINT(row),values,3);
+            result=forward(d,type,base,minimum,vertices,start+3*(first+PerHandle*hand),PerHandle);
+        }
+        d->SetVertexShaderConstantF(UINT(row),rows[size_t(row)].data(),3);
+    };
+    drawHandles();
+    if(held && SUCCEEDED(result)) {
+        // Held: the handles again, added faintly in the laser's blue over themselves.
+        IDirect3DPixelShader9 *shader=handleGlowShader(d),*previous=nullptr;
+        DWORD blend=0,src=0,dst=0,zfunc=0,zwrite=0,alphaTest=0;
+        float glowColour[4]{.05f,.08f,.12f,0},previousColour[4]{};
+        if(shader && SUCCEEDED(d->GetPixelShader(&previous)) &&
+           SUCCEEDED(d->GetPixelShaderConstantF(0,previousColour,1))) {
+            d->GetRenderState(D3DRS_ALPHABLENDENABLE,&blend);d->GetRenderState(D3DRS_SRCBLEND,&src);
+            d->GetRenderState(D3DRS_DESTBLEND,&dst);d->GetRenderState(D3DRS_ZFUNC,&zfunc);
+            d->GetRenderState(D3DRS_ZWRITEENABLE,&zwrite);d->GetRenderState(D3DRS_ALPHATESTENABLE,&alphaTest);
+            d->SetPixelShader(shader);d->SetPixelShaderConstantF(0,glowColour,1);
+            d->SetRenderState(D3DRS_ALPHABLENDENABLE,TRUE);d->SetRenderState(D3DRS_SRCBLEND,D3DBLEND_ONE);
+            d->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_ONE);d->SetRenderState(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);
+            d->SetRenderState(D3DRS_ZWRITEENABLE,FALSE);d->SetRenderState(D3DRS_ALPHATESTENABLE,FALSE);
+            drawHandles();
+            d->SetPixelShader(previous);d->SetPixelShaderConstantF(0,previousColour,1);
+            d->SetRenderState(D3DRS_ALPHABLENDENABLE,blend);d->SetRenderState(D3DRS_SRCBLEND,src);
+            d->SetRenderState(D3DRS_DESTBLEND,dst);d->SetRenderState(D3DRS_ZFUNC,zfunc);
+            d->SetRenderState(D3DRS_ZWRITEENABLE,zwrite);d->SetRenderState(D3DRS_ALPHATESTENABLE,alphaTest);
+        }
+        if(previous)previous->Release();
+    }
+    if(SUCCEEDED(result))
+        result=forward(d,type,base,minimum,vertices,start+3*(first+2*PerHandle),primitives-first-2*PerHandle);
+    return result;
+}
+static bool learnHandleRig(const RideHandleGeometry &handles) noexcept {
+    auto &rig=handleRigs[unsigned(handles.profile)];
+    if(handles.profile==RideHandleProfile::Unknown || !handles.copied || rig.valid)return rig.valid;
+    RideHandleRig next;
+    if(!fitRideHandleRig(handles,next))return false;
+    rig=next;
+    log("Ride handle rig learned profile=%u",unsigned(handles.profile));
+    return true;
+}
 static HRESULT probeScopeDraw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base,UINT minimum,UINT vertices,
                      UINT start,UINT primitives,uintptr_t caller,ScopeIndexedForward forward) noexcept {
     if(probe.busy)probe.rideReentered=true;
@@ -1142,7 +1260,9 @@ static HRESULT probeScopeDraw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
             }
             if(probe.idleTrace && probe.idleTrace->streamProbe.selected)
                 probe.idleTrace->streamProbe.flags|=IdleWeaponTrace::StreamProbe::ForwardCalled;
-            result=forward(d,type,base,minimum,vertices,start,primitives);
+            if(probe.rideBefore.bank && rideSurfaceSupported(probe.rideBefore.layout))
+                result=drawRideHandlesTurned(d,type,base,minimum,vertices,start,primitives,forward);
+            else result=forward(d,type,base,minimum,vertices,start,primitives);
             probe.rideOriginalReturned=true;
             if(probe.rideGpuAttempt && SUCCEEDED(result))probe.rideGpuMatched=finishRideGpu(d);
             if(probe.rideBefore.bank && SUCCEEDED(result) &&

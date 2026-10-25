@@ -2173,6 +2173,14 @@ static int WINAPI eyeSystemMetrics(int index) {
 // forces the drawport aspect from it), whatever the canvas: on the 4:3 front-end
 // canvas a 16:9 layout was squeezed. In VR they follow the canvas; the user's
 // values are put back before the game saves its cvars (vmSaveCvars) on exit.
+// The front end's canvas (4:3; see the presentation's canvas choice).
+constexpr uint32_t MenuCanvasWidth = 1440, MenuCanvasHeight = 1080;
+// A level's 2D aspect ([Render] UiAspect, 16:9: the band of the eye-sized
+// canvas the HUD, cutscenes and flat screen use); the front end uses its canvas's.
+static float levelUiAspect = 16.f / 9;
+void setLevelUiAspect(float aspect) noexcept {
+    if (std::isfinite(aspect) && aspect > .3f && aspect < 4.f) levelUiAspect = aspect;
+}
 static int32_t *pixResWidth = nullptr, *pixResHeight = nullptr;
 static int32_t userPixRes[2]{};
 static bool pixResFollowing = false;
@@ -2199,7 +2207,8 @@ static void followCanvasResolution(int32_t w, int32_t h) noexcept {
         if (readableMemory(aspect, sizeof current)) {
             std::memcpy(&current, aspect, sizeof current);
             if (std::isfinite(current) && current > .3f && current < 4.f) {
-                const float next = float(w) / float(h);
+                const bool frontEnd = uint32_t(w) == MenuCanvasWidth && uint32_t(h) == MenuCanvasHeight;
+                const float next = frontEnd ? float(w) / float(h) : levelUiAspect;
                 std::memcpy(aspect, &next, sizeof next);
                 log("Display aspect %.3f -> %.3f with the canvas (configured %dx%d)", current, next, userPixRes[0], userPixRes[1]);
             }
@@ -2256,6 +2265,27 @@ static void notePromptProfile(bool index) noexcept {
     WritePrivateProfileStringW(L"Controls", L"Prompts", next, cache.c_str());
     log("Menu prompts for %ls controllers from the next start", next);
 }
+// The main menu (title) lays itself out once, when created (CMainMenu::PostCreate),
+// for the 2D aspect of that moment: created under the configured 16:9 it stayed
+// squeezed on the 4:3 front-end canvas. The front end's aspect is set just before.
+static void(__fastcall *originalMainMenuPostCreate)(void *, void *) = nullptr;
+static void __fastcall mainMenuPostCreate(void *menu, void *edx) {
+    followCanvasResolution(int32_t(MenuCanvasWidth), int32_t(MenuCanvasHeight));
+    static unsigned traced = 0;
+    if (traced < 4) { ++traced; log("Main menu created at the front end's 4:3 aspect"); }
+    originalMainMenuPostCreate(menu, edx);
+}
+void installMainMenuLayout() noexcept {
+    static bool installed = false;
+    if (installed || !GetModuleHandleW(L"Sam2Game.dll")) return;
+    installed = true;
+    const HMODULE sam = GetModuleHandleW(L"Sam2Game.dll");
+    void *target = sam ? reinterpret_cast<void *>(GetProcAddress(sam, "?PostCreate@CMainMenu@SeriousEngine@@UAEXXZ")) : nullptr;
+    const bool ok = target &&
+        MH_CreateHook(target, reinterpret_cast<void *>(mainMenuPostCreate), reinterpret_cast<void **>(&originalMainMenuPostCreate)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK;
+    if (!ok) log("Main menu layout hook unavailable");
+}
 void installEyeCanvas() noexcept {
     static bool installed = false;
     if (installed) return;
@@ -2275,6 +2305,10 @@ void installEyeCanvas() noexcept {
         const UINT h = GetPrivateProfileIntW(L"View", L"Height", 0, cache.c_str());
         if (w && h && w <= MaxDimension && h <= MaxDimension) { canvasWidth = w; canvasHeight = h; }
     }
+    // The game starts at the front end: its 4:3 canvas from the first frame (the
+    // last level's eye size made the title lay out before the switch).
+    canvasWidth = MenuCanvasWidth;
+    canvasHeight = MenuCanvasHeight;
     void *clientRect = reinterpret_cast<void *>(GetProcAddress(core,
         "?wndGetWindowClientRect@SeriousEngine@@YA?AVCTRect@1@ABVCWindow@1@@Z"));
     void *metrics = reinterpret_cast<void *>(GetProcAddress(user, "GetSystemMetrics"));
@@ -2293,10 +2327,9 @@ void installEyeCanvas() noexcept {
             log("Eye canvas: configured resolution not followed (exports unavailable)");
         }
     }
+    installMainMenuLayout();
     log("Eye canvas hooks=%d cached=%ux%u", ok, canvasWidth.load(), canvasHeight.load());
 }
-// The front end's canvas (4:3; see the presentation's canvas choice).
-constexpr uint32_t MenuCanvasWidth = 1440, MenuCanvasHeight = 1080;
 // Adopt the runtime's recommended eye size (or the front end's 4:3): remember it
 // for the next launch and let the main thread resize the native canvas at its
 // next input poll.
@@ -2856,6 +2889,89 @@ void present(IDirect3DDevice9 *d) {
     presentBody(d);
     perf.presentHook += PerfClock::seconds(hookStart, PerfClock::now());
 }
+// A menu image scaled on the GPU at present time and read back the next frame,
+// after the stereo pacing wait (collectMenuImage from stereo), when the GPU has
+// finished the pair. Reading it back at once stalled the CPU behind the whole
+// stereo pair: 30 ms frames under a pause menu over the live world (V838).
+struct PendingMenuImage {
+    bool active = false;
+    uint32_t outWidth = 0, outHeight = 0, copyWidth = 0, copyHeight = 0, overlay = 0, menuGeneration = 0;
+    uint64_t generation = 0, now = 0;
+    UiBand letterbox;
+    bool nativeMenu = false, netricsaPanel = false;
+};
+static PendingMenuImage pendingMenu;
+static void collectMenuImage() {
+    if (!pendingMenu.active) return;
+    const PendingMenuImage p = pendingMenu;
+    pendingMenu.active = false;
+    if (!device || !menuScaled || !menuScaledRead || menuScaledWidth != p.outWidth || menuScaledHeight != p.outHeight ||
+        p.generation != resourceGeneration.load(std::memory_order_acquire) || width != p.copyWidth || height != p.copyHeight)
+        return;
+    IDirect3DSurface9 *cpu = nullptr;
+    bool locked = false, lockAttempted = false, lockReturned = false, held = false;
+    const uint32_t outWidth = p.outWidth, outHeight = p.outHeight, copyWidth = p.copyWidth, copyHeight = p.copyHeight;
+    const auto generation = p.generation;
+    withNativeFinally([&] {
+        cpu = menuScaledRead; cpu->AddRef();
+        if (FAILED(device->GetRenderTargetData(menuScaled, cpu)) ||
+            generation != resourceGeneration.load(std::memory_order_acquire)) return;
+        D3DLOCKED_RECT pixels{};
+        lockAttempted = true;
+        const auto result = cpu->LockRect(&pixels, nullptr, D3DLOCK_READONLY);
+        lockReturned = true; locked = SUCCEEDED(result);
+        if (!locked || !pixels.pBits || pixels.Pitch < int(outWidth * 4) ||
+            generation != resourceGeneration.load(std::memory_order_acquire)) return;
+        uint8_t *target = pixelStore.matches(pixelStore.generation, copyWidth, copyHeight) ?
+            pixelStore.buffer(MenuPixelBuffer) : nullptr;
+        if (!target) return;
+        UiBand band{0, 0, outWidth, outHeight};
+        const UiBand &letterbox = p.letterbox;
+        if (p.netricsaPanel) {
+            band = {uint32_t(outWidth * .06f) & ~1u, uint32_t(outHeight * .12f) & ~1u, 0, 0};
+            band.width = (uint32_t(outWidth * .94f) - band.x) & ~1u;
+            band.height = (uint32_t(outHeight * .88f) - band.y) & ~1u;
+        } else if (!p.nativeMenu && letterbox.height < copyHeight) {
+            // The band in the scaled image; kept only if the rows outside it are black.
+            const uint32_t top = uint32_t(uint64_t(letterbox.y) * outHeight / copyHeight),
+                           rows = uint32_t(uint64_t(letterbox.height) * outHeight / copyHeight);
+            const auto rowBlack = [&](uint32_t y) {
+                const auto *row = static_cast<const uint8_t *>(pixels.pBits) + size_t(y) * pixels.Pitch;
+                for (uint32_t x = 0; x < outWidth; x += 7)
+                    if (row[x * 4] >= 10 || row[x * 4 + 1] >= 10 || row[x * 4 + 2] >= 10) return false;
+                return true;
+            };
+            bool black = rows >= 2 && top + rows <= outHeight;
+            for (uint32_t y = 0; black && y < top; y += 2) black = rowBlack(y);
+            for (uint32_t y = top + rows; black && y < outHeight; y += 2) black = rowBlack(y);
+            if (black) band = {0, top, outWidth, rows & ~1u};
+        }
+        held = channel.lock(5);
+        if (!held) return;
+        auto &m = channel.shared->menu;
+        for (uint32_t y = 0; y < band.height; ++y)
+            memcpy(target + size_t(y) * band.width * 4,
+                static_cast<uint8_t *>(pixels.pBits) + size_t(y + band.y) * pixels.Pitch + size_t(band.x) * 4,
+                band.width * 4);
+        // Opaque: a keyed image (MenuKeyed) gets its alpha in the host, where the
+        // black connected to the image's edge becomes transparent.
+        for (size_t pixel = 3; pixel < size_t(band.width) * band.height * 4; pixel += 4) target[pixel] = 255;
+        m.width = band.width; m.height = band.height; m.tickMs = p.now;
+        m.pixelGeneration = pixelStore.generation; m.overlay = p.overlay;
+        m.sequence = ++menuSequence; m.interactionGeneration = p.menuGeneration; m.visible = 1;
+    }, [&](bool aborted) noexcept {
+        if (held) { channel.unlock(); held = false; }
+        const bool uncertain = aborted && lockAttempted && !lockReturned;
+        const bool unlockFailed = locked && cpu && FAILED(cpu->UnlockRect());
+        locked = false;
+        if (cpu && (uncertain || unlockFailed)) {
+            uiHalted = true;
+            uiQuarantinedReadback = cpu; cpu = nullptr;
+        }
+        if (cpu) { cpu->Release(); cpu = nullptr; }
+        if (aborted) { uiHalted = true; nestedNativePresentation(); }
+    });
+}
 static void presentBody(IDirect3DDevice9 *d) {
     {
         const LARGE_INTEGER t = PerfClock::now();
@@ -3161,14 +3277,18 @@ static void presentBody(IDirect3DDevice9 *d) {
         if (l)
             channel.shared->menu.visible = menuVisible ? 1 : 0;
     }
+    // An image still pending (no stereo frame read it back) is published first.
+    if (pendingMenu.active) {
+        if (menuVisible) collectMenuImage();
+        else pendingMenu.active = false;
+    }
     if (!menuVisible || now - lastMenuCopy < 33)
         return;
     uint32_t menuGeneration = nativeMenu ? menus::captureGeneration() : 0;
     lastMenuCopy = now;
     const auto generation = resourceGeneration.load(std::memory_order_acquire);
     const uint32_t copyWidth = width, copyHeight = height;
-    IDirect3DSurface9 *backbuffer = nullptr, *cpu = nullptr;
-    bool locked = false, lockAttempted = false, lockReturned = false, held = false;
+    IDirect3DSurface9 *backbuffer = nullptr;
     // The game letterboxes its 2D view to gfx_fAspectRatio inside the (eye-
     // sized) canvas; the flat screen shows only that band, at its own aspect.
     // Its menus are drawn over the whole canvas (a 4:3 box filling the square
@@ -3183,9 +3303,9 @@ static void presentBody(IDirect3DDevice9 *d) {
     // band below only when everything outside the band is black (letterbox bars).
     const UiBand source{0, 0, copyWidth, copyHeight};
     const UiBand letterbox = nativeMenu ? source : uiBand(copyWidth, copyHeight);
-    // Over a level (the pause menu, Netricsa) the headset keeps the last world
-    // frame behind this panel. The pause menu was drawn without the world
-    // (menus::worldHidden): its black is transparent. Netricsa is drawn over the
+    // Over a level (the pause menu, Netricsa) the headset shows the world behind
+    // this panel. The pause menu was drawn without the world (menus::worldHidden):
+    // its black around the menu is transparent (keyed in the host). Netricsa is drawn over the
     // world: its panel alone is shown (its layout spans 8-92% x 14-86% y of the canvas).
     const bool netricsaPanel = !nativeMenu && netricsa && levelActive();
     const bool keyed = nativeMenu && menus::worldHidden();
@@ -3213,61 +3333,10 @@ static void presentBody(IDirect3DDevice9 *d) {
         }
         const RECT bandRect{LONG(source.x), LONG(source.y), LONG(source.x + source.width), LONG(source.y + source.height)};
         if (FAILED(originalStretch(device, backbuffer, &bandRect, menuScaled, nullptr, D3DTEXF_LINEAR))) return;
-        cpu = menuScaledRead; cpu->AddRef();
-        if (FAILED(device->GetRenderTargetData(menuScaled, cpu)) ||
-            generation != resourceGeneration.load(std::memory_order_acquire)) return;
         backbuffer->Release(); backbuffer = nullptr;
-        D3DLOCKED_RECT pixels{};
-        lockAttempted = true;
-        const auto result = cpu->LockRect(&pixels, nullptr, D3DLOCK_READONLY);
-        lockReturned = true; locked = SUCCEEDED(result);
-        if (!locked || !pixels.pBits || pixels.Pitch < int(outWidth * 4) ||
-            generation != resourceGeneration.load(std::memory_order_acquire)) return;
-        uint8_t *target = pixelStore.matches(pixelStore.generation, copyWidth, copyHeight) ?
-            pixelStore.buffer(MenuPixelBuffer) : nullptr;
-        if (!target) return;
-        UiBand band{0, 0, outWidth, outHeight};
-        if (netricsaPanel) {
-            band = {uint32_t(outWidth * .06f) & ~1u, uint32_t(outHeight * .12f) & ~1u, 0, 0};
-            band.width = (uint32_t(outWidth * .94f) - band.x) & ~1u;
-            band.height = (uint32_t(outHeight * .88f) - band.y) & ~1u;
-        } else if (!nativeMenu && letterbox.height < copyHeight) {
-            // The band in the scaled image; kept only if the rows outside it are black.
-            const uint32_t top = uint32_t(uint64_t(letterbox.y) * outHeight / copyHeight),
-                           rows = uint32_t(uint64_t(letterbox.height) * outHeight / copyHeight);
-            const auto rowBlack = [&](uint32_t y) {
-                const auto *row = static_cast<const uint8_t *>(pixels.pBits) + size_t(y) * pixels.Pitch;
-                for (uint32_t x = 0; x < outWidth; x += 7)
-                    if (row[x * 4] >= 10 || row[x * 4 + 1] >= 10 || row[x * 4 + 2] >= 10) return false;
-                return true;
-            };
-            bool black = rows >= 2 && top + rows <= outHeight;
-            for (uint32_t y = 0; black && y < top; y += 2) black = rowBlack(y);
-            for (uint32_t y = top + rows; black && y < outHeight; y += 2) black = rowBlack(y);
-            if (black) band = {0, top, outWidth, rows & ~1u};
-        }
-        held = channel.lock(5);
-        if (!held) return;
-        auto &m = channel.shared->menu;
-        for (uint32_t y = 0; y < band.height; ++y)
-            memcpy(target + size_t(y) * band.width * 4,
-                static_cast<uint8_t *>(pixels.pBits) + size_t(y + band.y) * pixels.Pitch + size_t(band.x) * 4,
-                band.width * 4);
-        for (size_t pixel = 3; pixel < size_t(band.width) * band.height * 4; pixel += 4)
-            target[pixel] = keyed && target[pixel - 3] < 12 && target[pixel - 2] < 12 && target[pixel - 1] < 12 ? 0 : 255;
-        m.width = band.width; m.height = band.height; m.tickMs = now;
-        m.pixelGeneration = pixelStore.generation; m.overlay = overlay;
-        m.sequence = ++menuSequence; m.interactionGeneration = menuGeneration; m.visible = 1;
+        pendingMenu = {true, outWidth, outHeight, copyWidth, copyHeight, overlay, menuGeneration, generation, now,
+                       letterbox, nativeMenu, netricsaPanel};
     }, [&](bool aborted) noexcept {
-        if (held) { channel.unlock(); held = false; }
-        const bool uncertain = aborted && lockAttempted && !lockReturned;
-        const bool unlockFailed = locked && cpu && FAILED(cpu->UnlockRect());
-        locked = false;
-        if (cpu && (uncertain || unlockFailed)) {
-            uiHalted = true;
-            uiQuarantinedReadback = cpu; cpu = nullptr;
-        }
-        if (cpu) { cpu->Release(); cpu = nullptr; }
         if (backbuffer) { backbuffer->Release(); backbuffer = nullptr; }
         if (aborted) { uiHalted = true; nestedNativePresentation(); }
     });
@@ -4445,6 +4514,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         }
     };
     acquireRequest();
+    collectMenuImage(); // After the pacing wait: the GPU has finished the last frame.
     static unsigned requestDiagnostics = 0;
     if (chosen >= 0 && requestDiagnostics < 4) {
         ++requestDiagnostics;

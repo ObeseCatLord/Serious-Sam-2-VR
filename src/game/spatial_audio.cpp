@@ -2,9 +2,11 @@
 #include "spatial_audio.hpp"
 #include "common/spatial_audio.hpp"
 #include "game.hpp"
+#include "native_memory.hpp"
 #include "common/win_settings.hpp"
 #include <MinHook.h>
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -186,6 +188,85 @@ LONG CALLBACK crashTrace(EXCEPTION_POINTERS *e) {
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+// Which sound files play: each distinct file once, with how it was started
+// (CSoundSource for positioned sounds, CSoundChannel otherwise) and the play
+// flags, to name looping sounds a player reports (a constant motor-like loop).
+using SoundPlay = void(__fastcall *)(void *, void *, void *, unsigned long);
+using ResourceFileOf = void *(__fastcall *)(void *, void *);
+using FileNameOf = const char *(__fastcall *)(void *, void *);
+SoundPlay originalSourceSoundPlay = nullptr, originalChannelSoundPlay = nullptr;
+ResourceFileOf resourceFileOf = nullptr;
+FileNameOf fileNameOf = nullptr;
+SRWLOCK namesLock = SRWLOCK_INIT;
+bool endsWith(const char *text, const char *tail) {
+    const size_t n = std::strlen(text), m = std::strlen(tail);
+    return n >= m && !_stricmp(text + n - m, tail);
+}
+bool noteSoundFile(void *sound, unsigned long flags, const char *via) {
+    if (!sound || !resourceFileOf || !fileNameOf || !readableMemory(sound, 8)) return false;
+    void *file = resourceFileOf(sound, nullptr);
+    const char *name = file && readableMemory(file, 8) ? fileNameOf(file, nullptr) : nullptr;
+    if (!name || !readableMemory(name, 1)) return false;
+    char copy[160]{};
+    for (size_t i = 0; i + 1 < sizeof copy && readableMemory(name + i, 1) && name[i]; ++i) copy[i] = name[i];
+    uint64_t hash = 1469598103934665603ull;
+    for (const char *c = copy; *c; ++c) hash = (hash ^ uint8_t(*c)) * 1099511628211ull;
+    hash ^= uint64_t(flags) << 1 ^ (via[0] == 's' ? 1 : 0);
+    static uint64_t seen[400]{};
+    static unsigned count = 0;
+    AcquireSRWLockExclusive(&namesLock);
+    bool fresh = count < 400;
+    for (unsigned i = 0; fresh && i < count; ++i) fresh = seen[i] != hash;
+    if (fresh) seen[count++] = hash;
+    ReleaseSRWLockExclusive(&namesLock);
+    if (fresh) log("Sound file %s via %s flags=%lx", copy, via, flags);
+    return endsWith(copy, "Weapons/CircularSaw/Saw_Engine.wav");
+}
+// The circular saw's engine loop left playing with no saw in hand (a constant
+// motor-like hum at the player, restored by saves too): channels that start it
+// are noted and stopped when the local player holds no saw (guardSawEngine).
+using ChannelPlaying = int(__fastcall *)(void *, void *);
+using ChannelSound = void *(__fastcall *)(void *, void *);
+using ChannelStop = void(__fastcall *)(void *, void *);
+ChannelPlaying channelPlaying = nullptr;
+ChannelSound channelSound = nullptr;
+ChannelStop channelStop = nullptr;
+struct SawChannel { void *channel = nullptr, *sound = nullptr; uint64_t unheldSince = 0; };
+SawChannel sawChannels[8];
+void noteSawChannel(void *channel, void *sound) {
+    AcquireSRWLockExclusive(&namesLock);
+    SawChannel *slot = nullptr;
+    for (auto &c : sawChannels) if (c.channel == channel) slot = &c;
+    for (auto &c : sawChannels) if (!slot && !c.channel) slot = &c;
+    if (slot) *slot = {channel, sound, 0};
+    ReleaseSRWLockExclusive(&namesLock);
+}
+void __fastcall sourceSoundPlay(void *self, void *edx, void *sound, unsigned long flags) {
+    noteSoundFile(sound, flags, "source");
+    originalSourceSoundPlay(self, edx, sound, flags);
+}
+void __fastcall channelSoundPlay(void *self, void *edx, void *sound, unsigned long flags) {
+    const bool saw = noteSoundFile(sound, flags, "channel");
+    originalChannelSoundPlay(self, edx, sound, flags);
+    if (saw && (flags & 1)) noteSawChannel(self, sound); // A looping saw engine.
+}
+void hookSoundNames(HMODULE engine) {
+    const HMODULE core = GetModuleHandleW(L"Core.dll");
+    resourceFileOf = core ? reinterpret_cast<ResourceFileOf>(GetProcAddress(core,
+        "?GetResourceFile@CResource@SeriousEngine@@QAEPAVCResourceFile@2@XZ")) : nullptr;
+    fileNameOf = core ? reinterpret_cast<FileNameOf>(GetProcAddress(core,
+        "?GetFileName@CResourceFile@SeriousEngine@@QAEPBDXZ")) : nullptr;
+    channelPlaying = reinterpret_cast<ChannelPlaying>(GetProcAddress(engine, "?IsPlaying@CSoundChannel@SeriousEngine@@QAEHXZ"));
+    channelSound = reinterpret_cast<ChannelSound>(GetProcAddress(engine, "?GetPlayingSound@CSoundChannel@SeriousEngine@@QAEPAVCBaseSound@2@XZ"));
+    channelStop = reinterpret_cast<ChannelStop>(GetProcAddress(engine, "?Stop@CSoundChannel@SeriousEngine@@QAEXXZ"));
+    void *source = reinterpret_cast<void *>(GetProcAddress(engine, "?Play@CSoundSource@SeriousEngine@@QAEXPAVCBaseSound@2@K@Z"));
+    void *channel = reinterpret_cast<void *>(GetProcAddress(engine, "?Play@CSoundChannel@SeriousEngine@@QAEXPAVCBaseSound@2@K@Z"));
+    const bool ok = resourceFileOf && fileNameOf && source && channel &&
+        MH_CreateHook(source, reinterpret_cast<void *>(sourceSoundPlay), reinterpret_cast<void **>(&originalSourceSoundPlay)) == MH_OK &&
+        MH_CreateHook(channel, reinterpret_cast<void *>(channelSoundPlay), reinterpret_cast<void **>(&originalChannelSoundPlay)) == MH_OK &&
+        MH_EnableHook(source) == MH_OK && MH_EnableHook(channel) == MH_OK;
+    log("Sound file names %s", ok ? "logged" : "unavailable");
+}
 void(__cdecl *originalStartup)(int, long) = nullptr;
 void __cdecl startup(int api, long frequency) {
     // The engine's settings are not loaded yet: read [Audio] here.
@@ -203,6 +284,33 @@ void __cdecl startup(int api, long frequency) {
 
 void configure(const Config &c) { config = c; }
 
+void guardSawEngine(bool active, bool sawHeld) {
+    if (!channelPlaying || !channelSound || !channelStop) return;
+    const uint64_t now = GetTickCount64();
+    SawChannel pending[8];
+    AcquireSRWLockExclusive(&namesLock);
+    std::copy(std::begin(sawChannels), std::end(sawChannels), pending);
+    ReleaseSRWLockExclusive(&namesLock);
+    for (auto &c : pending) {
+        if (!c.channel) continue;
+        bool drop = !readableMemory(c.channel, 0x20) || !channelPlaying(c.channel, nullptr) ||
+                    channelSound(c.channel, nullptr) != c.sound;
+        if (!drop && active && !sawHeld) {
+            if (!c.unheldSince) c.unheldSince = now;
+            else if (now - c.unheldSince > 1000) {
+                channelStop(c.channel, nullptr);
+                static unsigned logged = 0;
+                if (logged++ < 8) log("Saw engine loop stopped: no saw in hand");
+                drop = true;
+            }
+        } else c.unheldSince = 0;
+        AcquireSRWLockExclusive(&namesLock);
+        for (auto &live : sawChannels)
+            if (live.channel == c.channel && live.sound == c.sound) live = drop ? SawChannel{} : c;
+        ReleaseSRWLockExclusive(&namesLock);
+    }
+}
+
 void installStartupHook() {
     static bool installed = false;
     if (installed) return;
@@ -210,6 +318,7 @@ void installStartupHook() {
     wchar_t crash[2]{};
     if (GetEnvironmentVariableW(L"SS2VR_LAB_CRASH_TRACE", crash, 2) == 1 && crash[0] == L'1') AddVectoredExceptionHandler(1, crashTrace);
     HMODULE engine = GetModuleHandleW(L"Engine.dll");
+    if (engine) hookSoundNames(engine);
     void *target = engine ? reinterpret_cast<void *>(GetProcAddress(engine, "?sfxStartup_t@SeriousEngine@@YAXW4SfxAPI@1@J@Z")) : nullptr;
     if (!target || MH_CreateHook(target, reinterpret_cast<void *>(startup), reinterpret_cast<void **>(&originalStartup)) != MH_OK ||
         MH_EnableHook(target) != MH_OK) {

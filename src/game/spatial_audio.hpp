@@ -29,6 +29,9 @@ bool listener(const Pose &native, Pose &out);
 // Each frame: hooks OpenAL once the game loaded it, smooths occlusion and
 // applies the filters.
 void frame();
+// Each frame (main thread): a looping saw engine still playing when the local
+// player has held no saw for a second is stopped (active: single player).
+void guardSawEngine(bool active, bool sawHeld);
 // Occlusion rays (from the native ray context): sounds due a trace.
 unsigned dueTraces(Vec3 &from, uint32_t *ids, Vec3 *ends, unsigned max);
 void traced(uint32_t id, bool hit, float hitDistance, float distance);

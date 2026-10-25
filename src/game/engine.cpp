@@ -3384,6 +3384,18 @@ bool menuViewFrame() noexcept {
     publishSnapshot(s);
     return view;
 }
+// The game caps its frame rate while a menu renders (Sam2Game asks 33 fps). Under
+// a pause menu with the world live behind it (menuViewFrame) that made looking
+// around choppy: there the cap is lifted, and the headset paces frames as in play.
+static void(__cdecl *originalLimitFrameRate)(long) = nullptr;
+static void __cdecl limitFrameRate(long fps) {
+    if (fps > 0 && menus::worldHidden() && copySnapshot().menuView) {
+        static bool noted = false;
+        if (!noted) { noted = true; log("Menu frame cap %ld lifted: the world is live behind the menu", fps); }
+        fps = 0;
+    }
+    originalLimitFrameRate(fps);
+}
 struct PreparedPlayer {
     uint32_t handle = 0;
     void *subject = nullptr;
@@ -9660,6 +9672,45 @@ static bool handleRide(uint32_t rideHandle) {
     if (ride && readableMemory(ride, 4)) std::memcpy(&table, ride, 4);
     return table && (table == controlsGameBase + 0x2a8558 || table == controlsGameBase + 0x2b8420);
 }
+// The hoverbike's and UFO's handles: held (a squeeze toggles it while seated)
+// or not, and the latest steering (-1..1, right positive) they show. Main thread
+// writes; the eye draw (scope_gpu) reads rideHandlePose.
+static struct {
+    uint32_t ride = 0;
+    bool gripped = false, squeezed = false;
+    std::atomic<float> steer{0};
+    std::atomic<bool> held{false};
+    std::atomic<uint32_t> shownRide{0};
+    std::atomic<uint64_t> tick{0};
+} rideHandles;
+static void noteRideHandleGrip(uint32_t ride, const Input &input, uint64_t now) {
+    const bool squeeze = ((input.buttons[0] | input.buttons[1]) & Button::Wheel) != 0 && !recenterHeld(input);
+    const uint64_t last = rideHandles.tick.load();
+    if (rideHandles.ride != ride || !last || now < last || now - last > 1000) { // Boarded (again): not held.
+        rideHandles.ride = ride;
+        rideHandles.gripped = false;
+        rideHandles.squeezed = squeeze; // A squeeze held while boarding does not count.
+    }
+    if (squeeze && !rideHandles.squeezed && handleRide(ride)) {
+        rideHandles.gripped = !rideHandles.gripped;
+        log("Ride handles %s", rideHandles.gripped ? "held" : "released");
+    }
+    rideHandles.squeezed = squeeze;
+    rideHandles.held = rideHandles.gripped && handleRide(ride);
+    rideHandles.shownRide = ride;
+    rideHandles.tick = now;
+}
+static void noteRideHandleSteer(float steer, uint64_t now) {
+    rideHandles.steer = std::isfinite(steer) ? std::clamp(steer, -1.f, 1.f) : 0.f;
+    rideHandles.tick = now;
+}
+bool rideHandlePose(uint32_t ride, float &steer, bool &held) noexcept {
+    const uint64_t tick = rideHandles.tick.load(), now = GetTickCount64();
+    if (!ride || rideHandles.shownRide.load() != ride || !tick || now < tick || now - tick > 300) return false;
+    steer = rideHandles.steer.load();
+    held = rideHandles.held.load();
+    return true;
+}
 static void updateSteeringWheel(const Snapshot &s) {
     auto &w=steeringWheel;
     if(!nativeMainThread || !nativeMainThread())return;
@@ -10506,6 +10557,9 @@ static void maintainSpatialAudio() {
     spatial_audio::configure({settings.spatialAudio, settings.audioOcclusion});
     hud_wrist::configure(settings.hudMode == 1, settings.hudWristScale);
     spatial_audio::frame();
+    const auto s = copySnapshot();
+    spatial_audio::guardSawEngine(singlePlayer() && s.initialized && livePlayer(s),
+                                  s.ui.currentWeapon[0] == 0 || s.ui.currentWeapon[1] == 0);
 }
 static int __cdecl appForeground() {
     pollSettingsFile(); // Menus too: the options panel opens over the game's menus.
@@ -10705,16 +10759,21 @@ static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
                 const float dt = lookClock && now > lookClock ? std::min(.1f, float(now - lookClock) / 1000.f) : 0.f;
                 lookClock = now;
                 // The right stick turns every ride. On the hoverbike and the UFO
-                // (Vehicles ImmersiveGrips) the hands also steer as on a wheel, no
-                // grabbing: tilting it (the right hand lower) turns right, as the
-                // stick does; the two add up.
+                // (Vehicles ImmersiveGrips) a squeeze takes hold of the handles
+                // (another lets go; not held when boarding): held, the hands also
+                // steer as on a wheel, tilting it (the right hand lower) turns
+                // right, as the stick does; the two add up. The handles turn with
+                // the steering either way (rideHandlePose) and glow while held.
                 float steer = captured.input.axis[1][0];
                 float wheel = 0;
+                noteRideHandleGrip(captured.rider.ride, captured.input, now);
                 const bool modelControls = settings.immersiveVehicleGrips && handleRide(captured.rider.ride) &&
+                    rideHandles.gripped &&
                     controllerTracked(captured.input, 0) && controllerTracked(captured.input, 1) &&
                     captured.input.gripValid[0] && captured.input.gripValid[1] &&
                     handWheelDeflection(captured.input.grip[0].p, captured.input.grip[1].p, wheel, .03f, .6f); // The stick rate adds its own dead zone.
                 if (modelControls) steer = std::clamp(steer + wheel, -1.f, 1.f);
+                if (handleRide(captured.rider.ride)) noteRideHandleSteer(steer, now);
                 Vec3 rideLook = advanceTurretLook(look, steer,
                                                   settings.rideHeadPitch ? 0.f : captured.input.axis[1][1],
                                                   settings.smoothTurnRate, dt);
@@ -12163,9 +12222,15 @@ bool attach(bool headless) {
         // gfx_fAspectRatio (Sam2Game RVA 3F9DE0): the game letterboxes its whole 2D
         // view to this aspect. The eye-sized canvas is square, so use a widescreen
         // layout; the flat screen and HUD panel show exactly that band.
+        // At the front end (startup) the front-end canvas's 4:3 applies instead
+        // (bridge followCanvasResolution, set again as the main menu is created).
+        setLevelUiAspect(settings.uiAspect);
+        installMainMenuLayout();
         auto *aspect = reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(g) + 0x3f9de0);
-        log("2D aspect %.4f -> %.4f", *aspect, settings.uiAspect);
-        *aspect = settings.uiAspect;
+        if (levelActive()) {
+            log("2D aspect %.4f -> %.4f", *aspect, settings.uiAspect);
+            *aspect = settings.uiAspect;
+        }
     }
     const auto graphics = headless ? nullptr : GetModuleHandleW(L"GfxD3D.dll");
     roomscaleConfigured=false;
@@ -12568,6 +12633,7 @@ bool attach(bool headless) {
         H(e, "?ChallengeCalculateResponse@CSteamOnlineInterface@SeriousEngine@@UAEXPAEJAAPAEAAJ@Z", challengeResponse,
           originalChallengeResponse);
         H(e, "?sfuChangeAPI_t@SeriousEngine@@YAXW4SfxAPI@1@J@Z", changeSoundApi, originalChangeApi);
+        H(e, "?gfxLimitFrameRate@SeriousEngine@@YAXJ@Z", limitFrameRate, originalLimitFrameRate);
         H(e, "?AddSoundListener@CSoundSyncList@SeriousEngine@@QAEXMMABVQuatVect@2@ABVVector3f@2@@Z", soundListener,
           originalSoundListener);
     }

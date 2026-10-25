@@ -30,6 +30,13 @@ bool vrInputLive() noexcept;
 // Native eye canvas at the runtime's recommended size (installed before the
 // engine creates its window canvas; applied on the main thread's input poll).
 void installEyeCanvas() noexcept;
+// bridge.cpp: the front end's 4:3 aspect set as the main menu is created (once Sam2Game is loaded).
+void installMainMenuLayout() noexcept;
+// engine.cpp: the steering (-1..1, right positive) the hoverbike's/UFO's handles
+// show and whether the rider holds them, for the ride drawn now.
+bool rideHandlePose(uint32_t ride, float &steer, bool &held) noexcept;
+// bridge.cpp: a level's 2D aspect ([Render] UiAspect).
+void setLevelUiAspect(float aspect) noexcept;
 void setDesktopWorld(bool render) noexcept;
 bool netricsaShown() noexcept; // engine.cpp: Netricsa is open (its controls are player commands).
 bool levelActive() noexcept;

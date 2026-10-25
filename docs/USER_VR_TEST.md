@@ -23,6 +23,33 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the title, water, sticks and pause report (2026-10-25, evening)
+
+1. Title screen: it is laid out for the 4:3 menu panel when the game starts in
+   VR, instead of keeping the 16:9 desktop layout squeezed into 4:3. In levels
+   the HUD and cutscenes keep their 16:9 band as before.
+2. Pause menu over the live world:
+   - Full frame rate. The game slows itself to 33 fps while a menu is up; with
+     the world live behind the pause menu that limit is lifted (the lab went
+     from 30 ms to 19 ms frames).
+   - Dark outlines and borders inside the menu no longer let the world show
+     through. Only the black around the menu panel is see-through.
+3. Hoverbike and UFO handles:
+   - They turn with the steering, whether you steer with the right stick or
+     with your hands.
+   - They are not held when you board. Squeeze a grip to take hold of them:
+     they light up faintly, and tilting your hands steers (right hand lower
+     turns right). Squeeze again to let go; then only the stick steers.
+4. The circular saw's engine loop (a constant motor-like hum) is stopped when
+   no saw is in your hands, including when a save restores it. Every sound
+   file the game plays is now listed once in `Bin/SS2VR.log` ("Sound file ...")
+   so any other stray loop can be named.
+5. Water: no change. In the lab the reflections stay fixed in the world as the
+   head turns, at your Greendale save too, and the cube has no seams. The
+   reflection treats everything as about 60 m away, so reflections of trees or
+   banks a few metres off slide a little as you move your head. For exact
+   reflections turn on VR options > Render > Water mirror (costs frame rate).
+
 ## Changed after the hoverbike, menus and weapon wheel report (2026-10-25)
 
 1. Weapon wheel, styled after Serious Sam Fusion's VR wheel:

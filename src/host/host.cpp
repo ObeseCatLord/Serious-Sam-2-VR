@@ -6,6 +6,7 @@
 #include "common/color.hpp"
 #include "common/controls.hpp"
 #include "common/frame_policy.hpp"
+#include "common/menu_key.hpp"
 #include "common/head_clearance.hpp"
 #include "common/native_ui_finish.hpp"
 #include "common/options_bitmap.hpp"
@@ -3101,6 +3102,7 @@ struct Host {
                     if (sequence != menuSequence || menuChain.width != width || menuChain.height != height) {
                         menuSourcePixels.resize(size_t(width) * height * 4);
                         std::memcpy(menuSourcePixels.data(), pixels.buffer(MenuPixelBuffer), menuSourcePixels.size());
+                        if (menuKeyed) keyEdgeBlack(menuSourcePixels.data(), width, height);
                     }
                     fresh = true;
                 }
@@ -3207,6 +3209,15 @@ struct Host {
                         std::fwrite(rgb, 1, 3, f);
                     }
                     std::fclose(f);
+                }
+                if (menuKeyed) { // Its keyed alpha too (white: shown).
+                    name[std::wcslen(name) - 4] = 0;
+                    std::wcscat(name, L"-alpha.ppm");
+                    if (FILE *f = _wfopen((settingsFile.substr(0, settingsFile.find_last_of(L"\\/") + 1) + name).c_str(), L"wb")) {
+                        std::fprintf(f, "P5\n%u %u\n255\n", width, height);
+                        for (size_t i = 0; i < size_t(width) * height; ++i) std::fputc(menuSourcePixels[i * 4 + 3], f);
+                        std::fclose(f);
+                    }
                 }
                 char line[256];
                 const Pose &a = input.hand[hand < 2 ? hand : 1];
