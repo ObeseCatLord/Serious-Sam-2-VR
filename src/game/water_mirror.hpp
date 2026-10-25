@@ -1,11 +1,12 @@
 #pragma once
 // Planar water reflections ([Render] WaterMirror, common/water_mirror.hpp).
 // Each frame the eye pass notes the planes its water was drawn on; before the
-// next frame's eyes the world is rendered once more from the centre camera
-// mirrored about the nearest of them (a scope-style source render into the eye
-// scratch target, everything under the water clipped away, the water itself
-// left out), copied into the mirror image, and that frame's water on that
-// plane looks its reflection up there. Main thread only.
+// next frame's eyes the world is rendered once more per eye, from that eye's
+// camera mirrored about the nearest of them (a scope-style source render into
+// the eye scratch target, everything under the water clipped away, the water
+// itself left out), copied into that eye's mirror image, and that frame's
+// water on that plane projects each surface point into its own eye's image:
+// exact reflections at every distance. Main thread only.
 #include "common/replay_math.hpp"
 #include <windows.h>
 #include <d3d9.h>
@@ -20,10 +21,10 @@ void noteWater(const double (&plane)[4], const Vec3 &camera) noexcept;
 bool framePlane(double (&plane)[4]) noexcept;
 // Each frame before the mirror pass (or instead of it): last frame's image is spent.
 void frameStart() noexcept;
-// The mirror image (`width` x `height`, the eye target's format); false without one.
+// The two mirror images (`width` x `height`, the eye target's format); false without them.
 bool prepare(IDirect3DDevice9 *d, UINT width, UINT height, D3DFORMAT format) noexcept;
-// Around the mirror pass's native render into `target`.
-void beginPass(IDirect3DDevice9 *d, IDirect3DSurface9 *target, const double (&plane)[4], const Vec3 &camera) noexcept;
+// Around one eye's mirror pass (its native render into `target`).
+void beginPass(IDirect3DDevice9 *d, IDirect3DSurface9 *target, const double (&plane)[4], const Vec3 &camera, unsigned eye) noexcept;
 void endPass() noexcept;
 // A draw belongs to the pass (active, render target 0 is its target).
 bool drawing(IDirect3DDevice9 *d) noexcept;
@@ -35,10 +36,11 @@ bool clipBegin(IDirect3DDevice9 *d, bool &skip) noexcept; // Internal to around(
 void clipEnd(IDirect3DDevice9 *d) noexcept;
 // From the native pre-bloom capture: the target into the mirror image.
 bool capture(IDirect3DDevice9 *d, IDirect3DSurface9 *target, Copy copy) noexcept;
-// After the pass: the image is this frame's when the pass completed and captured.
+// After an eye's pass: its image is this frame's when the pass completed and captured.
 void publish(bool complete) noexcept;
-// Eye pass: this frame's image for water on `plane`, and the mirror camera's world -> clip.
-bool image(const double (&plane)[4], IDirect3DTexture9 *&texture, ::ss2vr::replay::M4 &worldToClip) noexcept;
+// Eye pass: this frame's images for water on `plane` (both eyes' or none), and
+// each eye's mirror camera world -> clip.
+bool image(const double (&plane)[4], IDirect3DTexture9 *(&texture)[2], ::ss2vr::replay::M4 (&worldToClip)[2]) noexcept;
 void release() noexcept; // Device reset or loss.
 struct Stats { unsigned passes = 0, published = 0, clipped = 0, skippedWater = 0, used = 0, draws = 0, noCamera = 0, flat = 0, sky = 0, busy = 0, captured = 0; };
 Stats takeStats() noexcept;

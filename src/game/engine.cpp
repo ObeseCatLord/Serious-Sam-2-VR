@@ -1880,6 +1880,15 @@ static void __fastcall carryJointPlacements(void *joint, void *, const Pose &a, 
     jointPlacements(joint, a, b);
 }
 static void(__thiscall *jointMaxLinVel)(void *, float) = nullptr, (__thiscall *jointMaxAngVel)(void *, float) = nullptr;
+// Kinematic hold: the joint's force and torque are switched off and the object
+// is placed at the hand each tick (CMechanism::SetAbsPlacement, as the props'
+// own SetAbsPlacement does) with the hand's velocity, so it neither lags and
+// oscillates on the spring nor pulls on the player (a heavy carried object's
+// reaction force cut every jump short).
+static void(__thiscall *jointMaxForce)(void *, float) = nullptr, (__thiscall *jointMaxTorque)(void *, float) = nullptr;
+static int(__thiscall *mechanismPlace)(void *, const Pose &, unsigned long) = nullptr;
+static Pose *(__thiscall *mechanismPlacement)(void *, Pose *) = nullptr;
+static void(__thiscall *mechanismVelocity)(void *, const Vec3 &) = nullptr;
 // A carried object does not collide with its carrier (CMechanism ignore list,
 // symmetric: each mechanism lists the other). Without it the player's capsule
 // pushed an object held near the body up and over the head. After the drop the
@@ -1912,8 +1921,9 @@ struct GripCarry {
     uint32_t requestHull = 0, joint = 0, carriedHull = 0;
     Pose requestPose{};
     bool gripDown[2]{};
-    struct Sample { double time; Vec3 p; } history[16]{};
+    struct Sample { double time; Vec3 p; Quat q; } history[16]{};
     unsigned samples = 0;
+    bool settled = false; // The object has reached the hand once (a pointed grab flies in first).
 };
 static GripCarry gripCarry; // Game thread only.
 static void *carriedMechanism(uint32_t hullHandle) {
@@ -2027,35 +2037,88 @@ static void traceThrown() {
     if (objectBody) memcpy(&placed, static_cast<uint8_t *>(objectBody) + 0x2c, sizeof(placed));
     log("Lab thrown t=%llu object=%.2f,%.2f,%.2f", (unsigned long long)(now - labThrown.at), placed.p.x, placed.p.y, placed.p.z);
 }
-static Vec3 carryVelocity() {
-    // Average over the last ~80 ms of carry ticks; the latest sample alone is noisy.
+// The hand's motion over a short window ending `back` samples ago (linear, and
+// angular from the orientation change). False with too few samples.
+struct HandMotion { Vec3 linear{}, angular{}; };
+static bool handMotion(unsigned endBack, double window, HandMotion &out) {
     const auto &g = gripCarry;
-    if (g.samples < 2) return {};
-    const auto &last = g.history[(g.samples - 1) % 16];
-    for (unsigned back = 2; back <= std::min(g.samples, 16u); ++back) {
-        const auto &first = g.history[(g.samples - back) % 16];
+    const unsigned available = std::min(g.samples, 16u);
+    if (available < endBack + 2) return false;
+    const auto &last = g.history[(g.samples - 1 - endBack) % 16];
+    for (unsigned back = endBack + 1; back < available; ++back) {
+        const auto &first = g.history[(g.samples - 1 - back) % 16];
         const double dt = last.time - first.time;
-        if (dt >= .08 || back == std::min(g.samples, 16u))
-            return dt > .005 ? (last.p - first.p) * float(1 / dt) : Vec3{};
+        if (dt < window && back + 1 < available) continue;
+        if (!(dt > .005)) return false;
+        out.linear = (last.p - first.p) * float(1 / dt);
+        Quat d = normalize(multiply(last.q, inverse(first.q)));
+        if (d.w < 0) d = {-d.x, -d.y, -d.z, -d.w};
+        const float s = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        const float angle = 2 * std::atan2(s, d.w);
+        out.angular = s > 1e-6f ? Vec3{d.x / s, d.y / s, d.z / s} * float(angle / dt) : Vec3{};
+        return finite(Pose{{}, out.linear}) && finite(Pose{{}, out.angular});
     }
-    return {};
+    return false;
+}
+// Holding: the hand's motion over the last ~50 ms.
+static HandMotion carryMotion() {
+    HandMotion m;
+    handMotion(0, .05, m);
+    return m;
+}
+// Releasing: of the 50 ms windows in the last ~120 ms, the fastest. A throw's
+// hand slows into the release; the average up to the release fell short.
+static HandMotion throwMotion() {
+    const auto &g = gripCarry;
+    HandMotion best;
+    float bestSpeed = -1;
+    const double now = g.samples ? g.history[(g.samples - 1) % 16].time : 0;
+    for (unsigned back = 0; back + 2 < std::min(g.samples, 16u); ++back) {
+        if (now - g.history[(g.samples - 1 - back) % 16].time > .12) break;
+        HandMotion m;
+        if (!handMotion(back, .05, m)) break;
+        const float speed = dot(m.linear, m.linear);
+        if (speed > bestSpeed) { bestSpeed = speed; best = m; }
+    }
+    return best;
+}
+static Vec3 carryVelocity() { return carryMotion().linear; }
+// The object's velocity at `centre` when it moves rigidly with the hand.
+static Vec3 heldVelocity(const HandMotion &m, Vec3 hand, Vec3 centre) { return m.linear + cross(m.angular, centre - hand); }
+static Pose carriedBodyPose() {
+    void *hull = gripCarry.carriedHull ? resolve(gripCarry.carriedHull) : nullptr;
+    void *objectBody = hull ? hullBody(hull) : nullptr;
+    Pose placed{};
+    if (objectBody) memcpy(&placed, static_cast<uint8_t *>(objectBody) + 0x2c, sizeof(placed));
+    return placed;
 }
 static void releaseGripCarry(void *puppet, bool throwIt) {
     const uint32_t bodyHandle = primaryField(puppet, 0x36c);
-    const Vec3 velocity = carryVelocity() * ThrowBoost;
+    const HandMotion motion = throwMotion();
+    const Pose placed = carriedBodyPose();
+    const Vec3 hand = gripCarry.samples ? gripCarry.history[(gripCarry.samples - 1) % 16].p : placed.p;
+    const Vec3 velocity = (finite(placed) ? heldVelocity(motion, hand, placed.p) : motion.linear) * ThrowBoost;
+    void *mechanism = carriedMechanism(gripCarry.carriedHull);
     virtualCall<void>(puppet, 0x29c); // DropObject: stock ObjectThrown events and weapon restore.
+    // The whole mechanism: a prop of several parts (the giant match) kept the
+    // throw on the gripped part only and the rest held it back.
+    if (throwIt && mechanism && mechanismVelocity && finite(Pose{{}, velocity})) mechanismVelocity(mechanism, velocity);
     if (void *body = throwIt && bodyHandle ? resolve(bodyHandle) : nullptr) {
         if (std::isfinite(velocity.x) && std::isfinite(velocity.y) && std::isfinite(velocity.z)) {
             virtualCall<void>(body, 0x4c, &velocity); // CBody::SetVelocity
+            const Vec3 spin = motion.angular;
+            if (finite(Pose{{}, spin})) virtualCall<void>(body, 0x50, &spin); // CBody::SetAngVelocity
             virtualCall<void>(body, 0x2c);            // Wake the body.
         }
     }
-    log("Grip carry released hand=%d velocity=%.2f,%.2f,%.2f", gripCarry.hand, velocity.x, velocity.y, velocity.z);
+    log("Grip carry released hand=%d velocity=%.2f,%.2f,%.2f spin=%.2f,%.2f,%.2f", gripCarry.hand, velocity.x, velocity.y, velocity.z,
+        motion.angular.x, motion.angular.y, motion.angular.z);
     labThrown = {gripCarry.carriedHull, GetTickCount64()};
     if (carryIgnore.active && !carryIgnore.releasedAt) carryIgnore.releasedAt = GetTickCount64();
     gripCarry.hand = -1;
     gripCarry.joint = 0;
     gripCarry.samples = 0;
+    gripCarry.settled = false;
     gripCarrying = false;
     carryTargetValid = false;
 }
@@ -2068,6 +2131,24 @@ static void __fastcall carryStep(void *puppet, void *) {
     }
     traceThrown();
     auto &g = gripCarry;
+    {
+        // Lab (SS2VR_LAB_CARRY_TRACE=1): every tick, before anything moves: the
+        // player body (jump height), the hand and the carried object as physics
+        // left it (how far it strays from the hand between placements).
+        static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_CARRY_TRACE", v, 2) == 1 && v[0] == L'1'; }();
+        void *ownBody = trace ? resolve(primaryField(puppet, 0x118)) : nullptr;
+        if (ownBody) {
+            Pose own{}, hand{};
+            memcpy(&own, static_cast<uint8_t *>(ownBody) + 0x2c, sizeof(own));
+            const bool held = g.hand >= 0 && handWorldPose(s, puppet, unsigned(g.hand), hand);
+            const Pose placed = g.hand >= 0 ? carriedBodyPose() : Pose{};
+            const Pose grab = [&] { Pose q{}; memcpy(&q, static_cast<uint8_t *>(puppet) + 0x56c, sizeof(q)); return q; }();
+            const Vec3 at = held ? compose(placed, grab).p : Vec3{};
+            log("Lab tick t=%.4f body=%.3f,%.3f,%.3f carry=%d hand=%.3f,%.3f,%.3f grabAt=%.3f,%.3f,%.3f jump=%d", carryClock(),
+                own.p.x, own.p.y, own.p.z, int(held), hand.p.x, hand.p.y, hand.p.z, at.x, at.y, at.z,
+                int(((s.input.buttons[0] | s.input.buttons[1]) & Jump) != 0));
+        }
+    }
     const bool live = vrSession(s) && fresh(s.input) && s.ui.gameplay && !recenterHeld(s.input);
     if (g.hand >= 0) {
         if (!primaryField(puppet, 0x564)) { // Ended natively: Use, death, object destroyed.
@@ -2075,6 +2156,9 @@ static void __fastcall carryStep(void *puppet, void *) {
             if (carryIgnore.active && !carryIgnore.releasedAt) carryIgnore.releasedAt = GetTickCount64();
             g.hand = -1; g.samples = 0; gripCarrying = false; carryTargetValid = false;
         } else if (!live || !(s.input.buttons[g.hand] & Wheel)) {
+            log("Grip carry release: session=%d fresh=%d gameplay=%d recenter=%d grip=%d buttons=%x", int(vrSession(s)),
+                int(fresh(s.input)), int(s.ui.gameplay != 0), int(recenterHeld(s.input)), int((s.input.buttons[g.hand] & Wheel) != 0),
+                unsigned(s.input.buttons[g.hand]));
             releaseGripCarry(puppet, live);
         }
     }
@@ -2085,9 +2169,14 @@ static void __fastcall carryStep(void *puppet, void *) {
             resolve(g.requestHull)) {
             virtualCall<void>(puppet, 0x290, g.requestHull, g.requestPose); // TakeObject(hull, world grab pose)
             if (primaryField(puppet, 0x564)) {
-                g.hand = int(h); g.samples = 0; g.joint = 0; g.carriedHull = g.requestHull;
+                g.hand = int(h); g.samples = 0; g.joint = 0; g.carriedHull = g.requestHull; g.settled = false;
                 gripCarrying = true;
-                log("Grip carry taken hand=%u object=%u", h, primaryField(puppet, 0x564));
+                void *mechanism = carriedMechanism(g.requestHull);
+                int parts = -1;
+                if (mechanism) memcpy(&parts, static_cast<uint8_t *>(mechanism) + 8, sizeof(parts)); // CMechanism part count.
+                void *owner = resolve(primaryField(puppet, 0x564));
+                const float mass = owner ? virtualCall<float>(owner, 0x148) : -1.f; // CBaseEntity::GetMass
+                log("Grip carry taken hand=%u object=%u mass=%.1f parts=%d", h, primaryField(puppet, 0x564), double(mass), parts);
                 beginCarryIgnore(puppet, g.requestHull);
             }
         }
@@ -2105,9 +2194,11 @@ static void __fastcall carryStep(void *puppet, void *) {
     memcpy(&grab, static_cast<uint8_t *>(puppet) + 0x56c, sizeof(grab));
     if (!finite(own) || !finite(grab)) return;
     const uint32_t jointHandle = primaryField(puppet, 0x374);
+    const bool kinematic = jointMaxForce && jointMaxTorque && mechanismPlace && mechanismPlacement && mechanismVelocity &&
+                           carriedMechanism(g.carriedHull);
     if (jointHandle != g.joint) {
         g.joint = jointHandle;
-        if (jointMaxLinVel) jointMaxLinVel(joint, 12.f); // Keep up with a hand without flinging the object.
+        if (jointMaxLinVel) jointMaxLinVel(joint, 12.f); // Joint fallback: keep up with a hand without flinging the object.
         if (jointMaxAngVel) jointMaxAngVel(joint, CarryMaxTurn);
     }
     // The joint holds the grab frame (object space) at the hand (player-body space).
@@ -2131,31 +2222,65 @@ static void __fastcall carryStep(void *puppet, void *) {
             hand.p.z = own.p.z + out.z * k;
         }
     }
-    // Ease in: the joint chases the hand at up to 12 m/s and a light object
-    // (a match) overshot and shook about the hand. Its speed limit follows the
-    // remaining gap (CarryEaseRate per second), so it settles without bouncing
-    // and still keeps up with a moving hand.
-    if (jointMaxLinVel) {
-        void *hull = g.carriedHull ? resolve(g.carriedHull) : nullptr;
-        void *objectBody = hull ? hullBody(hull) : nullptr;
-        Pose placed{};
-        if (objectBody) memcpy(&placed, static_cast<uint8_t *>(objectBody) + 0x2c, sizeof(placed));
-        if (objectBody && finite(placed)) {
+    carryJoint = joint;
+    carryTargetA = compose(inverse(own), hand);
+    carryTargetB = grab;
+    carryTargetValid = finite(carryTargetA) && finite(carryTargetB);
+    jointPlacements(joint, carryTargetA, grab);
+    if (kinematic) {
+        // The joint stays (the game's carry state and events need it) but pulls on
+        // nothing; HandleObjectCarrying sets its limits every tick, so again here.
+        jointMaxForce(joint, 0);
+        jointMaxTorque(joint, 0);
+        void *mechanism = carriedMechanism(g.carriedHull);
+        const Pose placed = carriedBodyPose();
+        Pose target = compose(hand, inverse(grab)); // Body placement that puts the grab frame at the hand.
+        const double now = carryClock();
+        const double previous = g.samples ? g.history[(g.samples - 1) % 16].time : now;
+        const float dt = float(std::clamp(now - previous, 1e-3, .1));
+        if (!g.settled && finite(placed)) {
+            // A pointed grab: the object flies to the hand (at up to 15 m/s), then locks on.
+            const Vec3 gap = target.p - placed.p;
+            const float distance = std::sqrt(dot(gap, gap));
+            const float step = 15.f * dt;
+            if (distance > step && distance < 10.f) {
+                const float k = step / distance;
+                Quat q = target.q;
+                if (q.x * placed.q.x + q.y * placed.q.y + q.z * placed.q.z + q.w * placed.q.w < 0) q = {-q.x, -q.y, -q.z, -q.w};
+                target = {normalize(Quat{placed.q.x + (q.x - placed.q.x) * k, placed.q.y + (q.y - placed.q.y) * k,
+                                         placed.q.z + (q.z - placed.q.z) * k, placed.q.w + (q.w - placed.q.w) * k}),
+                          placed.p + gap * k};
+            } else
+                g.settled = true;
+        }
+        Pose mechanismPose{};
+        if (finite(placed) && finite(target) && mechanismPlacement(mechanism, &mechanismPose) == &mechanismPose && finite(mechanismPose)) {
+            // The mechanism moves rigidly with the body: keep their relative placement.
+            const Pose placedMechanism = compose(target, compose(inverse(placed), mechanismPose));
+            mechanismPlace(mechanism, placedMechanism, 0);
+            const HandMotion motion = carryMotion();
+            const Vec3 velocity = g.settled ? heldVelocity(motion, hand.p, target.p) : Vec3{};
+            mechanismVelocity(mechanism, velocity);
+            void *hull = resolve(g.carriedHull);
+            if (void *objectBody = hull ? hullBody(hull) : nullptr) {
+                const Vec3 spin = g.settled ? motion.angular : Vec3{};
+                virtualCall<void>(objectBody, 0x50, &spin); // CBody::SetAngVelocity
+            }
+        }
+        static bool announced = false;
+        if (!announced) { announced = true; log("Grip carry: kinematic hold (joint force off, object placed at the hand)"); }
+    } else if (jointMaxLinVel) {
+        // Joint fallback (exports missing): ease in, the speed limit following the gap.
+        const Pose placed = carriedBodyPose();
+        if (finite(placed)) {
             const Vec3 gap = hand.p - compose(placed, grab).p;
             const float distance = std::sqrt(dot(gap, gap));
-            // A swinging hand (a throw) must not leave the object trailing: the
-            // limit is never below 1.5x the hand's own speed.
             const Vec3 handVelocity = carryVelocity();
             const float handSpeed = std::sqrt(dot(handVelocity, handVelocity));
             const float limit = std::max(distance * CarryEaseRate + .3f, std::isfinite(handSpeed) ? handSpeed * 1.5f : 0.f);
             if (std::isfinite(distance)) jointMaxLinVel(joint, std::clamp(limit, .3f, 12.f));
         }
     }
-    carryJoint = joint;
-    carryTargetA = compose(inverse(own), hand);
-    carryTargetB = grab;
-    carryTargetValid = finite(carryTargetA) && finite(carryTargetB);
-    jointPlacements(joint, carryTargetA, grab);
     {
         // Lab (SS2VR_LAB_SHOT_LOG=1): where the carried object is against the hand.
         static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SHOT_LOG", v, 2) == 1 && v[0] == L'1'; }();
@@ -2171,7 +2296,7 @@ static void __fastcall carryStep(void *puppet, void *) {
                 grab.p.z, grab.q.x, grab.q.y, grab.q.z, grab.q.w);
         }
     }
-    g.history[g.samples % 16] = {carryClock(), hand.p};
+    g.history[g.samples % 16] = {carryClock(), hand.p, hand.q};
     ++g.samples;
 }
 // Stick walking follows where the head faces ([Comfort] MoveDirection 0), or
@@ -2798,7 +2923,10 @@ static void update(void *p) {
                     int(primaryField(p, 0x988)), isDual(p));
             }
         }
-        if (parts >= 3 && rider.handheld() && singlePlayer() && nativeTeleport) {
+        static void *teleportPlayer = nullptr;
+        if (parts >= 3 && rider.handheld() && singlePlayer() && nativeTeleport && (!labLoadWanted || labLoadIssued)) {
+            // With a lab save load: 3 s into the loaded world (a new player entity).
+            if (p != teleportPlayer) { teleportPlayer = p; playingSince = 0; }
             if (!playingSince) playingSince = GetTickCount64();
             if (GetTickCount64() - playingSince > 3000) {
                 const float half = target[3] * .5f;
@@ -7914,18 +8042,18 @@ bool beginScopeSource(void *player, const Request &request, const ScopeSourceVie
     scopeBeginFailure = 0;
     return true;
 }
-// The water mirror's source render: the centre camera of `request` mirrored
-// about `plane` (common/water_mirror.hpp), through the same native source path
-// as a scope's (camera and projection substituted, pre-bloom capture command).
+// The water mirror's source render for one eye: that eye's camera and field of
+// view in `request` mirrored about `plane` (common/water_mirror.hpp), through the
+// same native source path as a scope's (camera and projection substituted,
+// pre-bloom capture command).
 bool waterMirrorEnabled() noexcept { return settings.waterMirror; }
 float waterMirrorScale() noexcept { return settings.waterMirrorScale; }
-bool waterMirrorView(const Request &request, const double (&plane)[4], Pose &camera, Fov &fov) noexcept {
-    if (!eyeAnchorReady || !eyeSnapshot.initialized) return false;
-    const Request centre = ss2vr::single_pass::centreRequest(request);
-    const Pose c = worldEyeTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, request.input.head, centre.eye[0]);
+bool waterMirrorView(const Request &request, const double (&plane)[4], unsigned eye, Pose &camera, Fov &fov) noexcept {
+    if (!eyeAnchorReady || !eyeSnapshot.initialized || eye > 1) return false;
+    const Pose c = worldEyeTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, request.input.head, request.eye[eye]);
     if (!finite(c) || !(ss2vr::water_mirror::signedDistance(plane, c.p) > .02)) return false;
     camera = ss2vr::water_mirror::mirrorCamera(c, plane);
-    fov = ss2vr::water_mirror::mirrorFov(centre.fov[0]);
+    fov = ss2vr::water_mirror::mirrorFov(request.fov[eye]);
     return finite(camera) && std::isfinite(fov.left + fov.right + fov.up + fov.down);
 }
 bool beginMirrorSource(void *player, const Request &request, const Pose &camera, const Fov &fov, const double (&plane)[4],
@@ -11796,6 +11924,11 @@ bool attach(bool headless) {
         symbol(e, "?GetBody@CHull@SeriousEngine@@QAEPAVCBody@2@XZ", hullBody);
         symbol(e, "?SetMaxLinVel@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxLinVel);
         symbol(e, "?SetMaxAngVel@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxAngVel);
+        symbol(e, "?SetMaxForce@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxForce);
+        symbol(e, "?SetMaxTorque@CManipulatorJoint@SeriousEngine@@QAEXM@Z", jointMaxTorque);
+        symbol(e, "?SetAbsPlacement@CMechanism@SeriousEngine@@QAEHABVQuatVect@2@K@Z", mechanismPlace);
+        symbol(e, "?GetAbsPlacement@CMechanism@SeriousEngine@@QAE?AVQuatVect@2@XZ", mechanismPlacement);
+        symbol(e, "?SetVelocity@CMechanism@SeriousEngine@@QAEXABVVector3f@2@@Z", mechanismVelocity);
         symbol(e, "?GetMechanism@CHull@SeriousEngine@@QAEPAVCMechanism@2@XZ", hullMechanism);
         symbol(e, "?AddToIgnoreList@CMechanism@SeriousEngine@@QAEXPAV12@@Z", mechanismIgnore);
         symbol(e, "?RemoveFromIgnoreList@CMechanism@SeriousEngine@@QAEXPAV12@@Z", mechanismUnignore);

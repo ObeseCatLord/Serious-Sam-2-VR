@@ -2912,8 +2912,8 @@ struct Host {
             return {L"Edge resolution", percent(f.periphery), L"The resolution outside the sharp region.", L"",
                     fraction(f.periphery, .25f, .8f), f.mode == 0};
         case OptWaterMirror:
-            return {L"Water reflections", settings.waterMirror ? L"Mirrored world" : L"Surroundings",
-                    L"Water reflects a mirrored render of the world (sharp, costs a render) or a captured picture of the surroundings."};
+            return {L"Water reflections", settings.waterMirror ? L"Mirror" : L"Cubemap",
+                    L"Mirror: the world rendered mirrored for each eye (exact, costs two extra renders). Cubemap: a captured picture of the surroundings (cheap, no close-up detail)."};
         case OptMirrorScale:
             return {L"Reflection resolution", percent(settings.waterMirrorScale),
                     L"The mirrored render's size as a share of an eye's. Lower is faster.", L"",

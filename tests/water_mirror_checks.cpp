@@ -76,5 +76,23 @@ int main() {
             else assert(z < -1);
         }
     }
+    // Per eye, exact: where an eye sees an object's reflection on the water (the
+    // plane point on the line from the eye to the object's mirror image), that
+    // eye's mirror camera images the water point and the object at the same place,
+    // so looking the water point up (distance 0) is right for any object distance.
+    for (const Pose eye : {Pose{normalize(Quat{-.3f, .1f, .02f, 1}), Vec3{-.032f, 2.6f, .1f}},
+                           Pose{normalize(Quat{-.3f, .1f, .02f, 1}), Vec3{.032f, 2.6f, .1f}}}) {
+        const Pose m = mirrorCamera(eye, flat);
+        const M4 vp = viewProjection(m, mirrorFov(fov, 0));
+        for (Vec3 x : {Vec3{.4f, 1.3f, -1.5f}, Vec3{-1, 2.5f, -6}, Vec3{3, 8, -40}}) {
+            const Vec3 image{x.x, 2 - x.y, x.z}; // Mirrored about y = 1.
+            const float t = (eye.p.y - 1) / (eye.p.y - image.y);
+            const Vec3 water{eye.p.x + (image.x - eye.p.x) * t, 1, eye.p.z + (image.z - eye.p.z) * t};
+            double u0, v0, w0, u1, v1, w1;
+            ndc(vp, water, u0, v0, w0);
+            ndc(vp, x, u1, v1, w1);
+            assert(std::abs(u0 - u1) < 1e-4 && std::abs(v0 - v1) < 1e-4);
+        }
+    }
     std::puts("water mirror ok");
 }

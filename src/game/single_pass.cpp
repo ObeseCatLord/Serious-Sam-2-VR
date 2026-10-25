@@ -727,10 +727,13 @@ bool waterDraw() noexcept {
 struct WaterConstantsScope {
     IDirect3DDevice9 *d;
     bool active = false, eyes = false, cube = false, mirrored = false;
-    float saved[20]{}, view[4]{}, offset[2][3]{}, savedMirror[16]{};
+    float saved[20]{}, view[4]{}, offset[2][3]{}, savedMirror[16]{}, toMirror[2][16]{};
+    IDirect3DTexture9 *reflection[2]{}; // Each eye's mirror image (water_mirror.hpp).
     // The cube's proxy sphere radius (env_probe), in the program's model units.
     float proxy = water::ProxyRadius;
-    float mirrorDistance = 10; // How far along each eye's reflected ray the mirror is looked up, model units.
+    // How far along each eye's reflected ray the mirror is looked up (model units):
+    // 0, the water point itself, since each eye has its own mirror camera (exact).
+    float mirrorDistance = 0;
     ProbePixel pixel;
     IDirect3DBaseTexture9 *image = nullptr;
     DWORD sampling[4]{};
@@ -752,8 +755,8 @@ struct WaterConstantsScope {
             const float scale = std::sqrt(rows[0] * rows[0] + rows[1] * rows[1] + rows[2] * rows[2]);
             if (std::isfinite(scale) && scale > 1e-4f) {
                 proxy = water::ProxyRadius / scale;
-                // Lab (SS2VR_LAB_MIRROR_DISTANCE=<metres>): the reflections' assumed distance (10 m).
-                static const float metres = [] { wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_MIRROR_DISTANCE", v, 16) ? float(_wtof(v)) : 10.f; }();
+                // Lab (SS2VR_LAB_MIRROR_DISTANCE=<metres>): look up a point that far along the reflected ray instead.
+                static const float metres = [] { wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_MIRROR_DISTANCE", v, 16) ? float(_wtof(v)) : 0.f; }();
                 mirrorDistance = metres / scale;
             }
         }
@@ -776,14 +779,15 @@ struct WaterConstantsScope {
                 water_mirror::noteWater(plane, Vec3{-(v[0] * v[3] + v[4] * v[7] + v[8] * v[11]),
                                                     -(v[1] * v[3] + v[5] * v[7] + v[9] * v[11]),
                                                     -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11])});
-                IDirect3DTexture9 *reflection = nullptr;
-                M4 worldToClip;
+                M4 worldToClip[2];
                 if (vertex->second.mirror && water_mirror::image(plane, reflection, worldToClip)) {
                     pixel = probePixelOf(d, enginePixelShader);
                     if (pixel.mirror && SUCCEEDED(d->GetTexture(pixel.sampler, &image))) {
-                        const M4 toMirror = multiply(worldToClip, model);
-                        float rows[16];
-                        for (unsigned k = 0; k < 16; ++k) rows[k] = float(toMirror[k]);
+                        for (unsigned e = 0; e < 2; ++e) {
+                            const M4 m = multiply(worldToClip[e], model);
+                            for (unsigned k = 0; k < 16; ++k) toMirror[e][k] = float(m[k]);
+                        }
+                        const float *rows = toMirror[0];
                         const D3DSAMPLERSTATETYPE kinds[4]{D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_SRGBTEXTURE};
                         for (unsigned k = 0; k < 4; ++k) d->GetSamplerState(pixel.sampler, kinds[k], &sampling[k]);
                         d->GetVertexShaderConstantF(MirrorConstant, savedMirror, 4);
@@ -792,7 +796,7 @@ struct WaterConstantsScope {
                         oSetVertexShader(d, vertex->second.mirror);
                         oSetPixelShader(d, pixel.mirror);
                         appliedPixelShader = pixel.mirror;
-                        d->SetTexture(pixel.sampler, reflection);
+                        d->SetTexture(pixel.sampler, reflection[0]);
                         for (unsigned k = 0; k < 3; ++k) d->SetSamplerState(pixel.sampler, kinds[k], D3DTADDRESS_CLAMP);
                         d->SetSamplerState(pixel.sampler, D3DSAMP_SRGBTEXTURE, FALSE);
                         return;
@@ -824,6 +828,10 @@ struct WaterConstantsScope {
                          view[2] + (eyes ? offset[e][2] : 0.f), 0, water::DomeScale, 1,
                          mirrored ? mirrorDistance : proxy * proxy, .9f * proxy};
         d->SetVertexShaderConstantF(WaterConstant, c, 2);
+        if (mirrored) { // That eye's own mirror camera and image.
+            d->SetVertexShaderConstantF(MirrorConstant, toMirror[e], 4);
+            d->SetTexture(pixel.sampler, reflection[e]);
+        }
     }
     // A water draw whose constants could not be read: its stereo variant would
     // look the reflection up from whatever c30.. hold, so it is not drawn.

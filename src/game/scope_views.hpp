@@ -24,7 +24,7 @@ unsigned scopeSourceFlags() noexcept; // Diagnostics: active, prepared, attempte
 // request and plane, and the source purpose (ended by endScopeSource).
 bool waterMirrorEnabled() noexcept;
 float waterMirrorScale() noexcept;
-bool waterMirrorView(const Request &request, const double (&plane)[4], Pose &camera, Fov &fov) noexcept;
+bool waterMirrorView(const Request &request, const double (&plane)[4], unsigned eye, Pose &camera, Fov &fov) noexcept;
 bool beginMirrorSource(void *player, const Request &request, const Pose &camera, const Fov &fov, const double (&plane)[4],
                        ScopeCaptureCallback callback, ScopeCaptureCurrent current, void *context);
 bool endScopeSource(bool normalCompletion) noexcept;
