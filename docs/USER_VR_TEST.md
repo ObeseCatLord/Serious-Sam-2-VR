@@ -23,6 +23,33 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the junkyard water and match report (2026-10-24)
+
+1. Held objects (the match, crates, balls) are held rigidly at your hand. The
+   game's carry is a spring attached to your body: it shook around the hand
+   and pulled on you, so jumps were short. Now:
+   - jumping while carrying is as high as without (lab: 1.62 m holding a
+     50 kg crate, 1.58 m empty);
+   - throws take your fastest recent hand motion, including the wrist flick,
+     and give the whole object that speed and spin (lab: the crate flew
+     6.9 m).
+
+   Please check in Giant Junkyard:
+   - the match stays steady in your hand;
+   - you can climb the mushrooms holding it;
+   - it flies when thrown.
+
+   Your log will say "Grip carry taken ... mass=... parts=..." for each grab.
+2. Water reflections: each eye now gets its own mirrored render, made from
+   that eye's own position and field of view (your Beyond's canted displays
+   included). Reflections should sit still in the world at any distance:
+   - the cans in the junkyard stream;
+   - walkways in Branchester.
+
+   This costs two extra renders while water is in view. In the VR options
+   (Graphics, Water reflections), "Cubemap" is the cheaper picture of the
+   surroundings. `[Render] WaterMirrorScale` sets each render's size.
+
 ## New: VR options menu (2026-10-23)
 
 The VR options panel is now a tabbed menu: Movement, Graphics, Sound, Voice
