@@ -152,7 +152,7 @@ inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg, un
 // With `probe` the water variant instead writes the world-space reflection
 // direction (model-space R turned by the rows in c<eyeClip+2..+4>) to the
 // texcoord set the reflection lookup wrote, for a cube map of the surroundings
-// (env_probe.cpp, and patchWaterPixelShader below).
+// anchored at c<eyeClip+5> (model space; env_probe.cpp, and patchWaterPixelShader below).
 // With `mirror` (a free constant register, 4 rows: model -> mirror camera clip)
 // the water variant instead looks its reflection up in the mirror camera's
 // image ([Render] WaterMirror): the lookup's clip position is replaced by the
@@ -171,7 +171,7 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
     const unsigned position = 11;
     unsigned clipReg = 0, normalReg = 0, positionReg = 0;
     size_t clipAt = eyeClip ? eyeClipSite(words, count, clipReg, &normalReg, &positionReg, &info.clipMatrix) : 0;
-    if (clipAt && (info.temps > 9 || info.constants > eyeClip || eyeClip + (probe ? 5 : 2) > 96)) clipAt = 0; // r9, r10 and c<eyeClip..> must be free.
+    if (clipAt && (info.temps > 9 || info.constants > eyeClip || eyeClip + (probe ? 6 : 2) > 96)) clipAt = 0; // r9, r10 and c<eyeClip..> must be free.
     if (mirror && (!clipAt || probe || mirror < eyeClip + 5 || mirror + 4 > 96)) return false;
     bool reflectionWritten = !probe || !clipAt;
     info.eyeClip = clipAt != 0;
@@ -231,14 +231,14 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
             result.insert(result.end(), std::begin(dome), probe ? std::begin(dome) + 28 : std::end(dome));
             if (probe) {
                 // Parallax: the cube shows the surroundings as a sphere of radius Rp
-                // around the viewer (cK.z = Rp^2, cK.w = 0.9 Rp, model units), not at
-                // infinity, where reflected trees and walls slid with every head move.
-                // The lookup is where the reflected ray from this point meets it:
-                // L = o + sR with o = P - eye (kept inside the sphere), s = sqrt(b^2 - c) - b,
+                // around its fixed world anchor (cE+5, cK.z = Rp^2, cK.w = 0.9 Rp, model
+                // units). Centred on the eye, it moved with the head and so did the
+                // reflections. The lookup is where the reflected ray from this point meets it:
+                // L = o + sR with o = P - anchor (kept inside the sphere), s = sqrt(b^2 - c) - b,
                 // b = o.R, c = o.o - Rp^2. rX (the replaced lookup) and r10 are scratch.
                 const uint32_t X = clipReg;
                 const uint32_t parallax[] = {
-                    0x03u, dst(Temp, X, 0x7), src(Temp, positionReg), src(Const, e),            // sub rX.xyz, rP, cE (o)
+                    0x03u, dst(Temp, X, 0x7), src(Temp, positionReg), src(Const, e + 5),        // sub rX.xyz, rP, cE+5 (o)
                     0x08u, dst(Temp, 10, 0x2), src(Temp, X), src(Temp, X),                      // dp3 r10.y, o, o
                     0x07u, dst(Temp, 10, 0x8), src(Temp, 10, 0x55u),                            // rsq r10.w, |o|^2
                     0x05u, dst(Temp, 10, 0x8), src(Temp, 10, 0xffu), src(Const, k, 0xffu),      // mul r10.w, 0.9Rp/|o|

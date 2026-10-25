@@ -98,6 +98,7 @@ struct ProbeVertex { IDirect3DVertexShader9 *variant = nullptr, *mirror = nullpt
 // The mirror variants ([Render] WaterMirror): model -> mirror camera clip in
 // c35..c38; the pixel program keeps its projective lookup, then the gain.
 constexpr unsigned MirrorConstant = 35;
+constexpr unsigned CubeAnchorConstant = 35; // Cube variant: the cube's world anchor in model space (shader_patch probe).
 std::unordered_map<IDirect3DVertexShader9 *, ProbeVertex> shaderProbe;
 struct ProbePixel { IDirect3DPixelShader9 *variant = nullptr, *mirror = nullptr; unsigned sampler = 0; };
 std::unordered_map<IDirect3DPixelShader9 *, ProbePixel> pixelProbe;
@@ -726,7 +727,8 @@ bool waterDraw() noexcept {
 // program's view position (c4, in its model space) plus the eye's offset.
 struct WaterConstantsScope {
     IDirect3DDevice9 *d;
-    bool active = false, eyes = false, cube = false, mirrored = false;
+    bool active = false, eyes = false, cube = false, mirrored = false, anchored = false;
+    float savedAnchor[4]{};
     float saved[20]{}, view[4]{}, offset[2][3]{}, savedMirror[16]{}, toMirror[2][16]{};
     IDirect3DTexture9 *reflection[2]{}; // Each eye's mirror image (water_mirror.hpp).
     // The cube's proxy sphere radius (env_probe), in the program's model units.
@@ -754,7 +756,7 @@ struct WaterConstantsScope {
         if (turned) {
             const float scale = std::sqrt(rows[0] * rows[0] + rows[1] * rows[1] + rows[2] * rows[2]);
             if (std::isfinite(scale) && scale > 1e-4f) {
-                proxy = water::ProxyRadius / scale;
+                proxy = env_probe::radius() / scale; // The cube's sphere (env_probe), model units.
                 // Lab (SS2VR_LAB_MIRROR_DISTANCE=<metres>): look up a point that far along the reflected ray instead.
                 static const float metres = [] { wchar_t v[16]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_MIRROR_DISTANCE", v, 16) ? float(_wtof(v)) : 0.f; }();
                 mirrorDistance = metres / scale;
@@ -807,13 +809,28 @@ struct WaterConstantsScope {
         }
         // The environment cube once it holds something, with both programs' variants.
         IDirect3DCubeTexture9 *environment = active ? env_probe::cube(d) : nullptr;
-        if (!environment || !turned || labWaterUnpatched() || !vertex->second.variant) return;
+        if (!environment || !turned || labWaterUnpatched() || !vertex->second.variant || !engineAdjusted) return;
+        // The cube's anchor in the water's model space (its sphere is centred there).
+        float anchorWorld[3], anchorModel[4]{0, 0, 0, 1};
+        {
+            M4 inv, model, modelInverse;
+            if (!env_probe::anchor(anchorWorld) || !invert(multiply(m4(engineAdjusted, 4), m4(engineView, 3)), inv) ||
+                !invert(model = multiply(inv, m4(wvp, 4)), modelInverse)) return;
+            for (unsigned r = 0; r < 3; ++r) {
+                const double v = modelInverse[4 * r] * anchorWorld[0] + modelInverse[4 * r + 1] * anchorWorld[1] +
+                                 modelInverse[4 * r + 2] * anchorWorld[2] + modelInverse[4 * r + 3];
+                if (!std::isfinite(v)) return;
+                anchorModel[r] = float(v);
+            }
+        }
         pixel = probePixelOf(d, enginePixelShader);
         if (!pixel.variant || FAILED(d->GetTexture(pixel.sampler, &image))) return;
         const D3DSAMPLERSTATETYPE kinds[4]{D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_SRGBTEXTURE};
         for (unsigned k = 0; k < 4; ++k) d->GetSamplerState(pixel.sampler, kinds[k], &sampling[k]);
         cube = true;
         d->SetVertexShaderConstantF(WaterConstant + 2, rows, 3);
+        anchored = SUCCEEDED(d->GetVertexShaderConstantF(CubeAnchorConstant, savedAnchor, 1));
+        d->SetVertexShaderConstantF(CubeAnchorConstant, anchorModel, 1);
         oSetVertexShader(d, vertex->second.variant);
         oSetPixelShader(d, pixel.variant);
         appliedPixelShader = pixel.variant;
@@ -842,6 +859,7 @@ struct WaterConstantsScope {
             for (unsigned k = 0; k < 4; ++k) d->SetSamplerState(pixel.sampler, kinds[k], sampling[k]);
             d->SetTexture(pixel.sampler, image);
             if (mirrored) d->SetVertexShaderConstantF(MirrorConstant, savedMirror, 4);
+            if (anchored) d->SetVertexShaderConstantF(CubeAnchorConstant, savedAnchor, 1);
             oSetVertexShader(d, variantOf(d, engineShader));
             oSetPixelShader(d, enginePixelShader);
             appliedPixelShader = enginePixelShader;

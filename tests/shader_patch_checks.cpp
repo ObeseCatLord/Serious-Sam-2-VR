@@ -101,6 +101,11 @@ int main() {
             if (out[i] == 0x01 && out[i + 1] == dst(TexCrdOut, 2, 0xf) && out[i + 2] == src(Temp, 2)) lookupLeft = true;
         }
         assert(turned && written && !lookupLeft);
+        // The parallax sphere is centred on the cube's anchor (c35), not on the eye (c30).
+        bool anchoredCentre = false;
+        for (size_t i = 0; i + 3 < out.size(); ++i)
+            if (out[i] == 0x03 && out[i + 3] == src(Const, 35)) anchoredCentre = true;
+        assert(anchoredCentre);
         // Probe mode needs constants up to c34 free and a texcoord fed by the lookup.
         assert(patchVertexShader(busyConstants.data(), busyConstants.size(), out, &w, 30, true) && !w.eyeClip);
         // Mirror mode: the lookup's clip position becomes the point's position in

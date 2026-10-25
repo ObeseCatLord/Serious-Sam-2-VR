@@ -1,5 +1,6 @@
 #include "env_probe.hpp"
 #include "common/env_probe.hpp"
+#include "common/water_reflection.hpp"
 #include "game.hpp"
 #include <algorithm>
 #include <cmath>
@@ -17,7 +18,17 @@ IDirect3DPixelShader9 *program = nullptr;
 IDirect3DStateBlock9 *state = nullptr;
 bool failed = false, filled = false;
 uint64_t lastWater = 0;
-float lastCamera[3]{};
+float lastCamera[3]{}, anchorAt[3]{};
+bool anchored = false;
+// The cube's fixed world point moves to the viewer only once they are this far
+// from it (metres): within that, reflections stay put as the head moves.
+constexpr float AnchorMove = 4.f;
+// The sphere's radius (metres): eased toward the measured surroundings, within
+// these limits (too small and distant scenery swims; too large and nearby
+// things reflect as if far away, gliding with the head).
+constexpr float RadiusMin = 4.f, RadiusMax = 40.f;
+float surroundings = ss2vr::water::ProxyRadius, sphereRadius = ss2vr::water::ProxyRadius;
+uint64_t radiusTick = 0;
 constexpr UINT SourceSize = 512;
 constexpr uint64_t KeepMs = 4000; // After the last water draw.
 template<class T> void drop(T *&p) { if (p) { p->Release(); p = nullptr; } }
@@ -66,17 +77,30 @@ void capture(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *eye, 
     if (!wanted() || !d || !eye || !view || !projection || !device.setRT || !device.drawUp || !device.stretch) return;
     D3DSURFACE_DESC desc{};
     if (FAILED(eye->GetDesc(&desc)) || !ensure(d, device, desc.Format)) return;
-    // The cube is centred on the viewer: a jump (respawn, load) starts it again.
+    // A jump (respawn, load) starts the cube again; walking away from its anchor
+    // moves the anchor (the old views fade out as new ones blend in).
     const float camera[3]{-(view[0] * view[3] + view[4] * view[7] + view[8] * view[11]),
                           -(view[1] * view[3] + view[5] * view[7] + view[9] * view[11]),
                           -(view[2] * view[3] + view[6] * view[7] + view[10] * view[11])};
     const float dx = camera[0] - lastCamera[0], dy = camera[1] - lastCamera[1], dz = camera[2] - lastCamera[2];
-    if (filled && dx * dx + dy * dy + dz * dz > 40.f * 40.f) clearFaces(d, device);
+    if (filled && dx * dx + dy * dy + dz * dz > 40.f * 40.f) { clearFaces(d, device); anchored = false; }
     std::copy(std::begin(camera), std::end(camera), lastCamera);
+    const float ax = camera[0] - anchorAt[0], ay = camera[1] - anchorAt[1], az = camera[2] - anchorAt[2];
+    if (!anchored || ax * ax + ay * ay + az * az > AnchorMove * AnchorMove) {
+        std::copy(std::begin(camera), std::end(camera), anchorAt);
+        anchored = true;
+    }
     const RECT whole{0, 0, LONG(width), LONG(height)};
     if (FAILED(device.stretch(d, eye, &whole, sourceSurface, nullptr, D3DTEXF_LINEAR))) return;
     float rows[16];
-    probe::captureRows(view, projection, rows);
+    {
+        // About a second to settle on a new measurement (no jumps in the reflections).
+        const uint64_t now = GetTickCount64();
+        const float dt = radiusTick ? std::min(float(now - radiusTick) * .001f, .1f) : 0.f;
+        radiusTick = now;
+        sphereRadius += (surroundings - sphereRadius) * std::min(1.f, dt * 2.5f);
+    }
+    probe::captureRows(view, projection, anchorAt, sphereRadius, rows);
     IDirect3DSurface9 *previous = nullptr;
     if (FAILED(state->Capture()) || FAILED(d->GetRenderTarget(0, &previous))) { drop(previous); return; }
     d->SetVertexShader(nullptr);
@@ -160,11 +184,21 @@ void capture(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *eye, 
     }
 }
 
-IDirect3DCubeTexture9 *cube(IDirect3DDevice9 *d) noexcept { return d == owner && filled ? cubeTexture : nullptr; }
+IDirect3DCubeTexture9 *cube(IDirect3DDevice9 *d) noexcept { return d == owner && filled && anchored ? cubeTexture : nullptr; }
+void setSurroundings(float metres) noexcept {
+    if (std::isfinite(metres)) surroundings = std::clamp(metres, RadiusMin, RadiusMax);
+}
+float radius() noexcept { return sphereRadius; }
+bool anchor(float (&out)[3]) noexcept {
+    if (!anchored) return false;
+    std::copy(std::begin(anchorAt), std::end(anchorAt), out);
+    return true;
+}
 
 void release() noexcept {
     drop(state); drop(program); drop(sourceSurface); drop(source); drop(cubeTexture);
     owner = nullptr;
     filled = false;
+    anchored = false;
 }
 } // namespace ss2vr::game::env_probe

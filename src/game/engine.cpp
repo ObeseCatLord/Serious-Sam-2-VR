@@ -1,5 +1,6 @@
 #include "eye_replay.hpp"
 #include "single_pass.hpp"
+#include "env_probe.hpp"
 #include "common/turret_look.hpp"
 #include "common/two_hand.hpp"
 #include "common/grenade_throw.hpp"
@@ -6674,6 +6675,54 @@ static void traceSoundOcclusion() {
             ends[0].x, ends[0].y, ends[0].z);
     }
 }
+// Water cubemap (env_probe): the surroundings' distance from the cube's anchor,
+// so its sphere (and the reflections' parallax) matches the scene: the median
+// distance of the rays out over the horizon and the sky that hit something
+// (open sky looks alike at any distance; mostly sky counts as far), at most once
+// a second, in the same native query lifecycle as the lasers.
+static void traceWaterSurroundings() {
+    float anchor[3];
+    static uint64_t last = 0;
+    const uint64_t now = GetTickCount64();
+    if (settings.waterMirror || !env_probe::wanted() || !env_probe::anchor(anchor) || now - last < 1000) return;
+    const auto s = copySnapshot();
+    if (!s.initialized || !livePlayer(s) || !s.ui.gameplay) return;
+    last = now;
+    constexpr float Far = 60;
+    float distances[24];
+    unsigned n = 0;
+    void *mechanism = getMechanism ? getMechanism(s.player) : nullptr;
+    laserQuerying = true;
+    for (unsigned ring = 0; ring < 3; ++ring) {
+        const unsigned count = ring == 0 ? 12 : ring == 1 ? 8 : 4;
+        const float elevation = ring == 0 ? .05f : ring == 1 ? .5f : 1.f;
+        for (unsigned k = 0; k < count; ++k) {
+            const float a = 2 * Pi * (k + .5f * ring) / count;
+            const Vec3 d{std::cos(a) * std::cos(elevation), std::sin(elevation), std::sin(a) * std::cos(elevation)}; // Unit length.
+            originalRayInit();
+            NativeRay ray{Vec3{anchor[0], anchor[1], anchor[2]}, d};
+            setRay(ray);
+            rayMaximum(Far);
+            rayMinimum(.05f);
+            rayRadius(0);
+            rayCategory(bulletCategory);
+            thickCategory(bulletCategory);
+            rayAvatar(s.player);
+            rayMechanism(mechanism);
+            rayFluids(0);
+            checkRay();
+            const float at = rayHit() != 0 ? hitDistance() : Far;
+            originalRayInit();
+            if (std::isfinite(at) && at < Far) distances[n++] = at;
+        }
+    }
+    laserQuerying = false;
+    if (n < 6) distances[0] = Far, n = 1; // Mostly open: far.
+    std::nth_element(distances, distances + n / 2, distances + n);
+    env_probe::setSurroundings(distances[n / 2]);
+    static unsigned traced = 0;
+    if (traced < 12) { ++traced; log("Water cube surroundings median %.1f m from %.1f,%.1f,%.1f (%u hits of 24)", double(distances[n / 2]), double(anchor[0]), double(anchor[1]), double(anchor[2]), n); }
+}
 static void trackedRayInitBody(uintptr_t caller, bool outermost) {
     // The native caller is intentionally beginning a new query. Retire its old
     // query first, use the same native lifecycle for our rays, then leave a fresh
@@ -6687,6 +6736,7 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
         return;
     }
     traceSoundOcclusion();
+    traceWaterSurroundings();
     auto s = copySnapshot();
     if ((!settings.lasers && !s.zoom[0] && !s.zoom[1]) ||
         !vrSession(s) || !fresh(s.input) || !s.ui.gameplay || !livePlayer(s)) {

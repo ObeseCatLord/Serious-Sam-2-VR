@@ -20,5 +20,11 @@ void capture(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *eye, 
              const float *projection) noexcept;
 // The cube once anything was captured into it on this device, else null.
 IDirect3DCubeTexture9 *cube(IDirect3DDevice9 *d) noexcept;
+// The cube's fixed world point (its surroundings lie on a sphere around it).
+bool anchor(float (&out)[3]) noexcept;
+// The measured distance of the surroundings from the anchor (metres): the
+// sphere's radius eases toward it.
+void setSurroundings(float metres) noexcept;
+float radius() noexcept; // The sphere's radius now (metres).
 void release() noexcept; // Device reset or loss: default-pool resources go.
 } // namespace ss2vr::game::env_probe

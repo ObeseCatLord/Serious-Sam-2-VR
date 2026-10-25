@@ -7,13 +7,14 @@
 // Water reflections from the surroundings (env_probe.cpp). The engine's water
 // looks a painted image up by screen position, so in VR the reflection lay on
 // the water and turned or slid with the head. Instead each frame's left-eye
-// world image (before HUD) is projected into a world-aligned cube map around
-// the viewer: only the upper half of the view and directions above the
-// horizon, where the guns and the water itself are not. The patched water
-// programs sample the cube by the world reflection direction, so reflections
-// show the real sky, trees and cliffs, fixed in the world and alike for both
-// eyes. Matrices are row-major: view is world -> view 3x4, projection 4x4 with
-// clip = P * view (w = -z).
+// world image (before HUD) is projected into a world-aligned cube map: only
+// the upper half of the view and directions above the horizon, where the guns
+// and the water itself are not. The cube is anchored at a fixed world point
+// (moved only when the player walks away from it), its contents taken to lie
+// on a sphere around that point; the patched water programs look up where
+// each eye's reflected ray meets that sphere, so reflections stay fixed in the
+// world as the head turns and moves. Matrices are row-major: view is world ->
+// view 3x4, projection 4x4 with clip = P * view (w = -z).
 namespace ss2vr::env_probe {
 constexpr unsigned FaceSize = 128;
 // D3D cube face order +X, -X, +Y, -Y, +Z, -Z; s, t in [-1, 1] across the face
@@ -28,16 +29,24 @@ inline void faceDirection(unsigned face, float s, float t, float (&out)[3]) {
     default: out[0] = -s; out[1] = -t; out[2] = -1; break;
     }
 }
-// Capture constants c0..c3: clip x, y, (unused), w of a world direction seen
-// from the camera (rotation only: the cube is centred on the viewer).
-inline void captureRows(const float *view, const float *projection, float (&out)[16]) {
-    for (unsigned r = 0; r < 4; ++r)
-        for (unsigned j = 0; j < 4; ++j) {
-            double v = 0;
-            if (j < 3)
-                for (unsigned k = 0; k < 3; ++k) v += double(projection[4 * r + k]) * view[4 * k + j];
-            out[4 * r + j] = float(v);
+// Capture constants c0..c3: clip x, y, (unused), w, as a dot product with
+// (n, 1), of the point anchor + radius * n (n a unit direction from the
+// anchor, world) seen by the camera.
+inline void captureRows(const float *view, const float *projection, const float (&anchor)[3], float radius, float (&out)[16]) {
+    for (unsigned r = 0; r < 4; ++r) {
+        double translation = projection[4 * r + 3];
+        for (unsigned k = 0; k < 3; ++k) {
+            const double viewed = double(view[4 * k]) * anchor[0] + double(view[4 * k + 1]) * anchor[1] +
+                                  double(view[4 * k + 2]) * anchor[2] + view[4 * k + 3];
+            translation += double(projection[4 * r + k]) * viewed;
         }
+        for (unsigned j = 0; j < 3; ++j) {
+            double v = 0;
+            for (unsigned k = 0; k < 3; ++k) v += double(projection[4 * r + k]) * view[4 * k + j];
+            out[4 * r + j] = float(v * radius);
+        }
+        out[4 * r + 3] = float(translation);
+    }
 }
 // Model -> world rotation (rows) of a draw from its model -> clip matrix
 // (`wvp`, rows) and the camera's view and projection: the x, y and w rows of
@@ -101,9 +110,11 @@ inline std::vector<uint32_t> captureProgram() {
         0x05000051u, d(C, 5, 0xf), f(ViewFloor), f(HorizonY), f(ViewEdge), f(CaptureBlend),
         0x0200001fu, 0x80000000u, d(T, 0, 0x7),
         0x0200001fu, 0x90000000u, d(S, 0, 0xf),
-        0x03000008u, d(R, 0, 0x1), s(T, 0), s(C, 0),                          // dp3 r0.x, t0, c0
-        0x03000008u, d(R, 0, 0x2), s(T, 0), s(C, 1),                          // dp3 r0.y, t0, c1
-        0x03000008u, d(R, 0, 0x8), s(T, 0), s(C, 3),                          // dp3 r0.w, t0, c3
+        0x02000024u, d(R, 6, 0x7), s(T, 0),                                   // nrm r6.xyz, t0 (n)
+        0x02000001u, d(R, 6, 0x8), s(C, 4, 0xaa),                             // mov r6.w, 1
+        0x03000009u, d(R, 0, 0x1), s(R, 6), s(C, 0),                          // dp4 r0.x, (n,1), c0
+        0x03000009u, d(R, 0, 0x2), s(R, 6), s(C, 1),                          // dp4 r0.y, (n,1), c1
+        0x03000009u, d(R, 0, 0x8), s(R, 6), s(C, 3),                          // dp4 r0.w, (n,1), c3
         0x02000006u, d(R, 1, 0x8), s(R, 0, 0xff),                             // rcp r1.w, r0.w
         0x03000005u, d(R, 1, 0x3), s(R, 0), s(R, 1, 0xff),                    // mul r1.xy, r0, r1.w (ndc)
         0x02000023u, d(R, 2, 0x3), s(R, 1),                                   // abs r2.xy, r1

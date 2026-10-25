@@ -26,7 +26,11 @@ int main() {
     // Camera rotation Ry (world from camera); view = Ry^T.
     const float view[12]{c, 0, -s, 3, 0, 1, 0, -2, s, 0, c, 7};
     float rows[16];
-    captureRows(view, P, rows);
+    // Anchored at the camera, the rows act on directions as the camera's rotation does.
+    const float camera[3]{-(view[0] * view[3] + view[4] * view[7] + view[8] * view[11]),
+                          -(view[1] * view[3] + view[5] * view[7] + view[9] * view[11]),
+                          -(view[2] * view[3] + view[6] * view[7] + view[10] * view[11])};
+    captureRows(view, P, camera, 1, rows);
     // The camera's forward in world (-Z of Ry = (-s, 0, -c)) projects to the centre (less the skew).
     const float fwd[3]{-s, 0, -c};
     const auto dot3 = [&](unsigned r, const float *v) { return rows[4 * r] * v[0] + rows[4 * r + 1] * v[1] + rows[4 * r + 2] * v[2]; };
@@ -38,6 +42,20 @@ int main() {
     const float back[3]{s, 0, c};
     assert(dot3(3, back) < 0);
     // Model rotation from model -> clip: W = yaw 0.9 scaled 2, moved; V = the view above.
+    // Anchored elsewhere: (n, 1) maps to the clip position of anchor + radius * n.
+    {
+        const float anchor[3]{4, -1, 2}, radius = 30;
+        float at[16];
+        captureRows(view, P, anchor, radius, at);
+        const float n[3]{.6f, .0f, -.8f};
+        const float X[3]{anchor[0] + radius * n[0], anchor[1] + radius * n[1], anchor[2] + radius * n[2]};
+        float v4[4], clip[4];
+        for (unsigned k = 0; k < 3; ++k) v4[k] = view[4 * k] * X[0] + view[4 * k + 1] * X[1] + view[4 * k + 2] * X[2] + view[4 * k + 3];
+        v4[3] = 1;
+        for (unsigned r = 0; r < 4; ++r) clip[r] = P[4 * r] * v4[0] + P[4 * r + 1] * v4[1] + P[4 * r + 2] * v4[2] + P[4 * r + 3] * v4[3];
+        for (unsigned r : {0u, 1u, 3u})
+            assert(near(at[4 * r] * n[0] + at[4 * r + 1] * n[1] + at[4 * r + 2] * n[2] + at[4 * r + 3], clip[r], 1e-3f));
+    }
     const float cw = std::cos(.9f) * 2, sw = std::sin(.9f) * 2;
     const float W[16]{cw, 0, sw, 10, 0, 2, 0, -1, -sw, 0, cw, 4, 0, 0, 0, 1};
     const float V4[16]{view[0], view[1], view[2], view[3], view[4], view[5], view[6], view[7], view[8], view[9], view[10], view[11], 0, 0, 0, 1};

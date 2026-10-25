@@ -40,15 +40,21 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
    - it flies when thrown.
 
    Your log will say "Grip carry taken ... mass=... parts=..." for each grab.
-2. Water reflections: each eye now gets its own mirrored render, made from
-   that eye's own position and field of view (your Beyond's canted displays
-   included). Reflections should sit still in the world at any distance:
-   - the cans in the junkyard stream;
-   - walkways in Branchester.
+2. Water reflections are back to the cubemap by default (`[Render]
+   WaterMirror=0`; VR options, Graphics, Water reflections: Cubemap). It no
+   longer moves with your head:
+   - The captured surroundings were treated as a 40 m sphere centred on your
+     eyes, so the sphere moved whenever your head did.
+   - Now the sphere is anchored to a fixed point in the world. It moves only
+     after you walk about 4 m away.
+   - Its size follows what is around you, measured with the game's own
+     collision rays: near walls and giant junk make it small, open ground
+     makes it large.
 
-   This costs two extra renders while water is in view. In the VR options
-   (Graphics, Water reflections), "Cubemap" is the cheaper picture of the
-   surroundings. `[Render] WaterMirrorScale` sets each render's size.
+   Turn your head and step sideways by the water: reflections should stay put
+   in the world. Very close objects can still look slightly too far away.
+   "Mirror" renders the world mirrored for each eye (exact at any distance,
+   costs two extra renders); try it once for comparison.
 
 ## New: VR options menu (2026-10-23)
 
