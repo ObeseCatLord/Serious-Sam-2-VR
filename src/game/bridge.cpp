@@ -2154,6 +2154,94 @@ static int WINAPI eyeSystemMetrics(int index) {
     const uint32_t eye = index == SM_CXSCREEN ? canvasWidth.load() : canvasHeight.load();
     return std::max(value, int(std::max<uint32_t>(eye, 4096)));
 }
+// The game lays its menus out for the configured resolution's aspect
+// (gfx_pixResWidth/Height, e.g. 1920x1080 from the launch options; Sam2Game
+// forces the drawport aspect from it), whatever the canvas: on the 4:3 front-end
+// canvas a 16:9 layout was squeezed. In VR they follow the canvas; the user's
+// values are put back before the game saves its cvars (vmSaveCvars) on exit.
+static int32_t *pixResWidth = nullptr, *pixResHeight = nullptr;
+static int32_t userPixRes[2]{};
+static bool pixResFollowing = false;
+static void(__cdecl *originalSaveCvars)() = nullptr;
+static void __cdecl saveCvars() {
+    if (pixResFollowing && pixResWidth && pixResHeight) {
+        *pixResWidth = userPixRes[0];
+        *pixResHeight = userPixRes[1];
+        pixResFollowing = false;
+        log("Configured resolution %dx%d restored before saving cvars", userPixRes[0], userPixRes[1]);
+    }
+    originalSaveCvars();
+}
+static void followCanvasResolution(int32_t w, int32_t h) noexcept {
+    if (!pixResWidth || !pixResHeight || !originalSaveCvars || w <= 0 || h <= 0) return;
+    if (!pixResFollowing) { userPixRes[0] = *pixResWidth; userPixRes[1] = *pixResHeight; pixResFollowing = true; }
+    *pixResWidth = w;
+    *pixResHeight = h;
+    // Sam2Game's display aspect (RVA 3F9DE0, float): set from those values only
+    // when the video options are applied; the frame render forces it on the view.
+    if (const HMODULE game = GetModuleHandleW(L"Sam2Game.dll")) {
+        auto *aspect = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(game) + 0x3f9de0);
+        float current = 0;
+        if (readableMemory(aspect, sizeof current)) {
+            std::memcpy(&current, aspect, sizeof current);
+            if (std::isfinite(current) && current > .3f && current < 4.f) {
+                const float next = float(w) / float(h);
+                std::memcpy(aspect, &next, sizeof next);
+                log("Display aspect %.3f -> %.3f with the canvas (configured %dx%d)", current, next, userPixRes[0], userPixRes[1]);
+            }
+        }
+    }
+}
+// Menu button prompts for the controller in hand: the menus show Xbox A/B/X/Y
+// images, and Index has only A and B per hand (its menu X function is left A,
+// Y left B). With Index the X and Y images load as A and B. Resources load at
+// startup, before any controller is known, so the last profile seen is kept in
+// headset-view.ini ([Controls] Prompts).
+using ObtainResource = void *(__cdecl *)(void **, void *, int, int, int, const char *, const char *);
+static ObtainResource originalObtainResource = nullptr;
+static bool indexPrompts = false;
+static bool endsWithNoCase(const char *text, const char *tail) {
+    const size_t n = std::strlen(text), m = std::strlen(tail);
+    return n >= m && !_stricmp(text + n - m, tail);
+}
+static void *__cdecl obtainResource(void **out, void *type, int method, int a, int b, const char *path, const char *name) {
+    if (indexPrompts && path) {
+        const char *replacement = endsWithNoCase(path, "Textures/Menu/X_button.tex") ? "Content/SeriousSam2/Textures/Menu/A_button.tex"
+                                : endsWithNoCase(path, "Textures/Menu/Y_button.tex") ? "Content/SeriousSam2/Textures/Menu/B_button.tex"
+                                : nullptr;
+        if (replacement) {
+            static unsigned traced = 0;
+            if (traced < 4) { ++traced; log("Menu prompt %s shown as %s (Index)", path, replacement); }
+            path = replacement;
+        }
+    }
+    return originalObtainResource(out, type, method, a, b, path, name);
+}
+static void installPromptImages() noexcept {
+    const auto cache = canvasCache();
+    wchar_t value[16]{};
+    if (!cache.empty()) GetPrivateProfileStringW(L"Controls", L"Prompts", L"", value, 16, cache.c_str());
+    indexPrompts = !_wcsicmp(value, L"index");
+    const HMODULE core = GetModuleHandleW(L"Core.dll");
+    void *obtain = core ? reinterpret_cast<void *>(GetProcAddress(core,
+        "?resObtainResource@SeriousEngine@@YA?AV?$Ptr@VCResource@SeriousEngine@@@1@PAVCDataType@1@W4ResObtainMethod@1@HHPBD2@Z")) : nullptr;
+    const bool ok = obtain && MH_CreateHook(obtain, reinterpret_cast<void *>(obtainResource), reinterpret_cast<void **>(&originalObtainResource)) == MH_OK &&
+                    MH_EnableHook(obtain) == MH_OK;
+    log("Menu prompts hook=%d profile=%ls", ok, value[0] ? value : L"(none yet)");
+}
+// The controller profile in hand, for the next start's prompt images.
+static void notePromptProfile(bool index) noexcept {
+    static int noted = -1;
+    if (noted == int(index)) return;
+    noted = int(index);
+    const auto cache = canvasCache();
+    wchar_t value[16]{};
+    if (!cache.empty()) GetPrivateProfileStringW(L"Controls", L"Prompts", L"", value, 16, cache.c_str());
+    const wchar_t *next = index ? L"index" : L"abxy";
+    if (cache.empty() || !_wcsicmp(value, next)) return;
+    WritePrivateProfileStringW(L"Controls", L"Prompts", next, cache.c_str());
+    log("Menu prompts for %ls controllers from the next start", next);
+}
 void installEyeCanvas() noexcept {
     static bool installed = false;
     if (installed) return;
@@ -2161,6 +2249,7 @@ void installEyeCanvas() noexcept {
     const HMODULE core = GetModuleHandleW(L"Core.dll"), gfx = GetModuleHandleW(L"GfxD3D.dll"),
                   user = GetModuleHandleW(L"user32.dll"), exe = GetModuleHandleW(nullptr);
     if (!core || !gfx || !user || !exe) { log("Eye canvas unavailable: modules missing"); return; }
+    installPromptImages();
     const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(gfx);
     const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(reinterpret_cast<const uint8_t *>(gfx) + dos->e_lfanew);
     canvasGfx = reinterpret_cast<uintptr_t>(gfx);
@@ -2179,6 +2268,17 @@ void installEyeCanvas() noexcept {
         MH_CreateHook(clientRect, reinterpret_cast<void *>(eyeClientRect), reinterpret_cast<void **>(&originalClientRect)) == MH_OK &&
         MH_CreateHook(metrics, reinterpret_cast<void *>(eyeSystemMetrics), reinterpret_cast<void **>(&originalSystemMetrics)) == MH_OK &&
         MH_EnableHook(clientRect) == MH_OK && MH_EnableHook(metrics) == MH_OK;
+    if (const HMODULE engine = GetModuleHandleW(L"Engine.dll")) {
+        pixResWidth = reinterpret_cast<int32_t *>(GetProcAddress(engine, "?gfx_pixResWidth@SeriousEngine@@3JA"));
+        pixResHeight = reinterpret_cast<int32_t *>(GetProcAddress(engine, "?gfx_pixResHeight@SeriousEngine@@3JA"));
+        void *save = reinterpret_cast<void *>(GetProcAddress(engine, "?vmSaveCvars@SeriousEngine@@YAXXZ"));
+        if (!pixResWidth || !pixResHeight || !save ||
+            MH_CreateHook(save, reinterpret_cast<void *>(saveCvars), reinterpret_cast<void **>(&originalSaveCvars)) != MH_OK ||
+            MH_EnableHook(save) != MH_OK) {
+            originalSaveCvars = nullptr;
+            log("Eye canvas: configured resolution not followed (exports unavailable)");
+        }
+    }
     log("Eye canvas hooks=%d cached=%ux%u", ok, canvasWidth.load(), canvasHeight.load());
 }
 // The front end's canvas (4:3; see the presentation's canvas choice).
@@ -2212,6 +2312,7 @@ void applyEyeCanvas() noexcept {
     memcpy(before, static_cast<uint8_t *>(canvas) + 0xc, sizeof(before));
     const int result = nativeResizeCanvas(canvas); // The same call Sam2.exe makes for a window resize.
     memcpy(after, static_cast<uint8_t *>(canvas) + 0xc, sizeof(after));
+    if (result) followCanvasResolution(after[0], after[1]);
     // A fullscreen display mode has no window canvas to resize: run the game windowed in VR.
     log("Eye canvas native resize result=%d canvas %dx%d -> %dx%d", result, before[0], before[1], after[0], after[1]);
 }
@@ -2968,7 +3069,13 @@ static void presentBody(IDirect3DDevice9 *d) {
     }
     bool valid = input.focused && input.headValid && now >= input.tickMs && now - input.tickMs < 200;
     if (valid) vrInputTick.store(now, std::memory_order_relaxed);
-    MenuAction action = menuNavigation.sample(input, menuVisible, valid, menus::pointerAvailable());
+    // Index: in the game's own menus left B is their Y function, not Back.
+    const bool indexHands = ((input.buttons[0] | input.buttons[1]) & JumpBound) != 0;
+    if (valid && (input.handValid[0] || input.handValid[1])) notePromptProfile(indexHands);
+    Input navigation = input;
+    if (indexHands && nativeMenu)
+        for (auto &b : navigation.buttons) b &= ~uint32_t(Menu);
+    MenuAction action = menuNavigation.sample(navigation, menuVisible, valid, menus::pointerAvailable());
     // The weapon wheel's menu bubble opens the pause menu exactly as Menu does.
     if (wheelMenuRequested(now) && action == MenuAction::None && valid && !menuVisible)
         action = MenuAction::Back;
@@ -3012,14 +3119,14 @@ static void presentBody(IDirect3DDevice9 *d) {
         break;
     }
     // Controller-prompt X/Y menu functions are syscmdF1/F2 in the menus:
-    // Touch X/Y, Index left A / left trackpad.
+    // Touch X/Y, Index left A / left B (or the left trackpad).
     {
         static uint32_t previousExtras = 0;
         // The wheel-open button took over Touch Y / Index left trackpad: still F2 here
         // (Touch's right B, also wheel-open, is the menus' B: Back).
         const bool jumpProfile = ((input.buttons[0] | input.buttons[1]) & JumpBound) != 0;
         const uint32_t right = jumpProfile ? input.buttons[1] : input.buttons[1] & ~uint32_t(WheelOpen);
-        const uint32_t extras = valid ? ((input.buttons[0] | right) & (Reload | Netricsa | WheelOpen)) : 0;
+        const uint32_t extras = valid ? ((input.buttons[0] | right) & (Reload | Netricsa | WheelOpen | (jumpProfile ? Menu : 0u))) : 0;
         const uint32_t pressed = extras & ~previousExtras;
         previousExtras = extras;
         if (nativeMenu && !key && pressed)
