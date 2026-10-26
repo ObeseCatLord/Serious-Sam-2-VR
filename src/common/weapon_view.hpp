@@ -60,6 +60,29 @@ inline bool sameProjectionXY(const Matrix44 &a, const Matrix44 &b) {
 }
 // The water mirror's projection: its whole depth row is the oblique near
 // plane at the water (common/water_mirror.hpp); x, y and w identify it.
+// A D3D perspective (w = view distance: row 3 = 0,0,-1,0; depth 0 at the near
+// plane) moved to a farther near plane, keeping its far plane (or an infinite
+// far plane). The near and far distances it had are returned. False (p left as
+// it was) when the depth row is not that form or the new plane is not nearer than far.
+inline bool withNearPlane(Matrix44 &p, float nearDistance, float *nearWas = nullptr, float *farWas = nullptr) {
+    const float a = p.m[10], b = p.m[11];
+    if (p.m[8] != 0 || p.m[9] != 0 || p.m[12] != 0 || p.m[13] != 0 || p.m[14] != -1 || p.m[15] != 0 ||
+        !std::isfinite(a) || !std::isfinite(b) || a >= 0 || b >= 0 || !(nearDistance > 0))
+        return false;
+    // z_clip = a z + b with z = -distance: 0 at distance b / a, w at distance b / (1 + a).
+    const float nearOld = b / a;
+    const bool infinite = std::abs(1 + a) < 1e-6f;
+    const float farOld = infinite ? INFINITY : b / (1 + a);
+    if (nearWas) *nearWas = nearOld;
+    if (farWas) *farWas = farOld;
+    if (!(nearOld > 0) || !(farOld > nearOld)) return false;
+    if (nearDistance <= nearOld) return true;
+    if (nearDistance >= farOld) return false;
+    const float a2 = infinite ? -1.f : farOld / (nearDistance - farOld);
+    p.m[10] = a2;
+    p.m[11] = a2 * nearDistance;
+    return true;
+}
 inline bool sameProjectionXYW(const Matrix44 &a, const Matrix44 &b) {
     for (unsigned i = 0; i != 16; ++i) {
         if (i >= 8 && i < 12) continue;

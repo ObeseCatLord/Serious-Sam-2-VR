@@ -5315,6 +5315,21 @@ static void __fastcall viewPrepare(void *command, void *, const Matrix34 &view, 
             if (!scopeSource.prepared) scopeSource.fault = true;
             identifier ^= scopeSource.cube ? 0x90000000u : scopeSource.mirror ? 0xc0000000u :
                           scopeSource.view.hand == 0 ? 0xa0000000u : 0xe0000000u;
+            if (scopeSource.cube && scopeSource.prepared) {
+                // The water cube keeps only scenery about as far as its sphere
+                // (env_probe::nearCut): nearer things would slide as the head moves.
+                Matrix44 cut = projection;
+                float nearWas = 0, farWas = 0;
+                const bool moved = withNearPlane(cut, env_probe::nearCut(), &nearWas, &farWas);
+                static unsigned traced = 0;
+                if (traced < 4) {
+                    ++traced;
+                    log("Water cube face near plane %.2f -> %.1f m (far %.0f m) moved=%d", double(nearWas), double(env_probe::nearCut()),
+                        double(farWas), int(moved));
+                }
+                originalViewPrepare(command, view, moved ? cut : projection, depthRange, identifier);
+                return;
+            }
         }
     }
     if (eyeIndex >= 0 && eyePlayer && caller == rootPrepareReturn) {
@@ -6813,7 +6828,7 @@ static void traceWaterSurroundings() {
     float anchor[3];
     static uint64_t last = 0;
     const uint64_t now = GetTickCount64();
-    if (settings.waterMirror || !env_probe::wanted() || !env_probe::anchor(anchor) || now - last < 1000) return;
+    if (settings.waterMirror || !env_probe::wanted() || !env_probe::probeAnchor(anchor) || now - last < 1000) return;
     const auto s = copySnapshot();
     if (!s.initialized || !livePlayer(s) || !s.ui.gameplay) return;
     last = now;

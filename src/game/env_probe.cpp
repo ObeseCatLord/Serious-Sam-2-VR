@@ -11,7 +11,10 @@ namespace ss2vr::game::env_probe {
 namespace probe = ss2vr::env_probe;
 namespace {
 IDirect3DDevice9 *owner = nullptr;
-IDirect3DCubeTexture9 *cubeTexture = nullptr;
+// Two cubes: the water looks up the front one (cubeTexture, published with its
+// anchor and radius) while a new anchor's faces render into the other; they
+// swap once all of its faces are done, so the reflection never mixes anchors.
+IDirect3DCubeTexture9 *cubeTexture = nullptr, *backTexture = nullptr;
 IDirect3DTexture9 *source = nullptr, *faceSource = nullptr;
 IDirect3DSurface9 *sourceSurface = nullptr, *faceSourceSurface = nullptr;
 // Rendered faces: the face being rendered, its target, which faces hold a render
@@ -29,10 +32,23 @@ bool anchored = false;
 // The cube's fixed world point moves to the viewer only once they are this far
 // from it (metres): within that, reflections stay put as the head moves.
 constexpr float AnchorMove = 4.f;
+// A new anchor (pending): rendered into the back cube once the surroundings
+// were measured from it (or after SettleMs), with its radius and near cut fixed;
+// each face once. The front cube then stays as it is: a still, basic image of
+// the surroundings, not a live view.
+bool pending = false;
+float pendingAt[3]{}, pendingRadius = 0;
+uint64_t pendingSince = 0, surroundingsTick = 0;
+unsigned backFresh = 0;
+constexpr uint64_t SettleMs = 2500;
+constexpr unsigned AllRendered = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5); // All but -Y.
 // The sphere's radius (metres): eased toward the measured surroundings, within
 // these limits (too small and distant scenery swims; too large and nearby
 // things reflect as if far away, gliding with the head).
-constexpr float RadiusMin = 4.f, RadiusMax = 40.f;
+constexpr float RadiusMin = 8.f, RadiusMax = 40.f;
+// Scenery nearer than this share of the radius is left out of rendered faces:
+// on the sphere it would reflect from the wrong place and slide as the head moves.
+constexpr float NearShare = .6f;
 float surroundings = ss2vr::water::ProxyRadius, sphereRadius = ss2vr::water::ProxyRadius;
 uint64_t radiusTick = 0;
 constexpr UINT SourceSize = 512;
@@ -40,13 +56,14 @@ constexpr uint64_t KeepMs = 4000; // After the last water draw.
 template<class T> void drop(T *&p) { if (p) { p->Release(); p = nullptr; } }
 // Sky-like start until views fill the cube (water seen before any capture).
 constexpr D3DCOLOR Neutral = D3DCOLOR_XRGB(150, 175, 200);
-bool clearFaces(IDirect3DDevice9 *d, const Device &device) {
+bool clearFaces(IDirect3DDevice9 *d, const Device &device, IDirect3DCubeTexture9 *cube = nullptr) {
+    if (!cube) cube = cubeTexture;
     IDirect3DSurface9 *previous = nullptr;
     if (FAILED(d->GetRenderTarget(0, &previous))) return false;
     bool ok = true;
     for (UINT face = 0; face < 6 && ok; ++face) {
         IDirect3DSurface9 *surface = nullptr;
-        ok = SUCCEEDED(cubeTexture->GetCubeMapSurface(D3DCUBEMAP_FACES(face), 0, &surface)) &&
+        ok = SUCCEEDED(cube->GetCubeMapSurface(D3DCUBEMAP_FACES(face), 0, &surface)) &&
              SUCCEEDED(device.setRT(d, 0, surface)) && SUCCEEDED(d->Clear(0, nullptr, D3DCLEAR_TARGET, Neutral, 1, 0));
         drop(surface);
     }
@@ -61,12 +78,13 @@ bool ensure(IDirect3DDevice9 *d, const Device &device, D3DFORMAT format) {
     owner = d;
     const auto words = probe::captureProgram();
     if (FAILED(d->CreateCubeTexture(probe::FaceSize, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &cubeTexture, nullptr)) ||
+        FAILED(d->CreateCubeTexture(probe::FaceSize, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &backTexture, nullptr)) ||
         FAILED(d->CreateTexture(SourceSize, SourceSize, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &source, nullptr)) ||
         FAILED(source->GetSurfaceLevel(0, &sourceSurface)) ||
         FAILED(d->CreateTexture(probe::FaceSize, probe::FaceSize, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &faceSource, nullptr)) ||
         FAILED(faceSource->GetSurfaceLevel(0, &faceSourceSurface)) ||
         FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(words.data()), &program)) ||
-        FAILED(d->CreateStateBlock(D3DSBT_ALL, &state)) || !clearFaces(d, device)) {
+        FAILED(d->CreateStateBlock(D3DSBT_ALL, &state)) || !clearFaces(d, device) || !clearFaces(d, device, backTexture)) {
         log("Water environment cube unavailable");
         release();
         failed = true;
@@ -121,36 +139,48 @@ static void labDump(IDirect3DDevice9 *d, D3DFORMAT format, unsigned every) noexc
 }
 void noteWater() noexcept { lastWater = GetTickCount64(); }
 bool wanted() noexcept { return lastWater && GetTickCount64() - lastWater < KeepMs && !failed; }
-bool rendered() noexcept { return lastFaceTick && GetTickCount64() - lastFaceTick < 1000; }
+bool rendered() noexcept { return faceEver == AllRendered || pending || (lastFaceTick && GetTickCount64() - lastFaceTick < 1000); }
 
 bool nextFace(IDirect3DDevice9 *d, const Device &device, D3DFORMAT format, const float (&viewer)[3], unsigned &face,
               float (&anchorOut)[3]) noexcept {
     if (!wanted() || !d || !std::isfinite(viewer[0] + viewer[1] + viewer[2]) || !ensure(d, device, format)) return false;
-    // A jump (respawn, load) starts the cube again; walking away from the anchor
-    // moves it, and every face is rendered again from there.
-    const float dx = viewer[0] - anchorAt[0], dy = viewer[1] - anchorAt[1], dz = viewer[2] - anchorAt[2];
-    const float moved = dx * dx + dy * dy + dz * dz;
-    if (anchored && moved > 40.f * 40.f) { clearFaces(d, device); faceEver = 0; anchored = false; }
-    if (!anchored || moved > AnchorMove * AnchorMove) {
-        std::copy(std::begin(viewer), std::end(viewer), anchorAt);
-        anchored = true;
-        faceFresh = 0;
-    }
     std::copy(std::begin(viewer), std::end(viewer), lastCamera);
-    // Stale faces first (after a move), then round and round.
-    unsigned k = faceNext;
-    for (unsigned n = 0; n < probe::RenderedFaces; ++n) {
-        const unsigned candidate = (faceNext + n) % probe::RenderedFaces;
-        if (!(faceFresh & (1u << probe::renderedFace(candidate)))) { k = candidate; break; }
+    const uint64_t now = GetTickCount64();
+    const auto away = [&](const float (&at)[3]) {
+        const float dx = viewer[0] - at[0], dy = viewer[1] - at[1], dz = viewer[2] - at[2];
+        return dx * dx + dy * dy + dz * dz > AnchorMove * AnchorMove;
+    };
+    // Walking away from the cube's anchor (or from a new one still settling, or a
+    // jump: respawn, load) starts a new anchor at the viewer.
+    if ((!anchored && !pending) || (anchored && !pending && away(anchorAt)) || (pending && away(pendingAt))) {
+        // A jump (respawn, load): the old place's reflection goes; a neutral sky until the new one is ready.
+        if (anchored) {
+            const float dx = viewer[0] - anchorAt[0], dy = viewer[1] - anchorAt[1], dz = viewer[2] - anchorAt[2];
+            if (dx * dx + dy * dy + dz * dz > 40.f * 40.f) { clearFaces(d, device); anchored = false; faceFresh = faceEver = 0; }
+        }
+        std::copy(std::begin(viewer), std::end(viewer), pendingAt);
+        pending = true;
+        pendingSince = now;
+        backFresh = 0;
+        pendingRadius = 0;
     }
-    faceNext = (k + 1) % probe::RenderedFaces;
+    if (!pending) return false; // The cube is complete: it stays as rendered.
+    if (!backFresh && !pendingRadius) {
+        // The surroundings measured from the new anchor (traceWaterSurroundings, about
+        // once a second), else the last measurement: then fixed for this anchor.
+        if (surroundingsTick <= pendingSince && now - pendingSince < SettleMs) return false;
+        pendingRadius = std::clamp(surroundings, RadiusMin, RadiusMax);
+    }
+    unsigned k = 0;
+    while (k < probe::RenderedFaces && (backFresh & (1u << probe::renderedFace(k)))) ++k;
+    if (k == probe::RenderedFaces) return false;
     face = probe::renderedFace(k);
-    std::copy(std::begin(anchorAt), std::end(anchorAt), anchorOut);
+    std::copy(std::begin(pendingAt), std::end(pendingAt), anchorOut);
     return true;
 }
 void beginFace(IDirect3DSurface9 *target, unsigned face) noexcept {
     passTarget = target;
-    passActive = target && cubeTexture && face < 6;
+    passActive = target && backTexture && pending && face < 6;
     passCaptured = false;
     passFace = face;
 }
@@ -171,7 +201,7 @@ bool captureFace(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *t
         static const D3DCOLOR face[6]{D3DCOLOR_XRGB(220, 40, 40), D3DCOLOR_XRGB(40, 200, 40), D3DCOLOR_XRGB(40, 60, 230),
                                       D3DCOLOR_XRGB(0, 0, 0), D3DCOLOR_XRGB(230, 220, 40), D3DCOLOR_XRGB(220, 40, 220)};
         IDirect3DSurface9 *previous = nullptr, *surface = nullptr;
-        bool ok = SUCCEEDED(d->GetRenderTarget(0, &previous)) && SUCCEEDED(cubeTexture->GetCubeMapSurface(D3DCUBEMAP_FACES(passFace), 0, &surface)) &&
+        bool ok = SUCCEEDED(d->GetRenderTarget(0, &previous)) && SUCCEEDED(backTexture->GetCubeMapSurface(D3DCUBEMAP_FACES(passFace), 0, &surface)) &&
                   SUCCEEDED(device.setRT(d, 0, surface)) && SUCCEEDED(d->Clear(0, nullptr, D3DCLEAR_TARGET, face[passFace], 1, 0));
         // A white cross through the face centre (s = 0 and t = 0) for orientation.
         const D3DRECT bars[2]{{LONG(probe::FaceSize / 2 - 2), 0, LONG(probe::FaceSize / 2 + 2), LONG(probe::FaceSize)},
@@ -210,7 +240,7 @@ bool captureFace(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *t
     const float n = float(probe::FaceSize) - .5f;
     const Vertex quad[4]{{-.5f, -.5f, 0, 1, 1, 0}, {n, -.5f, 0, 1, 0, 0}, {-.5f, n, 0, 1, 1, 1}, {n, n, 0, 1, 0, 1}};
     const D3DVIEWPORT9 viewport{0, 0, probe::FaceSize, probe::FaceSize, 0, 1};
-    const bool ok = SUCCEEDED(cubeTexture->GetCubeMapSurface(D3DCUBEMAP_FACES(passFace), 0, &surface)) &&
+    const bool ok = SUCCEEDED(backTexture->GetCubeMapSurface(D3DCUBEMAP_FACES(passFace), 0, &surface)) &&
                     SUCCEEDED(device.setRT(d, 0, surface)) && SUCCEEDED(d->SetViewport(&viewport)) &&
                     SUCCEEDED(device.drawUp(d, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vertex)));
     drop(surface);
@@ -222,14 +252,25 @@ bool captureFace(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *t
 }
 void endFace(bool complete) noexcept {
     if (passActive && complete && passCaptured) {
-        faceFresh |= 1u << passFace;
-        faceEver |= 1u << passFace;
+        backFresh |= 1u << passFace;
         lastFaceTick = GetTickCount64();
-        if (!filled) log("Water environment cube rendered from its anchor");
-        filled = true;
-        if (owner) {
-            D3DSURFACE_DESC desc{};
-            if (SUCCEEDED(cubeTexture->GetLevelDesc(0, &desc))) labDump(owner, desc.Format, 300);
+        if (backFresh == AllRendered) {
+            // The new anchor's cube is complete: the water looks it up from now on.
+            std::swap(cubeTexture, backTexture);
+            std::copy(std::begin(pendingAt), std::end(pendingAt), anchorAt);
+            sphereRadius = pendingRadius;
+            anchored = true;
+            pending = false;
+            faceFresh = faceEver = AllRendered;
+            static unsigned traced = 0;
+            if (traced++ < 12)
+                log("Water environment cube rendered from its anchor %.1f,%.1f,%.1f radius %.1f m, nearer than %.1f m left out",
+                    double(anchorAt[0]), double(anchorAt[1]), double(anchorAt[2]), double(sphereRadius), double(sphereRadius * NearShare));
+            filled = true;
+            if (owner) {
+                D3DSURFACE_DESC desc{};
+                if (SUCCEEDED(cubeTexture->GetLevelDesc(0, &desc))) labDump(owner, desc.Format, 1);
+            }
         }
     }
     passActive = false;
@@ -317,7 +358,14 @@ IDirect3DCubeTexture9 *cube(IDirect3DDevice9 *d) noexcept {
     return d == owner ? cubeTexture : nullptr;
 }
 void setSurroundings(float metres) noexcept {
-    if (std::isfinite(metres)) surroundings = std::clamp(metres, RadiusMin, RadiusMax);
+    if (std::isfinite(metres)) { surroundings = std::clamp(metres, RadiusMin, RadiusMax); surroundingsTick = GetTickCount64(); }
+}
+float nearCut() noexcept { return (pending && pendingRadius > 0 ? pendingRadius : sphereRadius) * NearShare; }
+bool probeAnchor(float (&out)[3]) noexcept {
+    if (!pending && !anchored) return false;
+    const float *at = pending ? pendingAt : anchorAt;
+    std::copy(at, at + 3, out);
+    return true;
 }
 float radius() noexcept { return sphereRadius; }
 bool anchor(float (&out)[3]) noexcept {
@@ -328,6 +376,9 @@ bool anchor(float (&out)[3]) noexcept {
 
 void release() noexcept {
     drop(state); drop(program); drop(sourceSurface); drop(source); drop(faceSourceSurface); drop(faceSource); drop(cubeTexture);
+    drop(backTexture);
+    pending = false;
+    backFresh = 0;
     owner = nullptr;
     filled = false;
     anchored = false;

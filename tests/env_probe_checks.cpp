@@ -1,4 +1,5 @@
 #include "common/env_probe.hpp"
+#include "common/weapon_view.hpp"
 #include <utility>
 #include <cassert>
 #include <cmath>
@@ -90,5 +91,22 @@ int main() {
     // The capture program is a closed ps_2_0 program.
     const auto program = captureProgram();
     assert(program.front() == 0xffff0200u && program.back() == 0x0000ffffu && program.size() < 160);
+    {
+        // Moving a face's near plane from 0.1 m to 15 m, finite far (1000 m) and infinite far.
+        const auto depthAt = [](const ss2vr::Matrix44 &p, float distance) {
+            return (p.m[10] * -distance + p.m[11]) / distance; // z / w at that view distance.
+        };
+        const float n = .1f, f = 1000;
+        ss2vr::Matrix44 p{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, f / (n - f), f * n / (n - f), 0, 0, -1, 0}};
+        float nearWas = 0, farWas = 0;
+        assert(ss2vr::withNearPlane(p, 15, &nearWas, &farWas) && std::abs(nearWas - n) < 1e-3f && std::abs(farWas - f) < .5f);
+        assert(std::abs(depthAt(p, 15)) < 1e-4f && std::abs(depthAt(p, f) - 1) < 1e-3f && depthAt(p, 10) < 0);
+        ss2vr::Matrix44 q{{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, -n, 0, 0, -1, 0}};
+        assert(ss2vr::withNearPlane(q, 15, &nearWas, &farWas) && std::isinf(farWas));
+        assert(std::abs(depthAt(q, 15)) < 1e-4f && depthAt(q, 1e6f) < 1 && depthAt(q, 10) < 0);
+        // Not that form: left alone.
+        ss2vr::Matrix44 r = p; r.m[14] = 1;
+        assert(!ss2vr::withNearPlane(r, 20));
+    }
     std::puts("Environment probe checks passed");
 }

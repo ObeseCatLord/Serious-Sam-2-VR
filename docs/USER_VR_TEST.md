@@ -44,11 +44,17 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
    no saw is in your hands, including when a save restores it. Every sound
    file the game plays is now listed once in `Bin/SS2VR.log` ("Sound file ...")
    so any other stray loop can be named.
-5. Water: no change. In the lab the reflections stay fixed in the world as the
-   head turns, at your Greendale save too, and the cube has no seams. The
-   reflection treats everything as about 60 m away, so reflections of trees or
-   banks a few metres off slide a little as you move your head. For exact
-   reflections turn on VR options > Render > Water mirror (costs frame rate).
+5. Water reflections are a still, basic picture of the surroundings:
+   - The reflection map is rendered once where you stand, from scenery about
+     as far away as the sphere it is mapped on (in the lab 15-24 m and beyond):
+     sky, far terrain and big landmarks. Nearby trees, banks and props are left
+     out, so nothing in the reflection slides as you move your head.
+   - It no longer updates live. Walking more than 4 m away renders a new one in
+     the background and switches to it in one go; no flicker or half-updated
+     reflection.
+   - Turning your head, reflections stay put in the world. Moving it, the
+     reflected sky shifts a little, as on real water.
+   - Exact mirror reflections: VR options > Render > Water mirror (frame rate cost).
 
 ## Changed after the hoverbike, menus and weapon wheel report (2026-10-25)
 

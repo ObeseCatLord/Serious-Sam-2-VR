@@ -41,5 +41,10 @@ bool anchor(float (&out)[3]) noexcept;
 // sphere's radius eases toward it.
 void setSurroundings(float metres) noexcept;
 float radius() noexcept; // The sphere's radius now (metres).
+// The distance (metres, along each face's view) nearer than which the face being
+// rendered leaves scenery out.
+float nearCut() noexcept;
+// Where the surroundings are measured from: the anchor being prepared, else the cube's.
+bool probeAnchor(float (&out)[3]) noexcept;
 void release() noexcept; // Device reset or loss: default-pool resources go.
 } // namespace ss2vr::game::env_probe
