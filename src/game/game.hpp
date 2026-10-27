@@ -43,6 +43,8 @@ bool levelActive() noexcept;
 // engine.cpp, main thread, a frame a menu hides the world: whether the world renders
 // live in stereo behind it (a pause menu over a level in VR, controls off).
 bool menuViewFrame() noexcept;
+void restoreDrawDistance() noexcept; // engine.cpp: the configured draw-distance cvars back (before the game saves them).
+bool liveMenuView() noexcept; // engine.cpp: a pause menu with the world live behind it (no side effects).
 void clearCanvasTarget() noexcept; // bridge.cpp: the current render target to black (a world-hidden menu frame).   // engine.cpp: a level with a live local player (else the front end or a load).
 void setSinglePass(bool enabled) noexcept;
 void setEyeReplay(bool enabled) noexcept;

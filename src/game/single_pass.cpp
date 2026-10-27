@@ -94,13 +94,14 @@ std::unordered_map<IDirect3DVertexShader9 *, bool> shaderEyeClip;
 // variant writing the world reflection direction (model -> world rows in
 // c32..c34, from the program's model -> clip rows), the pixel variant sampling
 // the cube on the reflection image's sampler.
-struct ProbeVertex { IDirect3DVertexShader9 *variant = nullptr, *mirror = nullptr; unsigned clipMatrix = 0; };
+struct ProbeVertex { IDirect3DVertexShader9 *variant = nullptr, *mirror = nullptr; unsigned clipMatrix = 0;
+                     IDirect3DVertexShader9 *perPixel = nullptr; }; // perPixel: the reflection found per pixel.
 // The mirror variants ([Render] WaterMirror): model -> mirror camera clip in
 // c35..c38; the pixel program keeps its projective lookup, then the gain.
 constexpr unsigned MirrorConstant = 35;
 constexpr unsigned CubeAnchorConstant = 35; // Cube variant: the cube's world anchor in model space (shader_patch probe).
 std::unordered_map<IDirect3DVertexShader9 *, ProbeVertex> shaderProbe;
-struct ProbePixel { IDirect3DPixelShader9 *variant = nullptr, *mirror = nullptr; unsigned sampler = 0; };
+struct ProbePixel { IDirect3DPixelShader9 *variant = nullptr, *mirror = nullptr, *perPixel = nullptr; unsigned sampler = 0; };
 std::unordered_map<IDirect3DPixelShader9 *, ProbePixel> pixelProbe;
 // The cube holds the scene's own brightness; the water program scales its
 // painted image (dark) up by 8.
@@ -124,10 +125,14 @@ ProbePixel probePixelOf(IDirect3DDevice9 *d, IDirect3DPixelShader9 *s) noexcept 
         if (probe.variant && sp::patchWaterPixelShader(words.data(), words.size(), patched, sampler, waterGain(), true) &&
             (sampler != probe.sampler || FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.mirror))))
             probe.mirror = nullptr;
+        if (probe.variant && sp::patchWaterPixelShader(words.data(), words.size(), patched, sampler, waterGain(), false, true) &&
+            (sampler != probe.sampler || FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.perPixel))))
+            probe.perPixel = nullptr;
     }
     s->AddRef();
     pixelProbe.emplace(s, probe);
-    log("Single pass: water pixel program %p %s", static_cast<void *>(s), probe.variant ? "samples the environment cube" : "keeps its image");
+    log("Single pass: water pixel program %p %s%s", static_cast<void *>(s), probe.variant ? "samples the environment cube" : "keeps its image",
+        probe.perPixel ? ", per pixel" : "");
     return probe;
 }
 std::unordered_map<IDirect3DVertexDeclaration9 *, IDirect3DVertexDeclaration9 *> declarationVariants;
@@ -151,7 +156,7 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
     shaderTexcoords.emplace(s, info.texcoordsWritten);
     shaderEyeClip.emplace(s, variant && info.eyeClip);
     if (variant && info.eyeClip) {
-        ProbeVertex probe{nullptr, nullptr, info.clipMatrix};
+        ProbeVertex probe{nullptr, nullptr, info.clipMatrix, nullptr};
         std::vector<uint32_t> words(bytes / 4), patched;
         UINT got = bytes;
         sp::VertexInfo probeInfo;
@@ -161,6 +166,11 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
             probe.variant = nullptr;
         if (!probe.variant) log("Single pass: water vertex program %p has no environment-cube variant (%zu words)",
                                 static_cast<void *>(s), patched.size());
+        sp::VertexInfo perPixelInfo;
+        if (probe.variant && SUCCEEDED(s->GetFunction(words.data(), &got)) &&
+            sp::patchVertexShader(words.data(), words.size(), patched, &perPixelInfo, WaterConstant, true, 0, true) &&
+            perPixelInfo.eyeClip && FAILED(d->CreateVertexShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.perPixel)))
+            probe.perPixel = nullptr;
         sp::VertexInfo mirrorInfo;
         if (SUCCEEDED(s->GetFunction(words.data(), &got)) &&
             sp::patchVertexShader(words.data(), words.size(), patched, &mirrorInfo, WaterConstant, false, MirrorConstant) &&
@@ -743,8 +753,9 @@ bool waterDraw() noexcept {
 // program's view position (c4, in its model space) plus the eye's offset.
 struct WaterConstantsScope {
     IDirect3DDevice9 *d;
-    bool active = false, eyes = false, cube = false, mirrored = false, anchored = false;
-    float savedAnchor[4]{};
+    bool active = false, eyes = false, cube = false, mirrored = false, anchored = false, pixelSaved = false;
+    float savedAnchor[4]{}, savedPixel[8]{};
+    static constexpr unsigned PerPixelConstant = 26; // c26 normal, c27 sphere (shader_patch perPixel).
     float saved[20]{}, view[4]{}, offset[2][3]{}, savedMirror[16]{}, toMirror[2][16]{};
     IDirect3DTexture9 *reflection[2]{}; // Each eye's mirror image (water_mirror.hpp).
     // The cube's proxy sphere radius (env_probe), in the program's model units.
@@ -869,9 +880,25 @@ struct WaterConstantsScope {
         d->SetVertexShaderConstantF(WaterConstant + 2, rows, 3);
         anchored = SUCCEEDED(d->GetVertexShaderConstantF(CubeAnchorConstant, savedAnchor, 1));
         d->SetVertexShaderConstantF(CubeAnchorConstant, anchorModel, 1);
-        oSetVertexShader(d, vertex->second.variant);
-        oSetPixelShader(d, pixel.variant);
-        appliedPixelShader = pixel.variant;
+        // Per pixel when both programs have it: the water's normal (its mesh is flat
+        // at model y = 0, so the model's up turned into the world) and the sphere.
+        const bool perPixel = vertex->second.perPixel && pixel.perPixel &&
+            SUCCEEDED(d->GetPixelShaderConstantF(PerPixelConstant, savedPixel, 2));
+        if (perPixel) {
+            const float up[3]{rows[1], rows[5], rows[9]};
+            const float length = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+            const float radius = env_probe::radius();
+            const float c[8]{up[0] / length, up[1] / length, up[2] / length, 0, .9f * radius, 1, radius * radius, 0};
+            d->SetPixelShaderConstantF(PerPixelConstant, c, 2);
+            pixelSaved = true;
+        }
+        oSetVertexShader(d, perPixel ? vertex->second.perPixel : vertex->second.variant);
+        oSetPixelShader(d, perPixel ? pixel.perPixel : pixel.variant);
+        appliedPixelShader = perPixel ? pixel.perPixel : pixel.variant;
+        {
+            static int traced = -1;
+            if (traced != int(perPixel)) { traced = int(perPixel); log("Single pass water reflection found per %s", perPixel ? "pixel" : "vertex"); }
+        }
         d->SetTexture(pixel.sampler, environment);
         for (unsigned k = 0; k < 3; ++k) d->SetSamplerState(pixel.sampler, kinds[k], D3DTADDRESS_CLAMP);
         d->SetSamplerState(pixel.sampler, D3DSAMP_SRGBTEXTURE, FALSE);
@@ -898,6 +925,7 @@ struct WaterConstantsScope {
             d->SetTexture(pixel.sampler, image);
             if (mirrored) d->SetVertexShaderConstantF(MirrorConstant, savedMirror, 4);
             if (anchored) d->SetVertexShaderConstantF(CubeAnchorConstant, savedAnchor, 1);
+            if (pixelSaved) d->SetPixelShaderConstantF(PerPixelConstant, savedPixel, 2);
             oSetVertexShader(d, variantOf(d, engineShader));
             oSetPixelShader(d, enginePixelShader);
             appliedPixelShader = enginePixelShader;

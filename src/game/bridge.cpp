@@ -2170,11 +2170,13 @@ static int WINAPI eyeSystemMetrics(int index) {
 }
 // The game lays its menus out for the configured resolution's aspect
 // (gfx_pixResWidth/Height, e.g. 1920x1080 from the launch options; Sam2Game
-// forces the drawport aspect from it), whatever the canvas: on the 4:3 front-end
-// canvas a 16:9 layout was squeezed. In VR they follow the canvas; the user's
+// forces the drawport aspect from it), whatever the canvas. In VR they follow
+// the canvas; the user's
 // values are put back before the game saves its cvars (vmSaveCvars) on exit.
-// The front end's canvas (4:3; see the presentation's canvas choice).
-constexpr uint32_t MenuCanvasWidth = 1440, MenuCanvasHeight = 1080;
+// The front end's canvas: 16:9, as on a desktop screen (see the presentation's
+// canvas choice). Its title art is drawn for 16:9 and mapped onto the whole
+// canvas: a 4:3 canvas squeezed it (the sun badge and A prompt taller than wide).
+constexpr uint32_t MenuCanvasWidth = 1920, MenuCanvasHeight = 1080;
 // A level's 2D aspect ([Render] UiAspect, 16:9: the band of the eye-sized
 // canvas the HUD, cutscenes and flat screen use); the front end uses its canvas's.
 static float levelUiAspect = 16.f / 9;
@@ -2186,6 +2188,7 @@ static int32_t userPixRes[2]{};
 static bool pixResFollowing = false;
 static void(__cdecl *originalSaveCvars)() = nullptr;
 static void __cdecl saveCvars() {
+    restoreDrawDistance();
     if (pixResFollowing && pixResWidth && pixResHeight) {
         *pixResWidth = userPixRes[0];
         *pixResHeight = userPixRes[1];
@@ -2265,14 +2268,13 @@ static void notePromptProfile(bool index) noexcept {
     WritePrivateProfileStringW(L"Controls", L"Prompts", next, cache.c_str());
     log("Menu prompts for %ls controllers from the next start", next);
 }
-// The main menu (title) lays itself out once, when created (CMainMenu::PostCreate),
-// for the 2D aspect of that moment: created under the configured 16:9 it stayed
-// squeezed on the 4:3 front-end canvas. The front end's aspect is set just before.
+// The main menu (title) is created (CMainMenu::PostCreate) as a level ends: the
+// front end's canvas aspect is set just before it, not the level's 2D aspect.
 static void(__fastcall *originalMainMenuPostCreate)(void *, void *) = nullptr;
 static void __fastcall mainMenuPostCreate(void *menu, void *edx) {
     followCanvasResolution(int32_t(MenuCanvasWidth), int32_t(MenuCanvasHeight));
     static unsigned traced = 0;
-    if (traced < 4) { ++traced; log("Main menu created at the front end's 4:3 aspect"); }
+    if (traced < 4) { ++traced; log("Main menu created at the front end's aspect"); }
     originalMainMenuPostCreate(menu, edx);
 }
 void installMainMenuLayout() noexcept {
@@ -2305,7 +2307,7 @@ void installEyeCanvas() noexcept {
         const UINT h = GetPrivateProfileIntW(L"View", L"Height", 0, cache.c_str());
         if (w && h && w <= MaxDimension && h <= MaxDimension) { canvasWidth = w; canvasHeight = h; }
     }
-    // The game starts at the front end: its 4:3 canvas from the first frame (the
+    // The game starts at the front end: its canvas from the first frame (the
     // last level's eye size made the title lay out before the switch).
     canvasWidth = MenuCanvasWidth;
     canvasHeight = MenuCanvasHeight;
@@ -2330,7 +2332,7 @@ void installEyeCanvas() noexcept {
     installMainMenuLayout();
     log("Eye canvas hooks=%d cached=%ux%u", ok, canvasWidth.load(), canvasHeight.load());
 }
-// Adopt the runtime's recommended eye size (or the front end's 4:3): remember it
+// Adopt the runtime's recommended eye size (or the front end's 16:9): remember it
 // for the next launch and let the main thread resize the native canvas at its
 // next input poll.
 static void requestEyeCanvas(uint32_t w, uint32_t h) {
@@ -2344,7 +2346,7 @@ static void requestEyeCanvas(uint32_t w, uint32_t h) {
         WritePrivateProfileStringW(L"View", L"Height", std::to_wstring(h).c_str(), cache.c_str());
     }
     canvasResizePending = true;
-    log("Eye canvas requested %ux%u (%s)", w, h, w == MenuCanvasWidth && h == MenuCanvasHeight ? "front end, 4:3" : "OpenXR recommended");
+    log("Eye canvas requested %ux%u (%s)", w, h, w == MenuCanvasWidth && h == MenuCanvasHeight ? "front end, 16:9" : "OpenXR recommended");
 }
 void applyEyeCanvas() noexcept {
     if (!canvasResizePending.exchange(false) || !canvasExe) return;
@@ -3164,9 +3166,9 @@ static void presentBody(IDirect3DDevice9 *d) {
         recommendedHeight = channel.shared->recommendedHeight;
     }
     {
-        // The front end (title, main menu, loading) renders no eyes: its menus lay
-        // out 640x480 over the whole canvas and its backgrounds draw at the
-        // canvas's own aspect, so a 4:3 canvas shows both true. A level gets the
+        // The front end (title, main menu, loading) renders no eyes: it gets a
+        // 16:9 canvas and is shown whole, exactly as on a desktop screen (its
+        // 640x480 menus stretched over it, its title art at 16:9). A level gets the
         // eye-sized canvas. Switched after a second in the new state (no flapping
         // through a load).
         static bool level = false;
@@ -3181,7 +3183,9 @@ static void presentBody(IDirect3DDevice9 *d) {
         else requestEyeCanvas(MenuCanvasWidth, MenuCanvasHeight);
     }
     uint64_t now = GetTickCount64();
-    bool gameplay = ui.gameplay && now >= ui.tickMs && now - ui.tickMs < 250;
+    // The world live behind a pause menu or Netricsa (GameplayMenuView) is not play:
+    // the flat frame (Netricsa's panel) is still shown.
+    bool gameplay = ui.gameplay && ui.gameplay != GameplayMenuView && now >= ui.tickMs && now - ui.tickMs < 250;
     const bool nativeMenu = menus::active();
     // Every frame the stereo world path cannot own is presented on the flat
     // screen: menus, loading, pre-rendered movies, cinematic cameras, Netricsa,
@@ -3282,7 +3286,9 @@ static void presentBody(IDirect3DDevice9 *d) {
         if (menuVisible) collectMenuImage();
         else pendingMenu.active = false;
     }
-    if (!menuVisible || now - lastMenuCopy < 33)
+    // Each frame (the cursor moves with it); the game paces menus (33 fps capped,
+    // raised at the front end, lifted over a live level: engine limitFrameRate).
+    if (!menuVisible || now - lastMenuCopy < 8)
         return;
     uint32_t menuGeneration = nativeMenu ? menus::captureGeneration() : 0;
     lastMenuCopy = now;
@@ -3316,7 +3322,9 @@ static void presentBody(IDirect3DDevice9 *d) {
         h = std::max(2u, uint32_t(float(source.height) * fit)) & ~1u;
     };
     uint32_t outWidth = 0, outHeight = 0;
-    scaled(nativeMenu ? float(source.height) * 4.f / 3.f : float(source.width), outWidth, outHeight);
+    // The front end's 16:9 canvas is shown as it is, like a desktop screen.
+    const bool frontEndCanvas = copyWidth == MenuCanvasWidth && copyHeight == MenuCanvasHeight;
+    scaled(nativeMenu && !frontEndCanvas ? float(source.height) * 4.f / 3.f : float(source.width), outWidth, outHeight);
     // The scaled image must fit the canvas-sized pixel buffer. (Bounding the
     // unscaled 4:3 width instead left every eye canvas, all narrower than 4:3,
     // at the canvas aspect: 1344x1512 was still published as 960x1080.)

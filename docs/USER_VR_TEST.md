@@ -23,6 +23,33 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the cubemap, cursor, Netricsa, title and pop-in report (2026-10-27)
+
+1. Title screen: shown at 16:9 on a wider panel, exactly as on the desktop. The
+   title art is drawn for 16:9 whatever the screen, so the earlier 4:3 panel
+   squeezed it every time (the sun badge and the A button were taller than
+   wide). Pause menus over a level keep their 4:3 panel.
+2. Menu cursor: the menu picture is now copied every frame (it was every 33 ms,
+   an uneven rhythm against the pause menu's 19 ms frames), and at the title
+   screen the game's 33 fps menu limit is raised to 90 in VR.
+3. Netricsa works like the pause menu: the world stays live behind its panel
+   and follows your head, at full frame rate. Scroll, page and close as before.
+4. Draw distance: `[Render] DrawDistance` in `SS2VR.ini` (default 2, range 1 to
+   4) multiplies the distances at which the game lowers model detail, culls
+   small objects and draws grass and clutter, starting from your video
+   settings. 1 is the game as configured. Your own values are put back before
+   the game saves its settings.
+5. Water reflections that moved with the head: the reflection was looked up
+   once per corner of the water's (large) triangles and blended between them,
+   so its sky/tree boundaries were straight lines that slid across the water as
+   the view changed. It is now worked out for every pixel. In the lab the
+   straight-edged sky triangles are gone, and the reflection stays with the
+   scene when the head turns or moves sideways.
+6. New save `KINGSBURG` in your profile's load list: the start of Kingsburg
+   with the weapons and ammo of that point, including the minigun and the
+   rocket launcher (not marked as cheated). No Kingsburg save had ever been written to the save
+   folder, so there was nothing to restore.
+
 ## Changed after the title, water, sticks and pause report (2026-10-25, evening)
 
 1. Title screen: it is laid out for the 4:3 menu panel when the game starts in

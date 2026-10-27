@@ -160,8 +160,16 @@ inline size_t eyeClipSite(const uint32_t *words, size_t count, unsigned &reg, un
 // units) along this eye's reflected ray (eye in c<eyeClip>): the one image
 // serves both eyes with the right stereo depth for reflections that far. The
 // game's own ripple, flip and bias apply as before.
+// The texcoord set the per-pixel water variant passes the view ray in.
+constexpr unsigned WaterViewSet = 7;
+// With `perPixel` (probe only) the reflection is found per pixel instead of per
+// vertex (patchWaterPixelShader perPixel): the lookup's texcoord takes the water
+// point relative to the anchor and set WaterViewSet the ray from the eye, both
+// in world space (turned by c<eyeClip+2..+4>); both are affine across a triangle,
+// so a large water polygon reflects as well as a fine one (per vertex, its few
+// big triangles showed as straight creases in the reflection).
 inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, VertexInfo *infoOut = nullptr,
-                              unsigned eyeClip = 0, bool probe = false, unsigned mirror = 0) {
+                              unsigned eyeClip = 0, bool probe = false, unsigned mirror = 0, bool perPixel = false) {
     using namespace detail;
     VertexInfo info;
     if (!inspect(words, count, info) || !info.positionWrites) return false;
@@ -173,6 +181,8 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
     size_t clipAt = eyeClip ? eyeClipSite(words, count, clipReg, &normalReg, &positionReg, &info.clipMatrix) : 0;
     if (clipAt && (info.temps > 9 || info.constants > eyeClip || eyeClip + (probe ? 6 : 2) > 96)) clipAt = 0; // r9, r10 and c<eyeClip..> must be free.
     if (mirror && (!clipAt || probe || mirror < eyeClip + 5 || mirror + 4 > 96)) return false;
+    if (perPixel && (!probe || !clipAt || (info.texcoordsWritten & (1u << WaterViewSet)) || killSet(info) == WaterViewSet))
+        return false;
     bool reflectionWritten = !probe || !clipAt;
     info.eyeClip = clipAt != 0;
     std::vector<uint32_t> result;
@@ -228,8 +238,26 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
             };
             // The view ray and its reflection (the first seven instructions), then
             // either the dome mapping or the world direction for the probe.
-            result.insert(result.end(), std::begin(dome), probe ? std::begin(dome) + 28 : std::end(dome));
-            if (probe) {
+            if (probe && perPixel) {
+                // o = P - anchor and the view ray V = P - eye, turned into world space:
+                // r10 (the lookup's texcoord, w = 1) and r9 (set WaterViewSet).
+                const uint32_t X = clipReg;
+                const uint32_t rays[] = {
+                    0x03u, dst(Temp, 10, 0x7), src(Temp, positionReg), src(Const, e + 5), // sub r10.xyz, rP, anchor
+                    0x08u, dst(Temp, X, 0x1), src(Temp, 10), src(Const, e + 2),          // dp3 rX.x, o, row0
+                    0x08u, dst(Temp, X, 0x2), src(Temp, 10), src(Const, e + 3),          // dp3 rX.y, o, row1
+                    0x08u, dst(Temp, X, 0x4), src(Temp, 10), src(Const, e + 4),          // dp3 rX.z, o, row2
+                    0x03u, dst(Temp, 10, 0x7), src(Temp, positionReg), src(Const, e),     // sub r10.xyz, rP, eye
+                    0x08u, dst(Temp, 9, 0x1), src(Temp, 10), src(Const, e + 2),          // dp3 r9.x, V, row0
+                    0x08u, dst(Temp, 9, 0x2), src(Temp, 10), src(Const, e + 3),          // dp3 r9.y, V, row1
+                    0x08u, dst(Temp, 9, 0x4), src(Temp, 10), src(Const, e + 4),          // dp3 r9.z, V, row2
+                    0x01u, dst(Temp, 9, 0x8), src(Const, k, 0x55u),                      // mov r9.w, 1
+                    0x01u, dst(Temp, 10, 0x7), src(Temp, X),                             // mov r10.xyz, o (world)
+                    0x01u, dst(Temp, 10, 0x8), src(Const, k, 0x55u),                     // mov r10.w, 1
+                };
+                result.insert(result.end(), std::begin(rays), std::end(rays));
+            } else result.insert(result.end(), std::begin(dome), probe ? std::begin(dome) + 28 : std::end(dome));
+            if (probe && !perPixel) {
                 // Parallax: the cube shows the surroundings as a sphere of radius Rp
                 // around its fixed world anchor (cE+5, cK.z = Rp^2, cK.w = 0.9 Rp, model
                 // units). Centred on the eye, it moved with the head and so did the
@@ -295,6 +323,12 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
     }
     for (unsigned k = 0; k < 8; ++k) {
         if (info.texcoordsWritten & (1u << k)) continue;
+        if (perPixel && k == WaterViewSet) { // The view ray (world).
+            result.push_back(0x01u);
+            result.push_back(dst(TexCrdOut, k, 0xf));
+            result.push_back(src(Temp, 9));
+            continue;
+        }
         const bool test = k == killSet(info);
         if (test) {
             result.push_back(0x09u); // dp4 oTk.x, p, v15
@@ -414,20 +448,29 @@ inline bool patchPixelShader(const uint32_t *words, size_t count, unsigned k, st
 constexpr float WaterRipple = .15f; // Direction change for the ripple's texture offset.
 // With `projective` (the mirror image, [Render] WaterMirror) the game's own
 // ripple and projective lookup stay; only the gain follows the lookup.
+// With `perPixel` (the vertex variant's perPixel): the lookup's texcoord holds
+// o = P - anchor and set WaterViewSet the view ray (world); each pixel reflects
+// the ray about the water's normal (c26), keeps o inside the sphere and finds
+// where the reflected ray meets it (c27 = 0.9 R, 1, R^2, 0; world units).
 inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, unsigned &sampler,
-                                  float gain = 1, bool projective = false) {
+                                  float gain = 1, bool projective = false, bool perPixel = false) {
     using namespace detail;
     constexpr unsigned Sampler = 10;
-    if (!words || count < 2 || words[0] != PsVersion20) return false;
+    if (!words || count < 2 || words[0] != PsVersion20 || (perPixel && projective)) return false;
     size_t site = 0, dclAt = 0;
-    unsigned a = 0, b = 0, c = 0, n = 0;
+    unsigned a = 0, b = 0, c = 0, n = 0, temps = 0;
+    const unsigned firstReserved = perPixel ? 26 : 29;
     for (size_t i = 1; i < count && words[i] != 0x0000ffffu;) {
         const uint32_t token = words[i], opcode = token & 0xffffu;
         if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
         const size_t len = (token >> 24) & 0xfu;
         if (i + 1 + len > count) return false;
         for (size_t k = 1; k <= len && opcode != 0x51 && opcode != 0x1f; ++k)
-            if (regType(words[i + k]) == Const && regNum(words[i + k]) >= 29 && regNum(words[i + k]) <= 31) return false;
+            if (regType(words[i + k]) == Const && regNum(words[i + k]) >= firstReserved && regNum(words[i + k]) <= 31) return false;
+        for (size_t k = 1; k <= len; ++k) {
+            if (regType(words[i + k]) == Temp) temps = std::max(temps, regNum(words[i + k]) + 1);
+            if (perPixel && regType(words[i + k]) == Texture && regNum(words[i + k]) == WaterViewSet) return false;
+        }
         const uint32_t *op = words + i + 1;
         if (!site && opcode == 0x04 && len == 4 && regType(op[0]) == Temp && ((op[0] >> 16) & 0xfu) == 0x3 &&
             regType(op[1]) == Temp && regType(op[2]) == Texture && ((op[2] >> 16) & 0xffu) == 0xaa &&
@@ -457,7 +500,7 @@ inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vect
         }
         i += 1 + len;
     }
-    if (!dclAt) return false;
+    if (!dclAt || (perPixel && temps + 2 > 12)) return false;
     const auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
     std::vector<uint32_t> result;
     result.reserve(count + 16);
@@ -465,6 +508,7 @@ inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vect
     result.insert(result.end(), {0x05000051u, dst(Const, 29, 0xf), bits(gain), bits(gain), bits(gain), bits(1),
                                  0x05000051u, dst(Const, 30, 0xf), bits(WaterRipple), 0u, 0u, 0u,
                                  0x05000051u, dst(Const, 31, 0xf), 0u, 0u, bits(WaterRipple), 0u});
+    if (perPixel) result.insert(result.end(), {0x0200001fu, 0x80000000u, dst(Texture, WaterViewSet, 0x7)}); // dcl t7.xyz
     const uint32_t pp = words[site + 1] & 0x00200000u; // Keep partial precision.
     for (size_t i = 1; i < count && words[i] != 0x0000ffffu;) {
         const uint32_t token = words[i], opcode = token & 0xffffu;
@@ -475,6 +519,35 @@ inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vect
         } else if (i == site && projective) {
             result.insert(result.end(), words + site, words + site + 12); // mad, mov, texldp as they were
             result.insert(result.end(), {0x03000005u, dst(Temp, a, 0x7) | pp, src(Temp, a), src(Const, 29)});
+            i = site + 12;
+            continue;
+        } else if (i == site && perPixel) {
+            // Per pixel (world units): R = reflect(normalize(V), N); o kept inside the
+            // sphere; s = sqrt(b^2 - c) - b with b = o.R, c = o.o - R^2; L = o + sR.
+            const uint32_t V = temps, O = temps + 1, neg = 1u << 24;
+            result.insert(result.end(), {
+                0x02000024u, dst(Temp, V, 0x7), src(Texture, WaterViewSet),                      // nrm rV.xyz, t7
+                0x03000008u, dst(Temp, O, 0x8), src(Temp, V), src(Const, 26),                    // dp3 rO.w, V, N
+                0x03000002u, dst(Temp, O, 0x8), src(Temp, O, 0xffu), src(Temp, O, 0xffu),        // add rO.w, 2 V.N
+                0x04000004u, dst(Temp, V, 0x7), src(Temp, O, 0xffu) | neg, src(Const, 26), src(Temp, V), // R
+                0x03000008u, dst(Temp, O, 0x8), src(Texture, c), src(Texture, c),                // dp3 rO.w, o, o
+                0x02000007u, dst(Temp, O, 0x8), src(Temp, O, 0xffu),                             // rsq rO.w
+                0x03000005u, dst(Temp, O, 0x8), src(Temp, O, 0xffu), src(Const, 27, 0x00u),      // 0.9R / |o|
+                0x0300000au, dst(Temp, O, 0x8), src(Temp, O, 0xffu), src(Const, 27, 0x55u),      // min 1
+                0x03000005u, dst(Temp, O, 0x7), src(Texture, c), src(Temp, O, 0xffu),            // o (inside)
+                0x03000008u, dst(Temp, V, 0x8), src(Temp, O), src(Temp, V),                      // dp3 rV.w, o, R (b)
+                0x03000008u, dst(Temp, a, 0x1), src(Temp, O), src(Temp, O),                      // dp3 rA.x, o, o
+                0x03000002u, dst(Temp, a, 0x1), src(Temp, a, 0x00u), src(Const, 27, 0xaau) | neg, // c = o.o - R^2
+                0x04000004u, dst(Temp, a, 0x2), src(Temp, V, 0xffu), src(Temp, V, 0xffu), src(Temp, a, 0x00u) | neg, // b^2 - c
+                0x0300000bu, dst(Temp, a, 0x2), src(Temp, a, 0x55u), src(Const, 27, 0xffu),     // max 0
+                0x02000007u, dst(Temp, a, 0x4), src(Temp, a, 0x55u),                             // rsq rA.z
+                0x03000005u, dst(Temp, a, 0x2), src(Temp, a, 0x55u), src(Temp, a, 0xaau),        // sqrt
+                0x03000002u, dst(Temp, a, 0x4), src(Temp, a, 0x55u), src(Temp, V, 0xffu) | neg,  // s = sqrt - b
+                0x04000004u, dst(Temp, a, 0x7), src(Temp, V), src(Temp, a, 0xaau), src(Temp, O), // L = o + sR
+                0x04000004u, dst(Temp, a, 0x7) | pp, src(Temp, b, 0x00u), src(Const, 30), src(Temp, a),
+                0x04000004u, dst(Temp, a, 0x7) | pp, src(Temp, b, 0x55u), src(Const, 31), src(Temp, a),
+                0x03000042u, words[site + 9], words[site + 10], words[site + 11],
+                0x03000005u, dst(Temp, a, 0x7) | pp, src(Temp, a), src(Const, 29)});
             i = site + 12;
             continue;
         } else if (i == site) {

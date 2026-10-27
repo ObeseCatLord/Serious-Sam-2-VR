@@ -200,7 +200,7 @@ static void __cdecl poll() {
         return;
     // Native Sam2Game cursor motion integrates deltas in a 640x480 menu space.
     // Supply the delta to its own dispatcher, not direct cursor/global writes.
-    // The menu image is the whole canvas (scaled to 4:3, bridge), as is the
+    // The menu image is the whole canvas (scaled to 4:3 over a level, bridge), as is the
     // cursor's space: the mapping is proportional.
     const MenuCursor target = menuCursor(pointer.u, pointer.v);
     motion((target.x - x) / sensitivity, (target.y - y) / sensitivity);

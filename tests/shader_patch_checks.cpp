@@ -106,6 +106,24 @@ int main() {
         for (size_t i = 0; i + 3 < out.size(); ++i)
             if (out[i] == 0x03 && out[i + 3] == src(Const, 35)) anchoredCentre = true;
         assert(anchoredCentre);
+        // Per pixel: o = P - anchor (c35) turned into the lookup's texcoord, the view
+        // ray P - eye (c30) turned into r9 and written to set 7; no sphere in the program.
+        VertexInfo perPixel;
+        assert(patchVertexShader(water.data(), water.size(), out, &perPixel, 30, true, 0, true) && perPixel.eyeClip);
+        bool fromAnchor = false, fromEye = false, rayTurned = false, viewWritten = false, lookupWritten = false, sphere = false;
+        for (size_t i = 0; i + 3 < out.size(); ++i) {
+            if (out[i] == 0x03 && out[i + 1] == dst(Temp, 10, 0x7) && out[i + 3] == src(Const, 35)) fromAnchor = true;
+            if (out[i] == 0x03 && out[i + 1] == dst(Temp, 10, 0x7) && out[i + 3] == src(Const, 30)) fromEye = true;
+            if (out[i] == 0x08 && out[i + 1] == dst(Temp, 9, 0x4) && out[i + 3] == src(Const, 34)) rayTurned = true;
+            if (out[i] == 0x01 && out[i + 1] == dst(TexCrdOut, 7, 0xf) && out[i + 2] == src(Temp, 9)) viewWritten = true;
+            if (out[i] == 0x01 && out[i + 1] == dst(TexCrdOut, 2, 0xf) && out[i + 2] == src(Temp, 10)) lookupWritten = true;
+            if (out[i] == 0x07 && out[i + 1] == dst(Temp, 10, 0x8)) sphere = true; // The per-vertex sphere's rsq.
+        }
+        assert(fromAnchor && fromEye && rayTurned && viewWritten && lookupWritten && !sphere);
+        // A program writing set 7 itself has no per-pixel variant.
+        std::vector<uint32_t> seventh = water;
+        seventh.insert(seventh.end() - 1, {0x01, dst(TexCrdOut, 7, 0xf), src(Temp, 0)});
+        assert(!patchVertexShader(seventh.data(), seventh.size(), out, &w, 30, true, 0, true));
         // Probe mode needs constants up to c34 free and a texcoord fed by the lookup.
         assert(patchVertexShader(busyConstants.data(), busyConstants.size(), out, &w, 30, true) && !w.eyeClip);
         // Mirror mode: the lookup's clip position becomes the point's position in
@@ -178,6 +196,25 @@ int main() {
             }
         }
         assert(keptDcl && keptLookup && gained && mirror.size() == ps.size() + 18 + 4);
+        // Per pixel: t7 declared, the view ray normalized and reflected about c26, the
+        // sphere (c27) met per pixel, then the ripple, the cube lookup and the gain.
+        std::vector<uint32_t> perPixel;
+        sampler = 99;
+        assert(patchWaterPixelShader(ps.data(), ps.size(), perPixel, sampler, .5f, false, true) && sampler == 2);
+        bool viewDcl = false, normalized = false, reflected = false, met = false, looked = false;
+        for (size_t i = 0; i + 4 < perPixel.size(); ++i) {
+            if (perPixel[i] == 0x0200001fu && perPixel[i + 1] == 0x80000000u && perPixel[i + 2] == dst(Tex, 7, 0x7)) viewDcl = true;
+            if (perPixel[i] == 0x02000024u && perPixel[i + 2] == src(Tex, 7)) normalized = true;
+            if (perPixel[i] == 0x04000004u && perPixel[i + 3] == src(Const, 26)) reflected = true;
+            if (perPixel[i] == 0x03000002u && perPixel[i + 3] == (src(Const, 27, 0xaau) | (1u << 24))) met = true;
+            if (perPixel[i] == 0x03000042u && perPixel[i + 1] == dst(Temp, 2, 0xf)) looked = true;
+        }
+        assert(viewDcl && normalized && reflected && met && looked && perPixel.back() == 0x0000ffffu);
+        // A program using c26 or reading t7 keeps the per-vertex variant only.
+        std::vector<uint32_t> busy26 = ps;
+        busy26.insert(busy26.end() - 1, {0x02000001u, dst(Temp, 3, 0xf), src(Const, 26)});
+        assert(patchWaterPixelShader(busy26.data(), busy26.size(), cube, sampler) &&
+               !patchWaterPixelShader(busy26.data(), busy26.size(), cube, sampler, 1, false, true));
         // Programs already using c30 are left alone; so are programs without the sequence.
         std::vector<uint32_t> busy = ps;
         busy.insert(busy.end() - 1, {0x02000001u, dst(Temp, 3, 0xf), src(Const, 30)});

@@ -266,6 +266,16 @@ static void(__cdecl *labSaveSniper)(const char *)=nullptr;
 // load menu's call), of Temp/SS2VR/user.sav once Temp/SS2VR/load-request exists.
 static void(__cdecl *labLoadGame)(const char *)=nullptr;
 static std::atomic<bool> labLoadPending{false}, labLoadIssued{false};
+// Lab (SS2VR_LAB_SAVE=1): the native save of the game in play (Sam2Game 0x22f00, as
+// the lab's fixture preparation) to Temp/SS2VR/lab.sav once Temp/SS2VR/save-request
+// exists; and (any lab run) the local player's inventory logged once a few seconds
+// into each level or load (Temp/SS2VR/inventory-request: again).
+static void(__cdecl *labNativeSave)(const char *) = nullptr;
+static std::atomic<bool> labSavePending{false};
+// Lab: CWorldInfoEntity::JumpToNextLevel (the level end's own change, the player's
+// inventory carried) once Temp/SS2VR/next-level-request exists (SS2VR_LAB_SAVE=1).
+static void(__thiscall *labJumpToNextLevel)(void *) = nullptr;
+static std::atomic<bool> labNextLevelPending{false};
 static uintptr_t labBrainGetter=0,labPuppetGetter=0;
 static bool labSniperConfigured=false;
 static const LabPreparationTarget *labPreparation=nullptr;
@@ -860,12 +870,12 @@ bool cinematicCameraActive() noexcept {
     uint32_t camera=0;std::memcpy(&camera,static_cast<uint8_t*>(info)+0x6c,4);
     return camera && resolve(camera);
 }
-// pausedView: a menu may be open (the stereo view behind a pause menu, no controls).
+// pausedView: a menu or Netricsa may be open (the stereo view behind it, no controls).
 static bool trackingEligible(void *p, bool pausedView = false) {
     RiderIdentity rider;
     return nativeInputHealthy() && hooksReady.load(std::memory_order_acquire) && local(p) &&
            (singlePlayer() || multiplayer::server() || multiplayer::negotiatedLocal()) && isAlive(p) &&
-           !isNetricsa(p) && (pausedView || !menus::active()) && !cinematicCameraActive() && readNativeRider(p, rider) &&
+           (pausedView || (!isNetricsa(p) && !menus::active())) && !cinematicCameraActive() && readNativeRider(p, rider) &&
            (rider.seated() || (rider.handheld() && !thirdPerson(p)));
 }
 static bool trackingAnchor(void *p, Pose &out) {
@@ -2415,7 +2425,7 @@ static void voiceFrame() {
 // The game itself decides what the menu pauses: single player stops, multiplayer runs on.
 static bool menuViewEligible(void *p, const Snapshot &s, const Input &input, const RiderIdentity &rider,
                              bool riderValid) {
-    return riderValid && s.initialized && menus::worldHidden() && fresh(input) &&
+    return riderValid && s.initialized && (menus::worldHidden() || netricsaShown()) && fresh(input) &&
            s.interruption.permits(input, GetTickCount64(), s.inputProducer) && trackingEligible(p, true) &&
            nativeRiderCurrent(p, rider) && validTrackingEpoch(s.generation);
 }
@@ -2425,6 +2435,19 @@ static void update(void *p) {
     if (rigMutationActive || !hooksReady.load(std::memory_order_acquire) || !channel.shared || !local(p))
         return;
     lastUpdateTick = GetTickCount64();
+    if (labSavePending.exchange(false) && labNativeSave) {
+        // In the simulation step, as the fixture preparation's save (between frames
+        // the game refused it as multiplayer). Core prefixes its root: a game path.
+        labNativeSave("Temp/SS2VR/lab.sav");
+        log("Lab save of Temp/SS2VR/lab.sav issued");
+    }
+    if (labNextLevelPending.exchange(false) && labJumpToNextLevel && nativeWorldInfo) {
+        if (void *info = nativeWorldInfo()) {
+            log("Lab next level issued");
+            labJumpToNextLevel(info);
+            return; // The world changes: nothing more of this step.
+        }
+    }
     simulationThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
     auto s = copySnapshot();
     Input input = s.input;
@@ -2965,6 +2988,36 @@ static void update(void *p) {
                 parts = 4;
             }
         }
+        {
+            static const bool labSave = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SAVE", v, 2) == 1 && v[0] == L'1'; }();
+            if (labSave && singlePlayer() && GetFileAttributesA("Temp\\SS2VR\\save-request") != INVALID_FILE_ATTRIBUTES) {
+                DeleteFileA("Temp\\SS2VR\\save-request");
+                log("Lab save of Temp/SS2VR/lab.sav requested");
+                labSavePending = true;
+            }
+            if (labSave && singlePlayer() && GetFileAttributesA("Temp\\SS2VR\\next-level-request") != INVALID_FILE_ATTRIBUTES) {
+                DeleteFileA("Temp\\SS2VR\\next-level-request");
+                log("Lab next level requested");
+                labNextLevelPending = true;
+            }
+            static const bool labInventory = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_TRACE", v, 2) == 1 && v[0] == L'1'; }();
+            static void *inventoryPlayer = nullptr;
+            static uint64_t inventorySince = 0;
+            if (labInventory && inInventory && ammo && rider.handheld()) {
+                if (p != inventoryPlayer) { inventoryPlayer = p; inventorySince = GetTickCount64(); }
+                const bool asked = GetFileAttributesA("Temp\\SS2VR\\inventory-request") != INVALID_FILE_ATTRIBUTES;
+                if (asked || (inventorySince && GetTickCount64() - inventorySince > 4000)) {
+                    if (asked) DeleteFileA("Temp\\SS2VR\\inventory-request");
+                    inventorySince = 0;
+                    char line[512]{};
+                    size_t used = 0;
+                    void *items = static_cast<uint8_t *>(p) + 0x8f8;
+                    for (int id = 0; id < 24 && used + 24 < sizeof line; ++id)
+                        if (inInventory(items, id)) used += std::snprintf(line + used, sizeof line - used, " %d:%d", id, ammo(items, id));
+                    log("Lab inventory (weapon:ammo) health=%d armor=%d%s", health(p), armor(p), line);
+                }
+            }
+        }
         static const bool labLoad = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_LOAD", v, 2) == 1 && v[0] == L'1'; }();
         static bool labLoaded = false;
         if (labLoad && !labLoaded && labLoadGame && singlePlayer() && nativeMainThread && nativeMainThread() &&
@@ -3384,15 +3437,22 @@ bool menuViewFrame() noexcept {
     publishSnapshot(s);
     return view;
 }
+bool liveMenuView() noexcept { return (menus::worldHidden() || netricsaShown()) && copySnapshot().menuView; }
 // The game caps its frame rate while a menu renders (Sam2Game asks 33 fps). Under
 // a pause menu with the world live behind it (menuViewFrame) that made looking
 // around choppy: there the cap is lifted, and the headset paces frames as in play.
+// At the front end the cap is raised to the headset's rate: the menu image (and
+// its cursor) is copied every frame, and 33 fps made the cursor judder.
 static void(__cdecl *originalLimitFrameRate)(long) = nullptr;
 static void __cdecl limitFrameRate(long fps) {
-    if (fps > 0 && menus::worldHidden() && copySnapshot().menuView) {
+    if (fps > 0 && liveMenuView()) {
         static bool noted = false;
         if (!noted) { noted = true; log("Menu frame cap %ld lifted: the world is live behind the menu", fps); }
         fps = 0;
+    } else if (fps > 0 && fps < 90 && vrInputLive() && !levelActive()) {
+        static bool noted = false;
+        if (!noted) { noted = true; log("Menu frame cap %ld raised to 90 at the front end", fps); }
+        fps = 90;
     }
     originalLimitFrameRate(fps);
 }
@@ -8859,10 +8919,12 @@ static void __fastcall brainRender(void *brain,void *) {
         uiOwnerGeneration=0;
     });
 }
+static bool netricsaEyes = false; // Main thread: the stereo eyes behind Netricsa are rendering.
 static void __fastcall overlayRender(void *player,void *,int flag) {
     // Behind a pause menu (menuViewFrame) the HUD is left out, as with the world
-    // hidden: it would be drawn into the flat menu panel.
-    if(menus::worldHidden() && copySnapshot().menuView) return;
+    // hidden: it would be drawn into the flat menu panel. Behind Netricsa the eyes
+    // leave it (and Netricsa) out: the flat frame after them carries Netricsa.
+    if((menus::worldHidden() && copySnapshot().menuView) || netricsaEyes) return;
     const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     const bool outer=uiOverlayDepth==0;
     ++uiOverlayDepth;
@@ -8927,13 +8989,17 @@ static void __fastcall render(void *p,void *) {
             originalRender(p); // Nested draws remain native; never begin another bank/eye pair.
             return;
         }
+        // Netricsa pauses the game like a pause menu: the world renders live in
+        // stereo behind it (menuViewFrame keeps the head pose fresh while paused).
+        const bool netricsa = !menus::active() && netricsaShown();
+        if (netricsa) menuViewFrame();
         auto s=copySnapshot();
         // Preserve the original short-circuit order: retired render extents must
         // never acquire a native player/rider getter merely for diagnostics.
         const bool extent = nativeRenderExtentCurrent(), samePlayer = extent && p == s.player;
         const bool eligible = samePlayer && trackingEligible(p);
         // A pause menu over the level (menuViewFrame): the stereo view without controls.
-        const bool menuView = samePlayer && !eligible && s.menuView && menus::worldHidden();
+        const bool menuView = samePlayer && !eligible && s.menuView && (menus::worldHidden() || netricsa);
         const bool view = menuView && trackingEligible(p, true);
         const bool session = (eligible || view) && vrSession(s), currentInput = session && fresh(s.input);
         static unsigned renderDiagnostics = 0;
@@ -8942,9 +9008,19 @@ static void __fastcall render(void *p,void *) {
             log("Native world render gate extent=%u player=%u eligible=%u session=%u fresh=%u gameplay=%u marker=%u",
                 extent,samePlayer,eligible,session,currentInput,s.ui.gameplay,caller==markerParentReturn);
         }
-        if(extent && samePlayer && session && currentInput && ((eligible && s.ui.gameplay) || view))
-            stereo(p,presentedRender,caller==markerParentReturn ? nativeMarkerPostlude : nullptr);
-        else if(menuView) clearCanvasTarget(); // As a hidden world: no flat world in the keyed menu.
+        if(extent && samePlayer && session && currentInput && ((eligible && s.ui.gameplay) || view)) {
+            if (view && netricsa) {
+                // The eyes without Netricsa, then the flat frame with it (its panel is
+                // shown over the live world; the bridge crops it).
+                netricsaEyes = true;
+                withNativeFinally([&] { stereo(p,presentedRender,nullptr); },[&](bool) noexcept { netricsaEyes = false; });
+                netricsaEyes = false;
+                static bool noted = false;
+                if (!noted) { noted = true; log("Netricsa over the live world: stereo eyes, then its flat frame"); }
+                presentedRender(p);
+            } else stereo(p,presentedRender,caller==markerParentReturn ? nativeMarkerPostlude : nullptr);
+        }
+        else if(menuView && !netricsa) clearCanvasTarget(); // As a hidden world: no flat world in the keyed menu.
         else presentedRender(p);
     },[&](bool aborted) noexcept {
         if(aborted) {
@@ -10576,9 +10652,58 @@ static void maintainSpatialAudio() {
     spatial_audio::guardSawEngine(singlePlayer() && s.initialized && livePlayer(s),
                                   s.ui.currentWeapon[0] == 0 || s.ui.currentWeapon[1] == 0);
 }
+// [Render] DrawDistance: the game lowers model detail and culls small objects by
+// distance (ren_fLODBias, clamped 0..4: larger is coarser) and draws clutter out to
+// a distance (crm_fDistanceBias, clamped 0.2..5: larger is farther). In VR those
+// are scaled from the configured values; a value the game itself changes (video
+// options) becomes the new configured one. The configured values are put back
+// before the game saves its cvars (bridge saveCvars).
+namespace draw_distance {
+struct Scaled {
+    float *cvar = nullptr;
+    float configured = 0, written = 0;
+    bool active = false;
+    // The configured value scaled (divided when larger is coarser), clamped.
+    void apply(float scale, bool coarser, float low, float high) {
+        if (!cvar) return;
+        if (!active || *cvar != written) configured = *cvar;
+        written = std::clamp(coarser ? configured / scale : configured * scale, low, high);
+        *cvar = written;
+        active = true;
+    }
+    void restore() {
+        if (cvar && active && *cvar == written) *cvar = configured;
+        active = false;
+    }
+};
+static Scaled lod, clutter;
+static void frame() {
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        if (const HMODULE e = GetModuleHandleW(L"Engine.dll"))
+            lod.cvar = reinterpret_cast<float *>(GetProcAddress(e, "?ren_fLODBias@SeriousEngine@@3MA"));
+        if (const HMODULE r = GetModuleHandleW(L"ProcRender.dll"))
+            clutter.cvar = reinterpret_cast<float *>(GetProcAddress(r, "?crm_fDistanceBias@SeriousEngine@@3MA"));
+        log("Draw distance cvars lod=%d clutter=%d", lod.cvar != nullptr, clutter.cvar != nullptr);
+    }
+    const float scale = settings.drawDistance;
+    if (!vrInputLive() || !(scale > 1.001f)) { lod.restore(); clutter.restore(); return; }
+    lod.apply(scale, true, .05f, 4.f);
+    clutter.apply(scale, false, .2f, 5.f);
+    static float noted = 0;
+    if (noted != scale) {
+        noted = scale;
+        log("Draw distance x%.2f: ren_fLODBias %.3f -> %.3f, crm_fDistanceBias %.3f -> %.3f", scale, lod.configured,
+            lod.written, clutter.configured, clutter.written);
+    }
+}
+} // namespace draw_distance
+void restoreDrawDistance() noexcept { draw_distance::lod.restore(); draw_distance::clutter.restore(); }
 static int __cdecl appForeground() {
     pollSettingsFile(); // Menus too: the options panel opens over the game's menus.
-    applyEyeCanvas();   // In play too: the canvas changes between the front end (4:3) and a level (eye size).
+    draw_distance::frame();
+    applyEyeCanvas();   // In play too: the canvas changes between the front end (16:9) and a level (eye size).
     maintainSpatialAudio();
     voiceFrame();
     // Desktop play (no headset driving the game): VR options from under the game's menus.
@@ -12237,7 +12362,7 @@ bool attach(bool headless) {
         // gfx_fAspectRatio (Sam2Game RVA 3F9DE0): the game letterboxes its whole 2D
         // view to this aspect. The eye-sized canvas is square, so use a widescreen
         // layout; the flat screen and HUD panel show exactly that band.
-        // At the front end (startup) the front-end canvas's 4:3 applies instead
+        // At the front end (startup) the front-end canvas's 16:9 applies instead
         // (bridge followCanvasResolution, set again as the main menu is created).
         setLevelUiAspect(settings.uiAspect);
         installMainMenuLayout();
@@ -12417,6 +12542,8 @@ bool attach(bool headless) {
     S(g, "?CanFireFromOwnWeapons@CPuppetEntity@SeriousEngine@@QAEHXZ", nativeOwnWeapons);
     nativeTeleport = loadProc<TeleportFn>(g, "?Teleport@CPuppetEntity@SeriousEngine@@UAEHVQuatVect@2@@Z");
     labLoadGame = reinterpret_cast<decltype(labLoadGame)>(reinterpret_cast<uintptr_t>(g) + 0x26980);
+    labNativeSave = reinterpret_cast<decltype(labNativeSave)>(reinterpret_cast<uintptr_t>(g) + 0x22f00);
+    labJumpToNextLevel = reinterpret_cast<decltype(labJumpToNextLevel)>(GetProcAddress(g, "?JumpToNextLevel@CWorldInfoEntity@SeriousEngine@@UAEXXZ"));
     nativeSimNow = loadProc<decltype(nativeSimNow)>(e, "?simNow@SeriousEngine@@YA?AVTime@1@XZ");
     ticksToSeconds = loadProc<decltype(ticksToSeconds)>(c, "?timTicksToFloat@SeriousEngine@@YAM_J@Z");
     {
