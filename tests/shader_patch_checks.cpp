@@ -286,5 +286,33 @@ int main() {
         }
         std::printf("dumped pixel programs with a free texcoord set %u/%u\n", covered, total);
     }
+    // Reflective materials: the view position read (sub rE.xyz, c7, v0) and the
+    // object-to-absolute rows (m3x3 ., ., c8) are found; a program without the rows is not one.
+    {
+        const std::vector<uint32_t> reflective{
+            VsVersion11,
+            0x1f, 0x80000000u | 0u, dst(Input, 0, 0xf),
+            0x03, dst(Temp, 0, 0x7), src(Const, 7), src(Input, 0),
+            0x17, dst(Temp, 1, 0x7), src(Temp, 0), src(Const, 8),
+            0x01, dst(TexCrdOut, 3, 0xf), src(Temp, 1),
+            0x0000ffffu};
+        unsigned rows = 0;
+        assert(reflectionViewConstant(reflective.data(), reflective.size(), rows) == 7 && rows == 8);
+        std::vector<uint32_t> flat(reflective.begin(), reflective.begin() + 8);
+        flat.push_back(0x0000ffffu);
+        assert(reflectionViewConstant(flat.data(), flat.size(), rows) == -1 && rows == NoMatrix);
+        // Without object rows (PolyBump, Specular) the model -> clip rows serve.
+        std::vector<uint32_t> lit(reflective.begin(), reflective.begin() + 8);
+        lit.insert(lit.end(), {0x14, dst(Temp, 2, 0xf), src(Input, 0), src(Const, 1), 0x0000ffffu});
+        unsigned clip = 0;
+        assert(reflectionViewConstant(lit.data(), lit.size(), rows, &clip) == 7 && rows == NoMatrix && clip == 1);
+        assert(reflectionViewConstant(lit.data(), lit.size(), rows) == -1);
+        // As assembled: add rE, cV, -v0 (full mask); a plain add of v0 is not a view vector.
+        std::vector<uint32_t> assembled = lit;
+        assembled[4] = 0x02; assembled[5] = dst(Temp, 0, 0xf); assembled[7] = src(Input, 0) | (1u << 24);
+        assert(reflectionViewConstant(assembled.data(), assembled.size(), rows, &clip) == 7 && clip == 1);
+        assembled[7] = src(Input, 0);
+        assert(reflectionViewConstant(assembled.data(), assembled.size(), rows, &clip) == -1);
+    }
     std::puts("shader patch ok");
 }

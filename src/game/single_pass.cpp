@@ -102,6 +102,11 @@ struct ProbeVertex { IDirect3DVertexShader9 *variant = nullptr, *mirror = nullpt
 constexpr unsigned MirrorConstant = 35;
 constexpr unsigned CubeAnchorConstant = 35; // Cube variant: the cube's world anchor in model space (shader_patch probe).
 std::unordered_map<IDirect3DVertexShader9 *, ProbeVertex> shaderProbe;
+// Programs reflecting or lighting by the view position (object space): the
+// position, and the object-to-absolute rows or else the model -> clip rows
+// (shader_patch reflectionViewConstant), so it can be set per eye.
+struct ReflectionView { unsigned view = 0, matrix = sp::NoMatrix, clip = sp::NoMatrix; };
+std::unordered_map<IDirect3DVertexShader9 *, ReflectionView> shaderReflectionView;
 struct ProbePixel { IDirect3DPixelShader9 *variant = nullptr, *mirror = nullptr, *perPixel = nullptr; unsigned sampler = 0; };
 std::unordered_map<IDirect3DPixelShader9 *, ProbePixel> pixelProbe;
 // The cube holds the scene's own brightness; the water program scales its
@@ -156,6 +161,30 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
     shaderVariants.emplace(s, variant);
     shaderTexcoords.emplace(s, info.texcoordsWritten);
     shaderEyeClip.emplace(s, variant && info.eyeClip);
+    if (!(variant && info.eyeClip)) {
+        std::vector<uint32_t> words(bytes / 4);
+        UINT got = bytes;
+        unsigned matrix = sp::NoMatrix, clip = sp::NoMatrix;
+        // Lab (SS2VR_LAB_DUMP_VS=1): every vertex program's bytecode to Temp/SS2VR/vs-<n>.bin.
+        static const bool dump = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_DUMP_VS", v, 2) == 1 && v[0] == L'1'; }();
+        static unsigned dumped = 0;
+        if (dump && bytes >= 8 && dumped < 400 && SUCCEEDED(s->GetFunction(words.data(), &got))) {
+            char name[64];
+            std::snprintf(name, sizeof name, "Temp\\SS2VR\\vs-%03u.bin", dumped++);
+            if (FILE *f = std::fopen(name, "wb")) { std::fwrite(words.data(), 4, words.size(), f); std::fclose(f); }
+        }
+        const int view = bytes >= 8 && SUCCEEDED(s->GetFunction(words.data(), &got))
+            ? sp::reflectionViewConstant(words.data(), words.size(), matrix, &clip) : -1;
+        if (view >= 0 && view < 96 && (matrix == sp::NoMatrix || matrix + 3 <= 96) && (clip == sp::NoMatrix || clip + 4 <= 96)) {
+            shaderReflectionView.emplace(s, ReflectionView{unsigned(view), matrix, clip});
+            static unsigned traced = 0;
+            if (traced < 12) {
+                ++traced;
+                log("Single pass: view-lit program %p views from c%d (rows c%d, clip c%d), set per eye", static_cast<void *>(s), view,
+                    matrix == sp::NoMatrix ? -1 : int(matrix), clip == sp::NoMatrix ? -1 : int(clip));
+            }
+        }
+    }
     if (variant && info.eyeClip) {
         ProbeVertex probe{nullptr, nullptr, info.clipMatrix, nullptr};
         std::vector<uint32_t> words(bytes / 4), patched;
@@ -753,6 +782,38 @@ bool waterDraw() noexcept {
 // Saves c30..c31 around a water draw (later programs, e.g. skinned bones,
 // expect the engine's values there) and sets each eye's position: the water
 // program's view position (c4, in its model space) plus the eye's offset.
+// Reflective materials: the view position (object space) per eye, from the
+// centre camera's plus the eye's world offset turned into the object's space by
+// its object-to-absolute rows. Restored after the draw.
+struct ReflectionViewScope {
+    IDirect3DDevice9 *d;
+    bool active = false;
+    unsigned view = 0;
+    float saved[4]{}, eye[2][4]{};
+    ReflectionViewScope(IDirect3DDevice9 *device, bool stereo) noexcept : d(device) {
+        if (!stereo) return;
+        const auto it = shaderReflectionView.find(engineShader);
+        if (it == shaderReflectionView.end()) return;
+        float rows[12], wvp[16], inverse[9], offset[2][3];
+        view = it->second.view;
+        const bool turned = it->second.matrix != sp::NoMatrix
+            ? SUCCEEDED(d->GetVertexShaderConstantF(it->second.matrix, rows, 3))
+            : it->second.clip != sp::NoMatrix && SUCCEEDED(d->GetVertexShaderConstantF(it->second.clip, wvp, 4)) &&
+                  env_probe_math::modelRotation(wvp, engineView, engineProjection, rows);
+        if (!turned || FAILED(d->GetVertexShaderConstantF(view, saved, 1)) || !water::invert3(rows, inverse) ||
+            !water::eyeOffset(engineView, changes[0], offset[0]) || !water::eyeOffset(engineView, changes[1], offset[1]))
+            return;
+        for (unsigned e = 0; e < 2; ++e) {
+            for (unsigned r = 0; r < 3; ++r)
+                eye[e][r] = saved[r] + inverse[3 * r] * offset[e][0] + inverse[3 * r + 1] * offset[e][1] + inverse[3 * r + 2] * offset[e][2];
+            eye[e][3] = saved[3];
+            if (!std::isfinite(eye[e][0] + eye[e][1] + eye[e][2])) return;
+        }
+        active = true;
+    }
+    void apply(unsigned i) noexcept { if (active) d->SetVertexShaderConstantF(view, eye[i & 1], 1); }
+    ~ReflectionViewScope() { if (active) d->SetVertexShaderConstantF(view, saved, 1); }
+};
 struct WaterConstantsScope {
     IDirect3DDevice9 *d;
     bool active = false, eyes = false, cube = false, mirrored = false, anchored = false, pixelSaved = false;
@@ -1205,6 +1266,7 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
         HRESULT hr = D3D_OK;
         WaterConstantsScope waterScope(d, stereo);
         if (stereo && waterScope.unusable()) return D3D_OK;
+        ReflectionViewScope reflectionView(d, stereo);
         const bool partial = scissorEnabled && (clip.left > LONG(v.X) || clip.top > LONG(v.Y) ||
                                                 clip.right < LONG(v.X + v.Width) || clip.bottom < LONG(v.Y + v.Height));
         const RECT eyeClipRect[2]{partial ? eyeScissor(0, clip) : clip, partial ? eyeScissor(1, clip) : clip};
@@ -1216,6 +1278,7 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
             applyScissor(d, r);
             applyPlanes(d, int(2 + j));
             waterScope.eye(layout.region[j].eye);
+            reflectionView.apply(layout.region[j].eye);
             if (eyePixelCount) d->SetPixelShaderConstantF(eyePixelStart, eyePixel[layout.region[j].eye], eyePixelCount);
             d->SetStreamSource(15, ring, regionOffset + j * RecordBytes, RecordBytes);
             const HRESULT one = call(false);
@@ -1231,10 +1294,12 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
     const D3DVIEWPORT9 &v = engineViewport;
     WaterConstantsScope waterScope(d, stereo);
     if (stereo && waterScope.unusable()) return D3D_OK;
+    ReflectionViewScope reflectionView(d, stereo);
     for (unsigned j = 0; j < layout.count; ++j) {
         const Region &g = layout.region[j];
         if (!g.scaled) continue;
         waterScope.eye(g.eye);
+        reflectionView.apply(g.eye);
         const RECT r = regionRect(g, LONG(v.X), LONG(v.Y), LONG(v.X + v.Width), LONG(v.Y + v.Height));
         if (r.right <= r.left || r.bottom <= r.top) continue;
         D3DVIEWPORT9 placed{DWORD(r.left), DWORD(r.top), DWORD(r.right - r.left), DWORD(r.bottom - r.top), v.MinZ, v.MaxZ};

@@ -669,6 +669,7 @@ static void pollSettingsFile() {
     settings.lasers = fresh.lasers;
     settings.laserDistance = fresh.laserDistance;
     settings.ammoScreens = fresh.ammoScreens;
+    settings.throwStrength = fresh.throwStrength;
     settings.snapTurn = fresh.snapTurn;
     settings.smoothTurnRate = fresh.smoothTurnRate;
     settings.snapTurnDegrees = fresh.snapTurnDegrees;
@@ -2003,7 +2004,13 @@ static std::atomic<bool> gripCarrying{false};
 // 3x real gravity, so a throw at the hand's own speed fell short of where it
 // was aimed. Scaling by sqrt(28 / 9.81) keeps the arc a real throw would have
 // (same apex and range), so a basketball goes where it is thrown.
-static constexpr float GripReach = .35f, GripPointReach = 3.f, ThrowBoost = 1.69f;
+static constexpr float GripReach = .35f, GripPointReach = 3.f;
+// Thrown props fall at about 2.65 g (lab trace 20261024T195114: ~26 m/s^2 down,
+// the vertical half of a 6 m/s throw gone in 0.13 s). Speeding the release up
+// by sqrt(2.65) gives a real throw's arc (same range and height, sooner);
+// [Throwing] Strength multiplies that (the old fixed 1.69 was about real range,
+// and gentle VR throws then barely moved the ball, ObeseCatLord).
+static constexpr float ThrowGravityMatch = 1.63f;
 static bool gripCarryAuthority(void *player) {
     return hooksReady.load(std::memory_order_acquire) && hullsInRange && hullOwner && hullBody && jointPlacements &&
         deleteArray && preDeleteArray && postDeleteArray && player && local(player) &&
@@ -2130,7 +2137,8 @@ static void releaseGripCarry(void *puppet, bool throwIt) {
     const HandMotion motion = throwMotion();
     const Pose placed = carriedBodyPose();
     const Vec3 hand = gripCarry.samples ? gripCarry.history[(gripCarry.samples - 1) % 16].p : placed.p;
-    const Vec3 velocity = (finite(placed) ? heldVelocity(motion, hand, placed.p) : motion.linear) * ThrowBoost;
+    const Vec3 velocity = (finite(placed) ? heldVelocity(motion, hand, placed.p) : motion.linear) *
+                          (ThrowGravityMatch * settings.throwStrength);
     void *mechanism = carriedMechanism(gripCarry.carriedHull);
     virtualCall<void>(puppet, 0x29c); // DropObject: stock ObjectThrown events and weapon restore.
     // The whole mechanism: a prop of several parts (the giant match) kept the
@@ -3018,6 +3026,23 @@ static void update(void *p) {
                 DeleteFileA("Temp\\SS2VR\\next-level-request");
                 log("Lab next level requested");
                 labNextLevelPending = true;
+            }
+            // Lab (SS2VR_LAB_GOD=1): the game's god cheat for each new player (the lab
+            // runs with cheats enabled), to look around a fight without dying.
+            static const bool labGod = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_GOD", v, 2) == 1 && v[0] == L'1'; }();
+            static void *godPlayer = nullptr;
+            static uint64_t godSince = 0;
+            if (labGod && p != godPlayer) { godPlayer = p; godSince = GetTickCount64(); }
+            if (labGod && godSince && GetTickCount64() - godSince > 3000) {
+                godSince = 0;
+                static void(__fastcall *godCheat)(void *, void *) = [] {
+                    const HMODULE g = GetModuleHandleW(L"Sam2Game.dll");
+                    return reinterpret_cast<void(__fastcall *)(void *, void *)>(g ? GetProcAddress(g, "?OnGodCheat@CGameInfoEntity@SeriousEngine@@QAEXXZ") : nullptr);
+                }();
+                uint32_t gameHandle = 0;
+                void *game = godCheat && nativeGameInfo && nativeGameInfo(&gameHandle) && gameHandle ? resolve(gameHandle) : nullptr;
+                if (game) godCheat(game, nullptr);
+                log("Lab god cheat %s", game ? "issued" : "unavailable");
             }
             static const bool labInventory = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_TRACE", v, 2) == 1 && v[0] == L'1'; }();
             static void *inventoryPlayer = nullptr;

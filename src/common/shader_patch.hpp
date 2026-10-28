@@ -388,6 +388,46 @@ inline int pixelOperands(uint32_t opcode) {
 }
 constexpr unsigned Texture = 3, ColorOut = 8;
 } // namespace detail
+// Programs that light or reflect by the view direction take the view position
+// in object space as a constant: `sub rE.xyz, cV, v0` (E, object to view; also as
+// `add rE, cV, -v0`). The
+// game's ReflectionShader (cube reflections, cV = c7, object-to-absolute rows
+// `m3x3 ., ., cM`), PolyBump (specular bump mapping, c6), Specular (c8) and Shade
+// (distance fading, c12) do; water (c4) has its own per-eye handling.
+// In single pass cV is the centre camera's, so both eyes reflected and lit
+// from it: the same reflections and highlights in both, lying flat on the
+// surface and moving with the head. Returns V, with M (or NoMatrix) and the
+// first model -> clip rows (m4x4 ., ., cC: C, or NoMatrix); -1 when the program
+// has no such read or no way to turn an offset into its object space.
+constexpr unsigned NoMatrix = ~0u;
+inline int reflectionViewConstant(const uint32_t *words, size_t count, unsigned &matrix, unsigned *clip = nullptr) {
+    using namespace detail;
+    matrix = NoMatrix;
+    if (clip) *clip = NoMatrix;
+    if (!words || count < 2 || words[0] != VsVersion11) return -1;
+    int view = -1;
+    unsigned projection = NoMatrix;
+    for (size_t i = 1; i < count && words[i] != 0x0000ffffu;) {
+        const uint32_t token = words[i], opcode = token & 0xffffu;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const int n = operands(opcode);
+        if (n < 0 || i + 1 + size_t(n) > count) return -1;
+        const uint32_t *op = words + i + 1;
+        // `sub rE, cV, v0`, as the game's assembler emits it: `add rE, cV, -v0` (any mask with xyz).
+        const unsigned negation = opcode == 0x02 ? 1u : 0u;
+        if (view < 0 && (opcode == 0x02 || opcode == 0x03) && n == 3 && regType(op[0]) == Temp &&
+            ((op[0] >> 16) & 0x7u) == 0x7 && regType(op[1]) == Const && regType(op[2]) == Input && regNum(op[2]) == 0 &&
+            !(op[1] >> 24 & 0xf) && ((op[2] >> 24) & 0xfu) == negation)
+            view = int(regNum(op[1]));
+        if (view >= 0 && matrix == NoMatrix && opcode == 0x17 && n == 3 && regType(op[2]) == Const) matrix = regNum(op[2]);
+        if (projection == NoMatrix && opcode == 0x14 && n == 3 && regType(op[2]) == Const) projection = regNum(op[2]);
+        i += 1 + size_t(n);
+    }
+    if (matrix != NoMatrix && int(matrix) == view) matrix = NoMatrix;
+    if (clip) *clip = projection;
+    return view >= 0 && (matrix != NoMatrix || (clip && projection != NoMatrix && int(projection) != view)) ? view : -1;
+}
+
 // Texcoord sets a pixel program reads (bit per set); false if not understood.
 inline bool pixelTexcoords(const uint32_t *words, size_t count, uint32_t &sets) {
     using namespace detail;

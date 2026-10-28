@@ -35,6 +35,23 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 3. "Ammo screens" on the VR options menu's Interface page (`[Weapons]
    AmmoScreens`) turns them off and on at once.
 
+## Changed after the ballista, throwing and reflections report (2026-10-28)
+
+1. Throwing: the game's objects fall about 2.6 times faster than real ones, so
+   a gentle VR throw dropped the ball at your feet. Throws are now sped up to
+   follow a real throw's arc, and `[Throwing] Strength` (default 1.6) adds to
+   that: the same throw leaves your hand about 1.5 times faster than before.
+2. Shine and reflections on objects (shiny weapons, metal, bump-mapped stone
+   and wood, posts): the game lit them from the centre of your head for both
+   eyes, so highlights and reflections looked painted on and moved with your
+   head. Each eye now uses its own position (reflection, specular, bump and
+   distance-fade programs). Lab V889.
+3. Cecil's crossbows (ballistas): in the lab they fire with the trigger from
+   both your CECIL save and your quick save (V888, V889): a loaded bolt is
+   visible on the crossbow, the right trigger shoots it, and further pulls
+   dry-fire until it is loaded again. Aim with your head. If one still will
+   not fire, note whether a bolt shows on it.
+
 ## Changed after the water, cursor, wheel and controller report (2026-10-27, night)
 
 1. Water that changed with the head: the water's see-through/reflective blend
