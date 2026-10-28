@@ -23,6 +23,18 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## New: ammo screens (2026-10-27, late)
+
+1. Hold the uzi, the minigun and the rocket launcher in turn, in either hand
+   (both uzis when dual wielding): each gun's small screen shows your ammo as
+   glowing seven-segment digits (green on the uzi, blue on the minigun's
+   flip-up screen, amber on the rocket launcher). The digits sit on the screen
+   in both eyes, move with the gun, read left to right in the left hand too,
+   and are hidden by anything in front of the screen.
+2. Fire: the count drops with each shot (both uzis show the shared bullets).
+3. "Ammo screens" on the VR options menu's Interface page (`[Weapons]
+   AmmoScreens`) turns them off and on at once.
+
 ## Changed after the water, cursor, wheel and controller report (2026-10-27, night)
 
 1. Water that changed with the head: the water's see-through/reflective blend

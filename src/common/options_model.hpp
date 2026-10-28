@@ -37,7 +37,7 @@ enum OptionsItem : unsigned {
     OptVoiceReceive, OptMicrophone, OptMicDevice, OptMicSensitivity, OptMicGain, OptVoiceVolume, OptRadioVolume,
     OptVoiceRange, OptVoiceIndicators,
     // Interface
-    OptHud, OptHudSize, OptLasers, OptLaserRange, OptMenuDistance, OptMenuSize,
+    OptHud, OptHudSize, OptLasers, OptLaserRange, OptAmmoScreens, OptMenuDistance, OptMenuSize,
     OptCount
 };
 inline constexpr unsigned OptionsPageCount = 5;
@@ -56,7 +56,7 @@ inline constexpr OptionKey OptionKeys[OptCount] = {
     {L"Voice", L"InputGain"}, {L"Voice", L"Volume"}, {L"Voice", L"RadioVolume"}, {L"Voice", L"SpatialDistanceMeters"},
     {L"Voice", L"Indicators"},
     {L"HUD", L"Mode"}, {L"HUD", L"WristScale"}, {L"Laser", L"Enabled"}, {L"Laser", L"MaxDistanceMeters"},
-    {L"Comfort", L"MenuDistanceMeters"}, {L"Comfort", L"MenuWidthMeters"}};
+    {L"Weapons", L"AmmoScreens"}, {L"Comfort", L"MenuDistanceMeters"}, {L"Comfort", L"MenuWidthMeters"}};
 inline unsigned pageItems(unsigned page) { return page < OptionsPageCount ? OptionsPageStart[page + 1] - OptionsPageStart[page] : 0; }
 struct OptionsContext {
     bool vr = true;          // In VR; false on the desktop, where VR-only settings are greyed out.
@@ -187,6 +187,9 @@ inline OptionsRow vrOptionRow(unsigned item, const VrSettings &settings, const V
     case OptLaserRange:
         return {L"Laser length", format(L"%.0f m", double(settings.laserDistance)), L"How far the aim lasers reach.", L"",
                 fraction(settings.laserDistance, 10, 200), !settings.lasers};
+    case OptAmmoScreens:
+        return {L"Ammo screens", onOff(settings.ammoScreens),
+                L"The uzi, minigun and rocket launcher show your ammo on their small screens."};
     case OptMenuDistance:
         return {L"Menu distance", format(L"%.1f m", double(settings.menuDistance)),
                 L"How far away the game's menus (and the head-mounted HUD) float.", L"", fraction(settings.menuDistance, 1.5f, 3)};
@@ -288,6 +291,7 @@ inline bool changeOption(unsigned item, int direction, VrSettings &settings, con
     case OptHudSize: number(settings.hudWristScale, .02f, .2f, .6f); break;
     case OptLasers: toggle(settings.lasers); break;
     case OptLaserRange: number(settings.laserDistance, 10, 10, 200); break;
+    case OptAmmoScreens: toggle(settings.ammoScreens); break;
     case OptMenuDistance: number(settings.menuDistance, .1f, 1.5f, 3); break;
     case OptMenuSize: number(settings.menuWidth, .1f, 1.4f, 2.8f); break;
     default: return false;

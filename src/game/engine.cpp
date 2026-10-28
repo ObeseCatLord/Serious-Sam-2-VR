@@ -1,6 +1,7 @@
 #include "eye_replay.hpp"
 #include "single_pass.hpp"
 #include "env_probe.hpp"
+#include "common/ammo_screen.hpp"
 #include "common/hand_wheel.hpp"
 #include "common/turret_look.hpp"
 #include "common/two_hand.hpp"
@@ -667,6 +668,7 @@ static void pollSettingsFile() {
     const VrSettings fresh = loadSettings(settingsFile);
     settings.lasers = fresh.lasers;
     settings.laserDistance = fresh.laserDistance;
+    settings.ammoScreens = fresh.ammoScreens;
     settings.snapTurn = fresh.snapTurn;
     settings.smoothTurnRate = fresh.smoothTurnRate;
     settings.snapTurnDegrees = fresh.snapTurnDegrees;
@@ -1884,6 +1886,7 @@ static int __fastcall comboWeapons(void *game, void *) {
 static int(__cdecl *boneAbsolute)(void *, uint32_t, Matrix34 &) = nullptr;
 static void(__thiscall *giveAllWeapons)(void *, int) = nullptr;
 static uint32_t boneHandIdent = 0, bonePalmIdent = 0, boneArmIdent = 0;
+static uint32_t ammoScreenBones[std::size(AmmoScreens)]{}; // IDENTs of AmmoScreens[i].bone.
 // Private weapon audit: every bone of a model (engine CStaticStackArray<BonePlacement>).
 struct BonePlacementArray { int32_t allocated = 0; uint8_t *data = nullptr; int32_t count = 0, step = 32; };
 static void(__cdecl *bonesAbsolute)(void *, BonePlacementArray &) = nullptr;
@@ -5359,6 +5362,7 @@ static bool reloading(const void *w) {
 }
 } // namespace weapon_reload
 static void drawLasers();
+static void drawAmmoScreens();
 static bool drivenVehicle(void *ride);
 static void drawVoiceIndicators();
 static void drawSteeringWheel();
@@ -5397,6 +5401,7 @@ static void __fastcall viewExecute(void *command, void *) {
             if (!executedWeaponWorld.valid) SS2VR_PAIR_FAULT();
             LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart);
             drawLasers();
+            drawAmmoScreens();
             drawVoiceIndicators();
             notePerfSection(1, sectionStart);
             drawSteeringWheel();
@@ -8505,6 +8510,17 @@ static void traceWeaponModel(void *w, int nativeId, float scale) {
     log("Weapon model id=%d extent=%.3f,%.3f,%.3f scale=%.2f", nativeId, box.max.x - box.min.x,
         box.max.y - box.min.y, box.max.z - box.min.z, scale);
 }
+// Where this eye's root view placed each hand's tracked weapon model (the
+// matrix the model is rendered with), for the ammo screens drawn after the
+// root executes. Value copies only: the draw resolves the handles again.
+struct AmmoScreenPlacement {
+    bool valid = false;
+    int eye = -1;
+    uint64_t request = 0;
+    uint32_t weapon = 0, model = 0;
+    Matrix34 placement{};
+};
+thread_local AmmoScreenPlacement ammoScreenPlacement[2];
 static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 &out) {
 #ifdef _MSC_VER
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -8642,6 +8658,8 @@ static int __fastcall weaponAbs(void *w, void *, const Matrix34 &view, Matrix34 
             trace.references(identity,rawGrip,gripValid,rawAim);
         }
         out = staged;
+        if (physical && eyeIndex >= 0 && ammoScreen(nativeId))
+            ammoScreenPlacement[h] = {true, eyeIndex, eyeRequest.sequence, s.handle[h], primaryField(w, 0x24), staged};
         // The Serious Bomb model is both arms: its left arm follows the left controller.
         if (nativeId == 11 && controllerTracked(tracking, 0) && mountHand(s, unsigned(h)) == 1)
             remote_render::setSplitModel(uintptr_t(modelAfter.instance),
@@ -10180,6 +10198,86 @@ struct WheelBatch {
     }
 };
 static WheelBatch wheelBatch;
+// Ammo counts on the uzi, minigun and rocket launcher screens (ammo_screen.hpp),
+// in each eye after the root world like the lasers. The screen follows the
+// model as this eye rendered it: the placement weaponAbs gave the model, its
+// stretch (the left hand's model is mirrored) and the live bone carrying the
+// screen, so idle sway and the minigun's hinged display take the digits along.
+// Opaque and depth tested (no depth writes) so the hand and anything in front
+// hide them. Main thread only; gfx state is restored after.
+static void drawAmmoScreens() {
+    if(!settings.ammoScreens || !eyeAnchorReady || eyeIndex<0 || !nativeMainThread || !nativeMainThread() ||
+       !eyeSnapshot.ui.gameplay || !eyeSnapshot.rider.handheld() || !rootView || !currentCanvas || !*currentCanvas ||
+       !boneAbsolute || !unbindVertexBuffers || !*unbindVertexBuffers || !bindVertexArray || !*bindVertexArray ||
+       !drawVertices || !*drawVertices || !useSimpleShader || !constantColor)return;
+    struct Readout {AmmoScreenFrame frame;const AmmoScreenSpec *screen;int32_t count;};
+    Readout readouts[2];
+    unsigned shown=0;
+    for(unsigned h=0;h!=2;++h) {
+        const auto &placed=ammoScreenPlacement[h];
+        if(!placed.valid || placed.eye!=eyeIndex || placed.request!=eyeRequest.sequence ||
+           placed.weapon!=eyeSnapshot.handle[h])continue; // Not rendered this eye (e.g. under an open wheel).
+        void *weapon=resolve(placed.weapon);
+        if(!weapon || nativeHandle(eyeSnapshot.player,int(h))!=placed.weapon || primaryField(weapon,0x24)!=placed.model)
+            continue;
+        const int id=int(primaryField(weapon,0xb4));
+        const AmmoScreenSpec *screen=ammoScreen(id);
+        void *instance=placed.model ? resolve(placed.model) : nullptr;
+        if(!screen || eyeSnapshot.ui.currentWeapon[h]!=id || !instance || !readableMemory(instance,sizeof(Vec3)))continue;
+        // CModelInstance+0 holds the base stretch; the left slot's weapon (selector
+        // 0) renders X-flipped, as for the grip alignment (V879: the minigun's
+        // screen, off the model's centre line, showed it).
+        Vec3 base,stretch;
+        std::memcpy(&base,instance,sizeof base);
+        if(!id1RenderedStretch(primaryField(weapon,0xbc),base,stretch))continue;
+        const uint32_t bone=ammoScreenBones[size_t(screen-AmmoScreens)];
+        Matrix34 boneNow{};
+        int found=0;
+        if(!bone || !withNativeFinally([&] {found=boneAbsolute(instance,bone,boneNow);},[](bool) noexcept {}) || !found)
+            continue;
+        Readout &r=readouts[shown];
+        if(!ammoScreenFrame(*screen,placed.placement,stretch,boneNow,r.frame))continue;
+        r.screen=screen;
+        r.count=eyeSnapshot.ui.currentAmmo[h];
+        ++shown;
+        static bool traced[2][WeaponCount]{};
+        if(!traced[h][id]) {
+            traced[h][id]=true;
+            const Pose bind=screen->bind;
+            log("Ammo screen id=%d hand=%u bone=%s at=%.4f,%.4f,%.4f bind=%.4f,%.4f,%.4f stretch=%.3f,%.3f,%.3f count=%d centre=%.3f,%.3f,%.3f",
+                id,h,screen->bone,boneNow.m[3],boneNow.m[7],boneNow.m[11],bind.p.x,bind.p.y,bind.p.z,stretch.x,stretch.y,
+                stretch.z,r.count,r.frame.centre.x,r.frame.centre.y,r.frame.centre.z);
+        }
+    }
+    if(!shown)return;
+    ortho();
+    activateView(rootView);
+    const bool wasDepth=*depthEnabled!=0,wasWrite=*depthWriting!=0;
+    const bool wasBlend=*blending!=0,wasAlpha=*alphaTesting!=0;
+    const int priorComparison=*depthComparison;
+    (*enableDepth)();(*disableDepthWrite)();(*disableBlend)();(*disableAlpha)();
+    (*setDepthComparison)(42); // LESSEQUAL, as for the lasers.
+    (*unbindVertexBuffers)();
+    useSimpleShader(0);
+    for(unsigned i=0;i!=shown;++i) {
+        const auto &r=readouts[i];
+        ammoReadoutTriangles(r.count,r.screen->width,r.screen->height,
+            [&](AmmoReadoutLayer layer,float u0,float v0,float u1,float v1,float u2,float v2) {
+                wheelBatch.triangle(r.screen->colour[unsigned(layer)],r.frame.at(u0,v0),r.frame.at(u1,v1),r.frame.at(u2,v2));
+            });
+        wheelBatch.flush();
+    }
+    (*unbindVertexBuffers)(); // Leave no client arrays bound to later native draws.
+    if(wasDepth)(*enableDepth)();
+    else (*disableDepth)();
+    if(wasWrite)(*enableDepthWrite)();
+    else (*disableDepthWrite)();
+    if(wasBlend)(*enableBlend)();
+    else (*disableBlend)();
+    if(wasAlpha)(*enableAlpha)();
+    else (*disableAlpha)();
+    (*setDepthComparison)(priorComparison);
+}
 static uint32_t wheelTint(uint8_t grey,uint8_t alpha) {
     return grey|uint32_t(grey)<<8|uint32_t(grey)<<16|uint32_t(alpha)<<24;
 }
@@ -12826,6 +12924,7 @@ bool attach(bool headless) {
         toId(&boneHandIdent, "Hand");
         toId(&bonePalmIdent, "Palm");
         toId(&boneArmIdent, "Arm");
+        for (size_t i = 0; i != std::size(AmmoScreens); ++i) toId(&ammoScreenBones[i], AmmoScreens[i].bone);
     }
 #define H(module, name, fn, orig)                                                                            \
     ok = hook(module, name, reinterpret_cast<void *>(fn), reinterpret_cast<void **>(&orig)) && ok
