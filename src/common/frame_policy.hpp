@@ -94,12 +94,16 @@ inline bool eligibleFrame(const Request &r, uint64_t deadline, const FrameContex
 // Display only: a pair that was shown may stay up a little past its age limit
 // and across a tracking-epoch change (weapon switch, snap turn, recentre) until
 // the next pair arrives, instead of the frame going black. Session, reference,
-// focus, head tracking, gameplay and size still have to hold.
-constexpr uint64_t FrameHoldMs = 250;
+// focus, head tracking, gameplay and size still have to hold. The game's last
+// published state may be old: the game stalls for up to a second on a weapon
+// switch (first use loads it) and published nothing meanwhile; at 250 ms the
+// view went black until it caught up (ObeseCatLord). A state it did publish
+// (gameplay off: menu, load) still ends the hold at once.
+constexpr uint64_t FrameHoldMs = 250, UiHoldAgeMs = 1500;
 inline bool holdableFrame(const Request &r, uint64_t deadline, const FrameContext &c) {
     return r.sequence && r.session && r.reference && validTrackingEpoch(r.trackingGeneration) && r.reserved == 0 &&
            c.renderer && c.gameplay && c.focused && c.headValid && c.now < deadline + FrameHoldMs &&
-           c.now >= c.uiTick && c.now - c.uiTick <= UiAgeMs && r.session == c.session && r.reference == c.reference &&
+           c.now >= c.uiTick && c.now - c.uiTick <= UiHoldAgeMs && r.session == c.session && r.reference == c.reference &&
            validTrackingEpoch(c.epoch) && r.width == c.width && r.height == c.height && r.input.session == r.session &&
            r.input.reference == r.reference && r.input.focused && r.input.headValid;
 }

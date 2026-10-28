@@ -178,7 +178,7 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
         if (view >= 0 && view < 96 && (matrix == sp::NoMatrix || matrix + 3 <= 96) && (clip == sp::NoMatrix || clip + 4 <= 96)) {
             shaderReflectionView.emplace(s, ReflectionView{unsigned(view), matrix, clip});
             static unsigned traced = 0;
-            if (traced < 12) {
+            if (traced < 48) {
                 ++traced;
                 log("Single pass: view-lit program %p views from c%d (rows c%d, clip c%d), set per eye", static_cast<void *>(s), view,
                     matrix == sp::NoMatrix ? -1 : int(matrix), clip == sp::NoMatrix ? -1 : int(clip));

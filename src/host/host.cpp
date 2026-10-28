@@ -45,7 +45,7 @@ using namespace ss2vr::options_model;
 static_assert(sizeof(void *) == 8, "The OpenXR host must be built for x64");
 constexpr XrDuration ImageWaitNs = 2'000'000;
 constexpr ULONGLONG UiFreshMs = 250;
-constexpr uint64_t CachedPairHoldMs = 1000;
+constexpr uint64_t CachedPairHoldMs = 1500;
 
 template <class T> struct Com {
     T *p = nullptr;
@@ -2485,7 +2485,7 @@ struct Host {
             cachedRequest = reply;
             cachedClearance = clearance;
             // A dropped pair or two must not blank the world: the last pair stays
-            // up (the runtime reprojects it to the current head pose) for a second.
+            // up (the runtime reprojects it to the current head pose) for 1.5 s.
             cachedDeadline = deadline - FrameAgeMs + CachedPairHoldMs;
             cachedPresentation = presentation;
             cachedFoveated = reply.foveated == 1;

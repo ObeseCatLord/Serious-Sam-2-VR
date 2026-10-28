@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <iterator>
+#include <utility>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -405,8 +406,12 @@ inline int reflectionViewConstant(const uint32_t *words, size_t count, unsigned 
     matrix = NoMatrix;
     if (clip) *clip = NoMatrix;
     if (!words || count < 2 || words[0] != VsVersion11) return -1;
-    int view = -1;
-    unsigned projection = NoMatrix;
+    int view = -1, skinnedView = -1;
+    unsigned projection = NoMatrix, projected = NoMatrix;
+    // Skinned and animated models: `add rE, cV, -rP` where rP is the blended
+    // position the clip transform projects (m4x4 oPos/rC, rP, cClip), not v0.
+    // Floaterra's characters and props: their view vectors kept the centre camera.
+    std::vector<std::pair<int, unsigned>> skinned;
     for (size_t i = 1; i < count && words[i] != 0x0000ffffu;) {
         const uint32_t token = words[i], opcode = token & 0xffffu;
         if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
@@ -415,13 +420,29 @@ inline int reflectionViewConstant(const uint32_t *words, size_t count, unsigned 
         const uint32_t *op = words + i + 1;
         // `sub rE, cV, v0`, as the game's assembler emits it: `add rE, cV, -v0` (any mask with xyz).
         const unsigned negation = opcode == 0x02 ? 1u : 0u;
-        if (view < 0 && (opcode == 0x02 || opcode == 0x03) && n == 3 && regType(op[0]) == Temp &&
-            ((op[0] >> 16) & 0x7u) == 0x7 && regType(op[1]) == Const && regType(op[2]) == Input && regNum(op[2]) == 0 &&
-            !(op[1] >> 24 & 0xf) && ((op[2] >> 24) & 0xfu) == negation)
+        const bool difference = (opcode == 0x02 || opcode == 0x03) && n == 3 && regType(op[0]) == Temp &&
+                                ((op[0] >> 16) & 0x7u) == 0x7 && regType(op[1]) == Const && !(op[1] >> 24 & 0xf) &&
+                                ((op[2] >> 24) & 0xfu) == negation;
+        if (view < 0 && difference && regType(op[2]) == Input && regNum(op[2]) == 0)
             view = int(regNum(op[1]));
+        if (difference && regType(op[2]) == Temp && ((op[2] >> 16) & 0xffu) == 0xe4 && !(op[1] & 0x2000))
+            skinned.push_back({int(regNum(op[1])), regNum(op[2])});
         if (view >= 0 && matrix == NoMatrix && opcode == 0x17 && n == 3 && regType(op[2]) == Const) matrix = regNum(op[2]);
-        if (projection == NoMatrix && opcode == 0x14 && n == 3 && regType(op[2]) == Const) projection = regNum(op[2]);
+        if (projection == NoMatrix && opcode == 0x14 && n == 3 && regType(op[2]) == Const) {
+            projection = regNum(op[2]);
+            if (regType(op[1]) == Temp && ((op[1] >> 16) & 0xffu) == 0xe4 && !(op[1] >> 24 & 0xf)) projected = regNum(op[1]);
+        }
         i += 1 + size_t(n);
+    }
+    if (view < 0 && projected != NoMatrix)
+        for (const auto &[constant, position] : skinned)
+            if (position == projected && unsigned(constant) != projection) { skinnedView = constant; break; }
+    if (view < 0 && skinnedView >= 0) {
+        // The position is not v0: object rows (m3x3 of v-inputs) are not known to
+        // apply to it; the clip rows do, since that position is what they project.
+        matrix = NoMatrix;
+        if (clip) *clip = projection;
+        return clip ? skinnedView : -1;
     }
     if (matrix != NoMatrix && int(matrix) == view) matrix = NoMatrix;
     if (clip) *clip = projection;

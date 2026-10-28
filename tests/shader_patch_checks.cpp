@@ -313,6 +313,18 @@ int main() {
         assert(reflectionViewConstant(assembled.data(), assembled.size(), rows, &clip) == 7 && clip == 1);
         assembled[7] = src(Input, 0);
         assert(reflectionViewConstant(assembled.data(), assembled.size(), rows, &clip) == -1);
+        // Skinned: the view vector from the blended position the clip transform projects.
+        const std::vector<uint32_t> skinned{VsVersion11,
+            0x01, dst(Temp, 5, 0xf), src(Input, 0),                                  // mov r5, v0 (the blend)
+            0x02, dst(Temp, 1, 0xf), src(Const, 12), src(Temp, 5) | (1u << 24),      // add r1, c12, -r5
+            0x14, dst(Temp, 2, 0xf), src(Temp, 5), src(Const, 1), 0x0000ffffu};      // m4x4 r2, r5, c1
+        rows = 0; clip = 0;
+        assert(reflectionViewConstant(skinned.data(), skinned.size(), rows, &clip) == 12 && rows == NoMatrix && clip == 1);
+        assert(reflectionViewConstant(skinned.data(), skinned.size(), rows) == -1);
+        // A constant minus some other register (not the projected position) is not a view vector.
+        std::vector<uint32_t> other = skinned;
+        other[7] = src(Temp, 6) | (1u << 24);
+        assert(reflectionViewConstant(other.data(), other.size(), rows, &clip) == -1);
     }
     std::puts("shader patch ok");
 }

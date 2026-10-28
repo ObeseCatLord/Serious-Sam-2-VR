@@ -23,6 +23,27 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the Floaterra report (2026-10-28, evening)
+
+1. Reflections on animated models still followed the head (the dunk tank at
+   the start of your FLOATERRA save, characters, moving props): the per-eye
+   fix only knew shaders that take the view direction from the model's raw
+   vertices. Animated models first bend their vertices with their skeleton and
+   take it from the bent ones; those shaders (11 of the 40 at the dunk tank)
+   kept the centre camera. They now get each eye's own position as well.
+2. Black screen on some weapon switches: switching weapons (the first time in
+   a level especially) can stall the game for up to a second (your log: 350 to
+   960 ms after switches). The headset kept the last picture only while the
+   game's status was under 250 ms old, then went black until the game caught
+   up. It now keeps the last picture (turned with your head) through a stall
+   of up to 1.5 s. Leaving play (menu, loading) still switches at once.
+3. Throwing: your throws were measured at about 2 m/s of hand speed. The
+   release looked back only 120 ms for the swing's fastest moment, and the
+   grip opens later than that. It now looks back 250 ms, and `[Throwing]
+   Strength` defaults to 2.5 (was 1.6; up to 5 now). Each throw is logged as
+   `Grip carry released ... hand peak=<m/s> <ms> before release`, so a report
+   shows how fast the swing was measured.
+
 ## New: ammo readouts on every gun (2026-10-28)
 
 The ammo screens now cover every gun that uses ammo, placed as Serious Sam

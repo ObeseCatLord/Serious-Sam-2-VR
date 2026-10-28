@@ -2106,19 +2106,24 @@ static HandMotion carryMotion() {
     handMotion(0, .05, m);
     return m;
 }
-// Releasing: of the 50 ms windows in the last ~120 ms, the fastest. A throw's
-// hand slows into the release; the average up to the release fell short.
-static HandMotion throwMotion() {
+// Releasing: of the 50 ms windows in the last ~250 ms, the fastest. A throw's
+// hand slows into the release; the average up to the release fell short. The
+// grip opens well after the swing's peak (Index squeeze release): looking back
+// only 120 ms measured 1.5-2 m/s throws and the ball barely moved (ObeseCatLord).
+struct ThrowPeak { HandMotion motion; double age = 0; float releaseSpeed = 0; };
+static ThrowPeak throwMotion() {
     const auto &g = gripCarry;
-    HandMotion best;
+    ThrowPeak best;
     float bestSpeed = -1;
     const double now = g.samples ? g.history[(g.samples - 1) % 16].time : 0;
     for (unsigned back = 0; back + 2 < std::min(g.samples, 16u); ++back) {
-        if (now - g.history[(g.samples - 1 - back) % 16].time > .12) break;
+        const double age = now - g.history[(g.samples - 1 - back) % 16].time;
+        if (age > .25) break;
         HandMotion m;
         if (!handMotion(back, .05, m)) break;
         const float speed = dot(m.linear, m.linear);
-        if (speed > bestSpeed) { bestSpeed = speed; best = m; }
+        if (back == 0) best.releaseSpeed = std::sqrt(speed);
+        if (speed > bestSpeed) { bestSpeed = speed; best.motion = m; best.age = age; }
     }
     return best;
 }
@@ -2134,7 +2139,8 @@ static Pose carriedBodyPose() {
 }
 static void releaseGripCarry(void *puppet, bool throwIt) {
     const uint32_t bodyHandle = primaryField(puppet, 0x36c);
-    const HandMotion motion = throwMotion();
+    const ThrowPeak peak = throwMotion();
+    const HandMotion &motion = peak.motion;
     const Pose placed = carriedBodyPose();
     const Vec3 hand = gripCarry.samples ? gripCarry.history[(gripCarry.samples - 1) % 16].p : placed.p;
     const Vec3 velocity = (finite(placed) ? heldVelocity(motion, hand, placed.p) : motion.linear) *
@@ -2152,8 +2158,9 @@ static void releaseGripCarry(void *puppet, bool throwIt) {
             virtualCall<void>(body, 0x2c);            // Wake the body.
         }
     }
-    log("Grip carry released hand=%d velocity=%.2f,%.2f,%.2f spin=%.2f,%.2f,%.2f", gripCarry.hand, velocity.x, velocity.y, velocity.z,
-        motion.angular.x, motion.angular.y, motion.angular.z);
+    log("Grip carry released hand=%d velocity=%.2f,%.2f,%.2f spin=%.2f,%.2f,%.2f hand peak=%.2f m/s %.0f ms before release "
+        "(at release %.2f m/s)", gripCarry.hand, velocity.x, velocity.y, velocity.z, motion.angular.x, motion.angular.y,
+        motion.angular.z, std::sqrt(dot(motion.linear, motion.linear)), peak.age * 1000, peak.releaseSpeed);
     labThrown = {gripCarry.carriedHull, GetTickCount64()};
     if (carryIgnore.active && !carryIgnore.releasedAt) carryIgnore.releasedAt = GetTickCount64();
     gripCarry.hand = -1;

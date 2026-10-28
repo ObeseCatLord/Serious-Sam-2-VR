@@ -28,7 +28,7 @@ struct VrSettings {
     bool desktopWorld = false; // Also draw the world into the desktop window on VR frames (costs a third render).
     float uiAspect = 16.f / 9; // Aspect the game lays out its 2D view (menus, HUD, movies) at in VR.
     float drawDistance = 2; // Multiplies the game's model detail and clutter distances (1 = as configured).
-    float throwStrength = 1.6f; // Thrown objects' speed over the hand's (after the game's heavier gravity is matched).
+    float throwStrength = 2.5f; // Thrown objects' speed over the hand's (after the game's heavier gravity is matched).
     bool labWeaponAudit = false; // Private lab: cycle every weapon and log its hand references.
     int labWeaponAuditHand = 1;  // Hand whose selection the audit simulates.
     int labAuditSeconds = 5;     // Seconds each audited weapon is held.
