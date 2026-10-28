@@ -23,6 +23,37 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the water, cursor, wheel and controller report (2026-10-27, night)
+
+1. Water that changed with the head: the water's see-through/reflective blend
+   (its fresnel term) was worked out once per corner of its large triangles
+   from the head's position, so straight-edged light and dark wedges slid
+   across it as you moved. It is now worked out for every pixel from each
+   eye's own view, with the game's own fresnel strength.
+2. Choppy cursor in the pause menu: the paused game ran unpaced (hundreds of
+   frames a second, most of them never shown), so the menu and the world
+   behind it updated unevenly. Menus in VR (title, pause, Netricsa) now draw
+   one frame per headset frame. Lab: pause menu 55 fps, every frame shown;
+   title about 47 fps.
+3. Weapon wheel names are capitalized: Zap Gun, Quick Save, Quick Load, Game
+   Menu, VR Options, Left Hand / Right Hand.
+4. Index menu prompts show which hand: A and B with a small R (right A
+   selects, right B goes back), and the menus' X and Y as A and B with a small
+   L (left A, left B). They follow the controllers in hand right away.
+5. Steam Frame: its A, B, X and Y are all on the right controller, like a
+   gamepad, so the game's Xbox prompts are used as they are: A uses (select),
+   B opens the right wheel (back), X reloads (the menus' X), Y opens Netricsa
+   (the menus' Y). Left D-pad up opens the left wheel, down reloads.
+6. The Colt's laser turns off while its reload animation plays and comes back
+   when it ends.
+7. Quick save: the game's "cheats enabled" flag (left by the lab that made the
+   KINGSBURG save; it is what adds the pause menu's "cheats" entry) is cleared.
+   Your previous quick save is kept in the archive's backups.
+8. The grey "microphone enabled" box is not from the game or the mod: it is a
+   desktop notification shown in the headset by the WayVR overlay (Envision's
+   wlx-overlay-s), like the other notification bubbles. Turn notifications off
+   in WayVR's settings, or silence the desktop notification, to remove it.
+
 ## Changed after the cubemap, cursor, Netricsa, title and pop-in report (2026-10-27)
 
 1. Title screen: shown at 16:9 on a wider panel, exactly as on the desktop. The

@@ -739,10 +739,14 @@ struct Actions {
                 bind(menu, 1, "menu/click");
                 break;
             case 4:
-                // Valve Frame has a left D-pad/view and right ABXY/menu.
-                // Keep the established action semantics; no invented left XY.
+                // Valve Frame has a left D-pad/view and right ABXY/menu, as a gamepad:
+                // the game's Xbox prompts are its own buttons. A uses (menus: select),
+                // B opens the right wheel (menus: back), X reloads (the menus' X), Y
+                // opens Netricsa (the menus' Y); D-pad up the left wheel, down reloads.
                 bind(sprint, 1, click);
                 bind(reload, 0, "dpad_down/click");
+                bind(reload, 1, "x/click");
+                bind(netricsa, 1, "y/click");
                 bind(use, 1, "a/click");
                 bind(wheelOpen, 0, "dpad_up/click");
                 bind(wheelOpen, 1, "b/click");
@@ -1078,7 +1082,7 @@ struct WheelBitmap {
                                     : bubble == WheelBubble::QuickLoad ? L"Release to load"
                                                                        : L"Release to open");
         } else {
-            std::swprintf(heading, 64, hand ? L"Right hand" : L"Left hand");
+            std::swprintf(heading, 64, hand ? L"Right Hand" : L"Left Hand");
             std::swprintf(line, 64, L"Reach to an item, release to choose");
         }
         text(heading, size * .5f, height * .08f, title, RGB(255, 255, 255), size * .92f, height * .44f);

@@ -51,11 +51,16 @@ left stick moves the selection, Reload and the wheel button act as the X/Y menu
 functions (F1/F2); the wheel button also closes the Netricsa screen.
 While VR is live the menus show the game's own controller prompts (A/B/X/Y) and
 the game does not need window focus: menu keys go through the native menu
-dispatcher, and the engine is kept in its foreground state.
+dispatcher, and the engine is kept in its foreground state. With Index
+controllers each prompt is the A or B image with a small hand mark: A R (right A,
+confirm), B R (right B, back), A L (left A, the X function), B L (left B, the Y
+function).
 
 The host enables XR_VALVE_frame_controller_interaction only when enumerated, then
-suggests /interaction_profiles/valve/frame_controller_valve. Left X/Y paths are
-not used for that native profile. Its squeeze/value uses the existing release and
+suggests /interaction_profiles/valve/frame_controller_valve. Its A/B/X/Y are all
+on the right controller, as on a gamepad, so the game's own Xbox prompts apply:
+A uses (select), B opens the right wheel (back), X reloads (the menus' X), Y opens
+Netricsa (the menus' Y); left D-pad up opens the left wheel, down reloads. Its squeeze/value uses the existing release and
 availability gates. Older runtimes retain all existing suggestions; Valve's
 documented Frame → Generic Controller → Touch fallback is separate from Index.
 See [Valve's input documentation](https://partner.steamgames.com/doc/steamhardware/steamframe/input).

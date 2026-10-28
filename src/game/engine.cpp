@@ -2438,6 +2438,22 @@ static void update(void *p) {
     if (labSavePending.exchange(false) && labNativeSave) {
         // In the simulation step, as the fixture preparation's save (between frames
         // the game refused it as multiplayer). Core prefixes its root: a game path.
+        // Lab (SS2VR_LAB_CLEAR_CHEATS=1): the game info's cheating flags cleared first
+        // (CGameInfoEntity +0x94 IsCheatingEnabled, +0x190 HasEverCheated): a save
+        // made in the lab (cheats on for its preparation) is not marked cheated.
+        static const bool clearCheats = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_CLEAR_CHEATS", v, 2) == 1 && v[0] == L'1'; }();
+        uint32_t gameHandle = 0;
+        if (clearCheats && nativeGameInfo && resolve && nativeGameInfo(&gameHandle) && gameHandle) {
+            auto *game = static_cast<uint8_t *>(resolve(gameHandle));
+            if (game && readableMemory(game + 0x190, 4)) {
+                int32_t enabled = 0, ever = 0;
+                std::memcpy(&enabled, game + 0x94, 4);
+                std::memcpy(&ever, game + 0x190, 4);
+                std::memset(game + 0x94, 0, 4);
+                std::memset(game + 0x190, 0, 4);
+                log("Lab save: cheating flags cleared (enabled %d, ever %d)", enabled, ever);
+            }
+        }
         labNativeSave("Temp/SS2VR/lab.sav");
         log("Lab save of Temp/SS2VR/lab.sav issued");
     }
@@ -3014,7 +3030,14 @@ static void update(void *p) {
                     void *items = static_cast<uint8_t *>(p) + 0x8f8;
                     for (int id = 0; id < 24 && used + 24 < sizeof line; ++id)
                         if (inInventory(items, id)) used += std::snprintf(line + used, sizeof line - used, " %d:%d", id, ammo(items, id));
-                    log("Lab inventory (weapon:ammo) health=%d armor=%d%s", health(p), armor(p), line);
+                    int32_t cheats[2]{-1, -1}; // CGameInfoEntity +0x94 cheating enabled, +0x190 ever cheated.
+                    uint32_t gameHandle = 0;
+                    if (nativeGameInfo && nativeGameInfo(&gameHandle) && gameHandle)
+                        if (const auto *game = static_cast<const uint8_t *>(resolve(gameHandle)); game && readableMemory(game + 0x190, 4)) {
+                            std::memcpy(&cheats[0], game + 0x94, 4);
+                            std::memcpy(&cheats[1], game + 0x190, 4);
+                        }
+                    log("Lab inventory (weapon:ammo) health=%d armor=%d cheats=%d ever=%d%s", health(p), armor(p), cheats[0], cheats[1], line);
                 }
             }
         }
@@ -5302,6 +5325,39 @@ float frozenWorldVisibility() {
     return eyeWorldVisibility;
 }
 static void freezeLasers(const Request &request);
+// A Colt reloading (CBaseWeaponEntity::DoReload until OnWeaponReloaded, bounded):
+// its laser is off while the reload animation plays (main thread).
+namespace weapon_reload {
+static void(__fastcall *originalDoReload)(void *, void *) = nullptr;
+static void(__fastcall *originalReloaded)(void *, void *) = nullptr;
+static void *weapon[2]{};
+static uint64_t since[2]{};
+constexpr uint64_t LongestMs = 3000;
+static void __fastcall doReload(void *w, void *edx) {
+    const uint64_t now = GetTickCount64();
+    const unsigned slot = weapon[0] == w || !weapon[0] || now - since[0] > LongestMs ? 0 : 1;
+    weapon[slot] = w;
+    since[slot] = now;
+    static unsigned traced = 0;
+    if (traced < 8) { ++traced; log("Weapon reload started %p", w); }
+    originalDoReload(w, edx);
+}
+static void __fastcall reloaded(void *w, void *edx) {
+    for (unsigned i = 0; i != 2; ++i)
+        if (weapon[i] == w) {
+            static unsigned traced = 0;
+            if (traced < 8) { ++traced; log("Weapon reload finished %p after %llu ms", w, static_cast<unsigned long long>(GetTickCount64() - since[i])); }
+            weapon[i] = nullptr;
+        }
+    originalReloaded(w, edx);
+}
+static bool reloading(const void *w) {
+    const uint64_t now = GetTickCount64();
+    for (unsigned i = 0; i != 2; ++i)
+        if (w && weapon[i] == w && now - since[i] < LongestMs) return true;
+    return false;
+}
+} // namespace weapon_reload
 static void drawLasers();
 static bool drivenVehicle(void *ride);
 static void drawVoiceIndicators();
@@ -6994,6 +7050,12 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
         if ((!settings.lasers && !(s.rider.handheld() && s.zoom[h])) || !s.input.handValid[m] ||
             (!s.rider.seated() && !s.input.gripValid[m]))
             { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,1);continue; }
+        // A Colt's laser is off while it reloads (the gun spins and opens).
+        if (!s.rider.seated()) {
+            void *held = s.handle[h] && resolve ? resolve(s.handle[h]) : nullptr;
+            if (held && weapon_reload::reloading(held) && primaryField(held, 0xb4) == 12)
+                { laserTraceValue(LaserTraceStage::Sample,"rejected",s,h,queryRequest.sequence,1);continue; }
+        }
         // Driven vehicles (hoverbike, UFO, cars) show no beam; turrets and
         // hand-aimed creatures keep theirs.
         if (s.rider.seated() && drivenVehicle(resolve(s.rider.ride)))
@@ -12805,6 +12867,8 @@ bool attach(bool headless) {
         H(g, "?GetProjectionMatrix@CPuppetEntity@SeriousEngine@@QAE?AVMatrix44f@2@XZ", project,
           originalProjection);
         H(g, "?Render3D@CPuppetEntity@SeriousEngine@@UAEXXZ", render, originalRender);
+        H(g, "?DoReload@CBaseWeaponEntity@SeriousEngine@@UAEXXZ", weapon_reload::doReload, weapon_reload::originalDoReload);
+        H(g, "?OnWeaponReloaded@CBaseWeaponEntity@SeriousEngine@@UAEXXZ", weapon_reload::reloaded, weapon_reload::originalReloaded);
         H(g, "?GetViewOrigin@CPlayerPuppetEntity@SeriousEngine@@UAE?AVQuatVect@2@W4LOSRequestPurpose@2@@Z", playerViewOrigin,
           originalViewOrigin);
         H(g, "?RenderView@CPlayerBrainEntity@SeriousEngine@@UAEXXZ", brainRender, originalBrainRender);

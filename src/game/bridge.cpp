@@ -6,6 +6,7 @@
 #include "common/single_pass_math.hpp"
 #include "common/native_ui.hpp"
 #include "common/native_ui_finish.hpp"
+#include "common/menu_prompt.hpp"
 #include "common/world_markers.hpp"
 #include "game.hpp"
 #include "menu.hpp"
@@ -2220,53 +2221,154 @@ static void followCanvasResolution(int32_t w, int32_t h) noexcept {
 }
 // Menu button prompts for the controller in hand: the menus show Xbox A/B/X/Y
 // images, and Index has only A and B per hand (its menu X function is left A,
-// Y left B). With Index the X and Y images load as A and B. Resources load at
-// startup, before any controller is known, so the last profile seen is kept in
-// headset-view.ini ([Controls] Prompts).
-using ObtainResource = void *(__cdecl *)(void **, void *, int, int, int, const char *, const char *);
-static ObtainResource originalObtainResource = nullptr;
-static bool indexPrompts = false;
-static bool endsWithNoCase(const char *text, const char *tail) {
-    const size_t n = std::strlen(text), m = std::strlen(tail);
-    return n >= m && !_stricmp(text + n - m, tail);
-}
-static void *__cdecl obtainResource(void **out, void *type, int method, int a, int b, const char *path, const char *name) {
-    if (indexPrompts && path) {
-        const char *replacement = endsWithNoCase(path, "Textures/Menu/X_button.tex") ? "Content/SeriousSam2/Textures/Menu/A_button.tex"
-                                : endsWithNoCase(path, "Textures/Menu/Y_button.tex") ? "Content/SeriousSam2/Textures/Menu/B_button.tex"
-                                : nullptr;
-        if (replacement) {
-            static unsigned traced = 0;
-            if (traced < 4) { ++traced; log("Menu prompt %s shown as %s (Index)", path, replacement); }
-            path = replacement;
-        }
-    }
-    return originalObtainResource(out, type, method, a, b, path, name);
-}
+// Y left B; A and B are right A and B: common/menu_prompt.hpp). With Index each
+// prompt is drawn as the A or B image with a small hand mark (R or L) at its
+// corner, from the controllers in hand (notePromptProfile). Before any is seen
+// (the title) the last profile seen applies, kept in headset-view.ini
+// ([Controls] Prompts).
+static std::atomic<bool> indexPrompts{false};
 static void installPromptImages() noexcept {
     const auto cache = canvasCache();
     wchar_t value[16]{};
     if (!cache.empty()) GetPrivateProfileStringW(L"Controls", L"Prompts", L"", value, 16, cache.c_str());
-    indexPrompts = !_wcsicmp(value, L"index");
-    const HMODULE core = GetModuleHandleW(L"Core.dll");
-    void *obtain = core ? reinterpret_cast<void *>(GetProcAddress(core,
-        "?resObtainResource@SeriousEngine@@YA?AV?$Ptr@VCResource@SeriousEngine@@@1@PAVCDataType@1@W4ResObtainMethod@1@HHPBD2@Z")) : nullptr;
-    const bool ok = obtain && MH_CreateHook(obtain, reinterpret_cast<void *>(obtainResource), reinterpret_cast<void **>(&originalObtainResource)) == MH_OK &&
-                    MH_EnableHook(obtain) == MH_OK;
-    log("Menu prompts hook=%d profile=%ls", ok, value[0] ? value : L"(none yet)");
+    indexPrompts.store(!_wcsicmp(value, L"index"), std::memory_order_relaxed);
+    log("Menu prompts profile=%ls", value[0] ? value : L"(none yet)");
 }
-// The controller profile in hand, for the next start's prompt images.
+// Sam2Game keeps its prompt textures in four slots (RVA 40A014: A, B, X, Y). Its
+// prompt getter (RVA 1AB090, its only reader) resolves a slot's resource proxy
+// in place and returns it, and both prompt layouts draw that texture with
+// gfuPutGradientTexturePart3f (corner x0,y0 at uv 0,0). Hooked there, a drawn
+// texture is a prompt when it is one of the slots: the X and Y images stay
+// their own resources (they used to load as A and B, which made the slots
+// indistinguishable), and the draw puts the A or B image there instead and the
+// hand mark over it in the current font: the prompt label's (drawn next with
+// gfuPutColorText3f), a glyph quad through the same call, so it shares the
+// prompt's coordinates, fade and blend state. Xbox prompts pass through as drawn.
+struct PromptBox3 {float x0, y0, z0, x1, y1, z1;};
+struct PromptBox2 {float x0, y0, x1, y1;};
+struct PromptVector2 {float x, y;};
+using PutTexturePart = void(__cdecl *)(const void *, const PromptBox3 *, const PromptBox3 *, const uint32_t *);
+static PutTexturePart originalPutTexturePart = nullptr;
+static void *(__cdecl *promptCurrentFont)() = nullptr;
+static void *(__thiscall *promptFontTexture)(void *) = nullptr;
+static PromptBox2 *(__thiscall *promptFontGlyph)(void *, PromptBox2 *, long) = nullptr; // Hidden-return Box2f.
+static PromptVector2 *(__cdecl *promptTextRect)(PromptVector2 *, const char *, const void *) = nullptr; // Hidden return.
+static uintptr_t promptSlots = 0; // Slot A's address once the getter's reads are confirmed.
+static void *promptSlot(MenuPrompt prompt) noexcept {
+    void *texture = nullptr;
+    std::memcpy(&texture, reinterpret_cast<const void *>(promptSlots + 4 * unsigned(prompt)), sizeof texture);
+    return texture;
+}
+// The image drawn instead: its proxy (a slot no prompt has asked for yet)
+// resolved as the getter does (vtable 3), for this draw only: the slot keeps
+// the proxy and its reference.
+static const void *promptSlotTexture(MenuPrompt prompt) noexcept {
+    void *texture = promptSlot(prompt);
+    if (texture && readableMemory(texture, 8) && (static_cast<const uint8_t *>(texture)[4] & 1u)) {
+        using Replacement = void *(__thiscall *)(void *);
+        texture = (*static_cast<Replacement **>(texture))[3](texture);
+    }
+    return texture;
+}
+static void drawPromptMark(char hand, const PromptBox3 &icon, const uint32_t *colors) noexcept {
+    void *font = promptCurrentFont();
+    const void *texture = font ? promptFontTexture(font) : nullptr;
+    PromptBox2 glyph{};
+    PromptVector2 extent{};
+    const char text[2]{hand, 0};
+    if (texture) {
+        promptFontGlyph(font, &glyph, long(uint8_t(hand)));
+        promptTextRect(&extent, text, font);
+    }
+    PromptMarkBox box;
+    if (!texture || !std::isfinite(glyph.x0 + glyph.y0 + glyph.x1 + glyph.y1) || glyph.x1 <= glyph.x0 ||
+        glyph.y1 <= glyph.y0 || !(extent.y > 0) ||
+        !promptMarkBox(icon.x0, icon.y0, icon.x1, icon.y1, extent.x / extent.y, box)) {
+        static bool traced = false;
+        if (!traced) { traced = true; log("Menu prompt hand mark %c not drawn: no usable current font", hand); }
+        return;
+    }
+    const uint32_t tint = colors ? colors[0] : 0xffffffffu;
+    const PromptBox3 uv{glyph.x0, glyph.y0, 0, glyph.x1, glyph.y1, 0};
+    const auto put = [&](float dx, float dy, uint32_t color) {
+        const PromptBox3 at{box.x0 + dx, box.y0 + dy, icon.z0, box.x1 + dx, box.y1 + dy, icon.z1};
+        const uint32_t corner[4]{color, color, color, color};
+        originalPutTexturePart(texture, &at, &uv, corner);
+    };
+    // A dark outline (eight offsets) keeps the mark legible over any button colour.
+    const float d = std::fabs(box.y1 - box.y0) * PromptMarkOutline;
+    const uint32_t outline = promptMarkColor(tint, 0x000000, .85f);
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x)
+            if (x || y) put(float(x) * d, float(y) * d, outline);
+    put(0, 0, promptMarkColor(tint, 0xffffff, 1));
+}
+static void __cdecl putTexturePart(const void *texture, const PromptBox3 *dest, const PromptBox3 *uv, const uint32_t *colors) {
+    // The getter has just resolved the drawn slot in place: plain compares (this
+    // call also draws other 2D images every frame).
+    MenuPrompt prompt = MenuPrompt::None;
+    if (texture && dest && promptSlots && indexPrompts.load(std::memory_order_relaxed))
+        for (const MenuPrompt slot : {MenuPrompt::A, MenuPrompt::B, MenuPrompt::X, MenuPrompt::Y})
+            if (texture == promptSlot(slot)) { prompt = slot; break; }
+    const PromptMark mark = indexPromptMark(prompt);
+    const void *image = mark.hand ? promptSlotTexture(mark.image) : nullptr;
+    if (!image) { originalPutTexturePart(texture, dest, uv, colors); return; }
+    originalPutTexturePart(image, dest, uv, colors);
+    drawPromptMark(mark.hand, *dest, colors);
+    static bool traced[4]{};
+    if (!traced[unsigned(prompt)]) {
+        traced[unsigned(prompt)] = true;
+        static const char names[] = "ABXY";
+        log("Menu prompt %c drawn as %c with hand mark %c at %.1f,%.1f-%.1f,%.1f", names[unsigned(prompt)],
+            names[unsigned(mark.image)], mark.hand, dest->x0, dest->y0, dest->x1, dest->y1);
+    }
+}
+// Once Sam2Game is loaded (the slots live there).
+static void installPromptMarks(HMODULE game) noexcept {
+    const auto base = reinterpret_cast<uintptr_t>(game);
+    // The getter's slot reads (mov ecx,[slot]) at RVA 1AB0BA, 1AB0F7, 1AB12E, 1AB165.
+    constexpr uint32_t reads[4]{0x1ab0ba, 0x1ab0f7, 0x1ab12e, 0x1ab165};
+    bool slots = true;
+    for (unsigned i = 0; i != 4 && slots; ++i) {
+        uint8_t code[6]{};
+        uint32_t address = 0;
+        slots = readableMemory(reinterpret_cast<const void *>(base + reads[i]), sizeof code);
+        if (slots) std::memcpy(code, reinterpret_cast<const void *>(base + reads[i]), sizeof code);
+        std::memcpy(&address, code + 2, sizeof address);
+        slots = slots && code[0] == 0x8b && code[1] == 0x0d && address == base + 0x40a014 + 4 * i;
+    }
+    const HMODULE engine = GetModuleHandleW(L"Engine.dll");
+    const auto symbol = [&](const char *name, auto &out) {
+        out = engine ? reinterpret_cast<std::remove_reference_t<decltype(out)>>(GetProcAddress(engine, name)) : nullptr;
+        return out != nullptr;
+    };
+    void *put = engine ? reinterpret_cast<void *>(GetProcAddress(engine,
+        "?gfuPutGradientTexturePart3f@SeriousEngine@@YAXPBVCTexture@1@ABVBox3f@1@1PBK@Z")) : nullptr;
+    const bool font = symbol("?gfuGetCurrentFont@SeriousEngine@@YAPAVCFontInstance@1@XZ", promptCurrentFont) &&
+        symbol("?GetFontTexture@CFontInstance@SeriousEngine@@QAEPAVCTexture@2@XZ", promptFontTexture) &&
+        symbol("?GetCharTexPos@CFontInstance@SeriousEngine@@QAE?AVBox2f@2@J@Z", promptFontGlyph) &&
+        symbol("?gfuGetTextRect@SeriousEngine@@YA?AVVector2f@1@PBDPBVCFontInstance@1@@Z", promptTextRect);
+    const bool ok = slots && font && put &&
+        MH_CreateHook(put, reinterpret_cast<void *>(putTexturePart), reinterpret_cast<void **>(&originalPutTexturePart)) == MH_OK;
+    if (ok) promptSlots = base + 0x40a014; // Before the hook can run.
+    const bool enabled = ok && MH_EnableHook(put) == MH_OK;
+    if (ok && !enabled) promptSlots = 0;
+    log("Menu prompt hand marks hook=%d slots=%d font=%d", enabled, slots, font);
+}
+// The controller profile in hand: the prompts follow it now, and the next
+// start's title shows it.
 static void notePromptProfile(bool index) noexcept {
     static int noted = -1;
     if (noted == int(index)) return;
     noted = int(index);
+    indexPrompts.store(index, std::memory_order_relaxed);
     const auto cache = canvasCache();
     wchar_t value[16]{};
     if (!cache.empty()) GetPrivateProfileStringW(L"Controls", L"Prompts", L"", value, 16, cache.c_str());
     const wchar_t *next = index ? L"index" : L"abxy";
     if (cache.empty() || !_wcsicmp(value, next)) return;
     WritePrivateProfileStringW(L"Controls", L"Prompts", next, cache.c_str());
-    log("Menu prompts for %ls controllers from the next start", next);
+    log("Menu prompts for %ls controllers (kept for the next start)", next);
 }
 // The main menu (title) is created (CMainMenu::PostCreate) as a level ends: the
 // front end's canvas aspect is set just before it, not the level's 2D aspect.
@@ -2287,6 +2389,7 @@ void installMainMenuLayout() noexcept {
         MH_CreateHook(target, reinterpret_cast<void *>(mainMenuPostCreate), reinterpret_cast<void **>(&originalMainMenuPostCreate)) == MH_OK &&
         MH_EnableHook(target) == MH_OK;
     if (!ok) log("Main menu layout hook unavailable");
+    installPromptMarks(sam);
 }
 void installEyeCanvas() noexcept {
     static bool installed = false;
@@ -2865,7 +2968,34 @@ static bool requestWaiting() {
         if (slot.state == SlotState::Requested && !slot.cancelled) return true;
     return false;
 }
+// Interactive menus in VR (the title's, a pause menu, Netricsa): one game frame
+// per headset frame, so the menu image (and the game's cursor in it) and the
+// world live behind it advance evenly. Without it a paused game ran unpaced (its
+// 33 fps menu cap lifted, and frames that took no pair do not wait in
+// paceToHeadset): hundreds of frames a second, its pairs and menu copies
+// irregular. The host publishes a new input sample each frame.
+static bool menuFramePaced = false; // Set by presentBody for its frame.
+static void paceMenuToHeadset() {
+    static uint64_t paced = 0;
+    const auto sequence = [] {
+        Lock l(channel, 2);
+        return l ? channel.shared->latest.sequence : 0;
+    };
+    uint64_t now = sequence();
+    if (!now) return; // Never stall on contention.
+    const LARGE_INTEGER start = PerfClock::now();
+    const ULONGLONG deadline = GetTickCount64() + 25;
+    while (now == paced && GetTickCount64() < deadline && !stopping) {
+        Sleep(1);
+        pollSharedFences();
+        now = sequence();
+    }
+    paced = now;
+    perf.wait += PerfClock::seconds(start, PerfClock::now());
+    ++perf.waits;
+}
 static void paceToHeadset() {
+    if (menuFramePaced && channel.shared && !stopping) { paceMenuToHeadset(); return; }
     if (!lastPairTick || GetTickCount64() - lastPairTick > 250 || !channel.shared || stopping) return;
     if (requestWaiting()) return;
     const LARGE_INTEGER start = PerfClock::now();
@@ -2975,6 +3105,7 @@ static void collectMenuImage() {
     });
 }
 static void presentBody(IDirect3DDevice9 *d) {
+    menuFramePaced = false; // Until this frame is known to be an interactive menu's.
     {
         const LARGE_INTEGER t = PerfClock::now();
         if (perf.lastPresent.QuadPart) { perf.frame += PerfClock::seconds(perf.lastPresent, t); ++perf.frames; }
@@ -3216,6 +3347,7 @@ static void presentBody(IDirect3DDevice9 *d) {
     // Netricsa takes its controls as player commands (engine poll): no menu keys,
     // Escape would open the pause menu over it.
     const bool netricsa = netricsaShown();
+    menuFramePaced = vrInputLive() && (nativeMenu || (netricsa && levelActive()));
     // A movie (the title demo, in-level films) stops on Enter, Space, Escape or a
     // click (its own bindings), never on menu commands: A or B posts Enter.
     const bool movie = menus::movieOnTop();

@@ -119,7 +119,20 @@ int main() {
             if (out[i] == 0x01 && out[i + 1] == dst(TexCrdOut, 2, 0xf) && out[i + 2] == src(Temp, 10)) lookupWritten = true;
             if (out[i] == 0x07 && out[i + 1] == dst(Temp, 10, 0x8)) sphere = true; // The per-vertex sphere's rsq.
         }
-        assert(fromAnchor && fromEye && rayTurned && viewWritten && lookupWritten && !sphere);
+        assert(fromAnchor && fromEye && rayTurned && viewWritten && lookupWritten && !sphere && perPixel.fresnel == -1);
+        // Its fresnel term (mad r0.w, r0.w, c11.x, c11.y) is left at c11.y for the pixel program.
+        std::vector<uint32_t> fresnel = water;
+        fresnel.insert(fresnel.begin() + 10, {0x04, dst(Temp, 0, 0x8), src(Temp, 0, 0xffu), src(Const, 11, 0x00u), src(Const, 11, 0x55u)});
+        VertexInfo withFresnel;
+        assert(patchVertexShader(fresnel.data(), fresnel.size(), out, &withFresnel, 30, true, 0, true) && withFresnel.fresnel == 11);
+        bool edgeOn = false, fresnelLeft = false;
+        for (size_t i = 0; i + 4 < out.size(); ++i) {
+            if (out[i] == 0x01 && out[i + 1] == dst(Temp, 0, 0x8) && out[i + 2] == src(Const, 11, 0x55u)) edgeOn = true;
+            if (out[i] == 0x04 && out[i + 1] == dst(Temp, 0, 0x8) && out[i + 3] == src(Const, 11, 0x00u)) fresnelLeft = true;
+        }
+        assert(edgeOn && !fresnelLeft);
+        VertexInfo cubeFresnel; // The per-vertex cube variant keeps it.
+        assert(patchVertexShader(fresnel.data(), fresnel.size(), out, &cubeFresnel, 30, true) && cubeFresnel.fresnel == -1);
         // A program writing set 7 itself has no per-pixel variant.
         std::vector<uint32_t> seventh = water;
         seventh.insert(seventh.end() - 1, {0x01, dst(TexCrdOut, 7, 0xf), src(Temp, 0)});
@@ -210,6 +223,19 @@ int main() {
             if (perPixel[i] == 0x03000042u && perPixel[i + 1] == dst(Temp, 2, 0xf)) looked = true;
         }
         assert(viewDcl && normalized && reflected && met && looked && perPixel.back() == 0x0000ffffu);
+        // The fresnel term per pixel ((N . -V) c28.x + c28.y) scales the output alpha, saturated.
+        bool term = false, scaled = false;
+        for (size_t i = 0; i + 4 < perPixel.size(); ++i) {
+            if (perPixel[i] == 0x04000004u && perPixel[i + 3] == src(Const, 28, 0x00u) && perPixel[i + 4] == src(Const, 28, 0x55u)) term = true;
+            if (perPixel[i] == 0x03000005u && perPixel[i + 1] == (dst(Temp, 2, 0x8) | 0x00100000u) &&
+                perPixel[i + 2] == src(Temp, 2, 0xffu) && i + 5 < perPixel.size() && perPixel[i + 4] == 0x02000001u &&
+                perPixel[i + 5] == (0x80000000u | reg(Out, 0) | (0xfu << 16))) scaled = true;
+        }
+        assert(term && scaled);
+        // Without a colour output written from a temp there is no per-pixel variant.
+        std::vector<uint32_t> noOutput(ps.begin(), ps.end() - 4);
+        noOutput.push_back(0x0000ffffu);
+        assert(!patchWaterPixelShader(noOutput.data(), noOutput.size(), cube, sampler, 1, false, true));
         // A program using c26 or reading t7 keeps the per-vertex variant only.
         std::vector<uint32_t> busy26 = ps;
         busy26.insert(busy26.end() - 1, {0x02000001u, dst(Temp, 3, 0xf), src(Const, 26)});

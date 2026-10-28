@@ -125,7 +125,7 @@ struct OptionsBitmap {
         const LONG W = LONG(width), H = LONG(height);
         box({0, 0, W, H}, RGB(16, 20, 26));
         box({0, 0, W, LONG(L::TitleBottom * H)}, RGB(24, 40, 60));
-        text(L"VR options", {LONG(L::Margin * W), 0, W / 2, LONG(L::TitleBottom * H)}, title, RGB(255, 255, 255), DT_LEFT);
+        text(L"VR Options", {LONG(L::Margin * W), 0, W / 2, LONG(L::TitleBottom * H)}, title, RGB(255, 255, 255), DT_LEFT);
         text(desktop ? L"Click a tab, or the arrows beside a value" : L"Point and pull the trigger, or use the stick", {W / 2, 0, LONG((1 - L::Margin) * W), LONG(L::TitleBottom * H)}, small,
              RGB(150, 170, 190), DT_RIGHT);
         for (unsigned i = 0; i < tabCount; ++i) {
@@ -186,7 +186,7 @@ struct OptionsBitmap {
         const LONG W = LONG(width), H = LONG(height);
         box({0, 0, W, H}, RGB(0, 0, 0));
         box({2, 2, W - 2, H - 2}, hovered ? RGB(40, 120, 190) : RGB(24, 40, 60), hovered ? RGB(255, 236, 160) : RGB(90, 150, 210), H / 2);
-        text(L"VR options", {0, 0, W, H}, button, RGB(255, 255, 255), DT_CENTER);
+        text(L"VR Options", {0, 0, W, H}, button, RGB(255, 255, 255), DT_CENTER);
         GdiFlush();
         // Transparent outside the rounded button (the black corners).
         for (size_t i = 0; i < size_t(width) * height; ++i) {

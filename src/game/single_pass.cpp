@@ -95,7 +95,8 @@ std::unordered_map<IDirect3DVertexShader9 *, bool> shaderEyeClip;
 // c32..c34, from the program's model -> clip rows), the pixel variant sampling
 // the cube on the reflection image's sampler.
 struct ProbeVertex { IDirect3DVertexShader9 *variant = nullptr, *mirror = nullptr; unsigned clipMatrix = 0;
-                     IDirect3DVertexShader9 *perPixel = nullptr; }; // perPixel: the reflection found per pixel.
+                     IDirect3DVertexShader9 *perPixel = nullptr; // perPixel: the reflection found per pixel,
+                     int fresnel = -1; };                        // its fresnel factors' constant (applied per pixel).
 // The mirror variants ([Render] WaterMirror): model -> mirror camera clip in
 // c35..c38; the pixel program keeps its projective lookup, then the gain.
 constexpr unsigned MirrorConstant = 35;
@@ -171,6 +172,7 @@ IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s
             sp::patchVertexShader(words.data(), words.size(), patched, &perPixelInfo, WaterConstant, true, 0, true) &&
             perPixelInfo.eyeClip && FAILED(d->CreateVertexShader(reinterpret_cast<const DWORD *>(patched.data()), &probe.perPixel)))
             probe.perPixel = nullptr;
+        if (probe.perPixel) probe.fresnel = perPixelInfo.fresnel;
         sp::VertexInfo mirrorInfo;
         if (SUCCEEDED(s->GetFunction(words.data(), &got)) &&
             sp::patchVertexShader(words.data(), words.size(), patched, &mirrorInfo, WaterConstant, false, MirrorConstant) &&
@@ -754,8 +756,8 @@ bool waterDraw() noexcept {
 struct WaterConstantsScope {
     IDirect3DDevice9 *d;
     bool active = false, eyes = false, cube = false, mirrored = false, anchored = false, pixelSaved = false;
-    float savedAnchor[4]{}, savedPixel[8]{};
-    static constexpr unsigned PerPixelConstant = 26; // c26 normal, c27 sphere (shader_patch perPixel).
+    float savedAnchor[4]{}, savedPixel[12]{};
+    static constexpr unsigned PerPixelConstant = 26; // c26 normal, c27 sphere, c28 fresnel (shader_patch perPixel).
     float saved[20]{}, view[4]{}, offset[2][3]{}, savedMirror[16]{}, toMirror[2][16]{};
     IDirect3DTexture9 *reflection[2]{}; // Each eye's mirror image (water_mirror.hpp).
     // The cube's proxy sphere radius (env_probe), in the program's model units.
@@ -883,14 +885,23 @@ struct WaterConstantsScope {
         // Per pixel when both programs have it: the water's normal (its mesh is flat
         // at model y = 0, so the model's up turned into the world) and the sphere.
         const bool perPixel = vertex->second.perPixel && pixel.perPixel &&
-            SUCCEEDED(d->GetPixelShaderConstantF(PerPixelConstant, savedPixel, 2));
+            SUCCEEDED(d->GetPixelShaderConstantF(PerPixelConstant, savedPixel, 3));
         if (perPixel) {
             const float up[3]{rows[1], rows[5], rows[9]};
             const float length = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
             const float radius = env_probe::radius();
-            const float c[8]{up[0] / length, up[1] / length, up[2] / length, 0, .9f * radius, 1, radius * radius, 0};
-            d->SetPixelShaderConstantF(PerPixelConstant, c, 2);
+            // The fresnel term per pixel: the program's factors (x, edge-on value y),
+            // scaled by 1/y (the vertex program left y in its alpha); 0, 1 when it kept its own.
+            float factors[4]{0, 1, 0, 0}, fresnel[2]{0, 1};
+            if (vertex->second.fresnel >= 0 && SUCCEEDED(d->GetVertexShaderConstantF(UINT(vertex->second.fresnel), factors, 1)) &&
+                std::isfinite(factors[0]) && std::isfinite(factors[1]) && std::fabs(factors[1]) > 1e-3f)
+                fresnel[0] = factors[0] / factors[1];
+            const float c[12]{up[0] / length, up[1] / length, up[2] / length, 0, .9f * radius, 1, radius * radius, 0,
+                              fresnel[0], fresnel[1], 0, 0};
+            d->SetPixelShaderConstantF(PerPixelConstant, c, 3);
             pixelSaved = true;
+            static float traced = -1e9f;
+            if (traced != factors[0]) { traced = factors[0]; log("Single pass water fresnel per pixel: constant c%d = %.3f, %.3f", vertex->second.fresnel, factors[0], factors[1]); }
         }
         oSetVertexShader(d, perPixel ? vertex->second.perPixel : vertex->second.variant);
         oSetPixelShader(d, perPixel ? pixel.perPixel : pixel.variant);
@@ -925,7 +936,7 @@ struct WaterConstantsScope {
             d->SetTexture(pixel.sampler, image);
             if (mirrored) d->SetVertexShaderConstantF(MirrorConstant, savedMirror, 4);
             if (anchored) d->SetVertexShaderConstantF(CubeAnchorConstant, savedAnchor, 1);
-            if (pixelSaved) d->SetPixelShaderConstantF(PerPixelConstant, savedPixel, 2);
+            if (pixelSaved) d->SetPixelShaderConstantF(PerPixelConstant, savedPixel, 3);
             oSetVertexShader(d, variantOf(d, engineShader));
             oSetPixelShader(d, enginePixelShader);
             appliedPixelShader = enginePixelShader;

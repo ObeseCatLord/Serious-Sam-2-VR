@@ -28,10 +28,10 @@ inline WheelBubble wheelHoveredBubble(int32_t hover) {
 inline const wchar_t *wheelBubbleName(WheelBubble bubble) {
     switch (bubble) {
     case WheelBubble::Netricsa: return L"Netricsa";
-    case WheelBubble::Menu: return L"Game menu";
-    case WheelBubble::QuickSave: return L"Quick save";
-    case WheelBubble::QuickLoad: return L"Quick load";
-    case WheelBubble::VrOptions: return L"VR options";
+    case WheelBubble::Menu: return L"Game Menu";
+    case WheelBubble::QuickSave: return L"Quick Save";
+    case WheelBubble::QuickLoad: return L"Quick Load";
+    case WheelBubble::VrOptions: return L"VR Options";
     default: return L"";
     }
 }

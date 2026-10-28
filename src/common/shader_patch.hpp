@@ -34,6 +34,7 @@ struct VertexInfo {
     unsigned constants = 0;      // Highest constant register read + 1 (relative reads: 256).
     bool eyeClip = false;        // Patched with the per-eye world-fixed reflection lookup (water).
     unsigned clipMatrix = 0;     // With eyeClip: first of the model -> clip rows (c#..c#+3).
+    int fresnel = -1;            // perPixel: the fresnel factors' constant (left to the pixel program), else -1.
 };
 // The texcoord output carrying the eye test (8 when the program writes all).
 inline unsigned killSet(const VertexInfo &original) {
@@ -167,7 +168,11 @@ constexpr unsigned WaterViewSet = 7;
 // point relative to the anchor and set WaterViewSet the ray from the eye, both
 // in world space (turned by c<eyeClip+2..+4>); both are affine across a triangle,
 // so a large water polygon reflects as well as a fine one (per vertex, its few
-// big triangles showed as straight creases in the reflection).
+// big triangles showed as straight creases in the reflection). Its fresnel term
+// (`mad rA.w, rA.w, cF.x, cF.y`: the view's cosine to the normal, per vertex
+// from the head's position, interpolated over those triangles into straight
+// light and dark wedges that moved with the head) becomes cF.y, its value
+// edge-on; the pixel program applies the term per pixel (info.fresnel = F).
 inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, VertexInfo *infoOut = nullptr,
                               unsigned eyeClip = 0, bool probe = false, unsigned mirror = 0, bool perPixel = false) {
     using namespace detail;
@@ -291,6 +296,19 @@ inline bool patchVertexShader(const uint32_t *words, size_t count, std::vector<u
                 result.insert(result.end(), std::begin(world), std::end(world));
             }
         }
+        // Per pixel: the per-vertex fresnel term is left at its edge-on value (cF.y).
+        if (perPixel && clipAt && info.fresnel < 0 && opcode == 0x04 && n == 4) {
+            const uint32_t *op = words + i + 1;
+            if (regType(op[0]) == Temp && ((op[0] >> 16) & 0xfu) == 0x8 && regType(op[1]) == Temp &&
+                regNum(op[1]) == regNum(op[0]) && ((op[1] >> 16) & 0xffu) == 0xff && regType(op[2]) == Const &&
+                ((op[2] >> 16) & 0xffu) == 0x00 && regType(op[3]) == Const && regNum(op[3]) == regNum(op[2]) &&
+                ((op[3] >> 16) & 0xffu) == 0x55 && !(op[1] >> 24 & 0xf) && !(op[2] >> 24 & 0xf) && !(op[3] >> 24 & 0xf)) {
+                info.fresnel = int(regNum(op[2]));
+                result.insert(result.end(), {0x01u, op[0], src(Const, regNum(op[2]), 0x55u)}); // mov rA.w, cF.y
+                i += 5;
+                continue;
+            }
+        }
         // Probe: the texcoord the reflection lookup wrote (from rX) takes the direction.
         if (clipAt && probe && !reflectionWritten && i > clipAt && n >= 2 && regType(words[i + 1]) == TexCrdOut) {
             bool fromLookup = false;
@@ -368,7 +386,7 @@ inline int pixelOperands(uint32_t opcode) {
     default: return -1;
     }
 }
-constexpr unsigned Texture = 3;
+constexpr unsigned Texture = 3, ColorOut = 8;
 } // namespace detail
 // Texcoord sets a pixel program reads (bit per set); false if not understood.
 inline bool pixelTexcoords(const uint32_t *words, size_t count, uint32_t &sets) {
@@ -451,7 +469,10 @@ constexpr float WaterRipple = .15f; // Direction change for the ripple's texture
 // With `perPixel` (the vertex variant's perPixel): the lookup's texcoord holds
 // o = P - anchor and set WaterViewSet the view ray (world); each pixel reflects
 // the ray about the water's normal (c26), keeps o inside the sphere and finds
-// where the reflected ray meets it (c27 = 0.9 R, 1, R^2, 0; world units).
+// where the reflected ray meets it (c27 = 0.9 R, 1, R^2, 0; world units). The
+// fresnel term is applied per pixel too: the output alpha (the water's
+// translucency) is scaled by (N . -V) c28.x + c28.y, saturated (c28 = F.x / F.y,
+// 1 of the vertex program's factors when it left its own term at F.y, else 0, 1).
 inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vector<uint32_t> &out, unsigned &sampler,
                                   float gain = 1, bool projective = false, bool perPixel = false) {
     using namespace detail;
@@ -500,7 +521,19 @@ inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vect
         }
         i += 1 + len;
     }
-    if (!dclAt || (perPixel && temps + 2 > 12)) return false;
+    // The colour output's source (mov oC0, rS: the fresnel scales its alpha).
+    size_t output = 0;
+    unsigned outputReg = 0;
+    for (size_t i = 1; perPixel && i < count && words[i] != 0x0000ffffu;) {
+        const uint32_t token = words[i], opcode = token & 0xffffu;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const size_t len = (token >> 24) & 0xfu;
+        if (opcode == 0x01 && len == 2 && regType(words[i + 1]) == ColorOut && regNum(words[i + 1]) == 0 &&
+            ((words[i + 1] >> 16) & 0xfu) == 0xf && regType(words[i + 2]) == Temp && ((words[i + 2] >> 16) & 0xffu) == 0xe4 &&
+            !(words[i + 2] >> 24 & 0xf)) { output = i; outputReg = regNum(words[i + 2]); }
+        i += 1 + len;
+    }
+    if (!dclAt || (perPixel && (temps + 3 > 12 || !output || output < site))) return false;
     const auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
     std::vector<uint32_t> result;
     result.reserve(count + 16);
@@ -524,9 +557,11 @@ inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vect
         } else if (i == site && perPixel) {
             // Per pixel (world units): R = reflect(normalize(V), N); o kept inside the
             // sphere; s = sqrt(b^2 - c) - b with b = o.R, c = o.o - R^2; L = o + sR.
-            const uint32_t V = temps, O = temps + 1, neg = 1u << 24;
+            const uint32_t V = temps, O = temps + 1, F = temps + 2, neg = 1u << 24;
             result.insert(result.end(), {
                 0x02000024u, dst(Temp, V, 0x7), src(Texture, WaterViewSet),                      // nrm rV.xyz, t7
+                0x03000008u, dst(Temp, F, 0x1), src(Temp, V), src(Const, 26),                    // dp3 rF.x, V, N
+                0x04000004u, dst(Temp, F, 0x1), src(Temp, F, 0x00u) | neg, src(Const, 28, 0x00u), src(Const, 28, 0x55u), // fresnel
                 0x03000008u, dst(Temp, O, 0x8), src(Temp, V), src(Const, 26),                    // dp3 rO.w, V, N
                 0x03000002u, dst(Temp, O, 0x8), src(Temp, O, 0xffu), src(Temp, O, 0xffu),        // add rO.w, 2 V.N
                 0x04000004u, dst(Temp, V, 0x7), src(Temp, O, 0xffu) | neg, src(Const, 26), src(Temp, V), // R
@@ -550,6 +585,11 @@ inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vect
                 0x03000005u, dst(Temp, a, 0x7) | pp, src(Temp, a), src(Const, 29)});
             i = site + 12;
             continue;
+        } else if (i == output && perPixel) {
+            constexpr uint32_t saturate = 0x00100000u;
+            result.insert(result.end(), {0x03000005u, dst(Temp, outputReg, 0x8) | saturate, src(Temp, outputReg, 0xffu),
+                                         src(Temp, temps + 2, 0x00u)}); // mul_sat rS.w, rS.w, rF.x
+            result.insert(result.end(), words + i, words + i + 1 + len);
         } else if (i == site) {
             result.insert(result.end(), {
                 0x04000004u, dst(Temp, a, 0x7) | pp, src(Temp, b, 0x00u), src(Const, 30), src(Texture, c),
