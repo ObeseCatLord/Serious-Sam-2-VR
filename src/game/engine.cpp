@@ -10223,11 +10223,11 @@ struct WheelBatch {
     }
 };
 static WheelBatch wheelBatch;
-// Ammo counts on the uzi, minigun and rocket launcher screens (ammo_screen.hpp),
-// in each eye after the root world like the lasers. The screen follows the
-// model as this eye rendered it: the placement weaponAbs gave the model, its
-// stretch (the left hand's model is mirrored) and the live bone carrying the
-// screen, so idle sway and the minigun's hinged display take the digits along.
+// Ammo counts on the guns' readouts (ammo_screen.hpp), in each eye after the
+// root world like the lasers. The readout follows the model as this eye
+// rendered it: the placement weaponAbs gave the model, its stretch (the left
+// hand's model is mirrored) and the live bone carrying the readout, so idle
+// sway, the minigun's hinged display and Klodovik's arm take the digits along.
 // Opaque and depth tested (no depth writes) so the hand and anything in front
 // hide them. Main thread only; gfx state is restored after.
 static void drawAmmoScreens() {
@@ -10263,7 +10263,10 @@ static void drawAmmoScreens() {
         Readout &r=readouts[shown];
         if(!ammoScreenFrame(*screen,placed.placement,stretch,boneNow,r.frame))continue;
         r.screen=screen;
-        r.count=eyeSnapshot.ui.currentAmmo[h];
+        // The revolvers count down their cylinder: shots since the last reload
+        // (CBaseWeaponEntity+AC), read like +B4 above on this main thread.
+        r.count=ammoScreenCount(*screen,eyeSnapshot.ui.currentAmmo[h],
+            screen->load ? int32_t(primaryField(weapon,0xac)) : 0);
         ++shown;
         static bool traced[2][WeaponCount]{};
         if(!traced[h][id]) {
@@ -10289,7 +10292,7 @@ static void drawAmmoScreens() {
         ammoReadoutTriangles(r.count,r.screen->width,r.screen->height,
             [&](AmmoReadoutLayer layer,float u0,float v0,float u1,float v1,float u2,float v2) {
                 wheelBatch.triangle(r.screen->colour[unsigned(layer)],r.frame.at(u0,v0),r.frame.at(u1,v1),r.frame.at(u2,v2));
-            });
+            },r.screen->places);
         wheelBatch.flush();
     }
     (*unbindVertexBuffers)(); // Leave no client arrays bound to later native draws.

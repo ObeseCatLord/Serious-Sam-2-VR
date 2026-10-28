@@ -189,7 +189,7 @@ inline OptionsRow vrOptionRow(unsigned item, const VrSettings &settings, const V
                 fraction(settings.laserDistance, 10, 200), !settings.lasers};
     case OptAmmoScreens:
         return {L"Ammo screens", onOff(settings.ammoScreens),
-                L"The uzi, minigun and rocket launcher show your ammo on their small screens."};
+                L"Each gun shows its ammo on a small readout; the revolvers show the rounds in the cylinder."};
     case OptMenuDistance:
         return {L"Menu distance", format(L"%.1f m", double(settings.menuDistance)),
                 L"How far away the game's menus (and the head-mounted HUD) float.", L"", fraction(settings.menuDistance, 1.5f, 3)};

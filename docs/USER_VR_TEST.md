@@ -23,7 +23,11 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
-## New: ammo screens (2026-10-27, late)
+## New: ammo readouts on every gun (2026-10-28)
+
+The ammo screens now cover every gun that uses ammo, placed as Serious Sam
+Fusion's VR weapons place theirs: on the gun's centre line at the rear of its
+top, in front of the hand, facing you and tilted back, about 4.5 x 2.3 cm.
 
 1. Hold the uzi, the minigun and the rocket launcher in turn, in either hand
    (both uzis when dual wielding): each gun's small screen shows your ammo as
@@ -31,26 +35,28 @@ the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
    flip-up screen, amber on the rocket launcher). The digits sit on the screen
    in both eyes, move with the gun, read left to right in the left hand too,
    and are hidden by anything in front of the screen.
-2. Fire: the count drops with each shot (both uzis show the shared bullets).
-3. "Ammo screens" on the VR options menu's Interface page (`[Weapons]
-   AmmoScreens`) turns them off and on at once.
-
-## Changed after the ballista, throwing and reflections report (2026-10-28)
-
-1. Throwing: the game's objects fall about 2.6 times faster than real ones, so
-   a gentle VR throw dropped the ball at your feet. Throws are now sped up to
-   follow a real throw's arc, and `[Throwing] Strength` (default 1.6) adds to
-   that: the same throw leaves your hand about 1.5 times faster than before.
-2. Shine and reflections on objects (shiny weapons, metal, bump-mapped stone
-   and wood, posts): the game lit them from the centre of your head for both
-   eyes, so highlights and reflections looked painted on and moved with your
-   head. Each eye now uses its own position (reflection, specular, bump and
-   distance-fade programs). Lab V889.
-3. Cecil's crossbows (ballistas): in the lab they fire with the trigger from
-   both your CECIL save and your quick save (V888, V889): a loaded bolt is
-   visible on the crossbow, the right trigger shoots it, and further pulls
-   dry-fire until it is loaded again. Aim with your head. If one still will
-   not fire, note whether a bolt shows on it.
+2. Hold each of the others, in either hand where the game allows it, and
+   check the readout sits flat on its spot, reads left to right and is not
+   cut by the gun:
+   - Auto shotgun: rust-orange, on the rust slope at the top rear.
+   - Double shotgun: brass, on the back of the breech between the hammers.
+   - Grenade launcher: orange, on the carry handle's rear ramp below the
+     warning label (its own screen still shows the charge).
+   - Plasma rifle: teal, on the top deck just behind the sight hood.
+   - Klodovik: magenta, a wrist display on top of Sam's forearm.
+   - Cannon: red, on the sloped rear ring at the top of the barrel.
+   - Serious Bomb: one orange digit (bombs left) on the bomb's forehead.
+   - Revolvers: one silver-white digit standing on the top strap behind the
+     barrel, the rounds left in the cylinder: 6 after a reload, one less per
+     shot, back to 6 when the reload starts.
+   - Sniper: orange, on the rear slope of the receiver below the scope
+     (smaller: the receiver is narrow).
+   - Beam gun: cyan, in the middle of its winged display.
+   - Flamer: yellow, on the receiver's rear face behind the napalm tank.
+   The chainsaw and the zap gun (unlimited ammo) have none.
+3. Fire: the count drops with each shot (both uzis show the shared bullets).
+4. "Ammo screens" on the VR options menu's Interface page (`[Weapons]
+   AmmoScreens`) turns them all off and on at once.
 
 ## Changed after the water, cursor, wheel and controller report (2026-10-27, night)
 

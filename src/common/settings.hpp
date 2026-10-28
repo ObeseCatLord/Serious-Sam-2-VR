@@ -10,7 +10,7 @@ struct VrSettings {
     float fireHaptic = .35f, damageHaptic = .55f;
     bool lasers = true;
     float laserDistance = 100.f;
-    bool ammoScreens = true; // [Weapons] AmmoScreens: ammo counts on the uzi, minigun and rocket launcher screens.
+    bool ammoScreens = true; // [Weapons] AmmoScreens: ammo counts on the guns (ammo_screen.hpp).
     float renderScale = 1.f; // Multiplier on the runtime's recommended per-eye size.
     FoveationSettings foveation;
     bool snapTurn = false;                 // Smooth stick turning unless enabled.
