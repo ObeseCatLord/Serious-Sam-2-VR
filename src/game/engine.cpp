@@ -873,6 +873,18 @@ bool cinematicCameraActive() noexcept {
     uint32_t camera=0;std::memcpy(&camera,static_cast<uint8_t*>(info)+0x6c,4);
     return camera && resolve(camera);
 }
+// Why play is off (a bit per failing check, 0 = eligible): logged when it changes,
+// so a flat (black) view in a level names its cause.
+static unsigned trackingIneligibility(void *p) {
+    RiderIdentity rider;
+    const bool riderOk = readNativeRider(p, rider);
+    return unsigned(!nativeInputHealthy()) | unsigned(!hooksReady.load(std::memory_order_acquire)) << 1 |
+           unsigned(!local(p)) << 2 | unsigned(!(singlePlayer() || multiplayer::server() || multiplayer::negotiatedLocal())) << 3 |
+           unsigned(!(p && isAlive && isAlive(p))) << 4 | unsigned(p && isNetricsa(p)) << 5 | unsigned(menus::active()) << 6 |
+           unsigned(cinematicCameraActive()) << 7 | unsigned(!riderOk) << 8 |
+           unsigned(riderOk && !rider.seated() && !rider.handheld()) << 9 |
+           unsigned(riderOk && rider.handheld() && thirdPerson(p)) << 10;
+}
 // pausedView: a menu or Netricsa may be open (the stereo view behind it, no controls).
 static bool trackingEligible(void *p, bool pausedView = false) {
     RiderIdentity rider;
@@ -2534,6 +2546,23 @@ static void update(void *p) {
         advanceGeneration(s);
     }
     enabled = enabled && validTrackingEpoch(s.generation);
+    {
+        // Play off while a level runs: which check (bits: 0 input, 1 hooks, 2 local,
+        // 3 net mode, 4 dead, 5 Netricsa, 6 menu, 7 cinematic camera, 8 rider unread,
+        // 9 neither seated nor on foot, 10 third person, 11 rider changed,
+        // 12 stale input, 13 interruption, 14 epoch).
+        static unsigned lastReasons = ~0u, logged = 0;
+        unsigned reasons = enabled ? 0u : trackingIneligibility(p);
+        if (!enabled && !reasons)
+            reasons = unsigned(!riderValid || !nativeRiderCurrent(p, rider)) << 11 | unsigned(!fresh(input)) << 12 |
+                      unsigned(!s.interruption.permits(input, GetTickCount64(), inputProducer)) << 13 |
+                      unsigned(!validTrackingEpoch(s.generation)) << 14;
+        if (reasons != lastReasons && logged < 200) {
+            ++logged;
+            lastReasons = reasons;
+            log("Play %s reasons=0x%x", enabled ? "on" : "off", reasons);
+        }
+    }
     {
         // Entering or leaving a ride the rider is neither seated nor on foot for a
         // few ticks (the instant transitions above): the headset keeps the last

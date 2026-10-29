@@ -2551,6 +2551,27 @@ static void pollSharedFences() {
         }
     }
 }
+// The game's depth buffer or viewport left behind the eye canvas (a level change
+// resized the canvas, then its own setup did not follow): every frame went flat
+// and the headset black until a restart (ObeseCatLord, Kronor 6_2 at 2544x2544).
+// After a second of that, the game's own canvas resize runs again (as for a
+// window resize), a few times at most per canvas size.
+static uint64_t stereoMismatchSince = 0, stereoResyncAt = 0;
+static unsigned stereoResyncs = 0;
+static uint32_t stereoResyncCanvas[2]{};
+static void noteStereoTargetMismatch() noexcept {
+    const uint64_t now = GetTickCount64();
+    if (!stereoMismatchSince) stereoMismatchSince = now;
+    if (stereoResyncCanvas[0] != canvasWidth.load() || stereoResyncCanvas[1] != canvasHeight.load()) {
+        stereoResyncCanvas[0] = canvasWidth.load(); stereoResyncCanvas[1] = canvasHeight.load(); stereoResyncs = 0;
+    }
+    if (now - stereoMismatchSince > 1000 && now - stereoResyncAt > 2000 && stereoResyncs < 5) {
+        stereoResyncAt = now;
+        ++stereoResyncs;
+        canvasResizePending = true;
+        log("Stereo targets: canvas resize run again (%u of 5)", stereoResyncs);
+    }
+}
 static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 *&nativeDepth) {
     if (!device || !presentationChain || resetQuarantined)
         return false;
@@ -2581,8 +2602,20 @@ static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 
     D3DVIEWPORT9 viewport{};
     if (FAILED(depthResult) || depthDesc.MultiSampleType != D3DMULTISAMPLE_NONE ||
         depthDesc.Width < width || depthDesc.Height < height || FAILED(device->GetViewport(&viewport)) ||
-        viewport.X || viewport.Y || viewport.Width != width || viewport.Height != height)
+        viewport.X || viewport.Y || viewport.Width != width || viewport.Height != height) {
+        // Stereo off (the flat view shown): say why when it changes.
+        static uint64_t lastKey = 0;
+        static unsigned logged = 0;
+        const uint64_t key = uint64_t(depthDesc.Width) << 48 ^ uint64_t(depthDesc.Height) << 32 ^
+                             uint64_t(viewport.Width) << 16 ^ viewport.Height ^ uint64_t(viewport.X + viewport.Y) << 60;
+        if (key != lastKey && logged < 64) {
+            ++logged; lastKey = key;
+            log("Stereo targets unavailable: canvas %ux%u depth %ux%u viewport %lu,%lu %lux%lu",
+                width, height, depthDesc.Width, depthDesc.Height, viewport.X, viewport.Y, viewport.Width, viewport.Height);
+        }
+        noteStereoTargetMismatch();
         return false;
+    }
     const auto ensureWide = [&] {
         if (!singlePassEnabled || (wideColor && wideDepth)) return;
         if (FAILED(device->CreateRenderTarget(width * 2, height, colorFormat, D3DMULTISAMPLE_NONE, 0, FALSE, &wideColor, nullptr)) ||
@@ -2597,6 +2630,7 @@ static bool allocateBody(bool stereo, IDirect3DSurface9 *&bb, IDirect3DSurface9 
         desc.Format == colorFormat) {
         ensureWide();
         createSharedImages();
+        stereoMismatchSince = 0;
         Lock l(channel);
         if (l)
             channel.shared->rendererReady = 1;
@@ -3326,7 +3360,7 @@ static void presentBody(IDirect3DDevice9 *d) {
     autoContinue(nativeMenu, nativeMenu || !gameplay, now);
     static unsigned diagnostics = 0, previousClassification = ~0u;
     const unsigned classification = unsigned(nativeMenu) | (unsigned(gameplay) << 1) | (unsigned(stereoReady) << 2);
-    if (diagnostics < 16 && classification != previousClassification) {
+    if (diagnostics < 200 && classification != previousClassification) {
         ++diagnostics;
         previousClassification = classification;
         log("Native frame classification menu=%d gameplayEnabled=%d stereoReady=%d uiAge=%llu",
