@@ -1,6 +1,6 @@
 # Dependencies and research credits
 
-SS2VR's original adapter/host source is MIT licensed. It was implemented with Codex and an Astra senior design review; implementation and review assistance included GPT-6.1 Sol and GPT-5.6 Terra. No generated artwork or game assets are included. Serious Sam belongs to its respective rights holders; this project is unofficial.
+SS2VR's original adapter, host, server module and installer source is licensed under the GNU General Public License version 3 (GPL-3.0-only; full text in LICENSE). It was implemented with Codex and an Astra senior design review; implementation and review assistance included GPT-6.1 Sol and GPT-5.6 Terra. No generated artwork or game assets are included. Serious Sam belongs to its respective rights holders; this project is unofficial.
 
 | Component | Pinned revision | License / notice |
 |---|---|---|

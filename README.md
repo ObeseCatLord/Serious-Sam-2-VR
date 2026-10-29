@@ -147,3 +147,10 @@ objects retain native commands. This follow-up is newer than the immutable
 The game proxy supports listen-host/client VR through native RPCs. Dedicated authority loads `SS2VRServer.dll` through `Content/SS2VR.mod`; a build containing those files is required. Run the native server with `+mod SS2VR` (without `.mod`) plus its usual `+level`, `+port` and session options. Every VR client and the authority need matching mod products. Gameplay damage/ammunition/cadence stay native. Unknown or stock authority does not negotiate VR weapon input. Authoritative aim updates are limited by20Hz and the reliable round trip; remote presentation expires after200ms. No dedicated server or network session was launched here.
 
 Voice chat (`[Voice]` in `SS2VR.ini`) rides the same native RPC carrier: each client's Opus voice packets go to the authority, which relays them unreliably to every other negotiated SS2VR player (75 packets and 16000 bytes per second per speaker). Playback is positional and fades to a centred radio voice with distance. The design follows QuakeSpasm VR's voice chat; see THIRD_PARTY.md.
+
+## License
+
+SS2VR is free software under the GNU General Public License version 3
+(GPL-3.0-only); see [LICENSE](LICENSE). Bundled third-party components keep their
+own licenses, listed in [THIRD_PARTY.md](THIRD_PARTY.md). Serious Sam 2 and its
+assets belong to their rights holders and are not included.
