@@ -669,6 +669,7 @@ static void pollSettingsFile() {
     settings.lasers = fresh.lasers;
     settings.laserDistance = fresh.laserDistance;
     settings.ammoScreens = fresh.ammoScreens;
+    settings.quickGrenade = fresh.quickGrenade;
     settings.throwStrength = fresh.throwStrength;
     settings.snapTurn = fresh.snapTurn;
     settings.smoothTurnRate = fresh.smoothTurnRate;
@@ -1638,6 +1639,7 @@ static GrenadeThrow grenadeThrow;
 static std::atomic<int> grenadeShownHand{-1};
 static std::atomic<unsigned> grenadeLaunchHand{0};
 static std::atomic<bool> grenadeLaunching{false}, grenadeTaken{false};
+static std::atomic<bool> grenadeQuick{false}; // Quick throw: aimed where the throwing hand itself points.
 using AmmoQuantity = int32_t(__thiscall *)(void *, int);
 static AmmoQuantity grenadeAmmoQuantity = nullptr; // CPlayerInventory::GetAmmoQuantity
 constexpr int HandGrenadeAmmo = 4;                 // AmmoIndex the native throw drains
@@ -3364,8 +3366,12 @@ static void update(void *p) {
                                                                                HandGrenadeAmmo) : 1;
         if (!enabled || resettingControls || !rider.handheld() || wheels[0].open || wheels[1].open)
             grenadeThrow.clear();
-        else if (pressed && (grenades > 0 || grenadeThrow.holding()))
+        else if (pressed && settings.quickGrenade && grenades > 0 && !grenadeThrow.holding()) {
+            grenadeThrow.launchNow(offHand, input.tickMs);
+            log("Grenade quick throw hand=%u grenades=%d", offHand, grenades);
+        } else if (pressed && !settings.quickGrenade && (grenades > 0 || grenadeThrow.holding()))
             grenadeThrow.press(offHand);
+        grenadeQuick = settings.quickGrenade;
         if (grenadeTaken.exchange(false)) grenadeThrow.thrown();
         const unsigned g = grenadeThrow.hand;
         const Vec3 forward = rotate(normalize(input.head.q), Vec3{0, 0, -1});
@@ -6033,7 +6039,8 @@ static Pose *__fastcall playerViewOrigin(void *p, void *, Pose *out, int purpose
         if (!grenadeLaunching.load() || !nativeMainThread || !nativeMainThread()) return out;
         const auto s = copySnapshot();
         Pose body;
-        const unsigned g = grenadeLaunchHand.load() & 1u, aim = 1u - g;
+        // A quick throw aims where the throwing (right) hand itself points.
+        const unsigned g = grenadeLaunchHand.load() & 1u, aim = grenadeQuick.load() ? g : 1u - g;
         if (p != s.player || !s.rider.handheld() || !vrSession(s) || !fresh(s.input) || !trackingAnchor(p, body) ||
             !controllerTracked(s.input, g))
             return out;

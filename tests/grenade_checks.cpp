@@ -8,6 +8,16 @@ static bool near(Vec3 a, Vec3 b, float e = 1e-3f) {
 }
 int main() {
     const Vec3 forward{0, 0, -1};
+    {
+        // Quick throw: launches at once from the given hand, and times out like a throw.
+        GrenadeThrow q;
+        q.launchNow(1, 500);
+        assert(q.state == GrenadeThrow::State::Launching && q.hand == 1 && q.holding());
+        assert(!q.update(true, {0, 1, 0}, 500 + GrenadeThrow::LaunchTimeout + 1, forward) && !q.holding());
+        q.launchNow(1, 900);
+        q.thrown();
+        assert(!q.holding());
+    }
     GrenadeThrow g;
     // Idle: motion does nothing.
     assert(!g.update(true, {0, 1, 0}, 100, forward) && !g.holding());

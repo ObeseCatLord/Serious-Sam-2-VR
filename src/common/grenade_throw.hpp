@@ -69,6 +69,13 @@ struct GrenadeThrow {
         launchedAt = now;
         return true;
     }
+    // Quick throw ([Grenades] QuickThrow): launch at once from `fromHand`, no holding.
+    void launchNow(unsigned fromHand, uint64_t now) {
+        clear();
+        hand = fromHand & 1;
+        state = State::Launching;
+        launchedAt = now;
+    }
     // The game threw it (or refused, e.g. no grenades left).
     void thrown() { clear(); }
 };

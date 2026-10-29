@@ -91,6 +91,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.foveation.periphery = number(L"Render", L"FoveationPeriphery", .5f, .25f, .8f);
     settings.weaponScale = number(L"Weapons", L"Scale", 0, 0, 4);
     settings.ammoScreens = number(L"Weapons", L"AmmoScreens", 1, 0, 1) >= .5f;
+    settings.quickGrenade = number(L"Grenades", L"QuickThrow", 0, 0, 1) >= .5f;
     settings.roomscale = number(L"Roomscale", L"Enabled", 0, 0, 1) >= .5f;
     settings.physicalMelee = number(L"Melee", L"Enabled", 0, 0, 1) >= .5f;
     settings.immersiveSwimming = number(L"Swimming", L"Immersive", 0, 0, 1) >= .5f;
