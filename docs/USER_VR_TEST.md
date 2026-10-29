@@ -23,6 +23,22 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## Changed after the Kronor black screen report (2026-10-28, night)
+
+1. Black screen at the start of the second prison level (Kronor 6_2, after the
+   level change from 6_1): the game resized its eye canvas back to 2544x2544
+   for the new level, but kept treating every frame as a flat one, so the host
+   never rebuilt its eye images for that size and the headset stayed black
+   (menus still worked). When the game's stereo targets stay out of step with
+   the eye canvas for a second, the mod now runs the game's own canvas resize
+   again (up to 5 times), which brings the VR view back.
+2. New log lines name the cause if a level goes flat again: `Play off
+   reasons=0x..` (0x10 dead, 0x40 menu, 0x80 cinematic camera, ...) and
+   `Stereo targets unavailable: canvas ... depth ... viewport ...`.
+3. Not reproduced exactly: the lab's simulated headset reaches 1920x2160 at
+   most, where the same level change worked; your 2544x2544 could not be
+   tested. Your COMMAND CENTER save itself loads and plays in the lab.
+
 ## Changed after the Floaterra report (2026-10-28, evening)
 
 1. Reflections on animated models still followed the head (the dunk tank at
@@ -642,4 +658,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `98c927d`, version `0.2.11-dev.7a265bd95331` (2026-10-28).
+Installed candidate: commit `2ac4ca8`, version `0.2.11-dev.75b534d9801c` (2026-10-28).

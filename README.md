@@ -51,6 +51,15 @@ Native remote head bones are enabled by default inside admitted frozen VR stereo
 
 ## Requirements and installation
 
+**Easiest: the installer.** Download `ss2vr-installer-windows-x86_64.exe` or
+`ss2vr-installer-linux-x86_64` from the
+[latest release](https://github.com/ObeseCatLord/ss2-vr/releases/latest) and run it
+(Linux: `chmod +x` first). It finds Serious Sam 2 through Steam, downloads the
+latest `SS2VR-<version>.zip` release, checks it, and installs, updates or
+removes the mod; your VR settings carry over on updates. Run it again any time
+to update. The same installers are also inside each release zip. See
+[installer/README.md](installer/README.md) for its command-line options.
+
 Use the stock game's first-person view and the exact binaries listed in [installed-build.json](docs/installed-build.json). Other native builds are rejected. Windows 10/11 x64 needs an active OpenXR HMD runtime offering D3D11 and BGRA8 or RGBA8 UNORM, with at least four composition layers. No proprietary game files are included.
 
 Desktop participants in mixed multiplayer do not need a headset. Every participant
