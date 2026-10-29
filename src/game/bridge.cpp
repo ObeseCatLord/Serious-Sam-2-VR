@@ -331,6 +331,36 @@ static void *__cdecl labUserStats() {
     return proxy;
 }
 static void (__cdecl *labOriginalInitialize)() = nullptr;
+// One-shot launch options: Bin/SS2VR/next-launch.ini, written by a start script
+// just before it launches the game ([Launch] VR=0 plays on the desktop, Server=
+// IP:port joins that dedicated server with +connect <its SteamID>). Read once and
+// deleted, so a later plain launch is unaffected. [VR] Enabled=0 in SS2VR.ini or
+// SS2VR.user.ini turns VR off for every launch.
+struct LaunchOptions { bool vr = true; char server[64]{}; };
+static const LaunchOptions &launchOptions() {
+    static const LaunchOptions options = [] {
+        LaunchOptions o;
+        std::wstring bin;
+        if (!moduleDirectory(nullptr, bin)) return o;
+        const std::wstring folder = bin + L"SS2VR\\";
+        for (const wchar_t *name : {L"SS2VR.ini", L"SS2VR.user.ini"}) {
+            const UINT value = GetPrivateProfileIntW(L"VR", L"Enabled", 2, (folder + name).c_str());
+            if (value != 2) o.vr = value != 0;
+        }
+        const std::wstring once = folder + L"next-launch.ini";
+        if (GetFileAttributesW(once.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            const UINT value = GetPrivateProfileIntW(L"Launch", L"VR", 2, once.c_str());
+            if (value != 2) o.vr = value != 0;
+            wchar_t server[64]{};
+            GetPrivateProfileStringW(L"Launch", L"Server", L"", server, 64, once.c_str());
+            WideCharToMultiByte(CP_ACP, 0, server, -1, o.server, sizeof o.server, nullptr, nullptr);
+            DeleteFileW(once.c_str());
+            log("Launch options (next-launch.ini): vr=%d server=%s", int(o.vr), o.server[0] ? o.server : "none");
+        } else if (!o.vr) log("Launch options: VR off ([VR] Enabled=0), desktop play");
+        return o;
+    }();
+    return options;
+}
 // The command line's +connect <SteamID> is taken as a Steam lobby (invites):
 // the client asks Steam for the lobby's owner, which a dedicated server is
 // not. When the ID is a game server's, connect to it directly as the server
@@ -341,11 +371,13 @@ static int32_t *labServerPort = nullptr;
 static int __fastcall labClientConnect(void *client, void *edx, int a, int b) {
     // The server browser also names the server's address (host order) and game
     // port, which +connect clears: the client queries and authenticates with them.
-    char address[32]{};
+    char address[64]{};
     unsigned ip[4]{}, port = 0;
-    if (labServerAddress && labServerPort &&
-        GetEnvironmentVariableA("SS2VR_LAB_SERVER_ADDRESS", address, sizeof address) &&
-        std::sscanf(address, "%u.%u.%u.%u:%u", &ip[0], &ip[1], &ip[2], &ip[3], &port) == 5) {
+    if (!GetEnvironmentVariableA("SS2VR_LAB_SERVER_ADDRESS", address, sizeof address))
+        std::snprintf(address, sizeof address, "%s", launchOptions().server);
+    if (labServerAddress && labServerPort && address[0] &&
+        std::sscanf(address, "%u.%u.%u.%u:%u", &ip[0], &ip[1], &ip[2], &ip[3], &port) == 5 &&
+        ip[0] < 256 && ip[1] < 256 && ip[2] < 256 && ip[3] < 256 && port && port < 65536) {
         *labServerAddress = ip[0] << 24 | ip[1] << 16 | ip[2] << 8 | ip[3];
         *labServerPort = int32_t(port);
     }
@@ -353,11 +385,33 @@ static int __fastcall labClientConnect(void *client, void *edx, int a, int b) {
         const uint32_t type = (labServerLobby[1] >> 20) & 0xf; // EAccountType
         if (type == 3 || type == 4) { // Game server or anonymous game server.
             *labSteamGameserver = 1;
-            log("Lab multiplayer: connecting directly to game server %08x%08x at %08x:%d", labServerLobby[1], labServerLobby[0],
+            log("Multiplayer: connecting directly to game server %08x%08x at %08x:%d", labServerLobby[1], labServerLobby[0],
                 labServerAddress ? *labServerAddress : 0u, labServerPort ? int(*labServerPort) : 0);
         }
     }
     return labOriginalClientConnect(client, edx, a, b);
+}
+// +connect <a dedicated server's SteamID> joins it directly (the server browser's
+// way); also for players, not only the lab. Once per process.
+bool installServerConnect() noexcept {
+    static int state = 0; // 0 untried, 1 installed, -1 unavailable
+    if (state) return state > 0;
+    state = -1;
+    HMODULE engine = GetModuleHandleW(L"Engine.dll");
+    if (!engine) { state = 0; return false; }
+    labSteamGameserver = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_bSteamGameserver@SeriousEngine@@3HA"));
+    labServerLobby = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_idSteamServerLobby@SeriousEngine@@3VCSteamID@@A"));
+    labServerAddress = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_ulServerAddress@SeriousEngine@@3KA"));
+    labServerPort = reinterpret_cast<int32_t *>(GetProcAddress(engine, "?net_iServerPort@SeriousEngine@@3JA"));
+    void *connect = reinterpret_cast<void *>(GetProcAddress(engine, "?Connect@CClientInterface@SeriousEngine@@UAEHHH@Z"));
+    if (!labSteamGameserver || !labServerLobby || !connect ||
+        MH_CreateHook(connect, reinterpret_cast<void *>(labClientConnect), reinterpret_cast<void **>(&labOriginalClientConnect)) != MH_OK ||
+        MH_EnableHook(connect) != MH_OK) {
+        log("Multiplayer: direct server connect unavailable");
+        return false;
+    }
+    state = 1;
+    return true;
 }
 static void labInstallSteamWriteBarrier() {
     HMODULE steam = GetModuleHandleW(L"steam_api.dll");
@@ -368,16 +422,7 @@ static void labInstallSteamWriteBarrier() {
         MH_CreateHook(stats, reinterpret_cast<void *>(labUserStats), reinterpret_cast<void **>(&labRealUserStats)) != MH_OK ||
         MH_EnableHook(storage) != MH_OK || MH_EnableHook(stats) != MH_OK)
         abortLab("multiplayer Steam write barrier unavailable");
-    HMODULE engine = GetModuleHandleW(L"Engine.dll");
-    labSteamGameserver = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_bSteamGameserver@SeriousEngine@@3HA"));
-    labServerLobby = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_idSteamServerLobby@SeriousEngine@@3VCSteamID@@A"));
-    labServerAddress = reinterpret_cast<uint32_t *>(GetProcAddress(engine, "?net_ulServerAddress@SeriousEngine@@3KA"));
-    labServerPort = reinterpret_cast<int32_t *>(GetProcAddress(engine, "?net_iServerPort@SeriousEngine@@3JA"));
-    void *connect = reinterpret_cast<void *>(GetProcAddress(engine, "?Connect@CClientInterface@SeriousEngine@@UAEHHH@Z"));
-    if (!labSteamGameserver || !labServerLobby || !connect ||
-        MH_CreateHook(connect, reinterpret_cast<void *>(labClientConnect), reinterpret_cast<void **>(&labOriginalClientConnect)) != MH_OK ||
-        MH_EnableHook(connect) != MH_OK)
-        abortLab("multiplayer direct server connect unavailable");
+    if (!installServerConnect()) abortLab("multiplayer direct server connect unavailable");
     log("Lab multiplayer: Steam write barrier installed (cloud, stats, achievements)");
 }
 static __attribute__((noinline)) void __cdecl suppressLabOnlineInitialization() {
@@ -2392,6 +2437,8 @@ void installMainMenuLayout() noexcept {
     installPromptMarks(sam);
 }
 void installEyeCanvas() noexcept {
+    launchOptions();
+    installServerConnect();
     static bool installed = false;
     if (installed) return;
     installed = true;
@@ -2775,6 +2822,8 @@ static void startChannel() {
     const bool ready = hooksReady.load(std::memory_order_acquire);
     if (!ready || !presentationChain || resetQuarantined || !nativeUiDeviceCurrent(d) ||
         !nativePresentationThreadCurrent()) return;
+    installServerConnect(); // Engine.dll is loaded by now (no-op once installed).
+    if (!launchOptions().vr) return; // Desktop play: no headset host, the game renders as it does without one.
     if (!channel.shared) {
         wchar_t token[64];
         swprintf(token, 64, L"%lu-%llu", GetCurrentProcessId(), GetTickCount64());
