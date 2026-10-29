@@ -1,4 +1,4 @@
-# Serious Sam 2 — OpenXR VR development mod
+# Serious Sam 2 VR — OpenXR VR development mod
 
 **PC development and runtime testing resumed under the user's 2026-10-07 authority.** The mod remains incomplete. Start with [current continuation](docs/CLOUD_CONTINUATION.md) and [implementation status](docs/IMPLEMENTATION_STATUS.md). The old handoff is historical; its pause/no-runtime restrictions are superseded. Native safety and privacy remain.
 
@@ -53,7 +53,7 @@ Native remote head bones are enabled by default inside admitted frozen VR stereo
 
 **Easiest: the installer.** Download `ss2vr-installer-windows-x86_64.exe` or
 `ss2vr-installer-linux-x86_64` from the
-[latest release](https://github.com/ObeseCatLord/ss2-vr/releases/latest) and run it
+[latest release](https://github.com/ObeseCatLord/Serious-Sam-2-VR/releases/latest) and run it
 (Linux: `chmod +x` first). It finds Serious Sam 2 through Steam, downloads the
 latest `SS2VR-<version>.zip` release, checks it, and installs, updates or
 removes the mod; your VR settings carry over on updates. Run it again any time

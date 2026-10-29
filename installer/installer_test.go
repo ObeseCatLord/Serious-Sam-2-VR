@@ -132,7 +132,7 @@ func fakeGitHub(t *testing.T, version, zipPath, checksum string) *httptest.Serve
 	name := "SS2VR-" + version + ".zip"
 	mux := http.NewServeMux()
 	var srv *httptest.Server
-	mux.HandleFunc("/repos/ObeseCatLord/ss2-vr/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/ObeseCatLord/Serious-Sam-2-VR/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		assets := []map[string]any{
 			{"name": "ss2vr-installer-windows-x86_64.exe", "browser_download_url": srv.URL + "/dl/installer.exe", "size": 3},
 			{"name": name, "browser_download_url": srv.URL + "/dl/" + name, "size": len(data)},
@@ -223,7 +223,7 @@ func TestFreshInstallFromRelease(t *testing.T) {
 	files := payload("1.0.0")
 	zipPath := zipDir(t, fakePackage(t, "1.0.0", files, ""), nil)
 	srv := fakeGitHub(t, "1.0.0", zipPath, zipSum(t, zipPath))
-	code, out := runCLI(t, "", "install", "--game", game, "--yes", "--release-api-url", srv.URL+"/repos/ObeseCatLord/ss2-vr/releases/latest")
+	code, out := runCLI(t, "", "install", "--game", game, "--yes", "--release-api-url", srv.URL+"/repos/ObeseCatLord/Serious-Sam-2-VR/releases/latest")
 	if code != 0 {
 		t.Fatalf("exit %d\n%s", code, out)
 	}
@@ -263,7 +263,7 @@ func TestUpdatePreservesUserSettings(t *testing.T) {
 	v2 := payload("2.0.0")
 	zipPath := zipDir(t, fakePackage(t, "2.0.0", v2, ""), nil)
 	srv := fakeGitHub(t, "2.0.0", zipPath, "")
-	code, out := runCLI(t, "", "install", "--yes", "--game", game, "--release-api-url", srv.URL+"/repos/ObeseCatLord/ss2-vr/releases/latest")
+	code, out := runCLI(t, "", "install", "--yes", "--game", game, "--release-api-url", srv.URL+"/repos/ObeseCatLord/Serious-Sam-2-VR/releases/latest")
 	if code != 0 {
 		t.Fatalf("update: %d\n%s", code, out)
 	}
@@ -472,7 +472,7 @@ func TestSHA256Mismatch(t *testing.T) {
 	zipPath := zipDir(t, fakePackage(t, "1.0.0", payload("1.0.0"), ""), nil)
 	srv := fakeGitHub(t, "1.0.0", zipPath, sum("not the zip"))
 	before := snapshot(t, game)
-	code, out := runCLI(t, "", "install", "--yes", "--game", game, "--release-api-url", srv.URL+"/repos/ObeseCatLord/ss2-vr/releases/latest")
+	code, out := runCLI(t, "", "install", "--yes", "--game", game, "--release-api-url", srv.URL+"/repos/ObeseCatLord/Serious-Sam-2-VR/releases/latest")
 	if code == 0 || !strings.Contains(out, "download sha256 mismatch") {
 		t.Fatalf("exit %d\n%s", code, out)
 	}
@@ -517,7 +517,7 @@ func TestStatus(t *testing.T) {
 	runCLI(t, "", "install", "--yes", "--game", game, "--package", pkg)
 	zipPath := zipDir(t, fakePackage(t, "2.0.0", payload("2.0.0"), ""), nil)
 	srv := fakeGitHub(t, "2.0.0", zipPath, "")
-	code, out := runCLI(t, "", "status", "--game", game, "--release-api-url", srv.URL+"/repos/ObeseCatLord/ss2-vr/releases/latest")
+	code, out := runCLI(t, "", "status", "--game", game, "--release-api-url", srv.URL+"/repos/ObeseCatLord/Serious-Sam-2-VR/releases/latest")
 	for _, want := range []string{"Installed:   1.0.0 (all files unmodified)", "Latest:      2.0.0 (GitHub release v2.0.0)", "update available"} {
 		if code != 0 || !strings.Contains(out, want) {
 			t.Errorf("missing %q (exit %d):\n%s", want, code, out)
@@ -533,7 +533,7 @@ func TestInteractiveMenu(t *testing.T) {
 	game := fakeGame(t)
 	zipPath := zipDir(t, fakePackage(t, "1.0.0", payload("1.0.0"), ""), nil)
 	srv := fakeGitHub(t, "1.0.0", zipPath, zipSum(t, zipPath))
-	api := srv.URL + "/repos/ObeseCatLord/ss2-vr/releases/latest"
+	api := srv.URL + "/repos/ObeseCatLord/Serious-Sam-2-VR/releases/latest"
 	steamRootsFunc = func() []string { return nil }
 	defer func() { steamRootsFunc = steamRoots }()
 	// Not found automatically: the player types the folder, picks 1, then Enter to exit.

@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	defaultRepo      = "ObeseCatLord/ss2-vr"
+	defaultRepo      = "ObeseCatLord/Serious-Sam-2-VR"
 	maxPackageBytes  = 1 << 30   // download / archive size cap
 	maxEntryBytes    = 512 << 20 // single extracted file cap
 	maxManifestBytes = 4 << 20
