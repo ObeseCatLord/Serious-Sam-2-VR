@@ -23,6 +23,18 @@ Report the first failing step with `Bin/SS2VR.log`, `Bin/SS2VR/ss2vr_host.log` a
 the game's `Sam2.log`. The `Perf` lines (game, every 5 s) and `Host perf` lines
 (host) record frame rate and frame cost; note roughly when a problem happened.
 
+## New: quick grenades, server join, desktop play (2026-10-29)
+
+1. Quick grenades (VR options, Movement page, off by default; `[Grenades]
+   QuickThrow=1`): a right stick click throws a hand grenade straight from the
+   right hand toward where it points. Lab: three clicks, three throws, each
+   aimed along the right hand.
+2. The co-op bundle's play scripts join the server directly and can start the
+   game without the headset (`[VR] Enabled=0`, or `VR=0` for one launch).
+3. Your saves from KINGSBURG on (and the quick save) were re-saved without the
+   lab's cheat flags, so achievements are awarded again; "Elvian Defender"
+   (Ellenier episode) was unlocked. Originals in the archive's backups.
+
 ## Changed after the Kronor black screen report (2026-10-28, night)
 
 1. Black screen at the start of the second prison level (Kronor 6_2, after the
@@ -658,4 +670,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `2ac4ca8`, version `0.2.11-dev.75b534d9801c` (2026-10-28).
+Installed candidate: commit `db22719`, version `0.2.11-dev.0f591713f224` (2026-10-29).
