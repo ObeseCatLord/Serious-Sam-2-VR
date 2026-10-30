@@ -1,8 +1,10 @@
 #include "menu.hpp"
 #include "common/controls.hpp"
 #include "game.hpp"
+#include "multiplayer.hpp"
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 #include <cstdio>
 
@@ -299,6 +301,62 @@ bool queueCommand(int command) {
     queuedCommand.store(command);
     return true;
 }
+// Level films in co-op. Sam2Game 23A10 and 22AF0 are the game's level start and
+// level end handlers (thiscall, world file name), both called as a level change
+// begins. Single player plays the level's .nfo films there through 21EF50 (cdecl
+// world, kind 0 intro / 1 outro / 2 episode, fade seconds for the first; returns how
+// many it queued): the episode film and the intro at the start, the outro at the end,
+// and loads the level after them. Both handlers gate on netIsLocal, so a network game
+// never shows them. Here a network game queues the same films once its player is live
+// in the new level (the outro first): a film queued at the change holds a client's
+// load until it ends, long enough for the client to time out (V950, V951: 118 s
+// loads). The hold markers (22F950) single player wraps them in are left out: a held
+// game stops stepping its simulation, and a client's follows the server.
+using LevelHandler = int(__fastcall *)(void *, void *, const char *);
+static LevelHandler originalLevelStart = nullptr, originalLevelEnd = nullptr;
+static int(__cdecl *queueLevelFilms)(const char *, int, float) = nullptr;
+// Main thread (the handlers and the post-step check). The films wait for a live
+// player other than the one at the change.
+static std::string pendingOutro, pendingLevel;
+static uint32_t playerAtChange = 0;
+static bool levelFilms(uintptr_t game, const char *world) {
+    const bool network = multiplayer::remoteClient() || multiplayer::server();
+    return game && world && network && read32(game + 0x10) && !read32(base + 0x40334c);
+}
+static void traceLevelFilms(const char *what, int queued, const char *world) {
+    static unsigned traced = 0;
+    if (traced++ < 32)
+        log("Level %s films=%d client=%d server=%d world=%.160s", what, queued, int(multiplayer::remoteClient()),
+            int(multiplayer::server()), world ? world : "");
+}
+void playPendingFilms() {
+    if (pendingLevel.empty()) return;
+    const uint32_t player = livePlayerHandle();
+    if (!player || player == playerAtChange) return;
+    int queued = -1;
+    if (levelFilms(read32(base + 0x403350), pendingLevel.c_str())) {
+        queued = pendingOutro.empty() ? 0 : queueLevelFilms(pendingOutro.c_str(), 1, .5f);
+        const int episode = queueLevelFilms(pendingLevel.c_str(), 2, queued > 0 ? -1.f : 2.f);
+        queued += episode + queueLevelFilms(pendingLevel.c_str(), 0, queued > 0 || episode > 0 ? -1.f : .5f);
+    }
+    traceLevelFilms("play", queued, pendingLevel.c_str());
+    pendingLevel.clear();
+    pendingOutro.clear();
+}
+static int __fastcall levelStart(void *game, void *edx, const char *world) {
+    const bool films = levelFilms(uintptr_t(game), world);
+    pendingLevel = films ? world : "";
+    if (!films) pendingOutro.clear();
+    playerAtChange = livePlayerHandle();
+    traceLevelFilms("start (films wait for the player)", films ? 0 : -1, world);
+    return originalLevelStart(game, edx, world);
+}
+static int __fastcall levelEnd(void *game, void *edx, const char *world) {
+    const bool films = levelFilms(uintptr_t(game), world);
+    if (films) pendingOutro = world;
+    traceLevelFilms("end", films ? 0 : -1, world);
+    return originalLevelEnd(game, edx, world);
+}
 bool initialize(HMODULE sam, HookInstaller install) {
     base = reinterpret_cast<uintptr_t>(sam);
     // These internal cdecl contracts are audited against the fingerprinted
@@ -310,6 +368,10 @@ bool initialize(HMODULE sam, HookInstaller install) {
     release = reinterpret_cast<decltype(release)>(base + 0x19e170);
     if (!install(sam, 0x19e010, reinterpret_cast<void *>(hidesWorld), reinterpret_cast<void **>(&originalHidesWorld)))
         log("Menu world hiding hook unavailable: the pause menu shows over its flat world copy");
+    queueLevelFilms = reinterpret_cast<decltype(queueLevelFilms)>(base + 0x21ef50);
+    if (!install(sam, 0x23a10, reinterpret_cast<void *>(levelStart), reinterpret_cast<void **>(&originalLevelStart)) ||
+        !install(sam, 0x22af0, reinterpret_cast<void *>(levelEnd), reinterpret_cast<void **>(&originalLevelEnd)))
+        log("Level film hooks unavailable: co-op levels start without their films");
     return install(sam, 0x192550, reinterpret_cast<void *>(poll), reinterpret_cast<void **>(&originalPoll));
 }
 } // namespace ss2vr::game::menus

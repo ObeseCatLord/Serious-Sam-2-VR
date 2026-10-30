@@ -3398,8 +3398,10 @@ static void presentBody(IDirect3DDevice9 *d) {
     }
     uint64_t now = GetTickCount64();
     // The world live behind a pause menu or Netricsa (GameplayMenuView) is not play:
-    // the flat frame (Netricsa's panel) is still shown.
-    bool gameplay = ui.gameplay && ui.gameplay != GameplayMenuView && now >= ui.tickMs && now - ui.tickMs < 250;
+    // the flat frame (Netricsa's panel) is still shown. Neither is the world behind a
+    // film: a network game keeps rendering it while a level film plays in front.
+    bool gameplay = ui.gameplay && ui.gameplay != GameplayMenuView && now >= ui.tickMs && now - ui.tickMs < 250 &&
+                    !menus::movieOnTop();
     const bool nativeMenu = menus::active();
     // Every frame the stereo world path cannot own is presented on the flat
     // screen: menus, loading, pre-rendered movies, cinematic cameras, Netricsa,

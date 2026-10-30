@@ -4674,6 +4674,7 @@ static void __fastcall simulationStep(void *simulation, void *) {
         runPostSimulationRoomscale(interval);
         runPostSimulationHeadVisibility(interval);
         runPostSimulationSniper(interval);
+        menus::playPendingFilms(); // Nothing waits on a dedicated server (no menus).
         // Retire input only after all original entity/script/physics work.
         if (interval.networkPrepared && nativeInputHealthy())
             multiplayer::completeTick();
@@ -11410,6 +11411,10 @@ static bool latestInput(Input &out) {
 bool levelActive() noexcept {
     const auto s = copySnapshot();
     return s.initialized && livePlayer(s) != nullptr;
+}
+uint32_t livePlayerHandle() noexcept {
+    const auto s = copySnapshot(); // Not s.initialized: a network client's stays 0 in play.
+    return livePlayer(s) ? s.playerHandle : 0;
 }
 bool netricsaShown() noexcept {
     const auto s = copySnapshot();

@@ -695,7 +695,10 @@ def validate(cfg):
         if not isinstance(connect,str) or not re.fullmatch(r'\d{17}',connect):
             raise ValueError('Multiplayer connect must be the server SteamID in decimal')
         if preparation_weapon(cfg) is not None:raise ValueError('A multiplayer client has no fixture preparation')
-        expected_arguments=['+mod','SS2VR','+sam_bBootSequence','0','+sam_bSkipMovies','1','+connect',connect]
+        # Opt-in: the client plays the game's films (co-op level films).
+        movies=cfg.get('multiplayer_movies',False)
+        if not isinstance(movies,bool): raise ValueError('Multiplayer movies must be true or false')
+        expected_arguments=['+mod','SS2VR','+sam_bBootSequence','0','+sam_bSkipMovies','0' if movies else '1','+connect',connect]
         address=cfg.get('multiplayer_address')
         if address is not None and (not isinstance(address,str) or not re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}:\d{2,5}',address)):
             raise ValueError('Multiplayer address must be an IPv4 address and game port')

@@ -40,6 +40,8 @@ void setLevelUiAspect(float aspect) noexcept;
 void setDesktopWorld(bool render) noexcept;
 bool netricsaShown() noexcept; // engine.cpp: Netricsa is open (its controls are player commands).
 bool levelActive() noexcept;
+// engine.cpp: the local player's entity handle while it is live in a level, else 0.
+uint32_t livePlayerHandle() noexcept;
 // engine.cpp, main thread, a frame a menu hides the world: whether the world renders
 // live in stereo behind it (a pause menu over a level in VR, controls off).
 bool menuViewFrame() noexcept;

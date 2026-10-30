@@ -20,4 +20,7 @@ bool movieOnTop();
 bool worldHidden();
 // A menu that takes input is up (not a loading screen or a movie). Main thread.
 bool interactiveMenu();
+// Co-op level films the last level change left waiting for the local player (main
+// thread, after a simulation step): queued once that player is live in the new level.
+void playPendingFilms();
 } // namespace ss2vr::game::menus
