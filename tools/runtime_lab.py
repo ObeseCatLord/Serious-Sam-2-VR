@@ -1444,8 +1444,9 @@ def run(cfg):
             (stock and not (state['local_transport'] and state['online_interface_null'])):
             raise RuntimeError('Fresh native local gameplay/isolation invariant not observed')
         receipts=re.findall(r'Lab native scene stream bytes=(\d+) positionRestored=(\d+) sha256=([a-f0-9]{64})',isolation_log)
-        if not receipts: raise RuntimeError('No successful native scene-stream receipt')
-        if any(h!=cfg['scene']['entry_sha256'] for size,pos,h in receipts):
+        # A multiplayer client loads whatever level the server runs, not the pinned scene.
+        if not receipts and not multiplayer: raise RuntimeError('No successful native scene-stream receipt')
+        if not multiplayer and any(h!=cfg['scene']['entry_sha256'] for size,pos,h in receipts):
             manifest['native_scene_receipts']=receipts
             raise RuntimeError('Actual native scene differs from the configured exact scene')
         manifest['native_scene_receipts']=receipts
@@ -1501,7 +1502,9 @@ def run(cfg):
             # Private neutral collection launches one owned observer per sample.
             # Its startup overhead can exceed ten seconds for thirty samples;
             # retain the same observations and clip to the global deadline.
-            pose_seconds=20 if cfg.get('idle_weapon_probe') else 10
+            # A multiplayer server may reload the level right after the join (its
+            # co-op opening restart): the game stops answering while it loads.
+            pose_seconds=20 if cfg.get('idle_weapon_probe') else 60 if multiplayer else 10
             matches=0;previous=boundary;pose_deadline=min(deadline,time.monotonic()+pose_seconds)
             while matches<30 and time.monotonic()<pose_deadline:
                 try:state=observer(cfg,env,'status',token,timeout=remaining(pose_deadline),deadline=pose_deadline)
@@ -1509,6 +1512,9 @@ def run(cfg):
                     if error.code==4:
                         time.sleep(.01);continue
                     raise
+                except (TimeoutError,subprocess.TimeoutExpired):
+                    if not multiplayer:raise
+                    time.sleep(1);continue
                 values=state['head']['p']+state['head']['q']
                 valid=(all(math.isfinite(v) for v in values) and abs(sum(v*v for v in state['head']['q'])-1)<.001 and
                     state['input_age_ms']<=150 and state['input_sequence']>boundary and
