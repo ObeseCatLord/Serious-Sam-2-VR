@@ -396,6 +396,27 @@ using MarkerDraw = void(__thiscall *)(void *, const Matrix34 &, const Matrix44 &
 using MarkerFade = float(__thiscall *)(void *);
 static MarkerDraw nativeNavigation = nullptr, nativeObjectives = nullptr;
 static void *(__cdecl *nativeDrawPort)() = nullptr, *(__cdecl *nativeWorldInfo)() = nullptr;
+// Lab (SS2VR_LAB_SERVER_NEXT_LEVEL=1, a dedicated server, after a simulation step):
+// Temp/SS2VR/next-level-request ends the level as its exit does, so connected
+// clients go through a real co-op level change.
+static void labServerNextLevel() {
+    static const bool enabled = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SERVER_NEXT_LEVEL", v, 2) == 1 && v[0] == L'1'; }();
+    if (!enabled || !multiplayer::server() ||
+        GetFileAttributesA("Temp\\SS2VR\\next-level-request") == INVALID_FILE_ATTRIBUTES)
+        return;
+    if (!DeleteFileA("Temp\\SS2VR\\next-level-request")) { // Once per request, never every step.
+        static bool warned = false;
+        if (!warned) { warned = true; log("Lab server next level request could not be removed: ignored"); }
+        return;
+    }
+    const HMODULE g = GetModuleHandleW(L"Sam2Game.dll"); // The client-only symbols are unset here.
+    const auto worldInfo = loadProc<void *(__cdecl *)()>(g, "?samGetWorldInfo@SeriousEngine@@YAPAVCWorldInfoEntity@1@XZ");
+    const auto jump = loadProc<void(__thiscall *)(void *)>(g, "?JumpToNextLevel@CWorldInfoEntity@SeriousEngine@@UAEXXZ");
+    if (void *info = worldInfo && jump ? worldInfo() : nullptr) {
+        log("Lab server next level issued");
+        jump(info);
+    }
+}
 static void(__cdecl *nativeBlendType)(int) = nullptr;
 static int(__cdecl *singlePlayer)() = nullptr;
 static SetWeapon setWeapon = nullptr;
@@ -2466,6 +2487,14 @@ static void update(void *p) {
     validateLabOnlineIsolation(false);
     if (rigMutationActive || !hooksReady.load(std::memory_order_acquire) || !channel.shared || !local(p))
         return;
+    {
+        static void *traced = nullptr;
+        static unsigned count = 0;
+        if (traced != p && count < 32 && multiplayer::remoteClient()) {
+            traced = p; ++count;
+            log("Update player=%08x alive=%d", unsigned(pointerHandle ? pointerHandle(p) : 0), int(isAlive && isAlive(p)));
+        }
+    }
     lastUpdateTick = GetTickCount64();
     if (labSavePending.exchange(false) && labNativeSave) {
         // In the simulation step, as the fixture preparation's save (between frames
@@ -3239,8 +3268,11 @@ static void update(void *p) {
         }
         previousIds[0] = ids[0]; previousIds[1] = ids[1];
     }
-    if (!nativeRiderCurrent(p, rider))
+    if (!nativeRiderCurrent(p, rider)) {
+        static void *traced = nullptr;
+        if (traced != p && multiplayer::remoteClient()) { traced = p; log("Update skipped: rider not current (no network submit)"); }
         return;
+    }
     refreshOwnership(s, p);
     prepareLocalGestureSource(s); // Current physical input, before the one native transport submission.
     for (unsigned h = 0; h < 2; ++h) {
@@ -4675,6 +4707,7 @@ static void __fastcall simulationStep(void *simulation, void *) {
         runPostSimulationHeadVisibility(interval);
         runPostSimulationSniper(interval);
         menus::playPendingFilms(); // Nothing waits on a dedicated server (no menus).
+        labServerNextLevel();
         // Retire input only after all original entity/script/physics work.
         if (interval.networkPrepared && nativeInputHealthy())
             multiplayer::completeTick();
@@ -11357,7 +11390,9 @@ static int commandIndex(void *b, uint32_t id) {
     return -1;
 }
 static bool respawnRoute(const Snapshot &s) {
-    return livePlayer(s) && s.initialized && local(s.player) && isAlive && !isAlive(s.player) &&
+    // Not s.initialized: a co-op level change hands the client a new player that waits
+    // dead ("Press fire to respawn") before it was ever in play (V961).
+    return livePlayer(s) && local(s.player) && isAlive && !isAlive(s.player) &&
            fresh(s.input) && !recenterHeld(s.input) && !menus::active();
 }
 static bool netricsaOpen(const Snapshot &s) {
@@ -11444,16 +11479,16 @@ static float __fastcall commandValue(void *b, void *, uint32_t id) {
         if (netricsaCommand(i) && netricsaLive(latest)) return netricsaValue(i, latest);
     }
     auto snapshot = copySnapshot();
-    if (!vrSession(snapshot))
-        return originalValue(b, id);
     {
-        AcquireSRWLockShared(&controlsLock);
+        AcquireSRWLockShared(&controlsLock); // Ahead of the session check (see query).
         const int i = commandIndex(b, id);
         const bool respawn = respawnCommand(i, snapshot);
         const float v = respawn ? respawnValues[i] : 0;
         ReleaseSRWLockShared(&controlsLock);
         if (respawn) return v;
     }
+    if (!vrSession(snapshot))
+        return originalValue(b, id);
     bool enabled = fresh(snapshot.input) && !recenterHeld(snapshot.input) && snapshot.ui.gameplay &&
                    GetTickCount64() - snapshot.ui.tickMs < 200 && livePlayer(snapshot);
     AcquireSRWLockShared(&controlsLock);
@@ -11486,9 +11521,9 @@ static int query(void *b, uint32_t id, int mode, CommandInt original) {
             netricsaPrior[i] = netricsaValue(i, snapshot.input);
         }
     }
-    if (!vrSession(snapshot))
-        return original(b, id);
     {
+        // Ahead of the session check, which needs the initialized rig a respawning
+        // player may not have yet (respawnRoute).
         AcquireSRWLockShared(&controlsLock);
         const int i = commandIndex(b, id);
         const bool respawn = respawnCommand(i, snapshot);
@@ -11496,6 +11531,8 @@ static int query(void *b, uint32_t id, int mode, CommandInt original) {
         ReleaseSRWLockShared(&controlsLock);
         if (respawn) return nativeCommandQuery(v, prev, mode, true);
     }
+    if (!vrSession(snapshot))
+        return original(b, id);
     bool enabled = fresh(snapshot.input) && !recenterHeld(snapshot.input) && snapshot.ui.gameplay &&
                    GetTickCount64() - snapshot.ui.tickMs < 200 && livePlayer(snapshot);
     AcquireSRWLockShared(&controlsLock);

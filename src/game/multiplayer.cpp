@@ -356,8 +356,14 @@ static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
     const int slot = int(read32(server, 0xc054));
     const uint32_t brain = read32(rpc, 0x14);
     if (parsed != network::ParseResult::Valid || read32(rpc, 0x24) != 0 ||
-        int(read32(rpc, 0x18)) != chatSelector() || !bound(server, slot, brain))
+        int(read32(rpc, 0x18)) != chatSelector() || !bound(server, slot, brain)) {
+        static unsigned traced = 0;
+        if (traced++ < 32)
+            log("Multiplayer server refused kind=%d parsed=%d slot=%d brain=%08x slotBrain=%08x bound=%d",
+                parsed == network::ParseResult::Valid ? int(message.kind) : -1, int(parsed), slot, unsigned(brain),
+                unsigned(brainFor(slot)), int(bound(server, slot, brain)));
         return true;
+    }
     const uint64_t now = GetTickCount64();
     network::Message ack{};
     ack.kind = network::Kind::Ack;
@@ -430,8 +436,12 @@ static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
     }
     for (size_t i = 0; i < discardCount; ++i)
         sendPeerAck(server, slot, brain, incarnation, discarded[i]);
-    if (reply)
-        sendPeerAck(server, slot, brain, incarnation, ack.ack);
+    if (reply && !sendPeerAck(server, slot, brain, incarnation, ack.ack)) {
+        static unsigned traced = 0;
+        if (traced++ < 16)
+            log("Multiplayer server reply failed kind=%d slot=%d brain=%08x incarnation=%u", int(message.kind), slot,
+                unsigned(brain), incarnation);
+    }
     return true;
 }
 static void dispatchServer(void *server, void *rpc, bool reliableTransport) noexcept {
@@ -511,6 +521,14 @@ static void executeClientBody(void *unusedThis, int h, uint32_t brain, int j, in
         return;
     void *client = clientContext->client;
     withPeerLock([&] {
+        if (message.kind == network::Kind::Ack &&
+            !(client == local.net && brain == local.brain && avatarFor(brain) == local.avatar)) {
+            static unsigned traced = 0;
+            if (traced++ < 16)
+                log("Multiplayer client ack refused net=%d brain=%08x local=%08x avatar=%08x local=%08x",
+                    int(client == local.net), unsigned(brain), unsigned(local.brain), unsigned(avatarFor(brain)),
+                    unsigned(local.avatar));
+        }
         if (client == local.net && brain == local.brain && avatarFor(brain) == local.avatar) {
             if (message.kind == network::Kind::Ack) {
                 ++seenAck;
@@ -731,6 +749,17 @@ static bool submitInput(void *player, network::PosePacket &admitted, bool reliab
     if (!hooksReady.load(std::memory_order_acquire) || !player || !currentNet())
         return false;
     int slot = slotFor(player);
+    {
+        // A client's Hello state as it changes (a level change hands it a new player).
+        static uint64_t traced = 0;
+        static unsigned count = 0;
+        const uint64_t key = uint64_t(uint32_t(slot)) << 32 | handleOf(player);
+        if (isClient() && key != traced && count < 32) {
+            traced = key; ++count;
+            log("Multiplayer client player=%08x slot=%d brain=%08x net=%d", unsigned(handleOf(player)), slot,
+                unsigned(slot >= 0 ? brainFor(slot) : 0), int(currentNet() != nullptr));
+        }
+    }
     if (slot < 0)
         return false;
     uint32_t brain = brainFor(slot), avatar = handleOf(player);
@@ -831,6 +860,10 @@ static bool submitInput(void *player, network::PosePacket &admitted, bool reliab
                     token = {local.clientNonce, 0, 0};
                     ready = handoff.granted = local.credits.grant(token);
                     local.lastHello = now;
+                    static unsigned traced = 0;
+                    if (traced++ < 32)
+                        log("Multiplayer client hello brain=%08x avatar=%08x granted=%d", unsigned(brain),
+                            unsigned(avatar), int(ready));
                 }
             } else if (local.serverNonce && local.hasLatest && !local.credits.full() &&
                        !local.credits.hasOutstandingCapability(local.clientNonce, local.serverNonce) &&
