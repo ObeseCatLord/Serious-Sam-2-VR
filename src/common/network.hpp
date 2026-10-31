@@ -790,6 +790,14 @@ class ConsumptionCredits {
             result += entry.clientNonce != 0;
         return result;
     }
+    // An unanswered Hello (no server nonce, sequence zero) holds nothing on the
+    // server: a client giving up on it takes its credit back. A refused Hello is
+    // never acknowledged, so four of them otherwise silenced the client for good.
+    void revokeHellos() {
+        for (auto &entry : entries_)
+            if (!entry.serverNonce && !entry.sequence)
+                entry = {};
+    }
     void revoke(ConsumptionToken token) {
         for (auto &entry : entries_)
             if (entry.clientNonce == token.clientNonce && entry.serverNonce == token.serverNonce &&

@@ -212,7 +212,18 @@ static bool bound(void *server, int slot, uint32_t brain) {
     if (!server || slot < 0 || slot >= 18 || !brain || brainFor(slot) != brain)
         return false;
     auto entry = static_cast<uint8_t *>(server) + 0xa70 + 0xa18 * slot;
-    return int32_t(read32(entry, 0)) >= 0 && read32(entry, 0x998) && avatarFor(brain) == read32(entry, 0x998);
+    const uint32_t avatar = avatarFor(brain), recorded = read32(entry, 0x998);
+    if (int32_t(read32(entry, 0)) < 0 || !avatar || !recorded)
+        return false;
+    if (avatar == recorded)
+        return true;
+    // A level change gives the slot's brain a new avatar with no SetAvatar: the entry
+    // keeps the first level's handle (V968). It is stale while no slot's brain still
+    // owns it; one that does belongs to another player.
+    for (int other = 0; other < 17; ++other)
+        if (avatarFor(brainFor(other)) == recorded)
+            return false;
+    return true;
 }
 static int chatSelector() {
     auto descriptor = *reinterpret_cast<uint8_t **>(samBase + 0x40694c);
@@ -359,9 +370,12 @@ static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
         int(read32(rpc, 0x18)) != chatSelector() || !bound(server, slot, brain)) {
         static unsigned traced = 0;
         if (traced++ < 32)
-            log("Multiplayer server refused kind=%d parsed=%d slot=%d brain=%08x slotBrain=%08x bound=%d",
-                parsed == network::ParseResult::Valid ? int(message.kind) : -1, int(parsed), slot, unsigned(brain),
-                unsigned(brainFor(slot)), int(bound(server, slot, brain)));
+            log("Multiplayer server refused kind=%d parsed=%d slot=%d brain=%08x slotBrain=%08x bound=%d entry=%d,%08x "
+                "avatar=%08x", parsed == network::ParseResult::Valid ? int(message.kind) : -1, int(parsed), slot,
+                unsigned(brain), unsigned(brainFor(slot)), int(bound(server, slot, brain)),
+                slot >= 0 && slot < 18 ? int(read32(static_cast<uint8_t *>(server) + 0xa70 + 0xa18 * slot, 0)) : -2,
+                slot >= 0 && slot < 18 ? unsigned(read32(static_cast<uint8_t *>(server) + 0xa70 + 0xa18 * slot, 0x998)) : 0u,
+                unsigned(avatarFor(brain)));
         return true;
     }
     const uint64_t now = GetTickCount64();
@@ -462,6 +476,10 @@ static void __fastcall unreliable(void *server, void *, void *rpc) {
     dispatchServer(server, rpc, false);
 }
 static void __fastcall setAvatar(void *server, void *, uint32_t avatar, int slot) {
+    {
+        static unsigned traced = 0;
+        if (traced++ < 32) log("Multiplayer server SetAvatar slot=%d avatar=%08x", slot, unsigned(avatar));
+    }
     if (!hooksReady.load(std::memory_order_acquire)) {
         originalSetAvatar(server, avatar, slot);
         return;
@@ -821,6 +839,7 @@ static bool submitInput(void *player, network::PosePacket &admitted, bool reliab
             if ((local.serverNonce && now - local.lastAck > 500) ||
                 (!local.serverNonce && local.lastHello && now - local.lastHello > 500 &&
                  local.credits.hasOutstandingCapability(local.clientNonce, 0))) {
+                local.credits.revokeHellos(); // Unanswered: a new Hello may go out.
                 local.serverNonce = 0;
                 local.lastHello = 0;
                 local.lastAck = 0;

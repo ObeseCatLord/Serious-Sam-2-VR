@@ -396,6 +396,20 @@ using MarkerDraw = void(__thiscall *)(void *, const Matrix34 &, const Matrix44 &
 using MarkerFade = float(__thiscall *)(void *);
 static MarkerDraw nativeNavigation = nullptr, nativeObjectives = nullptr;
 static void *(__cdecl *nativeDrawPort)() = nullptr, *(__cdecl *nativeWorldInfo)() = nullptr;
+// net_fConnectionTimeout (Engine RVA 2C825C, cvar descriptor storage; 15 s, saved in
+// Sam2.ini): both ends of a co-op game drop the other after it without traffic, and the
+// dedicated server under emulation took 16 s to load a level, dropping its client
+// (V957). Kept at 60 s or more after each simulation step (the ini loads after attach).
+static void raiseConnectionTimeout() {
+    static float *timeout = [] {
+        const auto e = GetModuleHandleW(L"Engine.dll");
+        return e ? reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(e) + 0x2c825c) : nullptr;
+    }();
+    if (!timeout || !(*timeout >= 1 && *timeout < 60)) return;
+    static unsigned traced = 0;
+    if (traced++ < 4) log("Network connection timeout %.0f s -> 60 s (slow co-op level loads)", *timeout);
+    *timeout = 60;
+}
 // Lab (SS2VR_LAB_SERVER_NEXT_LEVEL=1, a dedicated server, after a simulation step):
 // Temp/SS2VR/next-level-request ends the level as its exit does, so connected
 // clients go through a real co-op level change.
@@ -4708,6 +4722,7 @@ static void __fastcall simulationStep(void *simulation, void *) {
         runPostSimulationSniper(interval);
         menus::playPendingFilms(); // Nothing waits on a dedicated server (no menus).
         labServerNextLevel();
+        raiseConnectionTimeout();
         // Retire input only after all original entity/script/physics work.
         if (interval.networkPrepared && nativeInputHealthy())
             multiplayer::completeTick();

@@ -920,6 +920,19 @@ static void mixedGameplayOwnershipChecks() {
                       "desktop primary down/press/release/history/held remain untouched");
             }
     }
+    {
+        ConsumptionCredits hellos;
+        check(hellos.grant({1, 0, 0}) && hellos.grant({2, 0, 0}) && hellos.grant({3, 0, 0}) &&
+                  hellos.grant({4, 0, 0}) && hellos.full(),
+              "four unanswered Hellos fill the credits");
+        hellos.revokeHellos();
+        check(!hellos.full() && hellos.count() == 0 && hellos.grant({5, 0, 0}),
+              "revoking unanswered Hellos returns their credits");
+        check(hellos.grant({6, 7, 1}), "a pose token is granted beside a Hello");
+        hellos.revokeHellos();
+        check(hellos.count() == 1 && hellos.hasOutstandingCapability(6, 7),
+              "revoking Hellos keeps the outstanding pose credit");
+    }
     check(peer.finishInterval(ack) && credits.acknowledge(ack, 11, 22) &&
               !credits.hasOutstandingCapability(11, 22),
           "desktop neutral interval retires the exact transport credit");
