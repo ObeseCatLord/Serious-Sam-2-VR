@@ -148,6 +148,13 @@ The game proxy supports listen-host/client VR through native RPCs. Dedicated aut
 
 Voice chat (`[Voice]` in `SS2VR.ini`) rides the same native RPC carrier: each client's Opus voice packets go to the authority, which relays them unreliably to every other negotiated SS2VR player (75 packets and 16000 bytes per second per speaker). Playback is positional and fades to a centred radio voice with distance. The design follows QuakeSpasm VR's voice chat; see THIRD_PARTY.md.
 
+Co-op level films and level changes: each level's pre-rendered intro and outro (and an
+episode's opening film) play for every networked player, as in single player, once that
+player is in the level; A or B skips one. The level keeps running while a film plays.
+After a level change the VR link renegotiates, the trigger answers "Press fire to
+respawn", and the engine's connection timeout is kept at 60 s so a slow server level
+load does not drop clients. Clients and server must run the same SS2VR version.
+
 ## License
 
 SS2VR is free software under the GNU General Public License version 3
