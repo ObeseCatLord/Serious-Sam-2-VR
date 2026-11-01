@@ -42,6 +42,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.laserDistance = number(L"Laser", L"MaxDistanceMeters", 100, 5, 200);
     settings.scopeEyeRelief = number(L"Scope", L"EyeReliefMeters", .1f, .02f, .3f);
     settings.scopeAlwaysLive = number(L"Scope", L"AlwaysLive", 1, 0, 1) >= .5f;
+    settings.scopeZoomByEye = number(L"Scope", L"ZoomByEye", 1, 0, 1) >= .5f;
     settings.scopeIdleMagnification = number(L"Scope", L"IdleMagnification", 4, 1.5f, 10);
     settings.renderScale = number(L"Render", L"Scale", 1, .25f, 4);
     settings.foveation.mode = int(number(L"Render", L"Foveation", 1, 0, 2) + .5f);

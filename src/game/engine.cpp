@@ -705,6 +705,7 @@ static void pollSettingsFile() {
     settings.laserDistance = fresh.laserDistance;
     settings.ammoScreens = fresh.ammoScreens;
     settings.quickGrenade = fresh.quickGrenade;
+    settings.scopeZoomByEye = fresh.scopeZoomByEye;
     settings.throwStrength = fresh.throwStrength;
     settings.snapTurn = fresh.snapTurn;
     settings.smoothTurnRate = fresh.smoothTurnRate;
@@ -2497,6 +2498,7 @@ static bool menuViewEligible(void *p, const Snapshot &s, const Input &input, con
            nativeRiderCurrent(p, rider) && validTrackingEpoch(s.generation);
 }
 static uint64_t lastUpdateTick = 0; // Main thread: the simulation's last snapshot update.
+static bool scopeEyeAligned(unsigned hand, uint32_t weapon, uint64_t now); // Scope by eye (below).
 static void update(void *p) {
     validateLabOnlineIsolation(false);
     if (rigMutationActive || !hooksReady.load(std::memory_order_acquire) || !channel.shared || !local(p))
@@ -3289,6 +3291,20 @@ static void update(void *p) {
     }
     refreshOwnership(s, p);
     prepareLocalGestureSource(s); // Current physical input, before the one native transport submission.
+    if (settings.scopeZoomByEye) {
+        // Scope by eye: a sniper's zoom input is the eye behind its scope, not the
+        // zoom button, which goes back to its own use (sprint).
+        const uint64_t now = GetTickCount64();
+        for (unsigned h = 0; h < 2; ++h) {
+            void *weapon = s.handle[h] ? resolve(s.handle[h]) : nullptr;
+            if (!nativeSniper(weapon)) continue;
+            const unsigned physical = mountHand(s, h);
+            if (physical >= 2) continue;
+            const uint32_t bit = 1u << physical;
+            input.zoomDownMask = scopeEyeAligned(h, s.handle[h], now) ? input.zoomDownMask | bit : input.zoomDownMask & ~bit;
+            input.zoomSourceButton[physical] = 0;
+        }
+    }
     for (unsigned h = 0; h < 2; ++h) {
         void *weapon = s.handle[h] ? resolve(s.handle[h]) : nullptr;
         const bool sniper = enabled && rider.handheld() && !aliased(s) && nativeSniper(weapon);
@@ -8352,6 +8368,54 @@ void retireScopeGeometry(bool fatal) noexcept {
     }
     if (fatal) SS2VR_PAIR_FAULT();
 }
+// Scope by eye ([Scope] ZoomByEye): an eye close behind a sniper's rear lens, near its
+// optical axis and looking along it. Measured on each admitted cap draw from the exact
+// optical frame and this render's eye poses; published per native slot for update(),
+// which takes it as that hand's zoom input. Wider exit limits keep it from flickering.
+struct ScopeEyeAlignment { uint32_t weapon = 0; uint64_t tickMs = 0; bool aligned = false; };
+static SRWLOCK scopeEyeLock = SRWLOCK_INIT;
+static ScopeEyeAlignment scopeEye[2];
+static void noteScopeEye(unsigned hand, uint32_t weapon, const ScopeOpticalFrame &optic) {
+    if (hand >= 2 || !weapon || !eyePlayer || eyeIndex < 0 || eyeIndex > 1 || !scopeOpticalFrameValid(optic)) return;
+    const uint64_t now = GetTickCount64();
+    AcquireSRWLockShared(&scopeEyeLock);
+    const bool was = scopeEye[hand].weapon == weapon && scopeEye[hand].aligned && now - scopeEye[hand].tickMs < 250;
+    ReleaseSRWLockShared(&scopeEyeLock);
+    // Behind the lens (metres along its outward axis), off the axis, and the angle
+    // between the eye's view and the scope's.
+    const float maxBehind = was ? .32f : .25f, maxSide = was ? .06f : .04f,
+                minCos = std::cos((was ? 18.f : 12.f) * 3.14159265f / 180);
+    const Vec3 scopeForward{-optic.camera.m[2], -optic.camera.m[6], -optic.camera.m[10]};
+    bool aligned = false;
+    float bestBehind = 0, bestSide = 1e9f, bestCos = -1;
+    for (unsigned k = 0; k < 2; ++k) {
+        const Pose eye = worldEyeTracking(eyeAnchor, eyeSnapshot.origin, eyeSnapshot.turn, eyeRequest.input.head,
+                                          eyeRequest.eye[k]);
+        if (!finite(eye)) continue;
+        const Vec3 local = scopeTransformPoint(optic.inverseCamera, eye.p);
+        const float side = std::hypot(local.x, local.y), cosine = dot(rotate(eye.q, {0, 0, -1}), scopeForward);
+        if (side < bestSide) { bestSide = side; bestBehind = local.z; bestCos = cosine; }
+        aligned = aligned || (local.z > (was ? -.02f : 0.f) && local.z < maxBehind && side < maxSide && cosine > minCos);
+    }
+    AcquireSRWLockExclusive(&scopeEyeLock);
+    scopeEye[hand] = {weapon, now, aligned};
+    ReleaseSRWLockExclusive(&scopeEyeLock);
+    static bool previous[2]{};
+    static unsigned traced = 0;
+    if (aligned != previous[hand] && traced < 200) {
+        ++traced;
+        log("Scope eye hand=%u aligned=%d behind=%.3f side=%.3f angle=%.1f", hand, int(aligned), double(bestBehind),
+            double(bestSide), double(std::acos(std::clamp(bestCos, -1.f, 1.f)) * 180 / 3.14159265f));
+    }
+    previous[hand] = aligned;
+}
+static bool scopeEyeAligned(unsigned hand, uint32_t weapon, uint64_t now) {
+    if (hand >= 2 || !weapon) return false;
+    AcquireSRWLockShared(&scopeEyeLock);
+    const auto e = scopeEye[hand];
+    ReleaseSRWLockShared(&scopeEyeLock);
+    return e.weapon == weapon && e.aligned && now >= e.tickMs && now - e.tickMs < 250;
+}
 bool recordScopeGeometry(const ScopeRasterObservation &sample, const ScopeCapGeometry &cap,
                          const ScopeUvTransform &nativeUv, bool opaqueColorCandidate) {
     ScopeRasterObservation now;
@@ -8374,6 +8438,7 @@ bool recordScopeGeometry(const ScopeRasterObservation &sample, const ScopeCapGeo
     }
     physicalWeapon->scopePose.opticalFrame = optical;
     physicalWeapon->scopePose.imageCoordinates = coordinates;
+    noteScopeEye(now.hand, now.pose.weaponHandle, optical);
     // Color failure never retires independently admitted geometry. This value
     // describes matching pre-draw color observations, not uninterrupted device
     // state through this DIP, image permission, source resource or transfer.

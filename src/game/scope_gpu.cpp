@@ -938,9 +938,13 @@ static bool prepareImage(IDirect3DDevice9 *d) {
     const auto &source = probe.sourceView.pose.opticalFrame;
     Vec3 target;
     const bool aimed = scopeImageTarget(probe.raster.hand,target);
+    // Zoomed indicator (the native zoomed shot is live): the lens at full brightness
+    // with a bold crosshair; otherwise a dimmer picture and the thin crosshair.
+    const bool zoomed = probe.raster.pose.zoom.valid;
+    const float brightness = zoomed ? 1.f : .7f, reticle = zoomed ? .004f : .0015f;
     // One eye's lens constants (only the eye position, row 3, differs per eye).
     const auto build = [&](Vec3 eye, ScopeShaderConstants &out) {
-        if (!scopeShaderConstants(optic,probe.sourceView.opticalProjection,coordinates,eye,1,0,0,out)) return false;
+        if (!scopeShaderConstants(optic,probe.sourceView.opticalProjection,coordinates,eye,brightness,0,0,out)) return false;
         // Forgiving eye box: the sniper's scope rides well above the controller, so
         // a strict exit pupil (about 8 degrees at 4x) blacks the lens unless the
         // head is exactly behind it. Only a quarter of the eye's sideways offset
@@ -955,8 +959,8 @@ static bool prepareImage(IDirect3DDevice9 *d) {
         // lands (the laser's hit), as a rifle scope's reticle.
         // Without this frame's laser sample: the optical centre, where the shots
         // land too (lab V621: the laser's hit at uv 0.500,0.49).
-        if (!aimed || !scopeReticleTarget(source,probe.sourceView.opticalProjection,target,.0015f,2.f,out))
-            out.rows[6] = {.5f,.5f,.0015f,2.f};
+        if (!aimed || !scopeReticleTarget(source,probe.sourceView.opticalProjection,target,reticle,2.f,out))
+            out.rows[6] = {.5f,.5f,reticle,2.f};
         return true;
     };
     probe.stereoImage = false;

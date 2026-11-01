@@ -27,7 +27,7 @@ struct OptionsRow {
 
 enum OptionsItem : unsigned {
     // Movement
-    OptMoveDirection, OptTurning, OptTurnSpeed, OptSnapAngle, OptSwimming, OptGripTurn, OptQuickGrenade,
+    OptMoveDirection, OptTurning, OptTurnSpeed, OptSnapAngle, OptSwimming, OptGripTurn, OptQuickGrenade, OptScopeEye,
     // Graphics
     OptScale, OptFoveation, OptInset, OptPeriphery, OptWaterMirror, OptMirrorScale, OptScopeLive, OptScopeZoom,
     OptDesktopWorld, OptInstancing,
@@ -48,7 +48,7 @@ struct OptionKey { const wchar_t *section, *key; };
 inline constexpr OptionKey OptionKeys[OptCount] = {
     {L"Comfort", L"MoveDirection"}, {L"Comfort", L"SnapTurn"}, {L"Comfort", L"SmoothTurnDegreesPerSecond"},
     {L"Comfort", L"SnapTurnDegrees"}, {L"Swimming", L"Immersive"}, {L"Vehicles", L"GripTurnRateDegrees"},
-    {L"Grenades", L"QuickThrow"},
+    {L"Grenades", L"QuickThrow"}, {L"Scope", L"ZoomByEye"},
     {L"Render", L"Scale"}, {L"Render", L"Foveation"}, {L"Render", L"FoveationInset"}, {L"Render", L"FoveationPeriphery"},
     {L"Render", L"WaterMirror"}, {L"Render", L"WaterMirrorScale"}, {L"Scope", L"AlwaysLive"}, {L"Scope", L"IdleMagnification"},
     {L"Render", L"DesktopWorld"}, {L"Render", L"SinglePassInstancing"},
@@ -98,6 +98,9 @@ inline OptionsRow vrOptionRow(unsigned item, const VrSettings &settings, const V
     case OptQuickGrenade:
         return {L"Quick grenades", onOff(settings.quickGrenade),
                 L"Clicking the right stick throws a grenade straight from the right hand where it points, instead of taking one in hand to throw."};
+    case OptScopeEye:
+        return {L"Scope by eye", onOff(settings.scopeZoomByEye),
+                L"A sniper rifle zooms (its stronger scoped shot) while your eye is close behind its scope looking down it. Off: the zoom button. The scope's crosshair turns bold and its picture bright while zoomed."};
     case OptGripTurn:
         return {L"Vehicle control turn rate",
                 settings.gripTurnRateDegrees > 0 ? format(L"%.0f°/s", double(settings.gripTurnRateDegrees)) : std::wstring(L"1:1 with hands"),
@@ -297,6 +300,7 @@ inline bool changeOption(unsigned item, int direction, VrSettings &settings, con
     case OptLaserRange: number(settings.laserDistance, 10, 10, 200); break;
     case OptAmmoScreens: toggle(settings.ammoScreens); break;
     case OptQuickGrenade: toggle(settings.quickGrenade); break;
+    case OptScopeEye: toggle(settings.scopeZoomByEye); break;
     case OptMenuDistance: number(settings.menuDistance, .1f, 1.5f, 3); break;
     case OptMenuSize: number(settings.menuWidth, .1f, 1.4f, 2.8f); break;
     default: return false;

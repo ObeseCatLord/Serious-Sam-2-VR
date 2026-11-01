@@ -155,6 +155,12 @@ After a level change the VR link renegotiates, the trigger answers "Press fire t
 respawn", and the engine's connection timeout is kept at 60 s so a slow server level
 load does not drop clients. Clients and server must run the same SS2VR version.
 
+Scope by eye (`[Scope] ZoomByEye`, on by default, VR options → Movement): a sniper
+rifle takes its zoomed state (the game's stronger scoped shot, 300 instead of 75
+damage) while an eye is close behind its scope looking down it, instead of on the
+zoom button, which goes back to sprint. While zoomed the scope's picture is at full
+brightness with a bold crosshair; otherwise it is dimmer with a thin one.
+
 ## License
 
 SS2VR is free software under the GNU General Public License version 3

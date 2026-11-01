@@ -40,6 +40,9 @@ struct VrSettings {
     // [Scope] AlwaysLive: a held sniper's scope always shows the magnified view
     // (IdleMagnification while not zoomed; zooming uses the game's own zoom).
     bool scopeAlwaysLive = true;
+    // [Scope] ZoomByEye: a sniper zooms (the native zoomed shot) while an eye is behind its
+    // scope looking along it, not on the zoom button.
+    bool scopeZoomByEye = true;
     float scopeIdleMagnification = 4;
     bool immersiveSwimming = false;
     bool immersiveVehicleGrips = true;
