@@ -670,4 +670,4 @@ For each failure note the build, level/save, controller, left or right hand or
 eye, what you did, what you expected and what happened. Keep the three logs.
 After quitting, the game and `ss2vr_host.exe` should be gone.
 
-Installed candidate: commit `441710c`, version `0.2.11-dev.e23fb2fafab8` (2026-10-31): co-op level films, co-op level-change reconnect/respawn, 60 s connection timeout.
+Installed candidate: commit `0915c1b`, version `0.2.11-dev.5688bee720ab` (2026-11-01): scope by eye (zoomed sniper shot while an eye is behind the scope) with a zoomed indicator.
