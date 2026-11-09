@@ -1,169 +1,84 @@
-# Serious Sam 2 VR — OpenXR VR development mod
+# Serious Sam 2 VR
 
-**PC development and runtime testing resumed under the user's 2026-10-07 authority.** The mod remains incomplete. Start with [current continuation](docs/CLOUD_CONTINUATION.md) and [implementation status](docs/IMPLEMENTATION_STATUS.md). The old handoff is historical; its pause/no-runtime restrictions are superseded. Native safety and privacy remain.
+Serious Sam 2 VR is an OpenXR mod for the Steam version of Serious Sam 2, focused
+on tracked combat, comfort, and co-op.
 
-An original native adapter for the fingerprinted Steam Serious Sam 2 installation, with an x86 D3D9 proxy and an x64 OpenXR/D3D11 host. The interaction reference is Serious Sam VR: The First Encounter: tracked weapons in both hands, independent triggers, and a separate weapon wheel for each hand.
+<p>
+  <img src="docs/media/vr-combat.gif" width="360" height="360" alt="VR combat with tracked dual weapons">
+  <img src="docs/media/vr-outdoors.gif" width="360" height="360" alt="VR gameplay outdoors">
+</p>
 
-**Status: incomplete development build.** The private direct-scene harness now verifies Jungle scene bytes and captures sustained native world/UI stereo under simulated Monado/Proton. All seven controlled head poses produced request-correlated eye images and native camera response:0.1m translations and0.15rad yaw/pitch/roll. The native checkpoint passed82Debug and82assert-enabledRelease groups; subsequent offline collector changes passed their seven relevant consumer groups. Desktop terrain occlusion, hands/native dual wield, full immersive features, native Windows, multiplayer and real-headset acceptance remain open. See [rendering investigation](docs/PC_GAMEPLAY_READINESS.md), [Astra senior review](docs/RENDERING_SENIOR_REVIEW.md), [direct lab](docs/DIRECT_GAMEPLAY_LAB.md) and [required acceptance](docs/RUNTIME_ACCEPTANCE_MATRIX.md).
+## Features
 
-The current extension adds threshold-follow VR panels, native controller menu pointing, tracked native weapon placement, native-event haptics, collision lasers and multiplayer pose/weapon authority with remote weapon presentation and a dedicated server module. The **0.2.9** checkpoint connected native flat HUD/messages and full-field fades to both eye images through the original once-only native owner, with comfortable frozen panel geometry and conditional stats fallback. The current **0.2.11** source adds independent native sniper zoom controls and cleanup, including multiplayer shot context. It also retains the input/replication corrections from0.2.10. Astra approved these bounded source changes. Full immersive equivalence remains incomplete; teleport is excluded. See [UI source review](docs/NATIVE_FLAT_UI_CONNECTED_REVIEW.md), [input and multiplayer review](docs/NATIVE_INPUT_INTERVAL_REVIEW.md), [extension plan](docs/IMMERSIVE_PLAN.md) and [implementation status](docs/IMPLEMENTATION_STATUS.md).
+- OpenXR head and controller tracking with stereo rendering of the original game
+- Tracked weapons, dual wielding, and a weapon wheel on each hand
+- Throwable grenades, grabbing and throwing objects, and arm-stroke swimming
+- Sniper scopes you look through; the scoped shot is live while your eye is behind the scope
+- Vehicles and turrets with a virtual steering wheel and grabbable handles
+- Menus, cutscenes, and movies on a floating screen; wrist or head HUD
+- Co-op with VR and desktop players together, voice chat, and level cutscenes for everyone
+- Windows and Linux (Proton)
 
-Current source also contains default-off controlling-local single-player/multiplayer roomscale movement and
-handheld/seated world head-volume protection. The latter uses post-simulation native queries,
-rejects initial overlaps and constrains cached image reuse to the checked space
-and age. Native mechanism exclusions can omit the ridden vehicle itself; this
-is not cockpit-interior protection or a runtime-verified safety system.
-Current IPC11 retains the earlier head-clearance receipt and requires matching game/host builds; do not mix
-with older archives. See [head-volume integration](docs/HEAD_VOLUME_INTEGRATION.md)
-and [MP origin/capture ownership](docs/MP_LOCAL_ORIGIN_CAPTURE.md).
+## Installation
 
-## Implemented
+Download the installer for your system from
+[Releases](https://github.com/ObeseCatLord/Serious-Sam-2-VR/releases/latest) and run it:
 
-Current cloud source now connects magnified per-hand scope images through native
-pre-bloom scene capture and an ordered RGB-only lens pass. This supports a strict
-stock-geometry, opaque PS2, direct non-MSAA UNORM-target subset; unsupported
-render paths keep the native draw. Surrounding headset FOV and native zoom timing
-stay unchanged. The lens is verified in the simulated-headset lab (4x image on the
-zero-copy path, mipmapped, forgiving eye box, about +1.7 ms CPU per frame while zoomed); it has
-not yet been tried on a real headset. See [scope source integration](docs/SCOPE_SOURCE_INTEGRATION.md).
-This does not update the historical development archive described below.
+- **Windows:** `ss2vr-installer-windows-x86_64.exe`
+- **Linux:** `ss2vr-installer-linux-x86_64` (`chmod +x` it first)
 
-Current source uses IPC11 and multiplayer wire7. Matching host/game/server products preserve independent raw actions, acknowledged hand epochs and native shot/zoom context. Wire7 adds physical gesture fields separately from manual firing, release and zoom. The default-off unique-saw adapter now connects local, authoritative and remote-observer native consumers; short remote gestures are retained per hand until native consumption or explicit discard. Original ClientAction transport, manual history and native combat remain unchanged. See [melee source review](docs/PHYSICAL_MELEE_CONSUMPTION.md).
+It finds Serious Sam 2 through Steam and installs the mod. Run it again to update
+(your settings are kept) or to uninstall.
 
-Earlier0.2.11 archives precede the current magnified scope integration above. Per-hand native zoom preserves original activation, timing, damage and cleanup; surrounding XR FOV stays unchanged. See [zoom source acceptance](docs/SNIPER_BORROWED_ZOOM_SOURCE_REVIEW.md) and [current scope integration](docs/SCOPE_SOURCE_INTEGRATION.md). Historical scope-stage/GPU-geometry documents describe their narrower original snapshots.
+Run the game **windowed** with MSAA off, and start your OpenXR runtime (SteamVR,
+Monado, WiVRn...) before the game.
 
-- OpenXR six-DOF HMD and hand poses: lateral/vertical/forward translation plus pitch/yaw/roll, separate eye views and asymmetric projections. Deep crouches retain physical height; eyes and hands share one tracking correction. Physical translation is bounded; development-gated native body settlement supports the controlling local actor in SP/MP. Actual collision/convergence remains user acceptance.
-- Physical native gun projection/view/depth matching for admitted XR draws, with failed placement/state restoration rejecting the stereo pair. Native gun models retain their authored animation/content, including hands/arms where the actual assembly provides them; a universal hand model, articulated fingers and full-body IK are not added.
-- Mounted six-DOF head/hand rig follows the native seat body pose and eye height. Right-hand aim feeds the original vehicle look clamp/control path; left-stick controls and both fire commands remain native. Handheld wheels/equip/muzzle adaptation are suppressed while mounted; mount/seat changes reset the existing rig. Replicated riders use the same anchor and native vehicle RPCs. See [mounted source acceptance](docs/MOUNTED_ADAPTER_SOURCE_GO.md).
-- Collision lasers start at the original native gun muzzle. Mounted turret beams use the native authored attachment/world placement and reported aim direction, exclude the actual vehicle mechanism and end at the native collision hit. Exact audited turret implementation only; final projectile scatter is not predicted. See [Astra source acceptance](docs/NATIVE_VEHICLE_LASER_SOURCE_REVIEW.md).
-- Native dual wielding, independent per-weapon fire routing (including identical weapon types), hand-specific shooting/model placement, and native ammo/cooldown/damage behavior.
-- Two hand wheels, each held open by that hand's wheel button (Touch Y/B, trackpad press on Index/Vive/Microsoft, Frame D-pad up/B): the game's own weapon models (the stock pickup meshes, slowly spinning; the weapon icon if a mesh is unavailable) float on a ring 15 cm ahead of where the hand opened it, along its pointing direction; the action bubbles (Netricsa, game menu, single-player quick save/load) form a short separate arc beyond the ring on that hand's outer side. Point the controller at an item, or reach into the ring, to highlight it (a light haptic tick; a host card names it and its ammo) and release the button to choose; releasing with nothing highlighted (pointing at the centre) cancels. A deflected stick still picks weapons by direction. The native inventory validates selections, with a pending hand-specific intent during weapon cooldown; bubbles press the native command once.
-- Left-stick movement relative to where your head faces, smooth right-stick turning (`[Comfort] SmoothTurnDegreesPerSecond`, default 150; `SnapTurn=1` for 30° snaps), use/jump/sprint and recenter. Wheel opening, tracking/focus loss and weapon changes suppress fire until a trigger release.
-- Grip pickup: squeezing a grip beside a takeable object (the game's "Press Use to take" props) picks it up into that hand through the native carry joint; it follows the hand and releasing the grip drops or throws it with the hand's velocity. Otherwise, on foot, the grip jumps while held; in vehicles it grasps.
-- Native flat HUD, messages, player names, scores/death and other original overlay content render once on desktop, then admitted immediate draws appear on the comfortable panel in both eyes. Exact native fades cover each whole eye. The panel starts following after a 35° head turn, stops within 8°, and moves at at most 90°/s. Default full canvas is 2.2m wide at 2.2m distance; menu settings control its physical size. Native timing, localization and blend order remain original. Health/armor/per-hand ammo stats remain a fallback when the actually submitted pair lacks completed native UI. Unsupported output rejects the pair; point/line/wireframe/custom-program UI paths and device/thread compatibility remain explicit limits. See [source acceptance](docs/NATIVE_FLAT_UI_CONNECTED_REVIEW.md).
-- A separately classified flat screen carries native menus/loading; left stick navigates, a presented controller ray and trigger click native menu items; Use confirms, Menu goes back/pauses. Menu input goes through the native menu dispatcher (system commands) and other screens get keys posted to the game window, so no window focus is needed.
-- Native navigational beacons and world objective markers use each eye's actual view and full asymmetric projection, with the original native fade/content/draw helpers. Failed target or lifecycle checks reject the whole pair. See [Astra source acceptance](docs/NATIVE_WORLD_OVERLAY_SOURCE_REVIEW.md). Flat panels use the separately admitted once-only UI path above.
-- Touch, Index, Vive and Microsoft motion-controller action profiles; exact mappings are in [host details](docs/HOST_STATUS.md).
+On Linux, set the game's Steam launch options to:
 
-Experimental head-volume protection can be enabled with `[HeadComfort] Enabled=1` in `Bin/SS2VR/SS2VR.ini`. Current source waits for a matching query attempt and makes obstructed or unavailable owned attempts opaque in both world views while preserving UI. Clear cached images must remain inside their admitted volume and lifetime. It remains disabled by default and runtime-unverified. See [current head-volume integration](docs/HEAD_VOLUME_INTEGRATION.md); the [earlier head comfort review](docs/HEAD_COMFORT_REVIEW_DISPOSITION.md) describes the superseded opportunistic ray implementation.
-
-Native remote head bones are enabled by default inside admitted frozen VR stereo pairs. The adapter retains native animation and applies full XYZ/quaternion tracking about the body eye. Ordinary desktop observers retain native heads. Set `[Multiplayer] RemoteHeadTracking=0` to disable the adapter; actual multiplayer appearance and lifecycle still need your in-VR acceptance. This does not affect local 6DOF tracking. See [current ownership and coverage](docs/REMOTE_HEAD_RESOURCE_OWNERSHIP.md).
-
-## Requirements and installation
-
-**Easiest: the installer.** Download `ss2vr-installer-windows-x86_64.exe` or
-`ss2vr-installer-linux-x86_64` from the
-[latest release](https://github.com/ObeseCatLord/Serious-Sam-2-VR/releases/latest) and run it
-(Linux: `chmod +x` first). It finds Serious Sam 2 through Steam, downloads the
-latest `SS2VR-<version>.zip` release, checks it, and installs, updates or
-removes the mod; your VR settings carry over on updates. Run it again any time
-to update. The same installers are also inside each release zip. See
-[installer/README.md](installer/README.md) for its command-line options.
-
-Use the stock game's first-person view and the exact binaries listed in [installed-build.json](docs/installed-build.json). Other native builds are rejected. Windows 10/11 x64 needs an active OpenXR HMD runtime offering D3D11 and BGRA8 or RGBA8 UNORM, with at least four composition layers. No proprietary game files are included.
-
-Desktop participants in mixed multiplayer do not need a headset. Every participant
-and the server need matching mod products. A mod handshake does not take over
-desktop controls; accepted tracked poses establish VR gameplay ownership. Mixed
-gameplay acceptance remains open; admitted mono remote-head rendering is connected
-in source. See
-[mixed desktop/VR status](docs/MIXED_DESKTOP_VR.md).
-
-Set **USE COMBO WEAPONS → YES** in the stock single-player or cooperative settings. Independent identical weapons require the game's combo capability and valid native dual state; its fallback mode couples the guns. Patch resources permit custom combinations, but archive filenames alone do not prove the loaded setting. See [native combo evidence](docs/NATIVE_COMBO_CAPABILITY_AUDIT.md).
-
-Run the game **windowed** with MSAA disabled and a 32-bit color mode. Each eye renders at the OpenXR runtime's recommended image size (which already includes the runtime's own supersampling); `[Render] Scale` in `Bin/SS2VR/SS2VR.ini` multiplies it. The native window canvas reports that size for the game's window, the windowed depth buffer covers it, and the size is cached in `Bin/SS2VR/headset-view.ini` so later launches start at it (the first launch switches once the runtime reports it). The desktop window mirrors the left eye; VR frames do not render the world a third time for it (`[Render] DesktopWorld=1` restores that). Eye images reach the host without a CPU copy: the game renders each pair into D3D9 render targets shared with the host (DXVK shared resources), which copies them on the GPU into its OpenXR swapchains once the game has observed the pair's GPU work complete. Head-clearance fades, lab captures and BGRA-less swapchains fall back to shared-memory pixel sections. The host keeps a second request queued while the game renders, so every game frame can become a headset frame. In the simulated lab (1344x1512 per eye) this went from 16 to about 40 pairs/s; headset performance has not been measured on hardware.
-
-Foveated readback (`[Render] Foveation`, only used when the zero-copy path above is unavailable): the game still renders each eye at full size but returns only a downsampled full view (`FoveationPeriphery`, default 0.5 per axis) plus a full-resolution crop around your gaze (`FoveationInset`, default 0.4 per axis), about 40% of the bytes. The host submits them as a base projection layer and a feathered inset projection layer whose FOV is the crop's exact FOV. Gaze comes from `XR_EXT_eye_gaze_interaction`, the path Valve documents for Steam Frame; the default mode 1 turns foveation on only when the runtime reports an eye tracker, mode 2 always (centred without gaze). Monado does not currently pass the Bigscreen Beyond 2e's eye tracking. Valve's own Steam Frame foveation (`XR_FB_foveation`/`XR_META_foveation_eye_tracked`) changes GPU rasterization of Vulkan swapchains and does not apply to this CPU-transferred D3D9 renderer; single-pass stereo is not available in Direct3D 9.
-
-The historical extension archive is `dist/ss2vr-0.2.11-dev.zip`; it predates current IPC10 source and remains unchanged. Current packaging derives a `-dev.<source-fingerprint>` name and refuses stale or mixed game/server/host builds. No current finished-device-test package is available yet. For a matching development package, extract it and use Python 3:
-
-```sh
-python install.py install --game "/path/to/Serious Sam 2" --dry-run
-python install.py install --game "/path/to/Serious Sam 2"
 ```
-
-From this repository, pass the fresh directory printed by `tools/package.py` as the installer’s `--package` argument. The installer checks all five game fingerprints and every package hash, refuses collisions with `Bin/d3d9.dll`, `Bin/SS2VR`, `Bin/SS2VRServer.dll` or `Content/SS2VR.mod`, and writes a receipt. It never overwrites another mod. Removal checks that all payload files still match:
-
-```sh
-python install.py uninstall --game "/path/to/Serious Sam 2"
-```
-
-Only mod-owned files are removed. Added logs remain. This task created a separate package and did not deploy into the installed game's Bin folder or alter its settings.
-
-Both Windows and Linux through Proton are required targets. See [platform setup and verification limits](docs/PLATFORM_SUPPORT.md).
-
-## Linux / Proton
-
-The products are Windows PE binaries and the host must inherit the game's Proton prefix. The game starts its host through CreateProcess; do not run it in an unrelated Wine prefix. Steam launch options need the proxy override:
-
-```sh
 WINEDLLOVERRIDES="d3d9=n,b" PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 %command%
 ```
 
-This is an installation recipe, not verified Linux support. Valve supplies a [wineopenxr D3D11 bridge](https://github.com/ValveSoftware/Proton/blob/proton_11.0/wineopenxr/openxr_loader.c), and the installed Proton Hotfix contains its x64 manifest. A native OpenXR runtime and its socket/manifest must be accessible inside Steam's container; the Windows loader also needs the prefix's registered wineopenxr runtime. Start the chosen runtime before the game. No prefix or headset-runtime configuration was changed here. `VR_OVERRIDE`/xrizer alone configures OpenVR applications; this mod calls OpenXR directly.
+## Co-op
 
-## Controls
+Every player and the server need the same mod version. Desktop players can join VR
+players. Run the dedicated server with `+mod SS2VR`. Turn on **USE COMBO WEAPONS**
+in the co-op settings for independent dual weapons.
 
-The hardware test procedure for the current build is
-[USER_VR_TEST.md](docs/USER_VR_TEST.md). Hand-operated checks (firing, wheels,
-vehicles) are done by the user in VR; the simulated lab covers rendering and timing.
+## Settings
 
-| Action | Input |
-|---|---|
-| Fire | Trigger on that weapon's hand |
-| Sniper zoom | Hold that hand’s stick/trackpad click (unavailable on the Vive right hand). Release after equip, wheel or tracking loss before pressing again |
-| Jump | Index: right B. Other profiles: squeeze a grip on foot (carrying an object takes priority) |
-| Grab / throw | Squeeze a grip near a takeable object, or while pointing that hand at one up to 3 m away (it comes to your hand); release to throw (Index: a firm squeeze) |
-| Use, enter/leave turrets and vehicles | Right A (Index/Touch): look at the seat; the HUD prompt names the button |
-| Pause menu | Left B (Index), left menu (Touch); the menu shows on the flat screen, point and pull a trigger |
-| Hand grenade | Right stick click (when not holding a sniper rifle) |
-| Sprint | Left stick click |
-| Turrets | Aim with the right hand (red laser), right trigger fires, left trigger alt-fires |
-| Select weapon / bubble | Hold that hand's wheel button, point the controller at (or reach into) a weapon or an outer-side bubble, or point its stick at a weapon, release the button |
-| Cancel wheel | Point back at the ring centre (stick centred) before releasing the wheel button |
-| Move | Left stick/trackpad, relative to where your head faces |
-| Turn | Right stick/trackpad left/right, smooth (snap turns with `[Comfort] SnapTurn=1`) |
-| Steer (vehicles without handles) | Squeeze a grip on the virtual wheel rim and turn it; release to recenter |
-| Recenter | Click both sticks together, or hold both grips and click the left stick/trackpad; release triggers before firing again. Keep holding 2 s while looking straight ahead to also level a tilted view |
-| Use / menu / sprint / wheel button | Profile-specific buttons listed in HOST_STATUS.md |
+In VR, open **VR options** from the weapon wheel's options bubble or the button under
+the game's menus. Settings are also in
+`Bin/SS2VR/SS2VR.ini` in the game folder.
 
-Weapons retain native gameplay; the chainsaw cuts while its trigger is held. A default-off unique-saw gesture adapter is source-reviewed for SP and matching modded MP local/authority/observer roles. After equip/tracking changes, fresh quiet motion arms the first swing. It issues a real native press without guessing initial low; actual stops require later quiet before rearming. Actual contact, cadence and multiplayer behavior need user acceptance. See [melee consumption](docs/PHYSICAL_MELEE_CONSUMPTION.md). Fighter/Saucer one-/two-hand handle grabbing uses submitted native geometry and the native mode2 heading callback. Other driven vehicles get a virtual steering wheel (no stock vehicle models one): squeeze the rim with either or both hands and turn it; cars take it as steering and hover/air vehicles as a turn rate. The wheel mesh is generated with Blender (`tools/blender/steering_wheel.py`) and textured from the stock HoverFighter texture loaded from your game files at runtime. Physical handling, roomscale and remote-head source integration require user-operated acceptance. Immersive scope source code now supports the bounded subset documented above; broader compatibility and runtime behavior remain unverified. Mounted tracking/control integration is implemented; vehicle runtime behavior remains unverified. Multiplayer replication is implemented in source and has not been run in a network session. Teleport is excluded. Native flat overlays now have a source-reviewed headset path; stock callback coverage, raster appearance and performance remain unverified. Menus, loading screens, in-engine cutscenes (the native alternate world camera), pre-rendered movies, Netricsa, death and third-person views are presented on the flat threshold-follow screen; only menus take the pointer. Complex postprocessing is not verified. The host may reuse its last complete stereo pair with the original poses/FOV (the runtime reprojects it) while its epoch, focus, tracking and age remain valid, for up to one second after its request. Without an eligible complete pair it submits no world projection; no two-copy mono stereo fallback exists. Flat frames (menus, loading screens) stay up while loading blocks the game for up to a minute.
+### VR controllers (Valve Index)
 
-## Build and repository
+| Input | Action |
+| --- | --- |
+| Left stick | Move (relative to where you look) |
+| Right stick left/right | Smooth or snap turn |
+| Trigger | Fire that hand's weapon |
+| Trackpad press (either hand) | Weapon wheel for that hand |
+| Right A | Use, enter/leave vehicles and turrets |
+| Right B | Jump |
+| Left B | Pause menu |
+| Left A | Reload |
+| Left stick click | Sprint |
+| Right stick click | Grenade |
+| Grip | Grab and throw objects |
+| Look through a sniper scope | Zoom (scoped shot) |
+| Both sticks clicked | Recenter |
 
-Linux tools: CMake ≥3.24, Git, Python 3, native C++ compiler, Clang with the i686 Windows MSVC target, and i686/x86_64 GNU MinGW-w64 C/C++ cross-compilers/binutils. The game compiler must provide native Windows TLS (for example GCC 16 configured with `--enable-tls`, plus binutils ≥2.44); CMake checks an actual compiled TLS probe. Clang is used only for the small native-finally object, not as a replacement game compiler. The small native-finally C object isolates native SEH cleanup while the surrounding C++ remains on MinGW. CMake fetches pinned MinHook/OpenXR revisions onto the project drive. `python tools/build.py` builds both products and runs only native offline checks. Optional `--minhook-source` and `--openxr-source` accept matching local checkouts. Voice chat builds the Opus 1.5.2 release sources (`src`, `celt`, `silk`, `include`) from `../deps-src/opus-1.5.2` (CMake `OPUS_SOURCE`). `python tools/package.py` verifies exported compiled source/version/layout contracts before staging and derives the manifest ABI from them. Its default output includes the build-input fingerprint; existing outputs are refused. Choose `--output` for another fresh directory. Install the Python dependencies in `tools/requirements.txt` before verification/packaging. See [package identity checks](docs/PACKAGE_IDENTITY.md).
+Other controllers (Touch, Vive, Windows Mixed Reality, Steam Frame) are supported;
+see [controller bindings](docs/HOST_STATUS.md#controller-bindings).
 
-`python tools/verify_zoom_entry_abi.py` inspects actual linked native zoom entries and callback return conventions; `verify_sniper_predicate_sites.py --game ..` checks pinned native boundaries and HDE decoder acceptance. Neither executes Windows or game code. `python tools/verify_weapon_abi.py` inspects the compiled MinGW x86 gun-hook calling conventions and unchanged camera forwarding. `python tools/verify_world_marker_abi.py` checks native marker caller shape, supplemented by the manual provenance audit for accepted artifact hashes. `python tools/verify_artifacts.py --game ..` checks final PE architectures, exports/imports, both IPC layouts and installed hook symbols. It needs pefile (`python -m pip install -r tools/requirements.txt`). No verification tool launches the game, host or headset runtime.
+## More
 
-[AGENTS.md](AGENTS.md) records task constraints and engineering rules. [Research](docs/RESEARCH.md), the [Astra review](docs/ASTRA_REVIEW.md), [disposition](docs/REVIEW_DISPOSITION.md) and [final plan](docs/FINAL_PLAN.md) record the design. [Completion audit](docs/COMPLETION_AUDIT.md) and [MODLOG.md](MODLOG.md) record implementation and offline evidence. Original source is MIT; dependency notices and AI contribution disclosure are in [THIRD_PARTY.md](THIRD_PARTY.md).
-
-## Current multiplayer source
-
-Current source uses the source-reviewed native firing operator and held-input
-path, preserving mapping, blocking and history. Desktop startup and carried
-objects retain native commands. This follow-up is newer than the immutable
-0.2.11 archive. See [Astra source acceptance](docs/PRIMARY_JOIN_SOURCE_REVIEW.md).
-
-The game proxy supports listen-host/client VR through native RPCs. Dedicated authority loads `SS2VRServer.dll` through `Content/SS2VR.mod`; a build containing those files is required. Run the native server with `+mod SS2VR` (without `.mod`) plus its usual `+level`, `+port` and session options. Every VR client and the authority need matching mod products. Gameplay damage/ammunition/cadence stay native. Unknown or stock authority does not negotiate VR weapon input. Authoritative aim updates are limited by20Hz and the reliable round trip; remote presentation expires after200ms. No dedicated server or network session was launched here.
-
-Voice chat (`[Voice]` in `SS2VR.ini`) rides the same native RPC carrier: each client's Opus voice packets go to the authority, which relays them unreliably to every other negotiated SS2VR player (75 packets and 16000 bytes per second per speaker). Playback is positional and fades to a centred radio voice with distance. The design follows QuakeSpasm VR's voice chat; see THIRD_PARTY.md.
-
-Co-op level films and level changes: each level's pre-rendered intro and outro (and an
-episode's opening film) play for every networked player, as in single player, once that
-player is in the level; A or B skips one. The level keeps running while a film plays.
-After a level change the VR link renegotiates, the trigger answers "Press fire to
-respawn", and the engine's connection timeout is kept at 60 s so a slow server level
-load does not drop clients. Clients and server must run the same SS2VR version.
-
-Scope by eye (`[Scope] ZoomByEye`, on by default, VR options → Movement): a sniper
-rifle takes its zoomed state (the game's stronger scoped shot, 300 instead of 75
-damage) while an eye is close behind its scope looking down it, instead of on the
-zoom button, which goes back to sprint. While zoomed the scope's picture is at full
-brightness with a bold crosshair; otherwise it is dimmer with a thin one.
+Development notes, testing status, and build instructions are in
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## License
 
-SS2VR is free software under the GNU General Public License version 3
-(GPL-3.0-only); see [LICENSE](LICENSE). Bundled third-party components keep their
-own licenses, listed in [THIRD_PARTY.md](THIRD_PARTY.md). Serious Sam 2 and its
-assets belong to their rights holders and are not included.
+GNU General Public License version 3 (GPL-3.0-only); see [LICENSE](LICENSE).
+Third-party components are listed in [THIRD_PARTY.md](THIRD_PARTY.md). Serious Sam 2
+and its assets belong to their rights holders and are not included.
