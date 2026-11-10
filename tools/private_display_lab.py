@@ -85,8 +85,8 @@ def prepared_configuration(path):
     if path.name!='config.json':raise ValueError('Collector must use its sealed config.json')
     cfg=json.loads(path.read_text());validate(cfg)
     selected_shell(cfg)
-    if cfg.get('multiplayer_connect') is not None:
-        # A multiplayer client (runtime_lab) has no neutral collection.
+    if cfg.get('multiplayer_connect') is not None or cfg.get('game_mod','SeriousSam2')!='SeriousSam2':
+        # A multiplayer client or bundled-mod run (runtime_lab) has no neutral collection.
         if not cfg.get('display_timing_probe'):raise ValueError('Prepared private display requires the timing probe')
         return cfg
     if cfg.get('idle_weapon_probe') is not True or not cfg.get('display_timing_probe'):
@@ -189,8 +189,8 @@ def inside(cfg_path, output, display_only=False, prerequisite_only=False):
             'monado_launched':ordered,'data_ready_for_review':False}))
         return
     cfg=prepared_configuration(cfg_path)
-    if cfg.get('multiplayer_connect') is not None:
-        # A multiplayer client: runtime_lab's run and cleanup, then its hold.
+    if cfg.get('multiplayer_connect') is not None or cfg.get('game_mod','SeriousSam2')!='SeriousSam2':
+        # A multiplayer client or bundled-mod run: runtime_lab's run and cleanup, then its hold.
         try:directory=run(cfg)
         except BaseException as error:
             (output/'collection-outcome.json').write_text(json.dumps({'completed':False,'error':str(error)}))
