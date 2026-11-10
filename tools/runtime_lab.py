@@ -25,6 +25,11 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 
+def game_log_name(cfg):
+    """The game's own log: Sam2.log, or <mod>.log for a bundled mod (Sam2.exe names it so)."""
+    mod=cfg.get('game_mod','SeriousSam2')
+    named=mod+'.log'
+    return named if mod!='SeriousSam2' and (Path(cfg['game_lab'])/named).exists() else 'Sam2.log'
 def native_grip_resource_receipts(log):
     """Successful native opens only; never a rendered-instance/grip certificate."""
     names = ('ZapGunWeapon.ep', 'ZapGun_FP.mdl', 'Zapgun.bmf', 'Zapgun.skl', 'R_Hand.bmf')
@@ -682,7 +687,14 @@ def validate(cfg):
     receipt=json.loads((lab/'Bin/SS2VR/install-receipt.json').read_text())
     for name, expected in receipt['files'].items(): checked_file(lab/name,expected)
     startup=cfg['startup']
+    # Opt-in: the game's bundled mods (Renovation, InSamnity2) instead of the stock game.
+    game_mod=cfg.get('game_mod','SeriousSam2')
+    if game_mod not in ('SeriousSam2','Sam2Renovation','InSamnity2'):
+        raise ValueError('Game mod must be SeriousSam2, Sam2Renovation or InSamnity2')
     expected_arguments=['+mod','SeriousSam2','+sam_bBootSequence','0','+sam_bSkipMovies','1','+level',cfg['scene']['entry']]
+    if game_mod!='SeriousSam2': # Selected as the in-game Mods menu does, by Content/CurrentMod.txt.
+        if (lab/'Content/CurrentMod.txt').read_text().strip()!='CURRENTMOD = %s.mod ;'%game_mod:
+            raise ValueError('Bundled mod run needs its Content/CurrentMod.txt')
     if preparation_weapon(cfg) is not None:
         expected_arguments[6:6]=['+sam_iEnableCheats','1']
         validate_fixture_destination(lab,preparation_weapon(cfg))
@@ -763,7 +775,8 @@ def validate(cfg):
         cfg.get('renderer_mode','vr')!='vr' or cfg.get('native_input_probe')):
         raise ValueError('Background controls diagnostic requires a separate non-firing VR run')
     hold=cfg.get('interactive_hold_seconds',0)
-    if type(hold) is not int or not 0<=hold<=600 or (hold and not (cfg.get('neutral_runtime_probe') or cfg.get('multiplayer_connect'))):
+    if type(hold) is not int or not 0<=hold<=600 or (hold and not (cfg.get('neutral_runtime_probe') or cfg.get('multiplayer_connect') or
+            cfg.get('game_mod','SeriousSam2')!='SeriousSam2')):
         raise ValueError('Interactive hold is a bounded neutral-runtime extension only')
     if type(cfg.get('capture_desktop',True)) is not bool:
         raise ValueError('Desktop capture selection must be explicit boolean')
@@ -1113,7 +1126,7 @@ def capture_startup_snapshot(cfg,env,run_dir,manifest,owned_game,stock_token):
     try:
         if cfg.get('startup_snapshot') is not True or manifest.get('result')!='incomplete' or manifest.get('loaded_scene_confirmed') is True or not owned_game or not still_owned(owned_game):
             return
-        log=Path(cfg['game_lab'])/'Sam2.log'
+        log=Path(cfg['game_lab'])/game_log_name(cfg)
         if log.is_symlink() or not log.is_file() or log.stat().st_size>16*1024*1024:
             raise RuntimeError('Fresh native startup log unavailable or unbounded')
         if manifest.get('world_before_vr_readiness') is True or "Started simulation on '" in log.read_text(errors='replace'):
@@ -1293,7 +1306,7 @@ def run(cfg):
                     manifest.update(result='monado_window_order_prerequisite_only',simulation=True)
                     return run_dir
         # Existing runtime logs are preserved before each new process opens them.
-        for path in (lab/'Bin/SS2VR.log',lab/'Bin/SS2VR/ss2vr_host.log',lab/'Sam2.log'):
+        for path in (lab/'Bin/SS2VR.log',lab/'Bin/SS2VR/ss2vr_host.log',lab/game_log_name(cfg)):
             if path.exists():
                 # Reversible move gives the fresh launch a new log boundary.
                 path.rename(run_dir/('previous-'+path.name))
@@ -1356,7 +1369,7 @@ def run(cfg):
                 receipts=re.findall(r'Lab native scene stream bytes=(\d+) positionRestored=(\d+) sha256=([a-f0-9]{64})',native_log)
                 isolated=('Lab native online initializer suppressed; interface=0;' in native_log and
                     'Lab stock renderer selected before VR worker creation; graphics hooks disabled' in native_log)
-                scene=(lab/'Sam2.log').read_text(errors='replace') if (lab/'Sam2.log').exists() else ''
+                scene=(lab/game_log_name(cfg)).read_text(errors='replace') if (lab/game_log_name(cfg)).exists() else ''
                 if state['loading_ready'] and not loading_continue_sent:
                     if not isolated or not receipts or any(h!=cfg['scene']['entry_sha256'] for size,pos,h in receipts):
                         raise RuntimeError('Stock continuation lacks consistent scene/isolation evidence')
@@ -1434,7 +1447,7 @@ def run(cfg):
             time.sleep(.2)
         else:raise TimeoutError('Verified scene did not reach gameplay readiness')
         manifest['game_pid']=owned_game['pid'];manifest['host_pid']=owned_host['pid'] if owned_host else None
-        scene_log=(lab/'Sam2.log').read_text(errors='replace')
+        scene_log=(lab/game_log_name(cfg)).read_text(errors='replace')
         if not multiplayer and not re.search(r"Started simulation on '"+re.escape(cfg['scene']['entry'])+r"'",scene_log):
             raise RuntimeError('Fresh native log does not certify requested simulation')
         manifest['loaded_scene_confirmed']=True
@@ -1507,7 +1520,7 @@ def run(cfg):
             # retain the same observations and clip to the global deadline.
             # A multiplayer server may reload the level right after the join (its
             # co-op opening restart): the game stops answering while it loads.
-            pose_seconds=20 if cfg.get('idle_weapon_probe') else 60 if multiplayer else 10
+            pose_seconds=20 if cfg.get('idle_weapon_probe') else 60 if multiplayer or cfg.get('game_mod','SeriousSam2')!='SeriousSam2' else 10
             matches=0;previous=boundary;pose_deadline=min(deadline,time.monotonic()+pose_seconds)
             while matches<30 and time.monotonic()<pose_deadline:
                 try:state=observer(cfg,env,'status',token,timeout=remaining(pose_deadline),deadline=pose_deadline)
@@ -1522,12 +1535,14 @@ def run(cfg):
                 valid=(all(math.isfinite(v) for v in values) and abs(sum(v*v for v in state['head']['q'])-1)<.001 and
                     state['input_age_ms']<=150 and state['input_sequence']>boundary and
                     state['focused'] and state['head_valid'] and state['gameplay'] and not state['menu'] and
-                    max(abs(state['head']['p'][i]-expected[i]) for i in range(3))<.001 and
+                    # A bundled-mod run has no recentering fixture preparation: STAGE height stays in.
+                    (cfg.get('game_mod','SeriousSam2')!='SeriousSam2' or max(abs(state['head']['p'][i]-expected[i]) for i in range(3))<.001) and
                     abs(sum(a*b for a,b in zip(state['head']['q'],q)))>.99999)
                 if state['input_sequence']>previous:
                     matches=matches+1 if valid else 0;previous=state['input_sequence']
                 time.sleep(.01)
             if matches<30:raise TimeoutError('Held pose did not produce 30 matching OpenXR observations: '+step['name'])
+            if cfg.get('game_mod','SeriousSam2')!='SeriousSam2':expected=list(state['head']['p']) # unrecentered STAGE pose
             if step['name']=='baseline':
                 sustained_deadline=min(deadline,time.monotonic()+60)
                 count=0
@@ -1621,7 +1636,7 @@ def run(cfg):
         os.close(master)
         if slave>=0:os.close(slave)
         import shutil
-        for path in (lab/'Bin/SS2VR.log',lab/'Bin/SS2VR/ss2vr_host.log',lab/'Sam2.log'):
+        for path in (lab/'Bin/SS2VR.log',lab/'Bin/SS2VR/ss2vr_host.log',lab/game_log_name(cfg)):
             if path.exists():shutil.copy2(path,run_dir/path.name)
         manifest['shutdown_observed']='Lab native online shutdown wrapper entered; interface=0;' in (run_dir/'SS2VR.log').read_text(errors='replace') if (run_dir/'SS2VR.log').exists() else False
         manifest['termination_requests']=termination_requests
