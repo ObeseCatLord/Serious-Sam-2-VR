@@ -103,13 +103,12 @@ with tempfile.TemporaryDirectory(prefix='ss2vr-contract-') as temporary:
     import zipfile
     packaging.ROOT = root
     for directory in ['build-game', 'build-host/openxr/src/loader', 'build-openal', 'licenses',
-                      'config', 'tests', 'tools', 'docs']:
+                      'config', 'tests', 'tools', 'tools/data']:
         (root/directory).mkdir(parents=True, exist_ok=True)
-    for name in ['README.md', 'AGENTS.md', 'LICENSE', 'THIRD_PARTY.md', 'MODDING_PLAN.md',
-                 'MODLOG.md', '.clang-format', '.gitignore', 'tools/install.py',
+    for name in ['README.md', 'LICENSE', 'THIRD_PARTY.md', '.clang-format', '.gitignore', 'tools/install.py',
                  'licenses/test.txt', 'config/SS2VR.ini', 'config/SS2VR.mod', 'config/alsoft.ini']:
         (root/name).write_text('fixture\n')
-    (root/'docs/installed-build.json').write_text('{}')
+    (root/'tools/data/installed-build.json').write_text('{}')
     for component, relative in [('game','build-game/d3d9.dll'),
                                ('server','build-game/SS2VRServer.dll'),
                                ('host','build-host/ss2vr_host.exe')]:

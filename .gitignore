@@ -4,3 +4,14 @@
 *.log
 *.dmp
 __pycache__/
+
+# Local working notes, kept out of the public repository.
+/AGENTS.md
+/CLAUDE.md
+/MODLOG.md
+/MODDING_PLAN.md
+/handoff/
+
+# Development notes stay local; only the README media is public.
+/docs/*
+!/docs/media/

@@ -1,7 +1,0 @@
-# Astra mounted source follow-up: history blocker
-
-Astra/xhigh closed initial findings1,3,4,5 and accepted one-call clamp simplification and both current compiled ABI proofs. Source remained NO-GO for the remaining half of finding2: poll copied previous fire values by rider/generation/session/reference only, losing the previous per-hand action generation/handheld epoch when it overwrote sampledControls. A held stream1 command followed by a coalesced held stream2 sample reset TriggerGate to zero but copied priorValue1; the valid new context could therefore emit a false release. Handheld epoch replacement had the same history gap.
-
-Main spot-checked the exact trace at poll/currentControls/query, then adopted the narrow correction: primaryCommandHistoryCompatible checks each previous/current logical primary stream and, only for handheld mode, the previous/current admission epoch. Poll clears only index5(right) or6(left) when that hand's history is incompatible, before replacing sampledControls. Opposite hand and unrelated commands remain. Mounted history ignores handheld ACK epochs, preserving native vehicle fire across retained handgun deletion/admission changes. No additional state/cache/queue or protocol.
-
-Focused actual-helper regressions cover both hands' coalesced held stream change, handheld epoch replacement, mounted epoch independence, opposite-hand preservation, and ordinary release. Final bounded source follow-up is requested; no runtime was launched.

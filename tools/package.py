@@ -35,7 +35,7 @@ def package(output=None):
     version = development_version(contract)
     output = Path(output).resolve() if output is not None else ROOT/'dist'/('ss2vr-' + version)
     if any(output.is_relative_to(ROOT/directory) for directory in
-           ['src','tests','cmake','tools','docs','licenses','config']):
+           ['src','tests','cmake','tools','licenses','config']):
         raise ValueError('Package output must be outside copied source directories')
     # Spatial audio: OpenAL Soft built by tools/build_openal.sh (32-bit, loaded by the game).
     payload['Bin/SS2VR/OpenAL32.dll'] = ROOT/'build-openal/OpenAL32.dll'
@@ -55,9 +55,9 @@ def package(output=None):
         target = output/relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
-    for name in ['README.md','AGENTS.md','CMakeLists.txt','LICENSE','THIRD_PARTY.md','MODDING_PLAN.md','MODLOG.md','.clang-format','.gitignore']:
+    for name in ['README.md','CMakeLists.txt','LICENSE','THIRD_PARTY.md','.clang-format','.gitignore']:
         shutil.copy2(ROOT/name,output/name)
-    for directory in ['src','tests','cmake','tools','docs','licenses','config']:
+    for directory in ['src','tests','cmake','tools','licenses','config']:
         for source in (ROOT/directory).rglob('*'):
             if source.is_file() and '__pycache__' not in source.parts and source.suffix not in ('.pyc','.log','.dmp'):
                 target=output/source.relative_to(ROOT);target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,target)
@@ -68,7 +68,7 @@ def package(output=None):
         'server':output/'Bin/SS2VRServer.dll','host':output/'Bin/SS2VR/ss2vr_host.exe'})
     files = {relative: digest(output/relative) for relative in payload}
     manifest = {'version': version, 'files': files,
-                'game_fingerprints': json.loads((ROOT/'docs/installed-build.json').read_text()),
+                'game_fingerprints': json.loads((ROOT/'tools/data/installed-build.json').read_text()),
                 'ipc_abi': contract['ipc_abi'], 'multiplayer_wire_version': contract['multiplayer_wire_version'],
                 'build_contract': contract,
                 'scope': 'incomplete-development-checkpoint',

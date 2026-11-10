@@ -69,13 +69,14 @@ the game's menus. Settings are also in
 | Look through a sniper scope | Zoom (scoped shot) |
 | Both sticks clicked | Recenter |
 
-Other controllers (Touch, Vive, Windows Mixed Reality, Steam Frame) are supported;
-see [controller bindings](docs/HOST_STATUS.md#controller-bindings).
+Other controllers:
 
-## More
-
-Development notes, testing status, and build instructions are in
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+| Profile | Weapon wheel (left / right) | Use | Jump | Menu | Reload |
+| --- | --- | --- | --- | --- | --- |
+| Oculus Touch | Y / B | A | Grip | Left menu | X |
+| HTC Vive | Trackpad click | Right menu | Grip | Left menu | — |
+| Windows Mixed Reality | Trackpad click | Left menu | Grip | Right menu | — |
+| Steam Frame | Left D-pad up / right B | Right A | Grip | Left view / right menu | Left D-pad down |
 
 ## License
 

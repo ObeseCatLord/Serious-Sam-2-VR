@@ -31,7 +31,7 @@ def verify(game):
         'server':ROOT/'build-game/SS2VRServer.dll','host':ROOT/'build-host/ss2vr_host.exe'})
     source=(ROOT/'src/game/engine.cpp').read_text()
     mapping={'g':'Sam2Game.dll','e':'Engine.dll','c':'Core.dll'}
-    fingerprints=json.loads((ROOT/'docs/installed-build.json').read_text())
+    fingerprints=json.loads((ROOT/'tools/data/installed-build.json').read_text())
     symbols={}
     for name,data in fingerprints.items():
         path=game/'Bin'/name
@@ -69,7 +69,7 @@ def verify(game):
         native=pefile.PE(str(game/'Bin'/name),max_symbol_exports=65536)
         if native.get_data(rva,len(entry))!=entry:raise ValueError('Internal seam changed: '+label)
         report['internal_hooks'].append({'module':name,'rva':hex(rva),'role':label})
-    boundaries=json.loads((ROOT/'docs/sniper-predicate-boundaries.json').read_text())
+    boundaries=json.loads((ROOT/'tools/data/sniper-predicate-boundaries.json').read_text())
     selected={'activate','deactivate_owner','deactivate_fov','interpolate','sound_start','sound_stop'}
     sniper=pefile.PE(str(game/'Bin/Sam2Game.dll'),max_symbol_exports=65536)
     for candidate in boundaries['candidates']:
@@ -82,7 +82,7 @@ def verify(game):
             raise ValueError('Native zoom predicate window changed: '+candidate['role'])
         report['internal_hooks'].append({'module':'Sam2Game.dll','rva':hex(rva),
                                         'role':'native zoom '+candidate['role']})
-    primary=json.loads((ROOT/'docs/primary-load-boundaries.json').read_text())
+    primary=json.loads((ROOT/'tools/data/primary-load-boundaries.json').read_text())
     if hashlib.sha256((game/'Bin'/primary['module']).read_bytes()).hexdigest()!=primary['module_sha256']:
         raise ValueError('Primary consumer fingerprint differs')
     for boundary in primary['boundaries']:

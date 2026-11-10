@@ -26,8 +26,8 @@ except ModuleNotFoundError as error:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BOUNDARIES_PATH = ROOT / "docs/sniper-predicate-boundaries.json"
-CHECKS_PATH = ROOT / "docs/sniper-predicate-site-checks.json"
+BOUNDARIES_PATH = ROOT / "tools/data/sniper-predicate-boundaries.json"
+CHECKS_PATH = ROOT / "tools/data/sniper-predicate-site-checks.json"
 MINHOOK_FILES = {
     "trampoline_c_sha256": "src/trampoline.c",
     "trampoline_h_sha256": "src/trampoline.h",
