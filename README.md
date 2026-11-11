@@ -1,8 +1,6 @@
 # Serious Sam 2 VR
 
-Serious Sam 2 VR is an OpenXR mod for the Steam version of Serious Sam 2, focused
-on tracked combat, comfort, and co-op.
-
+Serious Sam 2 VR is an OpenXR mod for the Steam version of Serious Sam 2
 <p>
   <img src="docs/media/vr-combat.gif" width="360" height="360" alt="VR combat with tracked dual weapons">
   <img src="docs/media/vr-outdoors.gif" width="360" height="360" alt="VR gameplay outdoors">
