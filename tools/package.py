@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import shutil
+import shutil, subprocess
 import struct
 import zipfile
 from build_contract import validate_products, development_version
@@ -57,10 +57,18 @@ def package(output=None):
         shutil.copy2(source, target)
     for name in ['README.md','CMakeLists.txt','LICENSE','THIRD_PARTY.md','.clang-format','.gitignore']:
         shutil.copy2(ROOT/name,output/name)
-    for directory in ['src','tests','cmake','tools','licenses','config']:
-        for source in (ROOT/directory).rglob('*'):
-            if source.is_file() and '__pycache__' not in source.parts and source.suffix not in ('.pyc','.log','.dmp'):
-                target=output/source.relative_to(ROOT);target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,target)
+    directories=['src','tests','cmake','tools','licenses','config']
+    # Only what git would publish (tracked, or new and not ignored): notes, lab
+    # dumps and scratch files left in these folders stay out of the archive.
+    try:
+        listed=subprocess.run(['git','ls-files','-z','--cached','--others','--exclude-standard','--',*directories],cwd=ROOT,
+                              check=True,capture_output=True).stdout.decode().split('\0')
+        sources=[ROOT/name for name in listed if name]
+    except (OSError,subprocess.CalledProcessError):
+        sources=[p for directory in directories for p in (ROOT/directory).rglob('*')]
+    for source in sources:
+        if source.is_file() and '__pycache__' not in source.parts and source.suffix not in ('.pyc','.log','.dmp'):
+            target=output/source.relative_to(ROOT);target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,target)
     shutil.copy2(ROOT/'tools/install.py', output/'install.py')
     # Validate the staged bytes too: a source edit during copying must not turn
     # a matching build into an archive containing a different source snapshot.

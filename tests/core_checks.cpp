@@ -600,7 +600,7 @@ int main() {
           "Asymmetric XR FOV maps image edges");
     check(near((p.m[10] * -.1f + p.m[11]) / .1f, -1), "Native projection near plane convention");
     check(offsetof(Shared, latest) == 48 && sizeof(Pose) == 28 && sizeof(Request) == 480 &&
-              sizeof(Shared) == 2064 && offsetof(Shared, slot) == 680 &&
+              sizeof(Shared) == 2136 && offsetof(Shared, slot) == 680 &&
               offsetof(Shared, pixels) == 2000 && sizeof(Slot) == 584,
           "Cross-architecture ABI layout");
     InputSampleBoundary interruptedInput{7,3,100,2000,42};

@@ -5,7 +5,7 @@
 namespace ss2vr {
 // MaxDimension only bounds sanity checks: images travel in pixel sections sized
 // to the current canvas, which follows the runtime's recommended eye size.
-constexpr uint32_t Magic = 0x32565253, Abi = 15, MaxDimension = 16384, WeaponCount = 17;
+constexpr uint32_t Magic = 0x32565253, Abi = 16, MaxDimension = 16384, WeaponCount = 17;
 // Pixel sections: slot0 left/right, slot1 left/right, then the mono menu frame.
 constexpr unsigned PixelBufferCount = 5, MenuPixelBuffer = 4;
 constexpr unsigned slotPixelBuffer(unsigned slot, unsigned eye) { return slot * 2 + eye; }
@@ -153,6 +153,13 @@ struct WorldSubmission {
     uint32_t producer=0,session=0,reference=0,trackingGeneration=0;
     uint32_t continuity=0,active=0;
 };
+// ABI16: a grip's velocity from the runtime (XrSpaceVelocity chained to the grip
+// xrLocateSpace), in the reference space of the published input: m/s and rad/s.
+enum HandVelocityValid : uint32_t { LinearVelocityValid = 1, AngularVelocityValid = 2 };
+struct HandVelocity {
+    Vec3 linear{}, angular{};
+    uint32_t valid = 0, reserved = 0;
+};
 struct Shared {
     uint32_t magic = Magic, abi = Abi, bytes = sizeof(Shared), gamePid = 0;
     uint32_t hostPid = 0, width = 0, height = 0, shutdown = 0, rendererReady = 0, error = 0;
@@ -172,6 +179,10 @@ struct Shared {
     PixelSections pixels;
     uint32_t recommendedWidth = 0, recommendedHeight = 0;
     SharedImages images;
+    // ABI16: the predicted display time (XrTime, ns) the latest input's poses are
+    // located at, and its grip velocities; published with it under the IPC mutex.
+    int64_t latestTime = 0;
+    HandVelocity gripVelocity[2];
 };
 #pragma pack(pop)
 static_assert(sizeof(Vec3) == 12 && sizeof(Quat) == 16 && sizeof(Pose) == 28);
@@ -180,5 +191,7 @@ static_assert(offsetof(Shared, latest) == 48);
 static_assert(sizeof(Input) == 272 && sizeof(Request) == 480);
 static_assert(sizeof(MenuPointer) == 64);
 static_assert(sizeof(WorldSubmission)==40 && sizeof(PixelSections)==16 && sizeof(SharedImages)==40);
-static_assert(sizeof(Shared) == 2064 && offsetof(Shared, pixels) == 2000 && offsetof(Shared, images) == 2024); // Same on x86 and x64.
+static_assert(sizeof(HandVelocity) == 32);
+static_assert(sizeof(Shared) == 2136 && offsetof(Shared, pixels) == 2000 && offsetof(Shared, images) == 2024 &&
+              offsetof(Shared, latestTime) == 2064); // Same on x86 and x64.
 } // namespace ss2vr

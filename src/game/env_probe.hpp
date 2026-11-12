@@ -28,6 +28,9 @@ bool captureFace(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *t
 void endFace(bool complete) noexcept;
 // Faces are being rendered (the eye-view capture below is then not used).
 bool rendered() noexcept;
+// A cube of rendered faces has been completed since the device's resources were made
+// (the eye-view capture must not overwrite it with a head-following projection).
+bool everRendered() noexcept;
 // Fallback when faces cannot be rendered: projects `eye` (the left eye's world
 // image, `width` x `height`), seen with `view` (world -> view, 3x4) and
 // `projection` (4x4), into the cube.

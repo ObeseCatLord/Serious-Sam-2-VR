@@ -6,6 +6,7 @@
 #include "common/turret_look.hpp"
 #include "common/two_hand.hpp"
 #include "common/grenade_throw.hpp"
+#include "common/throw_velocity.hpp"
 #include "common/bomb_fuse.hpp"
 #include "common/controls.hpp"
 #include "common/lab_preparation.hpp"
@@ -517,6 +518,9 @@ struct Snapshot {
     InputSampleBoundary interruption;
     uint32_t inputProducer = 0;
     uint32_t gripPoseGeneration[2]{};
+    // The runtime's grip velocities and the predicted display time of `input`.
+    HandVelocity gripVelocity[2]{};
+    int64_t inputTime = 0;
     WorldSubmission submittedWorld;
     Pose origin;
     uint64_t rigRevision = 0;
@@ -2005,8 +2009,13 @@ struct GripCarry {
     uint32_t requestHull = 0, joint = 0, carriedHull = 0;
     Pose requestPose{};
     bool gripDown[2]{};
-    struct Sample { double time; Vec3 p; Quat q; } history[16]{};
-    unsigned samples = 0;
+    // Hand samples (reference space, one per new host input) and body samples
+    // (one per carry tick) for the hold and throw velocities.
+    ThrowTracker motion;
+    uint64_t lastSequence = 0;
+    uint32_t trackingSession = 0, trackingReference = 0, trackingProducer = 0;
+    double lastTick = 0;  // The previous carry tick (fine seconds).
+    double liveLost = 0;  // When the carry tick first saw no live input (0: live).
     bool settled = false; // The object has reached the hand once (a pointed grab flies in first).
 };
 static GripCarry gripCarry; // Game thread only.
@@ -2107,12 +2116,7 @@ static uint32_t nearestCarryable(void *player, Vec3 at, float reach, CarryScan *
     }
     return best;
 }
-static double carryClock() {
-    LARGE_INTEGER frequency{}, now{};
-    QueryPerformanceFrequency(&frequency);
-    QueryPerformanceCounter(&now);
-    return double(now.QuadPart) / double(frequency.QuadPart);
-}
+static double carryClock() { return fineSeconds(); }
 // Lab (SS2VR_LAB_SHOT_LOG=1): a released object's flight for 2 s.
 static struct { uint32_t hull = 0; uint64_t at = 0; } labThrown;
 static void traceThrown() {
@@ -2127,59 +2131,18 @@ static void traceThrown() {
     if (objectBody) memcpy(&placed, static_cast<uint8_t *>(objectBody) + 0x2c, sizeof(placed));
     log("Lab thrown t=%llu object=%.2f,%.2f,%.2f", (unsigned long long)(now - labThrown.at), placed.p.x, placed.p.y, placed.p.z);
 }
-// The hand's motion over a short window ending `back` samples ago (linear, and
-// angular from the orientation change). False with too few samples.
-struct HandMotion { Vec3 linear{}, angular{}; };
-static bool handMotion(unsigned endBack, double window, HandMotion &out) {
-    const auto &g = gripCarry;
-    const unsigned available = std::min(g.samples, 16u);
-    if (available < endBack + 2) return false;
-    const auto &last = g.history[(g.samples - 1 - endBack) % 16];
-    for (unsigned back = endBack + 1; back < available; ++back) {
-        const auto &first = g.history[(g.samples - 1 - back) % 16];
-        const double dt = last.time - first.time;
-        if (dt < window && back + 1 < available) continue;
-        if (!(dt > .005)) return false;
-        out.linear = (last.p - first.p) * float(1 / dt);
-        Quat d = normalize(multiply(last.q, inverse(first.q)));
-        if (d.w < 0) d = {-d.x, -d.y, -d.z, -d.w};
-        const float s = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-        const float angle = 2 * std::atan2(s, d.w);
-        out.angular = s > 1e-6f ? Vec3{d.x / s, d.y / s, d.z / s} * float(angle / dt) : Vec3{};
-        return finite(Pose{{}, out.linear}) && finite(Pose{{}, out.angular});
-    }
-    return false;
+// A carried prop's velocity from the tracker: the hand motion rotated into the
+// world (with its swing about the grip, so the prop's centre moves as it would
+// in a real hand) and the player's own motion. `boost` scales the hand part only.
+static Vec3 carriedVelocity(const ThrowMotion &m, const Snapshot &s, void *player, Vec3 hand, Vec3 centre, float boost) {
+    Pose anchor;
+    if (!m.valid || !trackingAnchor(player, anchor)) return gripCarry.motion.bodyVelocity();
+    return throwVelocity(m, referenceToWorld(anchor, s.origin, s.turn), hand, centre, gripCarry.motion.bodyVelocity(), boost);
 }
-// Holding: the hand's motion over the last ~50 ms.
-static HandMotion carryMotion() {
-    HandMotion m;
-    handMotion(0, .05, m);
-    return m;
-}
-// Releasing: of the 50 ms windows in the last ~250 ms, the fastest. A throw's
-// hand slows into the release; the average up to the release fell short. The
-// grip opens well after the swing's peak (Index squeeze release): looking back
-// only 120 ms measured 1.5-2 m/s throws and the ball barely moved (ObeseCatLord).
-struct ThrowPeak { HandMotion motion; double age = 0; float releaseSpeed = 0; };
-static ThrowPeak throwMotion() {
-    const auto &g = gripCarry;
-    ThrowPeak best;
-    float bestSpeed = -1;
-    const double now = g.samples ? g.history[(g.samples - 1) % 16].time : 0;
-    for (unsigned back = 0; back + 2 < std::min(g.samples, 16u); ++back) {
-        const double age = now - g.history[(g.samples - 1 - back) % 16].time;
-        if (age > .25) break;
-        HandMotion m;
-        if (!handMotion(back, .05, m)) break;
-        const float speed = dot(m.linear, m.linear);
-        if (back == 0) best.releaseSpeed = std::sqrt(speed);
-        if (speed > bestSpeed) { bestSpeed = speed; best.motion = m; best.age = age; }
-    }
-    return best;
-}
-static Vec3 carryVelocity() { return carryMotion().linear; }
-// The object's velocity at `centre` when it moves rigidly with the hand.
-static Vec3 heldVelocity(const HandMotion &m, Vec3 hand, Vec3 centre) { return m.linear + cross(m.angular, centre - hand); }
+// Releasing: the fastest hand motion in the last 200 ms. A throw's hand slows
+// into the release, and the grip opens well after the swing's peak (Index
+// squeeze release).
+constexpr double ThrowPeakWindow = .2;
 static Pose carriedBodyPose() {
     void *hull = gripCarry.carriedHull ? resolve(gripCarry.carriedHull) : nullptr;
     void *objectBody = hull ? hullBody(hull) : nullptr;
@@ -2187,38 +2150,59 @@ static Pose carriedBodyPose() {
     if (objectBody) memcpy(&placed, static_cast<uint8_t *>(objectBody) + 0x2c, sizeof(placed));
     return placed;
 }
-static void releaseGripCarry(void *puppet, bool throwIt) {
+static void resetCarryMotion() {
+    auto &g = gripCarry;
+    g.motion.reset();
+    g.lastSequence = 0;
+    g.lastTick = 0;
+}
+static void endGripCarry() {
+    auto &g = gripCarry;
+    // Unpair the player and the prop once clear (updateCarryIgnore), whatever ended the carry.
+    if (carryIgnore.active && !carryIgnore.releasedAt) carryIgnore.releasedAt = GetTickCount64();
+    g.hand = -1;
+    g.joint = 0;
+    g.settled = false;
+    g.liveLost = 0;
+    resetCarryMotion();
+    gripCarrying = false;
+    carryTargetValid = false;
+    carryJoint = nullptr;
+}
+static void releaseGripCarry(void *puppet, const Snapshot &s, bool throwIt) {
+    auto &g = gripCarry;
     const uint32_t bodyHandle = primaryField(puppet, 0x36c);
-    const ThrowPeak peak = throwMotion();
-    const HandMotion &motion = peak.motion;
+    const double now = carryClock();
+    const ThrowMotion peak = g.motion.peak(now, ThrowPeakWindow);
     const Pose placed = carriedBodyPose();
-    const Vec3 hand = gripCarry.samples ? gripCarry.history[(gripCarry.samples - 1) % 16].p : placed.p;
-    const Vec3 velocity = (finite(placed) ? heldVelocity(motion, hand, placed.p) : motion.linear) *
-                          (ThrowGravityMatch * settings.throwStrength);
-    void *mechanism = carriedMechanism(gripCarry.carriedHull);
+    Pose hand{};
+    const bool handKnown = g.hand >= 0 && handWorldPose(s, puppet, unsigned(g.hand), hand);
+    const Vec3 centre = finite(placed) ? placed.p : hand.p;
+    const Vec3 velocity = carriedVelocity(peak, s, puppet, handKnown ? hand.p : centre, centre,
+                                          ThrowGravityMatch * settings.throwStrength);
+    Vec3 spin{};
+    Pose anchor;
+    if (peak.valid && trackingAnchor(puppet, anchor)) spin = rotate(referenceToWorld(anchor, s.origin, s.turn), peak.angular);
+    void *mechanism = carriedMechanism(g.carriedHull);
     virtualCall<void>(puppet, 0x29c); // DropObject: stock ObjectThrown events and weapon restore.
     // The whole mechanism: a prop of several parts (the giant match) kept the
     // throw on the gripped part only and the rest held it back.
     if (throwIt && mechanism && mechanismVelocity && finite(Pose{{}, velocity})) mechanismVelocity(mechanism, velocity);
     if (void *body = throwIt && bodyHandle ? resolve(bodyHandle) : nullptr) {
-        if (std::isfinite(velocity.x) && std::isfinite(velocity.y) && std::isfinite(velocity.z)) {
+        if (finite(Pose{{}, velocity})) {
             virtualCall<void>(body, 0x4c, &velocity); // CBody::SetVelocity
-            const Vec3 spin = motion.angular;
             if (finite(Pose{{}, spin})) virtualCall<void>(body, 0x50, &spin); // CBody::SetAngVelocity
             virtualCall<void>(body, 0x2c);            // Wake the body.
         }
     }
-    log("Grip carry released hand=%d velocity=%.2f,%.2f,%.2f spin=%.2f,%.2f,%.2f hand peak=%.2f m/s %.0f ms before release "
-        "(at release %.2f m/s)", gripCarry.hand, velocity.x, velocity.y, velocity.z, motion.angular.x, motion.angular.y,
-        motion.angular.z, std::sqrt(dot(motion.linear, motion.linear)), peak.age * 1000, peak.releaseSpeed);
-    labThrown = {gripCarry.carriedHull, GetTickCount64()};
+    const Vec3 bodyVelocity = g.motion.bodyVelocity();
+    log("Grip carry released hand=%d throw=%d velocity=%.2f,%.2f,%.2f spin=%.2f,%.2f,%.2f hand peak=%.2f m/s (%s) %.0f ms "
+        "before release, body %.2f m/s, samples=%u", g.hand, int(throwIt), velocity.x, velocity.y, velocity.z, spin.x, spin.y,
+        spin.z, std::sqrt(dot(peak.linear, peak.linear)), peak.runtime ? "runtime" : peak.valid ? "poses" : "none",
+        peak.age * 1000, std::sqrt(dot(bodyVelocity, bodyVelocity)), g.motion.handCount());
+    labThrown = {g.carriedHull, GetTickCount64()};
     if (carryIgnore.active && !carryIgnore.releasedAt) carryIgnore.releasedAt = GetTickCount64();
-    gripCarry.hand = -1;
-    gripCarry.joint = 0;
-    gripCarry.samples = 0;
-    gripCarry.settled = false;
-    gripCarrying = false;
-    carryTargetValid = false;
+    endGripCarry();
 }
 static void __fastcall carryStep(void *puppet, void *) {
     const auto s = copySnapshot();
@@ -2248,16 +2232,38 @@ static void __fastcall carryStep(void *puppet, void *) {
         }
     }
     const bool live = vrSession(s) && fresh(s.input) && s.ui.gameplay && !recenterHeld(s.input);
+    const double tickNow = carryClock();
+    // A new tracking space (session, reference space, host) makes the
+    // reference-space hand samples incomparable. Turns and recentres do not:
+    // they only change how the samples map into the world at the release.
+    if (g.trackingSession != s.input.session || g.trackingReference != s.input.reference ||
+        g.trackingProducer != s.inputProducer) {
+        g.trackingSession = s.input.session;
+        g.trackingReference = s.input.reference;
+        g.trackingProducer = s.inputProducer;
+        resetCarryMotion();
+    }
     if (g.hand >= 0) {
+        const bool grip = (s.input.buttons[g.hand] & Wheel) != 0;
+        // Input briefly not live (a tracking hiccup mid-swing, a reference space
+        // change): keep holding for up to 300 ms rather than dropping the prop
+        // with no throw; then throw from the samples if they are recent.
+        if (live) g.liveLost = 0;
+        else if (!g.liveLost) g.liveLost = tickNow;
+        const bool lostTooLong = !live && tickNow - g.liveLost > .3;
         if (!primaryField(puppet, 0x564)) { // Ended natively: Use, death, object destroyed.
             log("Grip carry ended natively hand=%d", g.hand);
             if (carryIgnore.active && !carryIgnore.releasedAt) carryIgnore.releasedAt = GetTickCount64();
-            g.hand = -1; g.samples = 0; gripCarrying = false; carryTargetValid = false;
-        } else if (!live || !(s.input.buttons[g.hand] & Wheel)) {
-            log("Grip carry release: session=%d fresh=%d gameplay=%d recenter=%d grip=%d buttons=%x", int(vrSession(s)),
-                int(fresh(s.input)), int(s.ui.gameplay != 0), int(recenterHeld(s.input)), int((s.input.buttons[g.hand] & Wheel) != 0),
-                unsigned(s.input.buttons[g.hand]));
-            releaseGripCarry(puppet, live);
+            endGripCarry();
+        } else if ((live && !grip) || lostTooLong) {
+            // Throw only from a fresh swing: samples near now (live) or near the
+            // moment input stopped being live (the grace ran out).
+            const auto *newest = g.motion.newestHand();
+            const bool recent = newest && (live ? tickNow - newest->tick < .15 : g.liveLost - newest->tick < .15);
+            log("Grip carry release: session=%d fresh=%d gameplay=%d recenter=%d grip=%d buttons=%x recent=%d", int(vrSession(s)),
+                int(fresh(s.input)), int(s.ui.gameplay != 0), int(recenterHeld(s.input)), int(grip),
+                unsigned(s.input.buttons[g.hand]), int(recent));
+            releaseGripCarry(puppet, s, recent);
         }
     }
     if (g.requestHand >= 0) {
@@ -2267,7 +2273,8 @@ static void __fastcall carryStep(void *puppet, void *) {
             resolve(g.requestHull)) {
             virtualCall<void>(puppet, 0x290, g.requestHull, g.requestPose); // TakeObject(hull, world grab pose)
             if (primaryField(puppet, 0x564)) {
-                g.hand = int(h); g.samples = 0; g.joint = 0; g.carriedHull = g.requestHull; g.settled = false;
+                g.hand = int(h); g.joint = 0; g.carriedHull = g.requestHull; g.settled = false; g.liveLost = 0;
+                resetCarryMotion();
                 gripCarrying = true;
                 void *mechanism = carriedMechanism(g.requestHull);
                 int parts = -1;
@@ -2333,9 +2340,7 @@ static void __fastcall carryStep(void *puppet, void *) {
         void *mechanism = carriedMechanism(g.carriedHull);
         const Pose placed = carriedBodyPose();
         Pose target = compose(hand, inverse(grab)); // Body placement that puts the grab frame at the hand.
-        const double now = carryClock();
-        const double previous = g.samples ? g.history[(g.samples - 1) % 16].time : now;
-        const float dt = float(std::clamp(now - previous, 1e-3, .1));
+        const float dt = float(std::clamp(g.lastTick ? tickNow - g.lastTick : 1. / 60, 1e-3, .1));
         if (!g.settled && finite(placed)) {
             // A pointed grab: the object flies to the hand (at up to 15 m/s), then locks on.
             const Vec3 gap = target.p - placed.p;
@@ -2356,13 +2361,16 @@ static void __fastcall carryStep(void *puppet, void *) {
             // The mechanism moves rigidly with the body: keep their relative placement.
             const Pose placedMechanism = compose(target, compose(inverse(placed), mechanismPose));
             mechanismPlace(mechanism, placedMechanism, 0);
-            const HandMotion motion = carryMotion();
-            const Vec3 velocity = g.settled ? heldVelocity(motion, hand.p, target.p) : Vec3{};
-            mechanismVelocity(mechanism, velocity);
+            const ThrowMotion motion = g.motion.peak(tickNow, 0);
+            const Vec3 velocity = g.settled ? carriedVelocity(motion, s, puppet, hand.p, target.p, 1) : Vec3{};
+            if (finite(Pose{{}, velocity})) mechanismVelocity(mechanism, velocity);
             void *hull = resolve(g.carriedHull);
+            Pose anchor;
             if (void *objectBody = hull ? hullBody(hull) : nullptr) {
-                const Vec3 spin = g.settled ? motion.angular : Vec3{};
-                virtualCall<void>(objectBody, 0x50, &spin); // CBody::SetAngVelocity
+                Vec3 spin{};
+                if (g.settled && motion.valid && trackingAnchor(puppet, anchor))
+                    spin = rotate(referenceToWorld(anchor, s.origin, s.turn), motion.angular);
+                if (finite(Pose{{}, spin})) virtualCall<void>(objectBody, 0x50, &spin); // CBody::SetAngVelocity
             }
         }
         static bool announced = false;
@@ -2373,7 +2381,7 @@ static void __fastcall carryStep(void *puppet, void *) {
         if (finite(placed)) {
             const Vec3 gap = hand.p - compose(placed, grab).p;
             const float distance = std::sqrt(dot(gap, gap));
-            const Vec3 handVelocity = carryVelocity();
+            const Vec3 handVelocity = carriedVelocity(g.motion.peak(tickNow, 0), s, puppet, hand.p, hand.p, 1);
             const float handSpeed = std::sqrt(dot(handVelocity, handVelocity));
             const float limit = std::max(distance * CarryEaseRate + .3f, std::isfinite(handSpeed) ? handSpeed * 1.5f : 0.f);
             if (std::isfinite(distance)) jointMaxLinVel(joint, std::clamp(limit, .3f, 12.f));
@@ -2394,8 +2402,26 @@ static void __fastcall carryStep(void *puppet, void *) {
                 grab.p.z, grab.q.x, grab.q.y, grab.q.z, grab.q.w);
         }
     }
-    g.history[g.samples % 16] = {carryClock(), hand.p, hand.q};
-    ++g.samples;
+    // One hand sample per new host input (a re-read input is the same pose),
+    // stamped with the pose's own predicted display time; one body sample per tick.
+    const unsigned h = unsigned(g.hand);
+    if (live && s.input.sequence != g.lastSequence && s.input.handValid[h]) {
+        g.lastSequence = s.input.sequence;
+        const bool gripPose = s.input.gripValid[h] && finite(s.input.grip[h]);
+        ThrowHandSample sample;
+        sample.tick = tickNow;
+        sample.poseTime = s.inputTime > 0 ? double(s.inputTime) * 1e-9 : tickNow;
+        sample.hand = gripPose ? s.input.grip[h] : s.input.hand[h];
+        if (gripPose) {
+            sample.linear = s.gripVelocity[h].linear;
+            sample.angular = s.gripVelocity[h].angular;
+            sample.valid = s.gripVelocity[h].valid;
+        }
+        g.motion.addHand(sample);
+    }
+    Pose anchor;
+    if (trackingAnchor(puppet, anchor)) g.motion.addBody(tickNow, anchor.p);
+    g.lastTick = tickNow;
 }
 // Stick walking follows where the head faces ([Comfort] MoveDirection 0), or
 // where a controller points (1 left, 2 right; the head while that controller is
@@ -2546,6 +2572,8 @@ static void update(void *p) {
     Input input = s.input;
     uint32_t inputProducer = s.inputProducer;
     uint32_t gripPoseGeneration[2]{s.gripPoseGeneration[0],s.gripPoseGeneration[1]};
+    HandVelocity gripVelocity[2]{s.gripVelocity[0], s.gripVelocity[1]};
+    int64_t inputTime = s.inputTime;
     WorldSubmission submittedWorld=s.submittedWorld;
     {
         Lock l(channel);
@@ -2553,6 +2581,8 @@ static void update(void *p) {
             input = channel.shared->latest;
             inputProducer = channel.shared->hostPid;
             std::copy_n(channel.shared->gripPoseGeneration,2,gripPoseGeneration);
+            std::copy_n(channel.shared->gripVelocity, 2, gripVelocity);
+            inputTime = channel.shared->latestTime;
             submittedWorld=channel.shared->worldSubmission;
         }
         if (l && !channel.shared->rendererReady)
@@ -2566,7 +2596,12 @@ static void update(void *p) {
     if (s.rider.ride != rider.ride || s.rider.state != rider.state) useAwaitsRelease = true;
     if (changed) {
         const auto interruption = s.interruption;
-        if (s.player != p) lastPickId = -1; // A new player (level) made no pick yet.
+        if (s.player != p) {
+            lastPickId = -1; // A new player (level) made no pick yet.
+            // The carry belongs to the old player (or world): its joint pointer may be
+            // reused by the new world, so forget it rather than steer a stranger's joint.
+            if (gripCarry.hand >= 0 || carryTargetValid) endGripCarry();
+        }
         s = Snapshot{};
         s.rigRevision = rigPublication.current();
         s.interruption = interruption;
@@ -2585,6 +2620,8 @@ static void update(void *p) {
     }
     s.inputProducer = inputProducer;
     std::copy_n(gripPoseGeneration,2,s.gripPoseGeneration);
+    std::copy_n(gripVelocity, 2, s.gripVelocity);
+    s.inputTime = inputTime;
     s.submittedWorld=submittedWorld;
     bool enabled = riderValid && fresh(input) && s.interruption.permits(input, GetTickCount64(), inputProducer) &&
                    trackingEligible(p) && nativeRiderCurrent(p, rider);

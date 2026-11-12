@@ -785,6 +785,93 @@ bool waterDraw() noexcept {
 // Reflective materials: the view position (object space) per eye, from the
 // centre camera's plus the eye's world offset turned into the object's space by
 // its object-to-absolute rows. Restored after the draw.
+// Right-eye twins of engine screen grabs (render thread). Each key texture is
+// held (AddRef) so its address cannot be reused by another texture while it
+// maps to a twin; all go with the device's other resources.
+struct GrabTwin { IDirect3DTexture9 *texture = nullptr, *twin = nullptr; IDirect3DSurface9 *surface = nullptr, *level = nullptr; bool fresh = false; };
+static GrabTwin grabTwins[8];
+static unsigned grabTwinCount = 0;
+static void releaseGrabTwins() noexcept {
+    for (unsigned i = 0; i < grabTwinCount; ++i) {
+        auto &g = grabTwins[i];
+        if (g.surface) g.surface->Release();
+        if (g.twin) g.twin->Release();
+        if (g.texture) g.texture->Release();
+        g = {};
+    }
+    grabTwinCount = 0;
+}
+IDirect3DSurface9 *grabTwinSurface(IDirect3DDevice9 *d, IDirect3DSurface9 *target) noexcept {
+    if (!d || !target) return nullptr;
+    IDirect3DTexture9 *texture = nullptr;
+    if (FAILED(target->GetContainer(__uuidof(IDirect3DTexture9), reinterpret_cast<void **>(&texture))) || !texture) return nullptr;
+    for (unsigned i = 0; i < grabTwinCount; ++i)
+        if (grabTwins[i].texture == texture) { texture->Release(); grabTwins[i].fresh = true; return grabTwins[i].surface; }
+    D3DSURFACE_DESC desc{};
+    IDirect3DSurface9 *level = nullptr;
+    const bool single = texture->GetLevelCount() == 1 && SUCCEEDED(texture->GetSurfaceLevel(0, &level)) && level == target;
+    if (level) level->Release();
+    if (!single || FAILED(target->GetDesc(&desc)) || !(desc.Usage & D3DUSAGE_RENDERTARGET) || desc.Pool != D3DPOOL_DEFAULT) {
+        texture->Release();
+        return nullptr;
+    }
+    if (grabTwinCount == std::size(grabTwins)) releaseGrabTwins(); // New grabs each level: start over.
+    GrabTwin g{texture};
+    g.level = target; // Compared only (the key texture's reference keeps it alive).
+    g.fresh = true;
+    if (FAILED(d->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET, desc.Format, D3DPOOL_DEFAULT, &g.twin, nullptr)) ||
+        FAILED(g.twin->GetSurfaceLevel(0, &g.surface))) {
+        if (g.twin) g.twin->Release();
+        texture->Release();
+        return nullptr;
+    }
+    static unsigned traced = 0;
+    if (traced++ < 16) log("Single pass right-eye screen grab %ux%u format=%d", desc.Width, desc.Height, int(desc.Format));
+    grabTwins[grabTwinCount++] = g;
+    return g.surface;
+}
+// Whether a fresh grab is bound to any sampler (such draws need per-eye regions).
+static bool grabBound(IDirect3DDevice9 *d) noexcept {
+    if (!grabTwinCount) return false;
+    bool found = false;
+    for (DWORD s = 0; s < 8 && !found; ++s) {
+        IDirect3DBaseTexture9 *bound = nullptr;
+        if (FAILED(d->GetTexture(s, &bound)) || !bound) continue;
+        for (unsigned i = 0; i < grabTwinCount && !found; ++i)
+            found = grabTwins[i].fresh && static_cast<IDirect3DBaseTexture9 *>(grabTwins[i].texture) == bound;
+        bound->Release();
+    }
+    return found;
+}
+// While a stereo draw samples a grabbed screen image, the right eye's regions
+// sample its twin (the right eye's own image) instead of the left eye's.
+struct GrabTwinScope {
+    IDirect3DDevice9 *d = nullptr;
+    DWORD stage[4]{};
+    IDirect3DTexture9 *left[4]{}, *right[4]{};
+    unsigned count = 0, applied = 0;
+    GrabTwinScope(IDirect3DDevice9 *device, bool stereo) noexcept {
+        if (!stereo || !grabTwinCount) return;
+        d = device;
+        for (DWORD s = 0; s < 8 && count < 4; ++s) {
+            IDirect3DBaseTexture9 *bound = nullptr;
+            if (FAILED(d->GetTexture(s, &bound)) || !bound) continue;
+            for (unsigned i = 0; i < grabTwinCount; ++i)
+                if (grabTwins[i].fresh && static_cast<IDirect3DBaseTexture9 *>(grabTwins[i].texture) == bound) {
+                    stage[count] = s; left[count] = grabTwins[i].texture; right[count] = grabTwins[i].twin; ++count;
+                    break;
+                }
+            bound->Release();
+        }
+    }
+    void eye(unsigned e) noexcept {
+        const unsigned want = e & 1;
+        if (!count || applied == want) return;
+        for (unsigned i = 0; i < count; ++i) d->SetTexture(stage[i], want ? right[i] : left[i]);
+        applied = want;
+    }
+    ~GrabTwinScope() { eye(0); }
+};
 struct ReflectionViewScope {
     IDirect3DDevice9 *d;
     bool active = false;
@@ -1181,11 +1268,13 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
         result = perHalf(d, call, stereo);
         onMirror(d, [&] {
             HRESULT ignored = D3D_OK;
-            if (!(stereo && instancing && instanced(d, call, ignored))) perHalf(d, call, stereo);
+            if (!(stereo && instancing && !shaderReflectionView.count(engineShader) && !grabBound(d) && instanced(d, call, ignored))) perHalf(d, call, stereo);
         });
         return result;
     }
-    if (stereo && instancing && !instancingSuspended && !eyePixelCount && !waterDraw() && instanced(d, call, result)) return result;
+    // Programs whose view position is set per eye (ReflectionViewScope) need the per-eye draws.
+    if (stereo && instancing && !instancingSuspended && !eyePixelCount && !waterDraw() && !shaderReflectionView.count(engineShader) &&
+        !grabBound(d) && instanced(d, call, result)) return result;
     return perHalf(d, call, stereo);
 }
 template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo, bool shifted) noexcept {
@@ -1267,6 +1356,7 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
         WaterConstantsScope waterScope(d, stereo);
         if (stereo && waterScope.unusable()) return D3D_OK;
         ReflectionViewScope reflectionView(d, stereo);
+        GrabTwinScope grabs(d, stereo);
         const bool partial = scissorEnabled && (clip.left > LONG(v.X) || clip.top > LONG(v.Y) ||
                                                 clip.right < LONG(v.X + v.Width) || clip.bottom < LONG(v.Y + v.Height));
         const RECT eyeClipRect[2]{partial ? eyeScissor(0, clip) : clip, partial ? eyeScissor(1, clip) : clip};
@@ -1279,6 +1369,7 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
             applyPlanes(d, int(2 + j));
             waterScope.eye(layout.region[j].eye);
             reflectionView.apply(layout.region[j].eye);
+            grabs.eye(layout.region[j].eye);
             if (eyePixelCount) d->SetPixelShaderConstantF(eyePixelStart, eyePixel[layout.region[j].eye], eyePixelCount);
             d->SetStreamSource(15, ring, regionOffset + j * RecordBytes, RecordBytes);
             const HRESULT one = call(false);
@@ -1295,11 +1386,13 @@ template<class Call> HRESULT perHalf(IDirect3DDevice9 *d, Call call, bool stereo
     WaterConstantsScope waterScope(d, stereo);
     if (stereo && waterScope.unusable()) return D3D_OK;
     ReflectionViewScope reflectionView(d, stereo);
+    GrabTwinScope grabs(d, stereo);
     for (unsigned j = 0; j < layout.count; ++j) {
         const Region &g = layout.region[j];
         if (!g.scaled) continue;
         waterScope.eye(g.eye);
         reflectionView.apply(g.eye);
+        grabs.eye(g.eye);
         const RECT r = regionRect(g, LONG(v.X), LONG(v.Y), LONG(v.X + v.Width), LONG(v.Y + v.Height));
         if (r.right <= r.left || r.bottom <= r.top) continue;
         D3DVIEWPORT9 placed{DWORD(r.left), DWORD(r.top), DWORD(r.right - r.left), DWORD(r.bottom - r.top), v.MinZ, v.MaxZ};
@@ -1365,7 +1458,9 @@ void setMainView(const float *v) noexcept {
     mainCamera[2] = -(v[2] * v[3] + v[6] * v[7] + v[10] * v[11]);
     mainCameraValid = std::isfinite(mainCamera[0] + mainCamera[1] + mainCamera[2]);
 }
+IDirect3DSurface9 *grabTwin(IDirect3DDevice9 *d, IDirect3DSurface9 *target) noexcept { return grabTwinSurface(d, target); }
 void releaseDeviceResources() noexcept {
+    releaseGrabTwins();
     // D3DPOOL_DEFAULT resources must be gone before IDirect3DDevice9::Reset; all
     // are recreated on first use.
     for (IUnknown **r : {reinterpret_cast<IUnknown **>(&ring), reinterpret_cast<IUnknown **>(&identityIndices),
@@ -1454,6 +1549,10 @@ void beforeRenderTarget(IDirect3DDevice9 *d, DWORD index) noexcept {
     if (active && !index && !mirroring) perHalfState(d);
 }
 void afterRenderTarget(IDirect3DDevice9 *d, DWORD index, IDirect3DSurface9 *target) noexcept {
+    // The engine drawing into a grabbed image (not a whole-screen copy): its
+    // right-eye twin is stale until the next copy, so both eyes use the image.
+    for (unsigned i = 0; target && i < grabTwinCount; ++i)
+        if (grabTwins[i].level == target) grabTwins[i].fresh = false;
     if (!active || index || !target || mirroring) return;
     // SetRenderTarget resets the viewport and scissor rectangle to the target;
     // the wide target stands in for an eye-sized one.
