@@ -29,6 +29,7 @@ bool failed = false, filled = false;
 uint64_t lastWater = 0;
 float lastCamera[3]{}, anchorAt[3]{};
 bool anchored = false;
+bool renderedOnce = false; // A face-rendered cube was completed (this resource lifetime).
 // The cube's fixed world point moves to the viewer only once they are this far
 // from it (metres): within that, reflections stay put as the head moves.
 constexpr float AnchorMove = 4.f;
@@ -50,7 +51,6 @@ constexpr float RadiusMin = 8.f, RadiusMax = 40.f;
 // on the sphere it would reflect from the wrong place and slide as the head moves.
 constexpr float NearShare = .6f;
 float surroundings = ss2vr::water::ProxyRadius, sphereRadius = ss2vr::water::ProxyRadius;
-uint64_t radiusTick = 0;
 constexpr UINT SourceSize = 512;
 constexpr uint64_t KeepMs = 4000; // After the last water draw.
 template<class T> void drop(T *&p) { if (p) { p->Release(); p = nullptr; } }
@@ -139,6 +139,7 @@ static void labDump(IDirect3DDevice9 *d, D3DFORMAT format, unsigned every) noexc
 }
 void noteWater() noexcept { lastWater = GetTickCount64(); }
 bool wanted() noexcept { return lastWater && GetTickCount64() - lastWater < KeepMs && !failed; }
+bool everRendered() noexcept { return renderedOnce; }
 bool rendered() noexcept { return faceEver == AllRendered || pending || (lastFaceTick && GetTickCount64() - lastFaceTick < 1000); }
 
 bool nextFace(IDirect3DDevice9 *d, const Device &device, D3DFORMAT format, const float (&viewer)[3], unsigned &face,
@@ -156,7 +157,7 @@ bool nextFace(IDirect3DDevice9 *d, const Device &device, D3DFORMAT format, const
         // A jump (respawn, load): the old place's reflection goes; a neutral sky until the new one is ready.
         if (anchored) {
             const float dx = viewer[0] - anchorAt[0], dy = viewer[1] - anchorAt[1], dz = viewer[2] - anchorAt[2];
-            if (dx * dx + dy * dy + dz * dz > 40.f * 40.f) { clearFaces(d, device); anchored = false; faceFresh = faceEver = 0; }
+            if (dx * dx + dy * dy + dz * dz > 40.f * 40.f) { clearFaces(d, device); anchored = false; faceFresh = faceEver = 0; renderedOnce = false; }
         }
         std::copy(std::begin(viewer), std::end(viewer), pendingAt);
         pending = true;
@@ -260,6 +261,7 @@ void endFace(bool complete) noexcept {
             std::copy(std::begin(pendingAt), std::end(pendingAt), anchorAt);
             sphereRadius = pendingRadius;
             anchored = true;
+            renderedOnce = true;
             pending = false;
             faceFresh = faceEver = AllRendered;
             static unsigned traced = 0;
@@ -290,21 +292,16 @@ void capture(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *eye, 
     const float dx = camera[0] - lastCamera[0], dy = camera[1] - lastCamera[1], dz = camera[2] - lastCamera[2];
     if (filled && dx * dx + dy * dy + dz * dz > 40.f * 40.f) { clearFaces(d, device); anchored = false; }
     std::copy(std::begin(camera), std::end(camera), lastCamera);
-    const float ax = camera[0] - anchorAt[0], ay = camera[1] - anchorAt[1], az = camera[2] - anchorAt[2];
-    if (!anchored || ax * ax + ay * ay + az * az > AnchorMove * AnchorMove) {
+    // Anchored once, where the capture began: moving the anchor under old texels
+    // (or easing the radius) made the reflections swim with the viewer.
+    if (!anchored) {
         std::copy(std::begin(camera), std::end(camera), anchorAt);
+        sphereRadius = surroundings;
         anchored = true;
     }
     const RECT whole{0, 0, LONG(width), LONG(height)};
     if (FAILED(device.stretch(d, eye, &whole, sourceSurface, nullptr, D3DTEXF_LINEAR))) return;
     float rows[16];
-    {
-        // About a second to settle on a new measurement (no jumps in the reflections).
-        const uint64_t now = GetTickCount64();
-        const float dt = radiusTick ? std::min(float(now - radiusTick) * .001f, .1f) : 0.f;
-        radiusTick = now;
-        sphereRadius += (surroundings - sphereRadius) * std::min(1.f, dt * 2.5f);
-    }
     probe::captureRows(view, projection, anchorAt, sphereRadius, rows);
     IDirect3DSurface9 *previous = nullptr;
     if (FAILED(state->Capture()) || FAILED(d->GetRenderTarget(0, &previous))) { drop(previous); return; }
@@ -385,5 +382,12 @@ void release() noexcept {
     faceFresh = faceEver = 0;
     passActive = false;
     passTarget = nullptr;
+    // A new resource lifetime (device reset, new level) starts clean: one failed
+    // creation no longer disables the cube for good, and no old anchor survives.
+    failed = false;
+    renderedOnce = false;
+    lastFaceTick = 0;
+    surroundings = sphereRadius = ss2vr::water::ProxyRadius;
+    std::fill(std::begin(lastCamera), std::end(lastCamera), 0.f);
 }
 } // namespace ss2vr::game::env_probe

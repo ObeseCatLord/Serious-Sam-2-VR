@@ -1913,6 +1913,14 @@ static HRESULT WINAPI stretch(IDirect3DDevice9 *d, IDirect3DSurface9 *source, co
         observeUiOutput(d, [&] {
             replay::recordStretch(eyeSurface(source), sourceRect, eyeSurface(target), targetRect, filter);
             return originalStretch(d, eyeSurface(source), sourceRect, eyeSurface(target), targetRect, filter); }, target, false);
+    // The right eye's half into the grab's twin, which the right eye's draws
+    // sample: refraction, haze and glass then show each eye its own image.
+    if (sourceRect == &half && SUCCEEDED(result) && eyeSurface(target) == target) {
+        if (IDirect3DSurface9 *twin = single_pass::grabTwin(d, target)) {
+            const RECT right{LONG(width), 0, LONG(2 * width), LONG(height)};
+            if (FAILED(originalStretch(d, eyeSurface(source), &right, twin, targetRect, filter))) eyeInvalid = true;
+        }
+    }
     if ((activeEye >= 0 || scopeScratch) && FAILED(result))
         eyeInvalid = true;
     return result;
@@ -5006,7 +5014,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                             SUCCEEDED(originalStretch(d,wideColor,&half,uiFrame.target[k],nullptr,D3DTEXF_NONE));
                     }
                     if(foveated) ++perf.foveatedPairs;
-                    if(centreReady && env_probe::wanted() && !env_probe::rendered()) {
+                    if(centreReady && env_probe::wanted() && !env_probe::rendered() && !env_probe::everRendered()) {
                         // Water reflections: this frame's left eye (world only) into the environment cube.
                         float eyeView[12], eyeProjection[16];
                         if(singlePassEyeView(request,0,eyeView,eyeProjection)) {
@@ -5197,6 +5205,10 @@ void deviceResetSucceeded(IDirect3DDevice9 *d) {
     if (d==creationDevice && GetCurrentThreadId()==creationThread) {
         uiHalted=false;
         resetQuarantined=false;
+        // The halted scope/mirror/cube sources guarded resources the reset released
+        // (releaseTargets); a new lifetime may render them again. Left set, water
+        // fell back to the head-following eye-view cube for the rest of the run.
+        if (scopeSourcesHalted.exchange(false)) log("Scope and reflection sources resumed after the device reset");
     }
     // Native additional chains are recreated after Reset returns. No eager
     // allocation/channel startup against the implicit buffer or retired owner.

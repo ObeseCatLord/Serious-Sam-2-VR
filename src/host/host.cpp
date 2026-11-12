@@ -557,6 +557,8 @@ struct Actions {
     XrPath viveProfile = XR_NULL_PATH, indexProfile = XR_NULL_PATH, currentProfile[2]{};
     bool wheelForceDown[2]{};
     ActionStream primaryStream[2], zoomStream[2], gripPoseStream[2];
+    // The grips' velocities located with the latest sample (published beside it).
+    HandVelocity gripVelocity[2]{};
     SqueezeAdmission squeeze[2];
     WheelOpenGate wheelGate[2];
     StickChord stickChord;
@@ -793,6 +795,7 @@ struct Actions {
         return state;
     }
     void sample(Api &api, XrInstance instance, XrSession session, XrSpace local, XrTime time, Input &input, bool validViews) {
+        gripVelocity[0] = gripVelocity[1] = {};
         XrActiveActionSet active{set, XR_NULL_PATH};
         XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
         sync.countActiveActionSets = 1;
@@ -851,12 +854,28 @@ struct Actions {
             auto gripInfo = get(grip, h);
             XrActionStatePose gripState{XR_TYPE_ACTION_STATE_POSE};
             api.check(api.GetActionStatePose(session, &gripInfo, &gripState), "xrGetActionStatePose grip");
+            gripVelocity[h] = {};
             if (gripState.isActive) {
-                XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+                // The runtime's own hand velocity (throws): far steadier than differencing
+                // poses whose game-side timestamps are coarse.
+                XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
+                XrSpaceLocation location{XR_TYPE_SPACE_LOCATION, &velocity};
                 api.check(api.LocateSpace(gripSpace[h], local, time, &location), "xrLocateSpace grip");
                 if (located(location)) {
                     input.grip[h] = pose(location.pose);
                     input.gripValid[h] = 1;
+                    const auto finiteVec = [](const XrVector3f &v) {
+                        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) &&
+                               v.x * v.x + v.y * v.y + v.z * v.z < 1e4f; // 100 m/s or rad/s: a glitch, not a hand.
+                    };
+                    if ((velocity.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) && finiteVec(velocity.linearVelocity)) {
+                        gripVelocity[h].linear = {velocity.linearVelocity.x, velocity.linearVelocity.y, velocity.linearVelocity.z};
+                        gripVelocity[h].valid |= LinearVelocityValid;
+                    }
+                    if ((velocity.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) && finiteVec(velocity.angularVelocity)) {
+                        gripVelocity[h].angular = {velocity.angularVelocity.x, velocity.angularVelocity.y, velocity.angularVelocity.z};
+                        gripVelocity[h].valid |= AngularVelocityValid;
+                    }
                 }
             }
             gripPoseStream[h].sample(rideGripPoseEligible(input,h));
@@ -1905,6 +1924,8 @@ struct Host {
         }
         shared.latest =
             quit ? emptyInput() : input; // Independent of render slot availability and renderer readiness.
+        shared.latestTime = quit ? 0 : latestTime;
+        for (unsigned h = 0; h < 2; ++h) shared.gripVelocity[h] = quit ? HandVelocity{} : actions.gripVelocity[h];
         for(unsigned h=0;h<2;++h)shared.gripPoseGeneration[h]=quit?0:actions.gripPoseStream[h].generation;
         shared.worldSubmission=worldSubmission.value;
         const auto eyeSize = recommendedEye();
@@ -2153,7 +2174,9 @@ struct Host {
         }
         return true;
     }
+    XrTime latestTime = 0; // The predicted display time of the last sample (published with it).
     Input sample(XrTime time, const std::array<XrView, 2> &views, bool validViews) {
+        latestTime = time;
         Input input = emptyInput();
         input.focused = state == XR_SESSION_STATE_FOCUSED ? 1 : 0;
         XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};

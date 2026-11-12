@@ -220,7 +220,7 @@ static bool bound(void *server, int slot, uint32_t brain) {
     // A level change gives the slot's brain a new avatar with no SetAvatar: the entry
     // keeps the first level's handle (V968). It is stale while no slot's brain still
     // owns it; one that does belongs to another player.
-    for (int other = 0; other < 17; ++other)
+    for (int other = 0; other < 18; ++other) // Every slot (18), the last one too.
         if (avatarFor(brainFor(other)) == recorded)
             return false;
     return true;
@@ -402,11 +402,19 @@ static bool receiveServer(void *server, void *rpc, bool reliableTransport) {
             peer = {};
         if (message.kind == network::Kind::Hello) {
             ++seenHello;
-            if (peer.validation.clientNonce != message.hello.nonce) {
+            // At most two renegotiations a second per slot (the server is public: a
+            // client spamming Hellos must not churn peer state or fill the log).
+            static std::array<std::pair<uint64_t, unsigned>, 18> helloRate{};
+            auto &rate = helloRate[size_t(slot) % helloRate.size()];
+            if (now - rate.first >= 1000) rate = {now, 0};
+            const bool admitted = ++rate.second <= 2;
+            if (admitted && peer.validation.clientNonce != message.hello.nonce) {
                 uint64_t serverNonce = nonce();
                 if (serverNonce && nextIncarnation != UINT32_MAX) {
-                    log("Multiplayer VR client negotiated slot=%d brain=%08x avatar=%08x incarnation=%u", slot, brain, avatar,
-                        nextIncarnation + 1);
+                    static unsigned negotiatedLogs = 0;
+                    if (negotiatedLogs++ < 64)
+                        log("Multiplayer VR client negotiated slot=%d brain=%08x avatar=%08x incarnation=%u", slot, brain, avatar,
+                            nextIncarnation + 1);
                     network::Ack old{};
                     if (peer.finishInterval(old))
                         discarded[discardCount++] = old;

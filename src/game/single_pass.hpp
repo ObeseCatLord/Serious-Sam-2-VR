@@ -32,6 +32,11 @@ void setScreenLocked(bool locked) noexcept;
 void setMainView(const float *view) noexcept;
 // Releases the pass's default-pool resources (before a device Reset).
 void releaseDeviceResources() noexcept;
+// The right eye's copy of an engine whole-screen grab: in the single pass the
+// grab gets the left eye's half, and this texture (created on first use, same
+// size and format) the right eye's; the right eye's draws sample it instead.
+// Null when `target` is not a single-level texture. Not AddRef'd.
+IDirect3DSurface9 *grabTwin(IDirect3DDevice9 *device, IDirect3DSurface9 *target) noexcept;
 // Engine globals: adjusted projection, projection, view (read at draw time).
 void setEngineMatrices(const float *adjusted, const float *projection, const float *view) noexcept;
 // Where the eyes go in the pass's target. Each region is a pixel rectangle of
