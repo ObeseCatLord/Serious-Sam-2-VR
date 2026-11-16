@@ -2190,6 +2190,11 @@ static HRESULT sourceBackbuffer(IDirect3DSurface9 **out) {
 // cached so the next launch creates its canvas and depth at it from the start.
 static std::atomic<uint32_t> canvasWidth{0}, canvasHeight{0};
 static std::atomic<bool> canvasResizePending{false};
+// Desktop play (VR off, or the headset host failed or never came up): the game
+// keeps its own window canvas and configured resolution. A headset-sized canvas
+// scaled into the window made the desktop cursor move wrongly (too fast to reach
+// the VR options button) and the image soft.
+static std::atomic<bool> desktopCanvas{false};
 static uintptr_t canvasExe = 0, canvasGfx = 0, canvasGfxEnd = 0;
 static int32_t *(__cdecl *originalClientRect)(int32_t *, const void *) = nullptr;
 static int(WINAPI *originalSystemMetrics)(int) = nullptr;
@@ -2215,6 +2220,7 @@ static int32_t *__cdecl eyeClientRect(int32_t *out, const void *window) {
 }
 static int WINAPI eyeSystemMetrics(int index) {
     const int value = originalSystemMetrics(index);
+    if (desktopCanvas.load(std::memory_order_relaxed)) return value;
     const auto caller = reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0)));
     if ((index != SM_CXSCREEN && index != SM_CYSCREEN) || caller < canvasGfx || caller >= canvasGfxEnd) return value;
     // Windowed depth is shared by every canvas; size it for any eye extent up to
@@ -2252,6 +2258,7 @@ static void __cdecl saveCvars() {
     originalSaveCvars();
 }
 static void followCanvasResolution(int32_t w, int32_t h) noexcept {
+    if (desktopCanvas.load(std::memory_order_relaxed)) return;
     if (!pixResWidth || !pixResHeight || !originalSaveCvars || w <= 0 || h <= 0) return;
     if (!pixResFollowing) { userPixRes[0] = *pixResWidth; userPixRes[1] = *pixResHeight; pixResFollowing = true; }
     *pixResWidth = w;
@@ -2469,6 +2476,10 @@ void installEyeCanvas() noexcept {
     // last level's eye size made the title lay out before the switch).
     canvasWidth = MenuCanvasWidth;
     canvasHeight = MenuCanvasHeight;
+    if (!launchOptions().vr) { // Desktop play: the game's own canvas from the start.
+        desktopCanvas = true;
+        canvasWidth = canvasHeight = 0;
+    }
     void *clientRect = reinterpret_cast<void *>(GetProcAddress(core,
         "?wndGetWindowClientRect@SeriousEngine@@YA?AVCTRect@1@ABVCWindow@1@@Z"));
     void *metrics = reinterpret_cast<void *>(GetProcAddress(user, "GetSystemMetrics"));
@@ -2494,6 +2505,7 @@ void installEyeCanvas() noexcept {
 // for the next launch and let the main thread resize the native canvas at its
 // next input poll.
 static void requestEyeCanvas(uint32_t w, uint32_t h) {
+    if (desktopCanvas.load(std::memory_order_relaxed)) return;
     if (!w || !h || w > MaxDimension || h > MaxDimension || !originalClientRect ||
         (w == canvasWidth.load() && h == canvasHeight.load())) return;
     canvasWidth = w;
@@ -2505,6 +2517,25 @@ static void requestEyeCanvas(uint32_t w, uint32_t h) {
     }
     canvasResizePending = true;
     log("Eye canvas requested %ux%u (%s)", w, h, w == MenuCanvasWidth && h == MenuCanvasHeight ? "front end, 16:9" : "OpenXR recommended");
+}
+// VR did not start (or its host failed): hand the game its window canvas and the
+// configured resolution back, for the rest of the session (the host is not restarted).
+static void releaseEyeCanvas(const char *why) noexcept {
+    if (desktopCanvas.exchange(true)) return;
+    canvasWidth = canvasHeight = 0;
+    if (pixResFollowing && pixResWidth && pixResHeight && userPixRes[0] > 0 && userPixRes[1] > 0) {
+        *pixResWidth = userPixRes[0];
+        *pixResHeight = userPixRes[1];
+        pixResFollowing = false;
+        if (const HMODULE game = GetModuleHandleW(L"Sam2Game.dll")) {
+            auto *aspect = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(game) + 0x3f9de0);
+            const float next = float(userPixRes[0]) / float(userPixRes[1]);
+            if (readableMemory(aspect, sizeof next)) std::memcpy(aspect, &next, sizeof next);
+        }
+    }
+    canvasResizePending = true;
+    log("VR unavailable (%s): desktop play with the game's own window canvas and resolution %dx%d", why,
+        pixResWidth ? *pixResWidth : 0, pixResHeight ? *pixResHeight : 0);
 }
 void applyEyeCanvas() noexcept {
     if (!canvasResizePending.exchange(false) || !canvasExe) return;
@@ -2856,6 +2887,9 @@ static void startChannel() {
         PROCESS_INFORMATION pi{};
         std::vector<wchar_t> arg(cmd.begin(), cmd.end());
         arg.push_back(0);
+        // Lab (SS2VR_LAB_NO_HOST=1): the host is not started, as when no OpenXR runtime runs.
+        static const bool labNoHost = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_NO_HOST", v, 2) == 1 && v[0] == L'1'; }();
+        if (labNoHost) { log("Lab: headset host not started"); return; }
         // Explicit image path prevents whitespace-based executable search.
         // Null environment preserves Steam/Proton's prefix and runtime context.
         if (CreateProcessW(executable.c_str(), arg.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
@@ -3377,7 +3411,8 @@ static void presentBody(IDirect3DDevice9 *d) {
     const bool stereoReady = allocate();
     Input input{};
     Ui ui{};
-    uint32_t recommendedWidth = 0, recommendedHeight = 0;
+    uint32_t recommendedWidth = 0, recommendedHeight = 0, hostPid = 0, hostError = 0;
+    static bool hostSeen = false;
     {
         Lock l(channel);
         if (!l)
@@ -3386,8 +3421,23 @@ static void presentBody(IDirect3DDevice9 *d) {
         ui = channel.shared->ui;
         recommendedWidth = channel.shared->recommendedWidth;
         recommendedHeight = channel.shared->recommendedHeight;
+        hostPid = channel.shared->hostPid;
+        hostError = channel.shared->error;
     }
     {
+        // The host failed (no OpenXR runtime, runtime error) or never connected:
+        // desktop play with the game's own canvas (it is not started again).
+        static uint64_t channelSince = 0;
+        const uint64_t at = GetTickCount64();
+        if (!channelSince) channelSince = at;
+        if (hostPid) hostSeen = true;
+        if (!desktopCanvas.load(std::memory_order_relaxed)) {
+            if (hostError) releaseEyeCanvas("headset host reported an error");
+            else if (hostSeen && !hostPid) releaseEyeCanvas("headset host exited");
+            else if (!hostSeen && at - channelSince > 30000) releaseEyeCanvas("headset host did not start in 30 s");
+        }
+    }
+    if (!desktopCanvas.load(std::memory_order_relaxed)) {
         // The front end (title, main menu, loading) renders no eyes: it gets a
         // 16:9 canvas and is shown whole, exactly as on a desktop screen (its
         // 640x480 menus stretched over it, its title art at 16:9). A level gets the
