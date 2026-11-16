@@ -65,6 +65,11 @@ void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept;
 void notePerfSection(unsigned section, LARGE_INTEGER start) noexcept;
 void monoPresentationWithoutRender(void *player);
 void applyEyeCanvas() noexcept;
+// bridge.cpp: the game's window is reported to the engine as the eye canvas (VR
+// enabled and not given up for desktop play): the engine's mouse look is invalid.
+bool eyeCanvasReported() noexcept;
+// bridge.cpp: the engine must capture the mouse again (consumed per foreground poll).
+bool cursorRecaptureDue() noexcept;
 // Consumes a fresh weapon-wheel request to open the pause menu (one Back tap).
 bool wheelMenuRequested(uint64_t now) noexcept;
 void deviceReady(IDirect3DDevice9 *device);

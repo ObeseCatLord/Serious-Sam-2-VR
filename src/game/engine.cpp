@@ -9,6 +9,7 @@
 #include "common/throw_velocity.hpp"
 #include "common/bomb_fuse.hpp"
 #include "common/controls.hpp"
+#include "common/session_focus.hpp"
 #include "common/lab_preparation.hpp"
 #include "common/ride_control_observation.hpp"
 #include "common/ride_model_join.hpp"
@@ -2578,7 +2579,7 @@ static void update(void *p) {
     {
         Lock l(channel);
         if (l) {
-            input = channel.shared->latest;
+            input = admittedInput(channel.shared->latest);
             inputProducer = channel.shared->hostPid;
             std::copy_n(channel.shared->gripPoseGeneration,2,gripPoseGeneration);
             std::copy_n(channel.shared->gripVelocity, 2, gripVelocity);
@@ -3600,7 +3601,7 @@ bool menuViewFrame() noexcept {
     {
         Lock l(channel);
         if (!l) return s.menuView;
-        input = channel.shared->latest;
+        input = admittedInput(channel.shared->latest);
         producer = channel.shared->hostPid;
         if (!channel.shared->rendererReady) input.session = input.focused = 0;
     }
@@ -11098,6 +11099,11 @@ static int __cdecl appForeground() {
         labSeenRide = 0;
         labLoadIssued = true;
     }
+    // Desktop play resumed on the game's own canvas: the engine drops and retakes
+    // its mouse capture (it captures while foreground), so its cursor centre is
+    // the real window's again.
+    if (cursorRecaptureDue())
+        return 0;
     if (vrInputLive())
         return 1;
     return originalAppForeground ? originalAppForeground() : 0;
@@ -11142,11 +11148,16 @@ static void *__fastcall substituteCommands(void *bindings, void *, void *result,
 // Mouse look turns the native body under the tracked head: a desk mouse nudged
 // mid-session, or the cursor the menu pointer moves, would pitch or turn the
 // whole world. While VR input is live the mouse axes read as still; keys and
-// mouse buttons are unchanged.
+// mouse buttons are unchanged. So do they in play whenever the window is reported
+// as the eye canvas (VR enabled, the headset not driving the game right now: its
+// host restarting or not yet started): the engine recentres the cursor against
+// that rectangle, and a centre outside the desktop reads as a constant turn (the
+// player spinning in place). The game's menus keep their mouse cursor.
 using ControlValue = float(__thiscall *)(void *, long);
 static ControlValue originalMouseControl = nullptr;
 static float __fastcall mouseControlValue(void *device, void *, long control) {
-    if (control >= 0x78 && control <= 0x7b && vrInputLive()) return 0.f; // Mouse X+, X-, Y+, Y-
+    if (control >= 0x78 && control <= 0x7b && // Mouse X+, X-, Y+, Y-
+        (vrInputLive() || (eyeCanvasReported() && !menus::active()))) return 0.f;
     return originalMouseControl(device, control);
 }
 static void __fastcall mountedLookClamp(void *brain, void *, Vec3 &look) {
@@ -11557,7 +11568,7 @@ static float netricsaPrior[CommandCount]{};
 static bool latestInput(Input &out) {
     Lock l(channel);
     if (!l) return false;
-    out = channel.shared->latest;
+    out = admittedInput(channel.shared->latest);
     return true;
 }
 bool levelActive() noexcept {

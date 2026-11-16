@@ -3,6 +3,8 @@
 #include "common/foveation.hpp"
 #include "common/winpath.hpp"
 #include "common/frame_policy.hpp"
+#include "common/host_supervisor.hpp"
+#include "common/session_focus.hpp"
 #include "common/single_pass_math.hpp"
 #include "common/native_ui.hpp"
 #include "common/native_ui_finish.hpp"
@@ -2190,11 +2192,22 @@ static HRESULT sourceBackbuffer(IDirect3DSurface9 **out) {
 // cached so the next launch creates its canvas and depth at it from the start.
 static std::atomic<uint32_t> canvasWidth{0}, canvasHeight{0};
 static std::atomic<bool> canvasResizePending{false};
-// Desktop play (VR off, or the headset host failed or never came up): the game
-// keeps its own window canvas and configured resolution. A headset-sized canvas
-// scaled into the window made the desktop cursor move wrongly (too fast to reach
-// the VR options button) and the image soft.
+// Desktop play (VR off, or the headset host failed or never came up before VR
+// ever ran): the game keeps its own window canvas and configured resolution. A
+// headset-sized canvas scaled into the window made the desktop cursor move
+// wrongly (too fast to reach the VR options button) and the image soft.
+// Once VR has run it is never set: a stopped host is started again instead.
 static std::atomic<bool> desktopCanvas{false};
+// The engine's mouse input (Engine.dll, input capture) recentres the cursor each
+// frame on the centre of wndGetWindowClientRect (screen coordinates), taken once
+// when it captures the mouse, and reads the next frame's movement as cursor minus
+// that centre. With the eye canvas reported there (origin 0,0, headset-sized) the
+// centre can lie outside the desktop: SetCursorPos clamps, and the same offset is
+// read every frame, a constant turn ("spinning in place") whenever the mouse
+// axes are live. In play the axes are therefore still while the eye canvas is
+// reported (engine mouseControlValue), and the capture is renewed once the game's
+// own rectangle is back (cursorRecaptureDue: the engine releases and retakes it).
+static std::atomic<int> cursorRecapture{0};
 static uintptr_t canvasExe = 0, canvasGfx = 0, canvasGfxEnd = 0;
 static int32_t *(__cdecl *originalClientRect)(int32_t *, const void *) = nullptr;
 static int(WINAPI *originalSystemMetrics)(int) = nullptr;
@@ -2202,6 +2215,15 @@ static int(__cdecl *nativeResizeCanvas)(void *) = nullptr;
 static std::wstring canvasCache() {
     std::wstring directory;
     return moduleDirectory(nullptr, directory) ? directory + L"SS2VR\\headset-view.ini" : std::wstring();
+}
+bool eyeCanvasReported() noexcept {
+    return !desktopCanvas.load(std::memory_order_relaxed) && originalClientRect &&
+           canvasWidth.load(std::memory_order_relaxed) && canvasHeight.load(std::memory_order_relaxed);
+}
+bool cursorRecaptureDue() noexcept {
+    int left = cursorRecapture.load(std::memory_order_relaxed);
+    while (left > 0 && !cursorRecapture.compare_exchange_weak(left, left - 1, std::memory_order_relaxed)) {}
+    return left > 0;
 }
 static void *mainCanvasWindow() noexcept {
     void *window = nullptr;
@@ -2518,11 +2540,15 @@ static void requestEyeCanvas(uint32_t w, uint32_t h) {
     canvasResizePending = true;
     log("Eye canvas requested %ux%u (%s)", w, h, w == MenuCanvasWidth && h == MenuCanvasHeight ? "front end, 16:9" : "OpenXR recommended");
 }
-// VR did not start (or its host failed): hand the game its window canvas and the
-// configured resolution back, for the rest of the session (the host is not restarted).
+// VR never started (no runtime, no headset, or its host failed before any session):
+// hand the game its window canvas and the configured resolution back, for the rest
+// of the session. Never after VR has run (HostSupervisor): the host is restarted.
 static void releaseEyeCanvas(const char *why) noexcept {
     if (desktopCanvas.exchange(true)) return;
     canvasWidth = canvasHeight = 0;
+    // A mouse captured against the eye canvas keeps its centre: capture it again
+    // (sysIsAppForeground reads 0 for a few polls, about three frames).
+    cursorRecapture.store(8, std::memory_order_relaxed);
     if (pixResFollowing && pixResWidth && pixResHeight && userPixRes[0] > 0 && userPixRes[1] > 0) {
         *pixResWidth = userPixRes[0];
         *pixResHeight = userPixRes[1];
@@ -2856,6 +2882,46 @@ void deviceReady(IDirect3DDevice9 *d) {
     if (!reported.exchange(true, std::memory_order_relaxed))
         logStartup("deviceReady", d, ready, uiRoutingReady);
 }
+// The headset host process of this game session (kept to notice its exit; a
+// stopped host is started again on the same channel once VR has run).
+static HANDLE hostProcess = nullptr;
+static HostSupervisor hostSupervisor;
+// A host that cannot come back is retried every 15 s for as long as the game
+// runs: its reports stop after the first 64 (the log is not bounded otherwise).
+static bool hostReport() noexcept {
+    static unsigned reports = 0;
+    return reports < 64 && ++reports;
+}
+static bool spawnHost() {
+    if (hostProcess) { CloseHandle(hostProcess); hostProcess = nullptr; }
+    std::wstring root;
+    if (!moduleDirectory(nullptr,root)) {
+        log("Startup OpenXR host creation skipped: directory unavailable");
+        return false;
+    }
+    const auto executable=root+L"SS2VR\\ss2vr_host.exe";
+    auto cmd=L"\""+executable+L"\" --channel "+channel.token;
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> arg(cmd.begin(), cmd.end());
+    arg.push_back(0);
+    // Lab (SS2VR_LAB_NO_HOST=1): the host is not started, as when no OpenXR runtime runs.
+    static const bool labNoHost = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_NO_HOST", v, 2) == 1 && v[0] == L'1'; }();
+    if (labNoHost) { log("Lab: headset host not started"); return false; }
+    // Explicit image path prevents whitespace-based executable search.
+    // Null environment preserves Steam/Proton's prefix and runtime context.
+    if (!CreateProcessW(executable.c_str(), arg.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                        root.c_str(), &si, &pi)) {
+        const DWORD error = GetLastError();
+        if (hostReport()) log("Startup OpenXR host created=0 error=%lu thread=%lu", error, GetCurrentThreadId());
+        return false;
+    }
+    if (hostReport()) log("Startup OpenXR host created=1 process=%lu thread=%lu", pi.dwProcessId, GetCurrentThreadId());
+    CloseHandle(pi.hThread);
+    hostProcess = pi.hProcess;
+    return true;
+}
 static void startChannel() {
     auto *d = device;
     const bool ready = hooksReady.load(std::memory_order_acquire);
@@ -2875,33 +2941,29 @@ static void startChannel() {
         static std::atomic<bool> opened{false};
         if (!opened.exchange(true, std::memory_order_relaxed))
             logStartup("IPC create success=1", d, ready, -1, 1);
-        std::wstring root;
-        if (!moduleDirectory(nullptr,root)) {
-            log("Startup OpenXR host creation skipped: directory unavailable");
+        spawnHost();
+    }
+}
+// VR ran and its host stopped: the channel is handed to a new host. Slots the
+// host owned are emptied; one the game still renders into is cancelled and
+// awaited (the renderer retires it), for at most 3 s.
+static void restartHost() {
+    static uint64_t renderingSince = 0;
+    const uint64_t now = GetTickCount64();
+    {
+        Lock l(channel, 5);
+        if (!l || stopping) return;
+        const bool force = renderingSince && now - renderingSince > 3000;
+        if (!releaseHostChannel(*channel.shared, force)) {
+            if (!renderingSince) renderingSince = now;
             return;
         }
-        const auto executable=root+L"SS2VR\\ss2vr_host.exe";
-        auto cmd=L"\""+executable+L"\" --channel "+token;
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
-        PROCESS_INFORMATION pi{};
-        std::vector<wchar_t> arg(cmd.begin(), cmd.end());
-        arg.push_back(0);
-        // Lab (SS2VR_LAB_NO_HOST=1): the host is not started, as when no OpenXR runtime runs.
-        static const bool labNoHost = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_NO_HOST", v, 2) == 1 && v[0] == L'1'; }();
-        if (labNoHost) { log("Lab: headset host not started"); return; }
-        // Explicit image path prevents whitespace-based executable search.
-        // Null environment preserves Steam/Proton's prefix and runtime context.
-        if (CreateProcessW(executable.c_str(), arg.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
-                           root.c_str(), &si, &pi)) {
-            log("Startup OpenXR host created=1 process=%lu thread=%lu", pi.dwProcessId, GetCurrentThreadId());
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-        } else {
-            const DWORD error = GetLastError();
-            log("Startup OpenXR host created=0 error=%lu thread=%lu", error, GetCurrentThreadId());
-        }
+        if (force) log("Headset host restart: a slot left rendering for 3 s was released");
+        renderingSince = 0;
     }
+    const bool created = spawnHost();
+    hostSupervisor.restarted(GetTickCount64(), created);
+    if (hostReport()) log("Headset host restart: created=%d attempt=%u", int(created), hostSupervisor.failures);
 }
 static uint64_t lastMenuCopy = 0, menuSequence = 0;
 // The flat screen is a ~2 m panel: a 1920-wide image is all a headset resolves on
@@ -3411,13 +3473,13 @@ static void presentBody(IDirect3DDevice9 *d) {
     const bool stereoReady = allocate();
     Input input{};
     Ui ui{};
-    uint32_t recommendedWidth = 0, recommendedHeight = 0, hostPid = 0, hostError = 0;
-    static bool hostSeen = false;
+    uint32_t recommendedWidth = 0, recommendedHeight = 0, hostPid = 0, hostError = 0, hostSession = 0;
     {
         Lock l(channel);
         if (!l)
             return;
-        input = channel.shared->latest;
+        hostSession = channel.shared->latest.session;
+        input = admittedInput(channel.shared->latest);
         ui = channel.shared->ui;
         recommendedWidth = channel.shared->recommendedWidth;
         recommendedHeight = channel.shared->recommendedHeight;
@@ -3425,16 +3487,37 @@ static void presentBody(IDirect3DDevice9 *d) {
         hostError = channel.shared->error;
     }
     {
-        // The host failed (no OpenXR runtime, runtime error) or never connected:
-        // desktop play with the game's own canvas (it is not started again).
-        static uint64_t channelSince = 0;
-        const uint64_t at = GetTickCount64();
-        if (!channelSince) channelSince = at;
-        if (hostPid) hostSeen = true;
-        if (!desktopCanvas.load(std::memory_order_relaxed)) {
-            if (hostError) releaseEyeCanvas("headset host reported an error");
-            else if (hostSeen && !hostPid) releaseEyeCanvas("headset host exited");
-            else if (!hostSeen && at - channelSince > 30000) releaseEyeCanvas("headset host did not start in 30 s");
+        // Before VR has run, a host that fails (no OpenXR runtime, no headset) or
+        // never connects means desktop play with the game's own canvas. Once VR
+        // has run it stays: a host that stops (runtime error, the runtime ending
+        // the session, a crash) is started again, as often as it takes. Leaving VR
+        // for the desktop mid-session is not supported.
+        HostObservation seen;
+        seen.now = GetTickCount64();
+        seen.spawned = hostProcess != nullptr;
+        seen.alive = hostProcess && WaitForSingleObject(hostProcess, 0) == WAIT_TIMEOUT;
+        seen.hostPid = hostPid;
+        seen.error = hostError;
+        seen.session = hostSession;
+        switch (hostSupervisor.step(seen)) {
+        case HostStep::Desktop:
+            releaseEyeCanvas(hostSupervisor.reason);
+            break;
+        case HostStep::Stopped:
+            if (hostReport())
+                log("Headset host %s (pid=%u error=%u): VR is kept, a new host starts in %llu ms (attempt %u)",
+                    hostSupervisor.reason, hostPid, hostError,
+                    static_cast<unsigned long long>(hostSupervisor.restartAt - seen.now), hostSupervisor.failures);
+            break;
+        case HostStep::Terminate:
+            log("Headset host %s and did not exit: process ended", hostSupervisor.reason);
+            if (hostProcess) TerminateProcess(hostProcess, 1);
+            break;
+        case HostStep::Restart:
+            restartHost();
+            break;
+        case HostStep::None:
+            break;
         }
     }
     if (!desktopCanvas.load(std::memory_order_relaxed)) {
@@ -3487,6 +3570,24 @@ static void presentBody(IDirect3DDevice9 *d) {
     // The weapon wheel's menu bubble opens the pause menu exactly as Menu does.
     if (wheelMenuRequested(now) && action == MenuAction::None && valid && !menuVisible)
         action = MenuAction::Back;
+    {
+        // The runtime's own menu took the controllers (the SteamVR dashboard: the
+        // session is shown but not focused). The world stays in the headset and
+        // nothing can be controlled, so play is paused once, the same way.
+        static uint64_t unfocusedSince = 0;
+        static bool pausedForFocus = false;
+        if (!valid || inputFocused(input)) {
+            unfocusedSince = 0;
+            pausedForFocus = false;
+        } else {
+            if (!unfocusedSince) unfocusedSince = now;
+            if (!pausedForFocus && now - unfocusedSince > 300 && action == MenuAction::None && !menuVisible) {
+                pausedForFocus = true;
+                action = MenuAction::Back;
+                log("Input focus left the game (runtime menu): pause menu opened");
+            }
+        }
+    }
     // Netricsa takes its controls as player commands (engine poll): no menu keys,
     // Escape would open the pause menu over it.
     const bool netricsa = netricsaShown();

@@ -15,6 +15,8 @@
 #include "common/ipc.hpp"
 #include "common/math.hpp"
 #include "common/rider.hpp"
+#include "common/host_supervisor.hpp"
+#include "common/session_focus.hpp"
 #include "common/ui.hpp"
 #include "common/weapon_names.hpp"
 #include "common/win_settings.hpp"
@@ -102,7 +104,15 @@ struct Log {
     Handle file;
     DWORD written = 0;
     explicit Log(const std::wstring &directory) {
-        file.h = CreateFileW((directory + L"ss2vr_host.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        // The game starts a new host when one stops, and a player restarts the game
+        // after a failure: the logs of the last three hosts are kept beside this one
+        // (ss2vr_host.1.log is the previous host), so the reason is not overwritten.
+        const auto name = [&](unsigned age) {
+            return directory + (age ? L"ss2vr_host." + std::to_wstring(age) + L".log" : std::wstring(L"ss2vr_host.log"));
+        };
+        for (unsigned age = 3; age-- != 0;)
+            MoveFileExW(name(age).c_str(), name(age + 1).c_str(), MOVEFILE_REPLACE_EXISTING);
+        file.h = CreateFileW(name(0).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     }
     void write(const char *message) noexcept {
@@ -800,9 +810,12 @@ struct Actions {
         XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
         sync.countActiveActionSets = 1;
         sync.activeActionSets = &active;
-        const XrResult result = api.SyncActions(session, &sync);
+        // Without input focus (the runtime's own menu is open, or the session is not
+        // shown) no action is read: the sample keeps its head and carries no control.
+        // The runtime reports that state by event and by xrSyncActions; either is enough.
+        const XrResult result = inputFocused(input) ? api.SyncActions(session, &sync) : XR_SESSION_NOT_FOCUSED;
         if (result == XR_SESSION_NOT_FOCUSED) {
-            input.focused = 0;
+            if (input.focused) input.focused = SessionVisible;
             for (unsigned h = 0; h != 2; ++h) {
                 squeeze[h].sample(0, false, false, false);
                 if (wheelGate[h].sample(false, false, false)) input.blockedWheels |= 1u << h;
@@ -1312,6 +1325,45 @@ struct Host {
     std::vector<XrTime> referenceChanges;
     uint32_t sessionGeneration = 0, referenceGeneration = 1;
     uint64_t inputSequence = 0, requestSequence = 0;
+    bool firstHost = true;          // No host used this channel before (connect).
+    ULONGLONG sessionBeganTick = 0; // The running session's xrBeginSession.
+    // Lab (SS2VR_LAB_UNFOCUS=after,for; seconds since the session began): for that
+    // window the session reads as VISIBLE, as under the SteamVR dashboard: the world
+    // stays up, the controllers are withheld. The simulated runtime is always FOCUSED.
+    bool labUnfocusedNow = false;
+    bool labUnfocused() {
+        struct Window { double after = 0, length = 0; bool set = false; };
+        static const Window window = [] {
+            Window w; wchar_t v[48]{};
+            const DWORD n = GetEnvironmentVariableW(L"SS2VR_LAB_UNFOCUS", v, 48);
+            w.set = n && n < 48 && swscanf(v, L"%lf,%lf", &w.after, &w.length) == 2 && w.after >= 0 && w.length > 0;
+            return w;
+        }();
+        if (!window.set || !running || !sessionBeganTick) return false;
+        const double t = double(GetTickCount64() - sessionBeganTick) / 1000.;
+        const bool withheld = t >= window.after && t < window.after + window.length;
+        if (withheld != labUnfocusedNow) {
+            labUnfocusedNow = withheld;
+            log.write(withheld ? "Lab: input focus withheld (the session reads as VISIBLE)" : "Lab: input focus returned");
+            if (withheld) { // As the session state event does.
+                if (!api.lossPending) actions.stopFeedback(api, session);
+                invalidate();
+            }
+        }
+        return withheld;
+    }
+    // Lab (SS2VR_LAB_HOST_EXIT=seconds): the first host of a game session stops that
+    // long after its session began, as when the runtime ends the session; the game
+    // must start another host and return to VR.
+    bool labExitDue() const {
+        static const double after = [] {
+            wchar_t v[24]{};
+            const DWORD n = GetEnvironmentVariableW(L"SS2VR_LAB_HOST_EXIT", v, 24);
+            return n && n < 24 ? _wtof(v) : 0.;
+        }();
+        return after > 0 && firstHost && running && sessionBeganTick &&
+               double(GetTickCount64() - sessionBeganTick) / 1000. >= after;
+    }
     uint64_t xrEndSuccess = 0, xrLayerSuccess = 0, xrMenuSuccess = 0, xrWorldSuccess = 0;
     uint64_t uiPairs = 0, clearedPairs = 0; // Pairs with the native HUD composited; head-clearance opaque pairs.
     uint64_t completed = 0, timeouts = 0, fullSlots = 0, discarded = 0, imageTimeouts = 0, invalidViews = 0, copyWaits = 0;
@@ -1417,6 +1469,15 @@ struct Host {
         gameProcess.h = OpenProcess(SYNCHRONIZE, FALSE, s.gamePid);
         if (!gameProcess.h || WaitForSingleObject(gameProcess.h, 0) != WAIT_TIMEOUT)
             throw std::runtime_error("IPC game process unavailable");
+        // The game starts a new host on the same channel when one stops: this one
+        // continues its sequences and generations, so nothing it publishes repeats an
+        // identity the game has already seen. (A new channel: 0, 0, 1, 0.)
+        const HostSeed seed = hostSeed(s);
+        inputSequence = seed.inputSequence;
+        requestSequence = seed.requestSequence;
+        sessionGeneration = seed.session;
+        referenceGeneration = seed.reference;
+        firstHost = !seed.inputSequence && !seed.session;
         s.hostPid = GetCurrentProcessId();
         ownsChannel = true;
     }
@@ -1798,13 +1859,24 @@ struct Host {
                     begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     api.check(api.BeginSession(session, &begin), "xrBeginSession");
                     running = true;
+                    sessionBeganTick = GetTickCount64();
                     if (++sessionGeneration == 0)
                         throw std::runtime_error("Session generation overflow");
                     invalidate();
                 } else if (state == XR_SESSION_STATE_STOPPING && running) {
-                    finishSessionAcquisitions();
+                    // The runtime stops the session (headset taken off, another
+                    // application shown): end it and wait for READY to begin again.
+                    // An image the runtime no longer hands over does not prevent that.
+                    try {
+                        finishSessionAcquisitions();
+                    } catch (const std::runtime_error &error) {
+                        if (api.lossPending) throw;
+                        log.write(error.what());
+                        log.write("Session stop: an acquired image was not retired; ending the session anyway");
+                    }
                     api.check(api.EndSession(session), "xrEndSession");
                     running = false;
+                    sessionBeganTick = 0;
                 } else if (state == XR_SESSION_STATE_EXITING || state == XR_SESSION_STATE_LOSS_PENDING) {
                     quit = true;
                     if (state == XR_SESSION_STATE_LOSS_PENDING)
@@ -1816,8 +1888,16 @@ struct Host {
                 const auto &change =
                     *reinterpret_cast<const XrEventDataReferenceSpaceChangePending *>(&event);
                 if (change.session == session && change.referenceSpaceType == worldSpaceType) {
-                    if (referenceChanges.size() >= 32)
-                        throw std::runtime_error("Too many pending LOCAL space changes");
+                    // Changes are applied by frame time; none is while the session is
+                    // stopped. A full queue takes its oldest change at once instead
+                    // of ending the host.
+                    if (referenceChanges.size() >= 32) {
+                        referenceChanges.erase(referenceChanges.begin());
+                        if (++referenceGeneration == 0)
+                            throw std::runtime_error("Reference generation overflow");
+                        invalidate();
+                        log.write("LOCAL reference generation changed (pending changes coalesced)");
+                    }
                     referenceChanges.push_back(change.changeTime);
                 }
                 break;
@@ -2178,7 +2258,11 @@ struct Host {
     Input sample(XrTime time, const std::array<XrView, 2> &views, bool validViews) {
         latestTime = time;
         Input input = emptyInput();
-        input.focused = state == XR_SESSION_STATE_FOCUSED ? 1 : 0;
+        // Shown (VISIBLE or FOCUSED): the head is tracked and the world is rendered.
+        // The controllers belong to this session only while it is FOCUSED: the
+        // SteamVR dashboard over the game leaves it VISIBLE.
+        input.focused = sessionFocus(state == XR_SESSION_STATE_VISIBLE || state == XR_SESSION_STATE_FOCUSED,
+                                     state == XR_SESSION_STATE_FOCUSED && !labUnfocused());
         XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
         api.check(api.LocateSpace(viewSpace, local, time, &head), "xrLocateSpace head VIEW");
         if (headLocated(head)) {
@@ -3301,7 +3385,7 @@ struct Host {
                                 input.primaryInputGeneration[hand]};
     }
     void feedback(const Ui &ui, const Input &input, bool menuVisible) {
-        bool valid = !quit && running && hapticsAvailable && ui.gameplay && input.focused &&
+        bool valid = !quit && running && hapticsAvailable && ui.gameplay && inputFocused(input) &&
                      input.headValid && !menuVisible && ui.tickMs && GetTickCount64() >= ui.tickMs &&
                      GetTickCount64() - ui.tickMs <= UiFreshMs;
         if (!valid) {
@@ -3381,6 +3465,10 @@ struct Host {
                 break;
             }
             events();
+            if (labExitDue()) {
+                log.write("Lab: host stops (SS2VR_LAB_HOST_EXIT)");
+                quit = true;
+            }
             if (quit || api.lossPending)
                 break;
             if (!running) {

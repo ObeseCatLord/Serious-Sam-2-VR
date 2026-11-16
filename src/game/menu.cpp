@@ -1,5 +1,6 @@
 #include "menu.hpp"
 #include "common/controls.hpp"
+#include "common/session_focus.hpp"
 #include "game.hpp"
 #include "multiplayer.hpp"
 #include <cstring>
@@ -128,7 +129,7 @@ static void __cdecl poll() {
             return;
         }
         pointer = channel.shared->pointer;
-        input = channel.shared->latest;
+        input = admittedInput(channel.shared->latest);
         publishedGeneration = channel.shared->menu.interactionGeneration;
         menuSequence = channel.shared->menu.sequence;
         imageWidth = channel.shared->menu.width;
@@ -253,7 +254,7 @@ bool pointerAvailable() {
         if (!lock)
             return false;
         pointer = channel.shared->pointer;
-        input = channel.shared->latest;
+        input = admittedInput(channel.shared->latest);
         sourceEligible = menuPointerEligible(pointer, input, channel.shared->menu.sequence,
                                              channel.shared->menu.interactionGeneration, GetTickCount64());
     }
