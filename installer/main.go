@@ -50,6 +50,9 @@ Options:
 `
 
 func main() {
+	if len(os.Args) == 1 && relaunchInTerminal() {
+		return // Running on in its own terminal window.
+	}
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
