@@ -124,10 +124,8 @@ struct MenuFrame {
     // world was left out and black is transparent).
     uint32_t pixelGeneration = 0, overlay = 0;
 };
-// MenuAlpha: the image carries its own alpha (Netricsa's rounded frame);
-// MenuPointable: a panel without a native menu that still takes the laser
-// pointer (Netricsa: the game maps the hit to its commands).
-enum MenuOverlay : uint32_t { MenuOverLevel = 1, MenuKeyed = 2, MenuAlpha = 4, MenuPointable = 8 };
+// MenuAlpha: the image carries its own alpha (Netricsa's rounded frame).
+enum MenuOverlay : uint32_t { MenuOverLevel = 1, MenuKeyed = 2, MenuAlpha = 4 };
 // The game creates one section per buffer for its current canvas extent and
 // publishes it here; readers reopen when the generation changes.
 struct PixelSections {

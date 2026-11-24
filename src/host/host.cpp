@@ -1333,7 +1333,7 @@ struct Host {
     // given, held world-locked behind it (the paused world does not change).
     Swapchain backdrop[2];
     Request backdropRequest{};
-    bool backdropValid = false, menuKeyed = false, menuAlpha = false, menuPointable = false;
+    bool backdropValid = false, menuKeyed = false, menuAlpha = false;
     // A pause menu over the level with the world rendered live behind it (the game's
     // GameplayMenuView): stereo pairs go on, the keyed menu panel over them.
     bool liveBehindMenu = false;
@@ -3326,7 +3326,7 @@ struct Host {
         }
         PanelHit hit;
         unsigned hand = 2;
-        if ((menuGeneration || menuPointable) && !recenterHeld(input) && !options.open) // The options panel over the menu takes the pointer.
+        if (menuGeneration && !recenterHeld(input) && !options.open) // The options panel over the menu takes the pointer.
             for (unsigned candidate : {1u, 0u})
                 if (input.handValid[candidate] && primaryActionEligible(input, candidate)) {
                     hit = pointAtPanel(input.hand[candidate], panel, settings.menuWidth, panelHeight);
@@ -3338,8 +3338,7 @@ struct Host {
         const int x = hit.valid ? std::min(int(width) - 1, int(hit.u * width)) : -1;
         const int y = hit.valid ? std::min(int(height) - 1, int(hit.v * height)) : -1;
         // A failed upload keeps the previous image (still in the swapchain).
-        const bool redraw = sequence != menuSequence || stripRows != menuStripRows || (strip && stripButton.hover != menuStripHover) ||
-                            (menuPointable && (x != cursorX || y != cursorY));
+        const bool redraw = sequence != menuSequence || stripRows != menuStripRows || (strip && stripButton.hover != menuStripHover);
         const uint8_t *image = menuSourcePixels.data();
         if (redraw && stripRows) {
             menuComposite.assign(size_t(width) * imageHeight * 4, 0);
@@ -3355,22 +3354,6 @@ struct Host {
                     const uint32_t sx = std::min(bm.width - 1, uint32_t((float(x) - x0) / bw * float(bm.width)));
                     const uint32_t sy = std::min(bm.height - 1, uint32_t((float(y) - y0) / bh * float(bm.height)));
                     std::memcpy(&menuComposite[(size_t(y) * width + x) * 4], bm.bits + (size_t(sy) * bm.width + sx) * 4, 4);
-                }
-            image = menuComposite.data();
-        }
-        if (redraw && !stripRows && menuPointable && hit.valid) {
-            // A pointable panel over the held world (Netricsa) has no cursor quad
-            // (Proton corrupts a second quad there): the cursor is painted into it.
-            menuComposite.assign(menuSourcePixels.begin(), menuSourcePixels.end());
-            const int radius = std::max(3, int(width) / 120);
-            for (int dy = -radius - 2; dy <= radius + 2; ++dy)
-                for (int dx = -radius - 2; dx <= radius + 2; ++dx) {
-                    const int px = x + dx, py = y + dy, d2 = dx * dx + dy * dy;
-                    if (px < 0 || py < 0 || px >= int(width) || py >= int(height) || d2 > (radius + 2) * (radius + 2)) continue;
-                    uint8_t *c = &menuComposite[(size_t(py) * width + px) * 4];
-                    const uint8_t v = d2 <= radius * radius ? 255 : 20; // White dot, dark rim.
-                    c[0] = c[1] = c[2] = v;
-                    c[3] = 255;
                 }
             image = menuComposite.data();
         }
@@ -3739,7 +3722,6 @@ struct Host {
                         for (auto &wheel : wheels)
                             wheel.reset();
                         menuAlpha = (snapshot.menuOverlay & MenuAlpha) != 0;
-                        menuPointable = (snapshot.menuOverlay & MenuPointable) != 0;
                         if (liveBehindMenu) {
                             // The live world (the projection above) behind the keyed menu.
                             menuKeyed = (snapshot.menuOverlay & MenuKeyed) != 0;

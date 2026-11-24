@@ -11641,28 +11641,6 @@ static bool respawnCommand(int i, const Snapshot &s) {
 // right stick the second axis, A (or a trigger) switches pages, B, Menu, the
 // wheel button or the Netricsa bubble close it, as its gamepad prompts say.
 static bool netricsaCommand(int i) { return i == 2 || i == 3 || i == 7 || i == 12 || i == 13 || i == 15; }
-// The laser on Netricsa's panel (the host's hit, in the panel image, V1011 crop):
-// exit and page buttons at the bottom left, the text box above them.
-enum class NetricsaTarget { None, Off, Exit, Page, ScrollUp, ScrollDown, Panel };
-static NetricsaTarget netricsaPointerTarget(const Input &in, unsigned &hand) {
-    MenuPointer pointer{};
-    {
-        Lock l(channel);
-        if (!l) return NetricsaTarget::Off;
-        pointer = channel.shared->pointer;
-    }
-    const uint64_t now = GetTickCount64();
-    if (!pointer.active || pointer.hand > 1 || pointer.interactionGeneration || pointer.session != in.session ||
-        now < pointer.tickMs || now - pointer.tickMs > 150 || !std::isfinite(pointer.u) || !std::isfinite(pointer.v))
-        return NetricsaTarget::Off;
-    hand = pointer.hand;
-    const float u = pointer.u, v = pointer.v;
-    if (v >= .86f && v <= .98f && u >= .035f && u < .155f) return NetricsaTarget::Exit;
-    if (v >= .86f && v <= .98f && u >= .155f && u <= .32f) return NetricsaTarget::Page;
-    if (u >= .02f && u <= .5f && v >= .36f && v <= .84f)
-        return v < .52f ? NetricsaTarget::ScrollUp : v > .66f ? NetricsaTarget::ScrollDown : NetricsaTarget::Panel;
-    return NetricsaTarget::Panel;
-}
 static float netricsaValue(int i, const Input &in) {
     const uint32_t buttons = in.buttons[0] | in.buttons[1];
     const bool jumpProfile = (buttons & JumpBound) != 0;
@@ -11674,20 +11652,14 @@ static float netricsaValue(int i, const Input &in) {
                                      : (in.buttons[0] & WheelOpen) != 0 || (buttons & Netricsa) != 0;
     const bool closeButton = jumpProfile ? bButton || (buttons & (Netricsa | WheelOpen)) != 0
                                          : bButton || (buttons & Menu) != 0;
-    unsigned hand = 2;
-    const NetricsaTarget target = netricsaPointerTarget(in, hand);
-    const auto pulled = [&](unsigned h) { return h < 2 && primaryActionEligible(in, h) && in.trigger[h] > .75f; };
-    const bool aimedPull = target != NetricsaTarget::Off && pulled(hand);
+    const auto pulled = [&](unsigned h) { return primaryActionEligible(in, h) && in.trigger[h] > .75f; };
     switch (i) {
-    case 3: return in.axis[0][1] > .5f || (aimedPull && target == NetricsaTarget::ScrollUp) ? 1.f : 0.f;   // plcmdZ-: up
-    case 2: return in.axis[0][1] < -.5f || (aimedPull && target == NetricsaTarget::ScrollDown) ? 1.f : 0.f; // plcmdZ+: down
+    case 3: return in.axis[0][1] > .5f ? 1.f : 0.f;   // plcmdZ-: up
+    case 2: return in.axis[0][1] < -.5f ? 1.f : 0.f; // plcmdZ+: down
     case 12: return in.axis[1][1] > .5f ? 1.f : 0.f;  // plcmdP+
     case 13: return in.axis[1][1] < -.5f ? 1.f : 0.f; // plcmdP-
-    case 7:
-        // Off the panel a trigger still switches the page, as before the laser.
-        return aButton || yButton || (aimedPull && target == NetricsaTarget::Page) ||
-               (target == NetricsaTarget::Off && (pulled(0) || pulled(1))) ? 1.f : 0.f;
-    case 15: return closeButton || (aimedPull && target == NetricsaTarget::Exit) ? 1.f : 0.f;
+    case 7: return aButton || yButton || pulled(0) || pulled(1) ? 1.f : 0.f;
+    case 15: return closeButton ? 1.f : 0.f;
     default: return 0.f;
     }
 }

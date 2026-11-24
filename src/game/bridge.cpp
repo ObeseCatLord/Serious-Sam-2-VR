@@ -2427,6 +2427,30 @@ static void __cdecl putTexturePart(const void *texture, const PromptBox3 *dest, 
             names[unsigned(mark.image)], mark.hand, dest->x0, dest->y0, dest->x1, dest->y1);
     }
 }
+// Netricsa draws its two prompts (B exit, Y page) itself with gfuPutRotatedTexture
+// (Sam2Game 18A13E and 18A19F: texture, centre, width, height, angle, colour),
+// not through the menus' prompt slots. With Index the same A/B image and hand
+// mark as the menus replace them there: B is right B, Y is left B.
+using PutRotatedTexture = void(__cdecl *)(const void *, float, float, float, float, float, uint32_t);
+static PutRotatedTexture originalPutRotatedTexture = nullptr;
+static uintptr_t netricsaPromptB = 0, netricsaPromptY = 0; // Return addresses of the two calls.
+static void __cdecl putRotatedTexture(const void *texture, float x, float y, float w, float h, float angle, uint32_t color) {
+    const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    const MenuPrompt prompt = !indexPrompts.load(std::memory_order_relaxed) || !promptSlots ? MenuPrompt::None :
+        caller == netricsaPromptB ? MenuPrompt::B : caller == netricsaPromptY ? MenuPrompt::Y : MenuPrompt::None;
+    const PromptMark mark = indexPromptMark(prompt);
+    const void *image = mark.hand && angle == 0 ? promptSlotTexture(mark.image) : nullptr;
+    if (!image) { originalPutRotatedTexture(texture, x, y, w, h, angle, color); return; }
+    originalPutRotatedTexture(image, x, y, w, h, angle, color);
+    const uint32_t colors[4]{color, color, color, color};
+    drawPromptMark(mark.hand, PromptBox3{x - w * .5f, y - h * .5f, 0, x + w * .5f, y + h * .5f, 0}, colors);
+    static bool traced[2]{};
+    if (!traced[prompt == MenuPrompt::Y]) {
+        traced[prompt == MenuPrompt::Y] = true;
+        log("Netricsa prompt %c drawn with hand mark %c at %.1f,%.1f size %.1fx%.1f", prompt == MenuPrompt::Y ? 'Y' : 'B',
+            mark.hand, x, y, w, h);
+    }
+}
 // Once Sam2Game is loaded (the slots live there).
 static void installPromptMarks(HMODULE game) noexcept {
     const auto base = reinterpret_cast<uintptr_t>(game);
@@ -2458,6 +2482,22 @@ static void installPromptMarks(HMODULE game) noexcept {
     const bool enabled = ok && MH_EnableHook(put) == MH_OK;
     if (ok && !enabled) promptSlots = 0;
     log("Menu prompt hand marks hook=%d slots=%d font=%d", enabled, slots, font);
+    // Netricsa's own two prompt draws (call [gfuPutRotatedTexture] at each site).
+    if (enabled) {
+        const auto site = [&](uint32_t rva) {
+            const auto *code = reinterpret_cast<const uint8_t *>(base + rva);
+            return readableMemory(code, 6) && code[0] == 0xff && code[1] == 0x15 ? base + rva + 6 : uintptr_t(0);
+        };
+        void *rotated = engine ? reinterpret_cast<void *>(GetProcAddress(engine,
+            "?gfuPutRotatedTexture@SeriousEngine@@YAXPBVCTexture@1@VVector2f@1@MMMK@Z")) : nullptr;
+        netricsaPromptB = site(0x18a13e);
+        netricsaPromptY = site(0x18a19f);
+        const bool hooked = rotated && netricsaPromptB && netricsaPromptY &&
+            MH_CreateHook(rotated, reinterpret_cast<void *>(putRotatedTexture), reinterpret_cast<void **>(&originalPutRotatedTexture)) == MH_OK &&
+            MH_EnableHook(rotated) == MH_OK;
+        if (!hooked) netricsaPromptB = netricsaPromptY = 0;
+        log("Netricsa prompt hand marks hook=%d", int(hooked));
+    }
 }
 // The controller profile in hand: the prompts follow it now, and the next
 // start's title shows it.
@@ -3744,7 +3784,7 @@ static void presentBody(IDirect3DDevice9 *d) {
     const bool netricsaPanel = !nativeMenu && netricsa && levelActive();
     const bool keyed = nativeMenu && menus::worldHidden();
     const uint32_t overlay = (keyed || netricsaPanel ? MenuOverLevel : 0u) | (keyed ? MenuKeyed : 0u) |
-                             (netricsaPanel ? MenuAlpha | MenuPointable : 0u);
+                             (netricsaPanel ? MenuAlpha : 0u);
     const auto scaled = [&](float sourceWidth, uint32_t &w, uint32_t &h) {
         const float fit = std::min({1.f, 1920.f / std::max(1.f, sourceWidth), 1080.f / float(std::max(1u, source.height))});
         w = std::max(2u, uint32_t(sourceWidth * fit)) & ~1u;
