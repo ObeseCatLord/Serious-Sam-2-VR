@@ -599,7 +599,7 @@ struct PerfClock {
     uint64_t eyeDraws = 0, desktopDraws = 0, hudDuplicates = 0, hudDraws = 0;
     double hudCpu = 0; // Whole HUD draw path (desktop draw, capture, both eye duplicates, restore).
     double hudFlushCpu = 0;
-    unsigned hudLayerDraws = 0, hudFallbackDraws = 0, hudFlushes = 0;
+    unsigned hudLayerDraws = 0, hudFallbackDraws = 0, hudFlushes = 0, hudSkippedDraws = 0;
     unsigned foveatedPairs = 0; // Pairs rendered through the foveated atlas.
     // Pairs rendered but not published, by the state they ended in.
     unsigned lostNoWorld = 0, lostFault = 0, lostNoOverlay = 0, lostIncomplete = 0, lostOther = 0;
@@ -1108,7 +1108,16 @@ static bool captureUiDraw(IDirect3DDevice9 *d) {
         if (e.Usage == D3DDECLUSAGE_POSITIONT) return false;
         if (e.Usage != D3DDECLUSAGE_TEXCOORD || e.UsageIndex != 0) continue;
         uiDraw.captureStage="position-layout";
-        if (positionBytes || !nativeUiPositionInput(e.Stream,e.Offset,e.Type,e.Method,e.Usage,e.UsageIndex)) return false;
+        if (positionBytes || !nativeUiPositionInput(e.Stream,e.Offset,e.Type,e.Method,e.Usage,e.UsageIndex)) {
+            static unsigned layoutDiagnostics=0;
+            if (layoutDiagnostics<6) {
+                ++layoutDiagnostics;
+                for (unsigned k=0;k<count && k<8 && elements[k].Stream!=0xff;++k)
+                    log("Native UI unsupported layout element=%u stream=%u offset=%u type=%u method=%u usage=%u index=%u",
+                        k,elements[k].Stream,elements[k].Offset,elements[k].Type,elements[k].Method,elements[k].Usage,elements[k].UsageIndex);
+            }
+            return false;
+        }
         positionBytes = 12;
         positionOffset = e.Offset;
     }
@@ -1551,6 +1560,19 @@ template<class Call> static bool hudLayerDraw(IDirect3DDevice9 *d,Call call,DWOR
     if (SUCCEEDED(result)) { uiFrame.hudLayerDirty = true; ++perf.hudLayerDraws; }
     return true;
 }
+// A screen draw the eyes cannot take. A vertex layout the UI program does not
+// read (a level's own overlay, e.g. Snow Base's) is left out of the eyes and
+// stays on the desktop; failing the whole pair for it left the headset with no
+// stereo frame for the rest of the level. Any other rejection still faults.
+static void uiCaptureRejected() noexcept {
+    const char *stage = uiDraw.captureStage;
+    if (stage && (!std::strcmp(stage, "position-layout") || !std::strcmp(stage, "position-missing") ||
+                  !std::strcmp(stage, "transformed-position"))) {
+        ++perf.hudSkippedDraws;
+        return;
+    }
+    nativeUiFault(stage);
+}
 template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVETYPE topology,Call call) noexcept {
     const auto generation = graphicsResourceGeneration();
     if (!scopeGpuForwardingAllowed()) return D3DERR_INVALIDCALL;
@@ -1568,7 +1590,7 @@ template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVET
                 result = call(); // Offscreen or unadmitted: native, exactly as before.
                 if (generation != graphicsResourceGeneration()) return;
                 if (FAILED(result)) { nativeUiFault("desktop-draw-hresult"); return; }
-                if (!uiDraw.color || sameSurface(uiDraw.color,uiFrame.color)) nativeUiFault(uiDraw.captureStage);
+                if (!uiDraw.color || sameSurface(uiDraw.color,uiFrame.color)) uiCaptureRejected();
                 return;
             }
             if (!nativeUiTriangleTopology(topology,uiDraw.fill)) { result = call(); nativeUiFault("topology-or-fill"); return; }
@@ -1590,7 +1612,7 @@ template<class Call> static HRESULT uiDrawCall(IDirect3DDevice9 *d,D3DPRIMITIVET
         if (uiFrame.ui) ++perf.hudFallbackDraws;
         if (!captureUiDraw(d)) {
             // Offscreen drawing stays native; only eventual desktop composition is adapted.
-            if (!uiDraw.color || sameSurface(uiDraw.color,uiFrame.color)) nativeUiFault(uiDraw.captureStage);
+            if (!uiDraw.color || sameSurface(uiDraw.color,uiFrame.color)) uiCaptureRejected();
             return;
         }
         if (!nativeUiTriangleTopology(topology,uiDraw.fill)) { nativeUiFault("topology-or-fill"); return; }
@@ -3220,6 +3242,35 @@ struct PendingMenuImage {
     bool nativeMenu = false, netricsaPanel = false;
 };
 static PendingMenuImage pendingMenu;
+// Netricsa's frame is a rounded rectangle inside its crop: the world and HUD
+// around it are made transparent (MenuAlpha), so only the panel shows in VR.
+// Measured on the 4:3 crop (V1012, 1266x822): the frame's outer edge 2.1% in
+// from the left, 1.3% from the right, 2.3% from the top, 1.7% from the bottom,
+// corners rounded about 40 px (3.2% of the width, 4.9% of the height). The mask
+// sits a pixel or two outside that edge, keeping the frame's own antialiasing.
+static void netricsaFrameAlpha(uint8_t *pixels, uint32_t w, uint32_t h) noexcept {
+    const float left = .020f * w, right = w - .012f * w, top = .021f * h, bottom = h - .015f * h;
+    const float rx = .034f * w, ry = .052f * h;
+    // Per row, the span inside the rounded frame (runs under the IPC lock: only
+    // the pixels outside it are touched).
+    for (uint32_t y = 0; y < h; ++y) {
+        auto *row = pixels + size_t(y) * w * 4;
+        const float fy = y + .5f;
+        float x0 = left, x1 = right;
+        bool inside = fy >= top && fy <= bottom;
+        if (inside) {
+            const float cy = fy < top + ry ? top + ry : fy > bottom - ry ? bottom - ry : fy;
+            const float dy = (fy - cy) / ry, dx = rx * std::sqrt(std::max(0.f, 1 - dy * dy));
+            x0 = left + rx - dx;
+            x1 = right - rx + dx;
+        }
+        for (uint32_t x = 0; x < w; ++x) {
+            const float fx = x + .5f;
+            if (!inside || fx < x0 || fx > x1) row[x * 4 + 3] = 0;
+            else if (fx < x1 - 1) x = std::max(x, uint32_t(std::max(0.f, x1 - 1.5f))); // Skip the inside.
+        }
+    }
+}
 static void collectMenuImage() {
     if (!pendingMenu.active) return;
     const PendingMenuImage p = pendingMenu;
@@ -3275,6 +3326,7 @@ static void collectMenuImage() {
         // Opaque: a keyed image (MenuKeyed) gets its alpha in the host, where the
         // black connected to the image's edge becomes transparent.
         for (size_t pixel = 3; pixel < size_t(band.width) * band.height * 4; pixel += 4) target[pixel] = 255;
+        if (p.netricsaPanel) netricsaFrameAlpha(target, band.width, band.height);
         m.width = band.width; m.height = band.height; m.tickMs = p.now;
         m.pixelGeneration = pixelStore.generation; m.overlay = p.overlay;
         m.sequence = ++menuSequence; m.interactionGeneration = p.menuGeneration; m.visible = 1;
@@ -3327,11 +3379,11 @@ static void presentBody(IDirect3DDevice9 *d) {
                 perf.scopeCallbacks ? perf.scopeTailCpu*1000/perf.scopeCallbacks : 0., perf.scopeBeginFailures[1],
                 perf.scopeBeginFailures[2], perf.scopeBeginFailures[3]);
             log("Perf draws per pair: eyes=%.0f hud duplicates=%.0f; other per frame=%.0f; hud draws per frame=%.1f "
-                "hud cpu per frame=%.3fms layer=%u fallback=%u flushes=%u flush=%.3fms",
+                "hud cpu per frame=%.3fms layer=%u fallback=%u flushes=%u flush=%.3fms skipped=%u",
                 perf.pairs ? double(perf.eyeDraws) / perf.pairs : 0., perf.pairs ? double(perf.hudDuplicates) / perf.pairs : 0.,
                 double(perf.desktopDraws) / perf.frames, double(perf.hudDraws) / perf.frames,
                 1000 * perf.hudCpu / perf.frames, perf.hudLayerDraws, perf.hudFallbackDraws, perf.hudFlushes,
-                perf.hudFlushes ? 1000 * perf.hudFlushCpu / perf.hudFlushes : 0.);
+                perf.hudFlushes ? 1000 * perf.hudFlushCpu / perf.hudFlushes : 0., perf.hudSkippedDraws);
             {
                 unsigned created = 0, reused = 0, missed = 0;
                 double createdMs = 0, reusedMs = 0;
@@ -3691,7 +3743,8 @@ static void presentBody(IDirect3DDevice9 *d) {
     // world: its panel alone is shown (its layout spans 8-92% x 14-86% y of the canvas).
     const bool netricsaPanel = !nativeMenu && netricsa && levelActive();
     const bool keyed = nativeMenu && menus::worldHidden();
-    const uint32_t overlay = (keyed || netricsaPanel ? MenuOverLevel : 0u) | (keyed ? MenuKeyed : 0u);
+    const uint32_t overlay = (keyed || netricsaPanel ? MenuOverLevel : 0u) | (keyed ? MenuKeyed : 0u) |
+                             (netricsaPanel ? MenuAlpha | MenuPointable : 0u);
     const auto scaled = [&](float sourceWidth, uint32_t &w, uint32_t &h) {
         const float fit = std::min({1.f, 1920.f / std::max(1.f, sourceWidth), 1080.f / float(std::max(1u, source.height))});
         w = std::max(2u, uint32_t(sourceWidth * fit)) & ~1u;
@@ -3700,7 +3753,10 @@ static void presentBody(IDirect3DDevice9 *d) {
     uint32_t outWidth = 0, outHeight = 0;
     // The front end's 16:9 canvas is shown as it is, like a desktop screen.
     const bool frontEndCanvas = copyWidth == MenuCanvasWidth && copyHeight == MenuCanvasHeight;
-    scaled(nativeMenu && !frontEndCanvas ? float(source.height) * 4.f / 3.f : float(source.width), outWidth, outHeight);
+    // Netricsa is laid out for 4:3 over the whole canvas too (its round logo came
+    // out 1.55 times taller than wide on the 1344x1512 eye canvas): widened alike.
+    scaled((nativeMenu || netricsaPanel) && !frontEndCanvas ? float(source.height) * 4.f / 3.f : float(source.width),
+           outWidth, outHeight);
     // The scaled image must fit the canvas-sized pixel buffer. (Bounding the
     // unscaled 4:3 width instead left every eye canvas, all narrower than 4:3,
     // at the canvas aspect: 1344x1512 was still published as 960x1080.)

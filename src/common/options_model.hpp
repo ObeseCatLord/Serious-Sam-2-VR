@@ -148,7 +148,7 @@ inline OptionsRow vrOptionRow(unsigned item, const VrSettings &settings, const V
         return {L"Sound occlusion", onOff(settings.audioOcclusion), L"Sounds behind walls are muffled (with spatial audio).",
                 L"", -1, !settings.spatialAudio};
     case OptFireHaptic:
-        return {L"Fire vibration", percent(settings.fireHaptic), L"Controller vibration when you shoot.", L"",
+        return {L"Fire vibration", percent(settings.fireHaptic), L"Vibration when you shoot, on turrets and in vehicles.", L"",
                 fraction(settings.fireHaptic, 0, 1)};
     case OptDamageHaptic:
         return {L"Damage vibration", percent(settings.damageHaptic), L"Controller vibration when you are hurt.", L"",

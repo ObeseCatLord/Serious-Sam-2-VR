@@ -105,13 +105,31 @@ struct Log {
     DWORD written = 0;
     explicit Log(const std::wstring &directory) {
         // The game starts a new host when one stops, and a player restarts the game
-        // after a failure: the logs of the last three hosts are kept beside this one
-        // (ss2vr_host.1.log is the previous host), so the reason is not overwritten.
+        // after a failure: the logs of the last three hosts that reached an OpenXR
+        // session are kept beside this one (ss2vr_host.1.log the latest), so the
+        // reason one stopped is not overwritten. A host that never got a session
+        // (the runtime not running: retried every few seconds) only replaces
+        // ss2vr_host.failed.log, and cannot push the informative logs out.
         const auto name = [&](unsigned age) {
             return directory + (age ? L"ss2vr_host." + std::to_wstring(age) + L".log" : std::wstring(L"ss2vr_host.log"));
         };
-        for (unsigned age = 3; age-- != 0;)
-            MoveFileExW(name(age).c_str(), name(age + 1).c_str(), MOVEFILE_REPLACE_EXISTING);
+        bool reachedSession = false;
+        {
+            Handle previous;
+            previous.h = CreateFileW(name(0).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (previous.h != INVALID_HANDLE_VALUE && previous.h) {
+                std::string text(64 * 1024, '\0');
+                DWORD read = 0;
+                if (ReadFile(previous.h, text.data(), DWORD(text.size()), &read, nullptr))
+                    reachedSession = text.substr(0, read).find("OpenXR session state") != std::string::npos;
+            }
+        }
+        if (reachedSession)
+            for (unsigned age = 3; age-- != 0;)
+                MoveFileExW(name(age).c_str(), name(age + 1).c_str(), MOVEFILE_REPLACE_EXISTING);
+        else
+            MoveFileExW(name(0).c_str(), (directory + L"ss2vr_host.failed.log").c_str(), MOVEFILE_REPLACE_EXISTING);
         file.h = CreateFileW(name(0).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     }
@@ -284,11 +302,20 @@ bool validPose(Pose p) {
     const float norm = p.q.x * p.q.x + p.q.y * p.q.y + p.q.z * p.q.z + p.q.w * p.q.w;
     return finite(p) && norm > .99f && norm < 1.01f;
 }
+// A hand: a pose the runtime calls valid is used even while it is not actively
+// tracked. Inside-out controllers (Rift S, WMR, Quest) report positions as
+// inferred whenever the cameras lose them, and some runtimes never set the
+// tracked bits for them at all; requiring those bits disabled every hand action
+// (fire, grip, wheels) while the sticks still worked.
 bool located(const XrSpaceLocation &location) {
-    constexpr auto needed = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
-                            XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT |
-                            XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+    constexpr auto needed = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
     return (location.locationFlags & needed) == needed && validPose(pose(location.pose));
+}
+// Lab (SS2VR_LAB_UNTRACKED_HANDS=1): hand poses report valid but never tracked,
+// as some inside-out runtimes do.
+XrSpaceLocationFlags labHandFlags(XrSpaceLocationFlags flags) {
+    static const bool untracked = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_UNTRACKED_HANDS", v, 2) == 1 && v[0] == L'1'; }();
+    return untracked ? flags & ~(XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT) : flags;
 }
 // The head: a pose the runtime calls valid is used even while it is not
 // actively tracked (inferred, e.g. lighthouses briefly out of view or tracking
@@ -629,7 +656,7 @@ struct Actions {
         direction = rotate(normalize(Quat{q.x, q.y, q.z, q.w}), {0, 0, -1});
         return std::isfinite(direction.x) && std::isfinite(direction.y) && std::isfinite(direction.z);
     }
-    void create(Api &api, XrInstance instance, XrSession session, bool frameController, bool eyeGaze = false) {
+    void create(Api &api, XrInstance instance, XrSession session, const std::vector<std::string> &profileExtensions, bool eyeGaze = false) {
         hand[0] = path(api, instance, "/user/hand/left");
         hand[1] = path(api, instance, "/user/hand/right");
         viveProfile = path(api, instance, "/interaction_profiles/htc/vive_controller");
@@ -654,7 +681,7 @@ struct Actions {
         sprint = action(api, "sprint", "Sprint / sniper zoom", XR_ACTION_TYPE_BOOLEAN_INPUT);
         reload = action(api, "reload", "Reload weapon", XR_ACTION_TYPE_BOOLEAN_INPUT);
         netricsa = action(api, "netricsa", "Netricsa / objectives", XR_ACTION_TYPE_BOOLEAN_INPUT);
-        suggest(api, instance, frameController);
+        suggest(api, instance, profileExtensions);
         if (eyeGaze) createGaze(api, instance);
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
         attach.countActionSets = 1;
@@ -676,22 +703,33 @@ struct Actions {
             gazeEnabled = XR_SUCCEEDED(api.CreateActionSpace(session, &space, &gazeSpace));
         }
     }
-    void suggest(Api &api, XrInstance instance, bool frameController) {
+    void suggest(Api &api, XrInstance instance, const std::vector<std::string> &extensions) {
+        // kind: 0 ABXY with a thumbstick (Touch and its relatives), 1 Index, 2 Vive
+        // wand, 3 WMR / Odyssey, 4 Valve Frame, 5 Khronos simple controller.
+        // An extension profile is suggested only when its extension was enabled.
         struct Profile {
-            const char *name;
-            const char *axis;
+            const char *name, *extension, *axis;
             bool analogGrip;
             unsigned kind;
         };
         const Profile profiles[] = {
-            {"/interaction_profiles/oculus/touch_controller", "thumbstick", true, 0},
-            {"/interaction_profiles/valve/index_controller", "thumbstick", true, 1},
-            {"/interaction_profiles/htc/vive_controller", "trackpad", false, 2},
-            {"/interaction_profiles/microsoft/motion_controller", "thumbstick", false, 3},
-            {"/interaction_profiles/valve/frame_controller_valve", "thumbstick", true, 4}};
+            {"/interaction_profiles/oculus/touch_controller", nullptr, "thumbstick", true, 0},
+            {"/interaction_profiles/valve/index_controller", nullptr, "thumbstick", true, 1},
+            {"/interaction_profiles/htc/vive_controller", nullptr, "trackpad", false, 2},
+            {"/interaction_profiles/microsoft/motion_controller", nullptr, "thumbstick", false, 3},
+            {"/interaction_profiles/valve/frame_controller_valve", "XR_VALVE_frame_controller_interaction", "thumbstick", true, 4},
+            {"/interaction_profiles/khr/simple_controller", nullptr, nullptr, false, 5},
+            {"/interaction_profiles/facebook/touch_controller_pro", "XR_FB_touch_controller_pro", "thumbstick", true, 0},
+            {"/interaction_profiles/meta/touch_controller_plus", "XR_META_touch_controller_plus", "thumbstick", true, 0},
+            {"/interaction_profiles/hp/mixed_reality_controller", "XR_EXT_hp_mixed_reality_controller", "thumbstick", true, 0},
+            {"/interaction_profiles/bytedance/pico4_controller", "XR_BD_controller_interaction", "thumbstick", true, 0},
+            {"/interaction_profiles/htc/vive_cosmos_controller", "XR_HTC_vive_cosmos_controller_interaction", "thumbstick", false, 0},
+            {"/interaction_profiles/htc/vive_focus3_controller", "XR_HTC_vive_focus3_controller_interaction", "thumbstick", false, 0},
+            {"/interaction_profiles/samsung/odyssey_controller", "XR_EXT_samsung_odyssey_controller", "thumbstick", false, 3}};
         unsigned accepted = 0;
         for (const auto &profile : profiles) {
-            if (profile.kind==4 && !frameController) continue;
+            if (profile.extension && std::find(extensions.begin(), extensions.end(), profile.extension) == extensions.end())
+                continue;
             std::vector<XrActionSuggestedBinding> bindings;
             auto bind = [&](XrAction a, unsigned h, const std::string &component) {
                 const std::string name =
@@ -704,6 +742,12 @@ struct Actions {
                 bindings.push_back(
                     {haptic, path(api, instance,
                                   h ? "/user/hand/right/output/haptic" : "/user/hand/left/output/haptic")});
+                if (profile.kind == 5) {
+                    // Select only: fire, and the menu button pauses.
+                    bind(trigger, h, "select/click");
+                    bind(menu, h, "menu/click");
+                    continue;
+                }
                 bind(trigger, h, "trigger/value");
                 bind(stick, h, profile.axis);
                 // Index squeeze/value is finger curl (high whenever the controller
@@ -711,21 +755,23 @@ struct Actions {
                 bind(profile.analogGrip ? wheelValue : wheel, h,
                      !profile.analogGrip ? "squeeze/click" : profile.kind == 1 ? "squeeze/force" : "squeeze/value");
             }
-            const std::string click = std::string(profile.axis) + "/click";
-            bind(sprint, 0, click);
-            bind(recenter, 0, click); // Same button, activated only with both grips held.
+            if (profile.kind != 5) {
+                const std::string click = std::string(profile.axis) + "/click";
+                bind(sprint, 0, click);
+                bind(recenter, 0, click); // Same button, activated only with both grips held.
+            }
             // The grip jumps on foot (game side); Netricsa is a weapon-wheel bubble.
             switch (profile.kind) {
             case 0:
-                bind(sprint, 1, click);
+                bind(sprint, 1, std::string(profile.axis) + "/click");
                 bind(reload, 0, "x/click");
                 bind(use, 1, "a/click");
                 bind(wheelOpen, 0, "y/click");
                 bind(wheelOpen, 1, "b/click");
-                bind(menu, 0, "menu/click"); // Touch has no right menu component.
+                bind(menu, 0, "menu/click"); // The right hand's menu/system button is the runtime's.
                 break;
             case 1:
-                bind(sprint, 1, click);
+                bind(sprint, 1, std::string(profile.axis) + "/click");
                 bind(reload, 0, "a/click");
                 bind(jump, 1, "a/click"); // Right A jumps, right B uses (user's choice).
                 bind(use, 1, "b/click");
@@ -744,7 +790,7 @@ struct Actions {
             case 3:
                 // Both trackpads open the wheels, so Use moves to the left menu
                 // button and the pause menu stays on the right one.
-                bind(sprint, 1, click);
+                bind(sprint, 1, std::string(profile.axis) + "/click");
                 bind(use, 0, "menu/click");
                 bind(wheelOpen, 0, "trackpad/click");
                 bind(wheelOpen, 1, "trackpad/click");
@@ -754,13 +800,13 @@ struct Actions {
                 // Valve Frame has a left D-pad/view and right ABXY/menu, as a gamepad:
                 // the game's Xbox prompts are its own buttons. A uses (menus: select),
                 // B opens the right wheel (menus: back), X reloads (the menus' X), Y
-                // opens Netricsa (the menus' Y); D-pad up the left wheel, down reloads.
-                bind(sprint, 1, click);
+                // opens Netricsa (the menus' Y); D-pad left the left wheel, down reloads.
+                bind(sprint, 1, std::string(profile.axis) + "/click");
                 bind(reload, 0, "dpad_down/click");
                 bind(reload, 1, "x/click");
                 bind(netricsa, 1, "y/click");
                 bind(use, 1, "a/click");
-                bind(wheelOpen, 0, "dpad_up/click");
+                bind(wheelOpen, 0, "dpad_left/click");
                 bind(wheelOpen, 1, "b/click");
                 bind(menu, 0, "view/click");
                 bind(menu, 1, "menu/click");
@@ -780,7 +826,7 @@ struct Actions {
                 ++accepted;
         }
         if (!accepted)
-            throw std::runtime_error("Runtime rejected all four controller binding profiles");
+            throw std::runtime_error("Runtime rejected every controller binding profile");
     }
     XrActionStateGetInfo get(XrAction a, unsigned h) const {
         XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -859,6 +905,7 @@ struct Actions {
             if (state.isActive) {
                 XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
                 api.check(api.LocateSpace(aimSpace[h], local, time, &location), "xrLocateSpace aim");
+                location.locationFlags = labHandFlags(location.locationFlags);
                 if (located(location)) {
                     input.hand[h] = pose(location.pose);
                     input.handValid[h] = 1;
@@ -874,6 +921,7 @@ struct Actions {
                 XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
                 XrSpaceLocation location{XR_TYPE_SPACE_LOCATION, &velocity};
                 api.check(api.LocateSpace(gripSpace[h], local, time, &location), "xrLocateSpace grip");
+                location.locationFlags = labHandFlags(location.locationFlags);
                 if (located(location)) {
                     input.grip[h] = pose(location.pose);
                     input.gripValid[h] = 1;
@@ -1274,7 +1322,8 @@ struct Host {
     std::wstring settingsFile;
     ComfortAnchor menuAnchor, hudAnchor;
     VrSettings settings;
-    uint32_t lastFire[2]{}, lastDamage = 0;
+    uint32_t lastFire[2]{}, lastDamage = 0, lastImpact = 0;
+    ULONGLONG lastRumble = 0;
     int32_t lastHover[2]{-1, -1};
     bool feedbackSeeded = false, hapticsAvailable = true;
     Fov currentFov[2];
@@ -1284,7 +1333,7 @@ struct Host {
     // given, held world-locked behind it (the paused world does not change).
     Swapchain backdrop[2];
     Request backdropRequest{};
-    bool backdropValid = false, menuKeyed = false;
+    bool backdropValid = false, menuKeyed = false, menuAlpha = false, menuPointable = false;
     // A pause menu over the level with the world rendered live behind it (the game's
     // GameplayMenuView): stereo pairs go on, the keyed menu panel over them.
     bool liveBehindMenu = false;
@@ -1292,6 +1341,7 @@ struct Host {
     // full-resolution crop submitted as a second projection layer.
     Swapchain inset[2];
     bool eyeGazeExtension = false, eyeGazeSupported = false, foveationActive = false, cachedFoveated = false;
+    std::vector<std::string> profileExtensions; // Controller profile extensions enabled on the instance.
     // XR_META_foveation_eye_tracked (with XR_FB_foveation, _configuration and
     // XR_FB_swapchain_update_state; e.g. Steam Frame through SteamVR): the
     // runtime's per-eye foveation centres steer the in-game sharp region when
@@ -1544,16 +1594,24 @@ struct Host {
             if (wine) log.write("Proton: check wineopenxr registration, DXVK and native OpenXR runtime visibility in Steam's container");
             throw std::runtime_error("Runtime does not offer XR_KHR_D3D11_enable");
         }
-        constexpr const char *frameExtension="XR_VALVE_frame_controller_interaction";
-        const bool frameController=std::any_of(extensions.begin(),extensions.end(),[](const auto &e) {
-            return !std::strcmp(e.extensionName,"XR_VALVE_frame_controller_interaction");
-        });
+        // Controller profiles that need their extension: enabled when offered, so the
+        // runtime binds the controller in hand natively instead of by emulation.
+        static const char *const controllerExtensions[]{"XR_VALVE_frame_controller_interaction",
+            "XR_FB_touch_controller_pro", "XR_META_touch_controller_plus", "XR_EXT_hp_mixed_reality_controller",
+            "XR_BD_controller_interaction", "XR_HTC_vive_cosmos_controller_interaction",
+            "XR_HTC_vive_focus3_controller_interaction", "XR_EXT_samsung_odyssey_controller"};
+        profileExtensions.clear();
+        for (const char *name : controllerExtensions)
+            if (std::any_of(extensions.begin(), extensions.end(), [&](const auto &e) { return !std::strcmp(e.extensionName, name); }))
+                profileExtensions.push_back(name);
+        const bool frameController = std::find(profileExtensions.begin(), profileExtensions.end(),
+            "XR_VALVE_frame_controller_interaction") != profileExtensions.end();
         // Eye gaze drives foveated readback when the runtime reports a tracker.
         eyeGazeExtension = settings.foveation.mode != 0 && std::any_of(extensions.begin(), extensions.end(),
             [](const auto &e) { return !std::strcmp(e.extensionName, "XR_EXT_eye_gaze_interaction"); });
         std::vector<const char *> enabled{XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
-        enabled.reserve(8);
-        if (frameController) enabled.push_back(frameExtension);
+        enabled.reserve(16);
+        for (const auto &name : profileExtensions) enabled.push_back(name.c_str());
         if (eyeGazeExtension) enabled.push_back("XR_EXT_eye_gaze_interaction");
         const char *const metaNames[]{XR_FB_FOVEATION_EXTENSION_NAME, XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME,
                                       XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME, XR_META_FOVEATION_EYE_TRACKED_EXTENSION_NAME};
@@ -1573,6 +1631,7 @@ struct Host {
         api.check(api.CreateInstance(&create, &instance), "xrCreateInstance");
         log.write(frameController ? "Frame controller extension enabled; native profile bindings available" :
                                    "Frame controller extension unavailable; existing runtime profile fallbacks retained");
+        for (const auto &name : profileExtensions) log.write(("Controller profile extension enabled: " + name).c_str());
         api.instanceFunctions(instance);
         XrInstanceProperties runtime{XR_TYPE_INSTANCE_PROPERTIES};
         const auto propertiesResult = api.GetInstanceProperties(instance, &runtime);
@@ -1677,7 +1736,7 @@ struct Host {
         log.write(worldSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE ? "World space: STAGE" : "World space: LOCAL");
         space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
         api.check(api.CreateReferenceSpace(session, &space, &viewSpace), "xrCreateReferenceSpace VIEW");
-        actions.create(api, instance, session, frameController, eyeGazeSupported);
+        actions.create(api, instance, session, profileExtensions, eyeGazeSupported);
         applyLabFoveation();
         const auto &f = settings.foveation;
         foveationActive = systemProperties.graphicsProperties.maxLayerCount >= 5 &&
@@ -1972,6 +2031,8 @@ struct Host {
         Ui ui{};
         bool menuVisible = false;
         uint32_t menuOverlay = 0; // MenuOverlay flags of the visible menu frame.
+        float rideRumble = 0;     // Seated feedback (Shared ABI17).
+        uint32_t rideImpactSequence = 0;
     };
     Snapshot lastSnapshot;            // The last published frame state, for a frame the IPC was busy.
     ULONGLONG lastSnapshotTick = 0;
@@ -2014,7 +2075,9 @@ struct Host {
         openSharedImages(shared.images);
         reapLocked();
         snapshot = {shared.width, shared.height, shared.rendererReady != 0, shared.ui,
-                    shared.menu.visible && GetTickCount64() - shared.menu.tickMs < MenuHoldMs, shared.menu.overlay};
+                    shared.menu.visible && GetTickCount64() - shared.menu.tickMs < MenuHoldMs, shared.menu.overlay,
+                    std::isfinite(shared.rideRumble) ? std::clamp(shared.rideRumble, 0.f, 1.f) : 0.f,
+                    shared.rideImpactSequence};
         return true;
     }
     void publishWorldSubmission() {
@@ -3263,7 +3326,7 @@ struct Host {
         }
         PanelHit hit;
         unsigned hand = 2;
-        if (menuGeneration && !recenterHeld(input) && !options.open) // The options panel over the menu takes the pointer.
+        if ((menuGeneration || menuPointable) && !recenterHeld(input) && !options.open) // The options panel over the menu takes the pointer.
             for (unsigned candidate : {1u, 0u})
                 if (input.handValid[candidate] && primaryActionEligible(input, candidate)) {
                     hit = pointAtPanel(input.hand[candidate], panel, settings.menuWidth, panelHeight);
@@ -3275,12 +3338,13 @@ struct Host {
         const int x = hit.valid ? std::min(int(width) - 1, int(hit.u * width)) : -1;
         const int y = hit.valid ? std::min(int(height) - 1, int(hit.v * height)) : -1;
         // A failed upload keeps the previous image (still in the swapchain).
-        const bool redraw = sequence != menuSequence || stripRows != menuStripRows || (strip && stripButton.hover != menuStripHover);
+        const bool redraw = sequence != menuSequence || stripRows != menuStripRows || (strip && stripButton.hover != menuStripHover) ||
+                            (menuPointable && (x != cursorX || y != cursorY));
         const uint8_t *image = menuSourcePixels.data();
         if (redraw && stripRows) {
             menuComposite.assign(size_t(width) * imageHeight * 4, 0);
             std::memcpy(menuComposite.data(), menuSourcePixels.data(), size_t(width) * height * 4);
-            if (!menuKeyed)
+            if (!menuKeyed && !menuAlpha)
                 for (size_t i = 0; i < size_t(width) * height; ++i) menuComposite[i * 4 + 3] = 255;
             auto &bm = stripButton.bitmap;
             bm.drawButton(stripButton.hover);
@@ -3291,6 +3355,22 @@ struct Host {
                     const uint32_t sx = std::min(bm.width - 1, uint32_t((float(x) - x0) / bw * float(bm.width)));
                     const uint32_t sy = std::min(bm.height - 1, uint32_t((float(y) - y0) / bh * float(bm.height)));
                     std::memcpy(&menuComposite[(size_t(y) * width + x) * 4], bm.bits + (size_t(sy) * bm.width + sx) * 4, 4);
+                }
+            image = menuComposite.data();
+        }
+        if (redraw && !stripRows && menuPointable && hit.valid) {
+            // A pointable panel over the held world (Netricsa) has no cursor quad
+            // (Proton corrupts a second quad there): the cursor is painted into it.
+            menuComposite.assign(menuSourcePixels.begin(), menuSourcePixels.end());
+            const int radius = std::max(3, int(width) / 120);
+            for (int dy = -radius - 2; dy <= radius + 2; ++dy)
+                for (int dx = -radius - 2; dx <= radius + 2; ++dx) {
+                    const int px = x + dx, py = y + dy, d2 = dx * dx + dy * dy;
+                    if (px < 0 || py < 0 || px >= int(width) || py >= int(height) || d2 > (radius + 2) * (radius + 2)) continue;
+                    uint8_t *c = &menuComposite[(size_t(py) * width + px) * 4];
+                    const uint8_t v = d2 <= radius * radius ? 255 : 20; // White dot, dark rim.
+                    c[0] = c[1] = c[2] = v;
+                    c[3] = 255;
                 }
             image = menuComposite.data();
         }
@@ -3345,7 +3425,7 @@ struct Host {
         // A keyed menu (the world left out) blends over the held world frame, as
         // does the button strip's clear background.
         const uint32_t shownStrip = menuChain.height > height ? menuChain.height - height : 0;
-        if (menuKeyed || shownStrip)
+        if (menuKeyed || menuAlpha || shownStrip)
             layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
         layer.space = local;
         layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -3384,7 +3464,7 @@ struct Host {
                                 menuGeneration, 1, hand, hit.u, hit.v, input.trigger[hand],
                                 input.primaryInputGeneration[hand]};
     }
-    void feedback(const Ui &ui, const Input &input, bool menuVisible) {
+    void feedback(const Ui &ui, const Input &input, bool menuVisible, float rumble = 0, uint32_t impacts = 0) {
         bool valid = !quit && running && hapticsAvailable && ui.gameplay && inputFocused(input) &&
                      input.headValid && !menuVisible && ui.tickMs && GetTickCount64() >= ui.tickMs &&
                      GetTickCount64() - ui.tickMs <= UiFreshMs;
@@ -3394,6 +3474,11 @@ struct Host {
             feedbackSeeded = false;
             return;
         }
+        // Vehicle vibration scales with the fire strength setting (off with it).
+        const float vehicleScale = std::clamp(settings.fireHaptic / .35f, 0.f, 2.f);
+        const bool impact = feedbackSeeded && impacts != lastImpact;
+        const ULONGLONG feedbackNow = GetTickCount64();
+        bool pulsed[2]{};
         if (feedbackSeeded) {
             for (unsigned h = 0; h != 2; ++h) {
                 bool hurt = ui.damageSequence != lastDamage;
@@ -3405,12 +3490,29 @@ struct Host {
                 const bool tick = amplitude <= 0 && hovered;
                 if (tick)
                     amplitude = .25f;
-                if (hapticsAvailable && amplitude > 0 && input.handValid[h])
+                if (impact && vehicleScale > 0) {
+                    amplitude = std::max(amplitude, std::min(1.f, .7f * vehicleScale));
+                    hurt = true; // The longer pulse.
+                }
+                if (hapticsAvailable && amplitude > 0 && input.handValid[h]) {
                     hapticsAvailable =
                         actions.pulse(api, session, h, amplitude,
-                                      hurt && settings.damageHaptic > 0 ? 80'000'000 : tick ? 15'000'000 : 40'000'000);
+                                      hurt && (settings.damageHaptic > 0 || impact) ? impact ? 140'000'000 : 80'000'000 :
+                                      tick ? 15'000'000 : 40'000'000);
+                    pulsed[h] = true;
+                }
+            }
+            // A driven vehicle's rumble: short overlapping pulses, renewed every 50 ms,
+            // under any stronger event of this frame.
+            const float level = rumble * vehicleScale;
+            if (level > .01f && feedbackNow - lastRumble >= 50) {
+                lastRumble = feedbackNow;
+                for (unsigned h = 0; h != 2; ++h)
+                    if (hapticsAvailable && !pulsed[h] && input.handValid[h])
+                        hapticsAvailable = actions.pulse(api, session, h, std::min(level, 1.f), 70'000'000);
             }
         }
+        lastImpact = impacts;
         for (unsigned h = 0; h != 2; ++h) {
             lastFire[h] = ui.fireSequence[h];
             lastHover[h] = ui.wheel[h].open ? ui.wheel[h].hover : -1;
@@ -3532,7 +3634,7 @@ struct Host {
                 ++heldSnapshots;
             }
             if (published && !api.lossPending)
-                feedback(snapshot.ui, input, snapshot.menuVisible);
+                feedback(snapshot.ui, input, snapshot.menuVisible, snapshot.rideRumble, snapshot.rideImpactSequence);
             if (published) watchOptionsBubble(snapshot.ui, input);
             const bool hudPrepared = published && prepareHudAnchor(snapshot, input);
             std::array<XrCompositionLayerProjectionView, 2> projectionViews, insetViews;
@@ -3636,6 +3738,8 @@ struct Host {
                         hudAnchor.reset();
                         for (auto &wheel : wheels)
                             wheel.reset();
+                        menuAlpha = (snapshot.menuOverlay & MenuAlpha) != 0;
+                        menuPointable = (snapshot.menuOverlay & MenuPointable) != 0;
                         if (liveBehindMenu) {
                             // The live world (the projection above) behind the keyed menu.
                             menuKeyed = (snapshot.menuOverlay & MenuKeyed) != 0;

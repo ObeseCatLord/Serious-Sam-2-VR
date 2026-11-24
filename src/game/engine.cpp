@@ -101,6 +101,12 @@ using NativeFire = int(__thiscall *)(void *, float);
 static NativeFire originalNativeFire = nullptr;
 static VrSettings settings;
 static std::atomic<uint32_t> fireFeedback[2]{}, damageFeedback{0};
+// Seated feedback (main thread writes, the publication reads): a driven
+// vehicle's rumble and its hard impacts.
+static std::atomic<float> rideRumble{0};
+static std::atomic<uint32_t> rideImpacts{0};
+struct Snapshot;
+static void updateRideFeedback(const Snapshot &s);
 struct Box1 {
     float min, max;
 };
@@ -1927,6 +1933,8 @@ static void publishSnapshot(const Snapshot &s) {
         for (int h = 0; h < 2; ++h)
             channel.shared->ui.fireSequence[h] = fireFeedback[h].load(std::memory_order_relaxed);
         channel.shared->ui.damageSequence = damageFeedback.load(std::memory_order_relaxed);
+        channel.shared->rideRumble = s.ui.gameplay == GameplayOn ? rideRumble.load(std::memory_order_relaxed) : 0.f;
+        channel.shared->rideImpactSequence = rideImpacts.load(std::memory_order_relaxed);
     }
 }
 static void prepareLocalGestureSource(Snapshot &);
@@ -5289,6 +5297,7 @@ static void __fastcall step(void *p, void *) {
             int currentHealth = health(p);
             if (s.ui.gameplay && currentHealth < s.ui.health)
                 damageFeedback.fetch_add(1, std::memory_order_relaxed);
+            updateRideFeedback(s);
             s.ui.health = currentHealth;
             s.ui.armor = armor(p);
             publishSnapshot(s);
@@ -6087,6 +6096,52 @@ static bool labPlacement(void *puppet, Pose &out) {
     const auto table = *static_cast<uintptr_t **>(puppet);
     reinterpret_cast<AbsPlacement>(table[0x54 / 4])(puppet, &out);
     return finite(out);
+}
+// A driven vehicle's vibration from its own motion (main thread, once a step):
+// a light engine rumble that grows with speed, and a jolt when it stops hard
+// (a crash or a heavy landing). Off on foot, in turrets and in menus.
+static void updateRideFeedback(const Snapshot &s) {
+    static uint32_t lastRide = 0;
+    static Vec3 lastPosition{}, lastVelocity{};
+    static double lastTime = 0, lastImpact = 0;
+    static bool primed = false;
+    void *ride = s.rider.seated() && resolve ? resolve(s.rider.ride) : nullptr;
+    if (!ride || !s.ui.gameplay || !drivenVehicle(ride)) {
+        rideRumble.store(0, std::memory_order_relaxed);
+        primed = false;
+        return;
+    }
+    Pose placement{};
+    const double now = fineSeconds();
+    if (!labPlacement(ride, placement)) {
+        rideRumble.store(0, std::memory_order_relaxed);
+        primed = false;
+        return;
+    }
+    if (!primed || s.rider.ride != lastRide || now - lastTime > .5 || now - lastTime < 1e-4) {
+        primed = true;
+        lastRide = s.rider.ride;
+        lastPosition = placement.p;
+        lastVelocity = {};
+        lastTime = now;
+        rideRumble.store(.04f, std::memory_order_relaxed);
+        return;
+    }
+    const float dt = float(now - lastTime);
+    const Vec3 velocity = (placement.p - lastPosition) * (1 / dt);
+    const float speed = std::sqrt(dot(velocity, velocity));
+    if (!std::isfinite(speed) || speed > 200) { primed = false; return; } // A teleport, not motion.
+    const Vec3 change = velocity - lastVelocity;
+    const float deceleration = std::sqrt(dot(change, change)) / dt;
+    const float previous = std::sqrt(dot(lastVelocity, lastVelocity));
+    if (previous > 5 && deceleration > 40 && now - lastImpact > .4) {
+        lastImpact = now;
+        rideImpacts.fetch_add(1, std::memory_order_relaxed);
+    }
+    rideRumble.store(speed > .3f ? std::min(.06f + speed * .008f, .3f) : .04f, std::memory_order_relaxed);
+    lastPosition = placement.p;
+    lastVelocity = velocity;
+    lastTime = now;
 }
 static bool labTurretView(Pose &out) {
     void *turret = labFindTurret();
@@ -7368,6 +7423,13 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
         sampled[h].local = local;
         sampled[h].distance = distance;
         sampled[h].relative = !mounted && relative;
+        if (mounted && finite(body)) {
+            // Seated: relative to the body anchor, rebuilt each frame (freezeLasers).
+            const Pose inverseBody = inverse(body);
+            sampled[h].local = compose(inverseBody, sampled[h].muzzle);
+            sampled[h].localEnd = rotate(inverseBody.q, sampled[h].end) + inverseBody.p;
+            sampled[h].relative = finite(sampled[h].local);
+        }
     }
     originalRayInit(); // Runs native collision cleanup and resets all native ray state.
     laserQuerying = false;
@@ -7451,6 +7513,15 @@ static void freezeLasers(const Request &request) {
         if (!held || !finite(grip) || !finite(muzzle)) { a.valid = false; continue; }
         a.muzzle = muzzle;
         a.end = muzzle.p + rotate(normalize(muzzle.q), Vec3{0, 0, -1}) * a.distance;
+    }
+    // Seated beams from this frame's body anchor (the turret turned with the head).
+    for (unsigned h = 0; h != 2; ++h) {
+        auto &a = pair[h];
+        if (!a.valid || !a.relative || a.kind != LaserSourceKind::Vehicle) continue;
+        a.muzzle = compose(eyeAnchor, a.local);
+        a.end = rotate(eyeAnchor.q, a.localEnd) + eyeAnchor.p;
+        a.body = eyeAnchor;
+        if (!finite(a.muzzle) || !std::isfinite(a.end.x) || !std::isfinite(a.end.y) || !std::isfinite(a.end.z)) a.valid = false;
     }
     // A hand-aimed dinosaur's beam starts at this frame's right hand, to the
     // sampled end (where the hand's ray hit).
@@ -7799,6 +7870,18 @@ static int __fastcall nativeFire(void *w, void *, float amount) {
         log("Input native DoTheFiring hand=%d result=%d", hand, result);
     if (result && hand >= 0 && vrSession(s) && fresh(s.input) && s.ui.gameplay)
         fireFeedback[hand].fetch_add(1, std::memory_order_relaxed);
+    // A turret's or vehicle's gun (the ride's firing mechanism) fires through the
+    // same weapon call: both hands, which hold the ride's handles or controls.
+    if (result && hand < 0 && s.rider.seated() && vrSession(s) && fresh(s.input) && s.ui.gameplay && resolve) {
+        void *ride = resolve(s.rider.ride);
+        const uint32_t mechanism = ride && readableMemory(static_cast<uint8_t *>(ride) + 0x114, 4) ? primaryField(ride, 0x114) : 0;
+        if (mechanism && resolve(mechanism) == w) {
+            fireFeedback[0].fetch_add(1, std::memory_order_relaxed);
+            fireFeedback[1].fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<unsigned> seatedTraced{0};
+            if (seatedTraced.fetch_add(1, std::memory_order_relaxed) < 8) log("Seated fire feedback ride=%08x", s.rider.ride);
+        }
+    }
     return result; // Feedback observes the native event; it never initiates damage/fire.
 }
 static bool trackedWeaponSession(const Snapshot &s) {
@@ -11124,6 +11207,19 @@ static const char *__cdecl translate(const char *id) {
         return "Press A or a trigger to continue";
     return originalTranslate(id);
 }
+// Netricsa draws its page and exit prompts as gamepad buttons or keyboard keys
+// by asking inpUsingGamepad() (Sam2Game 18A099), not the menus' input mode, so
+// under VR it showed keyboard keys. Only that call answers "gamepad" while VR
+// input is live; the game's other callers (fire-button flip, aiming) keep the
+// real answer.
+static int(__cdecl *originalUsingGamepad)() = nullptr;
+static uintptr_t netricsaPromptReturn = 0;
+static int __cdecl usingGamepad() {
+    if (netricsaPromptReturn && reinterpret_cast<uintptr_t>(__builtin_return_address(0)) == netricsaPromptReturn &&
+        vrInputLive())
+        return 1;
+    return originalUsingGamepad ? originalUsingGamepad() : 0;
+}
 // Native prompts ("Press {plcmdUse} to enter") name the bound keyboard key.
 // While VR input is live the commands the controllers drive name their VR
 // button instead; CInputBindings::SubstituteCommands copies the text first, so
@@ -11545,19 +11641,53 @@ static bool respawnCommand(int i, const Snapshot &s) {
 // right stick the second axis, A (or a trigger) switches pages, B, Menu, the
 // wheel button or the Netricsa bubble close it, as its gamepad prompts say.
 static bool netricsaCommand(int i) { return i == 2 || i == 3 || i == 7 || i == 12 || i == 13 || i == 15; }
+// The laser on Netricsa's panel (the host's hit, in the panel image, V1011 crop):
+// exit and page buttons at the bottom left, the text box above them.
+enum class NetricsaTarget { None, Off, Exit, Page, ScrollUp, ScrollDown, Panel };
+static NetricsaTarget netricsaPointerTarget(const Input &in, unsigned &hand) {
+    MenuPointer pointer{};
+    {
+        Lock l(channel);
+        if (!l) return NetricsaTarget::Off;
+        pointer = channel.shared->pointer;
+    }
+    const uint64_t now = GetTickCount64();
+    if (!pointer.active || pointer.hand > 1 || pointer.interactionGeneration || pointer.session != in.session ||
+        now < pointer.tickMs || now - pointer.tickMs > 150 || !std::isfinite(pointer.u) || !std::isfinite(pointer.v))
+        return NetricsaTarget::Off;
+    hand = pointer.hand;
+    const float u = pointer.u, v = pointer.v;
+    if (v >= .86f && v <= .98f && u >= .035f && u < .155f) return NetricsaTarget::Exit;
+    if (v >= .86f && v <= .98f && u >= .155f && u <= .32f) return NetricsaTarget::Page;
+    if (u >= .02f && u <= .5f && v >= .36f && v <= .84f)
+        return v < .52f ? NetricsaTarget::ScrollUp : v > .66f ? NetricsaTarget::ScrollDown : NetricsaTarget::Panel;
+    return NetricsaTarget::Panel;
+}
 static float netricsaValue(int i, const Input &in) {
     const uint32_t buttons = in.buttons[0] | in.buttons[1];
     const bool jumpProfile = (buttons & JumpBound) != 0;
+    // Its gamepad prompts: A (or Y) switches the page, B exits. Index: right A, left
+    // B (its Y function); Touch and alike: A, left Y; Frame: A, right Y (Netricsa).
     const bool aButton = jumpProfile ? (in.buttons[1] & Jump) != 0 : (buttons & Use) != 0;
     const bool bButton = jumpProfile ? (in.buttons[1] & Use) != 0 : (in.buttons[1] & WheelOpen) != 0;
+    const bool yButton = jumpProfile ? (in.buttons[0] & Menu) != 0
+                                     : (in.buttons[0] & WheelOpen) != 0 || (buttons & Netricsa) != 0;
+    const bool closeButton = jumpProfile ? bButton || (buttons & (Netricsa | WheelOpen)) != 0
+                                         : bButton || (buttons & Menu) != 0;
+    unsigned hand = 2;
+    const NetricsaTarget target = netricsaPointerTarget(in, hand);
+    const auto pulled = [&](unsigned h) { return h < 2 && primaryActionEligible(in, h) && in.trigger[h] > .75f; };
+    const bool aimedPull = target != NetricsaTarget::Off && pulled(hand);
     switch (i) {
-    case 3: return in.axis[0][1] > .5f ? 1.f : 0.f;   // plcmdZ-: up
-    case 2: return in.axis[0][1] < -.5f ? 1.f : 0.f;  // plcmdZ+: down
+    case 3: return in.axis[0][1] > .5f || (aimedPull && target == NetricsaTarget::ScrollUp) ? 1.f : 0.f;   // plcmdZ-: up
+    case 2: return in.axis[0][1] < -.5f || (aimedPull && target == NetricsaTarget::ScrollDown) ? 1.f : 0.f; // plcmdZ+: down
     case 12: return in.axis[1][1] > .5f ? 1.f : 0.f;  // plcmdP+
     case 13: return in.axis[1][1] < -.5f ? 1.f : 0.f; // plcmdP-
-    case 7: return aButton || (primaryActionEligible(in, 1) && in.trigger[1] > .75f) ||
-                   (primaryActionEligible(in, 0) && in.trigger[0] > .75f) ? 1.f : 0.f;
-    case 15: return bButton || (buttons & (Menu | Netricsa | WheelOpen)) ? 1.f : 0.f;
+    case 7:
+        // Off the panel a trigger still switches the page, as before the laser.
+        return aButton || yButton || (aimedPull && target == NetricsaTarget::Page) ||
+               (target == NetricsaTarget::Off && (pulled(0) || pulled(1))) ? 1.f : 0.f;
+    case 15: return closeButton || (aimedPull && target == NetricsaTarget::Exit) ? 1.f : 0.f;
     default: return 0.f;
     }
 }
@@ -13172,6 +13302,17 @@ bool attach(bool headless) {
     if (!headless) {
         H(c, "?sysIsAppForeground@SeriousEngine@@YAHXZ", appForeground, originalAppForeground);
         H(c, "?strTranslate@SeriousEngine@@YAPBDPBD@Z", translate, originalTranslate);
+    }
+    if (!headless) {
+        // call [inpUsingGamepad]; mov ebx,eax; test ebx,ebx (Netricsa's prompt choice).
+        static const uint8_t netricsaSite[]{0xff, 0x15};
+        static const uint8_t netricsaAfter[]{0x8b, 0xd8, 0x85, 0xdb};
+        const auto *site = reinterpret_cast<const uint8_t *>(g) + 0x18a099;
+        if (!memcmp(site, netricsaSite, 2) && !memcmp(site + 6, netricsaAfter, 4)) {
+            netricsaPromptReturn = reinterpret_cast<uintptr_t>(site + 6);
+            H(e, "?inpUsingGamepad@SeriousEngine@@YAHXZ", usingGamepad, originalUsingGamepad);
+        } else
+            log("Netricsa prompt call site mismatch: keyboard prompts stay");
     }
     if (!headless) {
         H(e, "?ChallengeCalculateResponse@CSteamOnlineInterface@SeriousEngine@@UAEXPAEJAAPAEAAJ@Z", challengeResponse,

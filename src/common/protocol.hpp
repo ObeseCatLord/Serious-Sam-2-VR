@@ -5,7 +5,7 @@
 namespace ss2vr {
 // MaxDimension only bounds sanity checks: images travel in pixel sections sized
 // to the current canvas, which follows the runtime's recommended eye size.
-constexpr uint32_t Magic = 0x32565253, Abi = 16, MaxDimension = 16384, WeaponCount = 17;
+constexpr uint32_t Magic = 0x32565253, Abi = 17, MaxDimension = 16384, WeaponCount = 17;
 // Pixel sections: slot0 left/right, slot1 left/right, then the mono menu frame.
 constexpr unsigned PixelBufferCount = 5, MenuPixelBuffer = 4;
 constexpr unsigned slotPixelBuffer(unsigned slot, unsigned eye) { return slot * 2 + eye; }
@@ -124,7 +124,10 @@ struct MenuFrame {
     // world was left out and black is transparent).
     uint32_t pixelGeneration = 0, overlay = 0;
 };
-enum MenuOverlay : uint32_t { MenuOverLevel = 1, MenuKeyed = 2 };
+// MenuAlpha: the image carries its own alpha (Netricsa's rounded frame);
+// MenuPointable: a panel without a native menu that still takes the laser
+// pointer (Netricsa: the game maps the hit to its commands).
+enum MenuOverlay : uint32_t { MenuOverLevel = 1, MenuKeyed = 2, MenuAlpha = 4, MenuPointable = 8 };
 // The game creates one section per buffer for its current canvas extent and
 // publishes it here; readers reopen when the generation changes.
 struct PixelSections {
@@ -183,6 +186,10 @@ struct Shared {
     // located at, and its grip velocities; published with it under the IPC mutex.
     int64_t latestTime = 0;
     HandVelocity gripVelocity[2];
+    // ABI17: seated feedback. A driven vehicle's continuous vibration (0..1, both
+    // hands) and a sequence advanced by each hard impact.
+    float rideRumble = 0;
+    uint32_t rideImpactSequence = 0;
 };
 #pragma pack(pop)
 static_assert(sizeof(Vec3) == 12 && sizeof(Quat) == 16 && sizeof(Pose) == 28);
@@ -192,6 +199,6 @@ static_assert(sizeof(Input) == 272 && sizeof(Request) == 480);
 static_assert(sizeof(MenuPointer) == 64);
 static_assert(sizeof(WorldSubmission)==40 && sizeof(PixelSections)==16 && sizeof(SharedImages)==40);
 static_assert(sizeof(HandVelocity) == 32);
-static_assert(sizeof(Shared) == 2136 && offsetof(Shared, pixels) == 2000 && offsetof(Shared, images) == 2024 &&
+static_assert(sizeof(Shared) == 2144 && offsetof(Shared, pixels) == 2000 && offsetof(Shared, images) == 2024 &&
               offsetof(Shared, latestTime) == 2064); // Same on x86 and x64.
 } // namespace ss2vr

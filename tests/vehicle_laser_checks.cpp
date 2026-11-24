@@ -80,5 +80,26 @@ int main() {
     frame.now = 201; rejects();
     check(frozen[1].valid && frozen[1].vehicle == originalFrame.vehicle,
           "Once frozen both eyes keep the same admitted values independent of later mutations");
+    {
+        // A seated beam kept relative to its body anchor survives a later request and
+        // a turned anchor (the turret follows the head), but not a new source or age.
+        LaserAim relative = samples[1];
+        relative.relative = true;
+        relative.local = Pose{{0, 0, 0, 1}, {0, .3f, -.5f}};
+        relative.localEnd = {0, .3f, -10.5f};
+        relative.distance = 10;
+        LaserFrame later = originalFrame;
+        later.requestSequence += 3;
+        later.sequence += 2;
+        later.body = Pose{yaw(.7f), {1, 0, 0}};
+        check(laserEligible(relative, later, 1), "A seated relative beam survives a later request and a turned anchor");
+        later.vehicle.mechanism++;
+        check(!laserEligible(relative, later, 1), "A seated relative beam never moves to another source");
+        later = originalFrame;
+        later.now = 201;
+        check(!laserEligible(relative, later, 1), "A seated relative beam still expires after 100 ms");
+        relative.localEnd.x = std::numeric_limits<float>::quiet_NaN();
+        check(!laserEligible(relative, originalFrame, 1), "A seated relative beam needs a finite end");
+    }
     std::cout << "Native laser pose, scratch, source and two-eye admission checks passed; no runtime executed\n";
 }

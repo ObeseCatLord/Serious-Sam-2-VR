@@ -71,10 +71,10 @@ Other controllers:
 
 | Profile | Weapon wheel (left / right) | Use | Jump | Menu | Reload |
 | --- | --- | --- | --- | --- | --- |
-| Oculus Touch | Y / B | A | Grip | Left menu | X |
+| Oculus Touch and alike (Rift, Rift S, Quest, Pico 4, HP Reverb G2, Vive Cosmos / Focus 3) | Y / B | A | Grip | Left menu | X |
 | HTC Vive | Trackpad click | Right menu | Grip | Left menu | — |
-| Windows Mixed Reality | Trackpad click | Left menu | Grip | Right menu | — |
-| Steam Frame | Left D-pad up / right B | Right A | Grip | Left view / right menu | Left D-pad down |
+| Windows Mixed Reality (and Samsung Odyssey) | Trackpad click | Left menu | Grip | Right menu | — |
+| Steam Frame | Left D-pad left / right B | Right A | Grip | Left view / right menu | Left D-pad down |
 
 ## License
 

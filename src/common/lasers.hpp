@@ -67,6 +67,11 @@ struct LaserAim {
     Pose local{};
     float distance = 0;
     bool relative = false;
+    // Vehicle (turret) beams: the muzzle (local) and the beam's end relative to
+    // the body anchor they were sampled in, rebuilt from each frame's own anchor.
+    // A turret turns with the head, moving that anchor every frame; requiring
+    // the sample's exact request and anchor hid its beam almost always.
+    Vec3 localEnd{};
 };
 struct LaserFrame {
     Pose body;
@@ -81,7 +86,7 @@ inline bool laserEligible(const LaserAim &aim, const LaserFrame &frame, unsigned
     // A grip-relative handheld beam is rebuilt from the frame's own grip pose, so
     // it does not need the sample's exact request (late-latched poses made those
     // flicker); world-space (vehicle) beams still do.
-    const bool rebuilt = aim.relative && aim.kind == LaserSourceKind::Handheld;
+    const bool rebuilt = aim.relative;
     if (hand >= 2 || !aim.valid || !aim.owner || !aim.weapon || aim.owner != frame.owner ||
         aim.weapon != frame.weapon[hand] || aim.generation != frame.generation ||
         (!rebuilt && aim.sequence != frame.sequence) || frame.now < aim.tickMs || frame.now - aim.tickMs > 100 ||
@@ -96,7 +101,10 @@ inline bool laserEligible(const LaserAim &aim, const LaserFrame &frame, unsigned
             return false;
     } else if (frame.wheel[hand] || frame.selecting[hand])
         return false;
-    if (rebuilt) return finite(aim.local) && std::isfinite(aim.distance) && aim.distance >= 0;
+    if (rebuilt)
+        return finite(aim.local) && std::isfinite(aim.distance) && aim.distance >= 0 &&
+               (aim.kind == LaserSourceKind::Handheld ||
+                (std::isfinite(aim.localEnd.x) && std::isfinite(aim.localEnd.y) && std::isfinite(aim.localEnd.z)));
     const Vec3 drift = aim.body.p - frame.body.p;
     const float alignment = aim.body.q.x * frame.body.q.x + aim.body.q.y * frame.body.q.y +
                             aim.body.q.z * frame.body.q.z + aim.body.q.w * frame.body.q.w;
