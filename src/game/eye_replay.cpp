@@ -1,3 +1,4 @@
+#include "hook_memory.hpp"
 #include "eye_replay.hpp"
 #include <unordered_map>
 #include "game.hpp"
@@ -226,7 +227,7 @@ Cmd &push(Op op) {
     return cmds.back();
 }
 template<class T> bool hook(void *address, void *detour, T &original) {
-    if (MH_CreateHook(address, detour, reinterpret_cast<void **>(&original)) != MH_OK) return false;
+    if (createHook(address, detour, reinterpret_cast<void **>(&original)) != MH_OK) return false;
     if (MH_EnableHook(address) != MH_OK) { MH_RemoveHook(address); original = nullptr; return false; }
     return true;
 }

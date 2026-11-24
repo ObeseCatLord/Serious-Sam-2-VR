@@ -1,3 +1,4 @@
+#include "hook_memory.hpp"
 #include "eye_replay.hpp"
 #include "single_pass.hpp"
 #include "env_probe.hpp"
@@ -11165,10 +11166,79 @@ static void frame() {
     }
 }
 } // namespace draw_distance
-void restoreDrawDistance() noexcept { draw_distance::lod.restore(); draw_distance::clutter.restore(); }
+// [Render] LowSpec: the game's costliest effects off while the mod runs, from
+// the cvars themselves (exported by Engine, Shaders and ProcRender). Each keeps
+// the value it had (the player's video settings, or a later change of theirs),
+// which is put back before the game saves its cvars (restoreDrawDistance).
+namespace low_spec {
+template <class T> struct Override {
+    T *cvar = nullptr;
+    T configured{}, written{};
+    bool active = false;
+    void apply(T value) {
+        if (!cvar) return;
+        if (!active || *cvar != written) configured = *cvar;
+        written = value;
+        *cvar = value;
+        active = true;
+    }
+    void restore() {
+        if (cvar && active && *cvar == written) *cvar = configured;
+        active = false;
+    }
+};
+static Override<int32_t> shadows, anisotropy, refractions, forceFlat, fastFlat, offsetMapping;
+static Override<float> density, lod, distance;
+template <class T> static void resolve(Override<T> &o, const wchar_t *module, const char *name) {
+    if (const HMODULE m = GetModuleHandleW(module)) o.cvar = reinterpret_cast<T *>(GetProcAddress(m, name));
+}
+static void restore() {
+    shadows.restore(); anisotropy.restore(); refractions.restore(); forceFlat.restore(); fastFlat.restore();
+    offsetMapping.restore(); density.restore(); lod.restore(); distance.restore();
+}
+static void frame() {
+    static bool resolved = false;
+    if (!settings.lowSpec) { restore(); return; }
+    if (!resolved) {
+        resolved = true;
+        resolve(shadows, L"Engine.dll", "?ren_iDynamicShadowQuality@SeriousEngine@@3JA");
+        resolve(anisotropy, L"Engine.dll", "?tex_iAnisotropy@SeriousEngine@@3JA");
+        resolve(lod, L"Engine.dll", "?ren_fLODBias@SeriousEngine@@3MA");
+        resolve(refractions, L"Shaders.dll", "?sha_bAllowRefractions@SeriousEngine@@3HA");
+        resolve(forceFlat, L"Shaders.dll", "?sha_bForceFlatCubeReflections@SeriousEngine@@3HA");
+        resolve(fastFlat, L"Shaders.dll", "?sha_bFastFlatCubeReflections@SeriousEngine@@3HA");
+        resolve(offsetMapping, L"Shaders.dll", "?sha_bNoOffsetMapping@SeriousEngine@@3HA");
+        resolve(density, L"ProcRender.dll", "?crm_fDensityBias@SeriousEngine@@3MA");
+        resolve(distance, L"ProcRender.dll", "?crm_fDistanceBias@SeriousEngine@@3MA");
+        log("Low-spec profile: cvars shadows=%d anisotropy=%d lod=%d refractions=%d flat=%d,%d offset=%d clutter=%d,%d",
+            shadows.cvar != nullptr, anisotropy.cvar != nullptr, lod.cvar != nullptr, refractions.cvar != nullptr,
+            forceFlat.cvar != nullptr, fastFlat.cvar != nullptr, offsetMapping.cvar != nullptr, density.cvar != nullptr,
+            distance.cvar != nullptr);
+    }
+    shadows.apply(0);
+    if (anisotropy.cvar && (!anisotropy.active ? *anisotropy.cvar : anisotropy.configured) > 4) anisotropy.apply(4);
+    refractions.apply(0);
+    forceFlat.apply(1);
+    fastFlat.apply(1);
+    offsetMapping.apply(1);
+    if (density.cvar) density.apply(std::min(.4f, density.active ? density.configured : *density.cvar));
+    // Detail and clutter distance only while DrawDistance leaves them alone (1).
+    if (settings.drawDistance <= 1.001f) {
+        if (lod.cvar) lod.apply(std::max(1.5f, lod.active ? lod.configured : *lod.cvar));
+        if (distance.cvar) distance.apply(std::min(.5f, distance.active ? distance.configured : *distance.cvar));
+    } else { lod.restore(); distance.restore(); }
+}
+} // namespace low_spec
+bool lowSpecActive() noexcept { return settings.lowSpec; }
+void restoreDrawDistance() noexcept {
+    low_spec::restore();
+    draw_distance::lod.restore();
+    draw_distance::clutter.restore();
+}
 static int __cdecl appForeground() {
     pollSettingsFile(); // Menus too: the options panel opens over the game's menus.
     draw_distance::frame();
+    low_spec::frame();
     applyEyeCanvas();   // In play too: the canvas changes between the front end (16:9) and a level (eye size).
     maintainSpatialAudio();
     voiceFrame();
@@ -11202,6 +11272,8 @@ static bool translationId(const char *text, const char *id) {
     return !std::strncmp(text, id, n) && (text[n] == '=' || text[n] == 0);
 }
 static const char *__cdecl translate(const char *id) {
+    if (id && id[0] == 'E' && (translationId(id, "ETRSLoadingFinished.MessageXbox") || translationId(id, "ETRSLoadingFinished.MessagePC")))
+        noteLoadingPrompt();
     if (id && id[0] == 'E' && vrInputLive() &&
         (translationId(id, "ETRSLoadingFinished.MessageXbox") || translationId(id, "ETRSLoadingFinished.MessagePC")))
         return "Press A or a trigger to continue";
@@ -12478,8 +12550,9 @@ static bool rollbackNativeHooks() {
 }
 static bool hook(HMODULE m, const char *name, void *target, void **original) {
     void *address = reinterpret_cast<void *>(GetProcAddress(m, name));
-    if (!address || MH_CreateHook(address, target, original) != MH_OK) {
-        log("Required hook missing: %s", name);
+    const MH_STATUS status = address ? createHook(address, target, original) : MH_ERROR_FUNCTION_NOT_FOUND;
+    if (status != MH_OK) {
+        log("Required hook missing: %s (status %d at %p)", name, int(status), address);
         return false;
     }
     ownedHooks.push_back(address);
@@ -12487,8 +12560,9 @@ static bool hook(HMODULE m, const char *name, void *target, void **original) {
 }
 static bool internalHook(HMODULE m, uint32_t rva, void *target, void **original) {
     void *address = reinterpret_cast<uint8_t *>(m) + rva;
-    if (MH_CreateHook(address, target, original) != MH_OK) {
-        log("Required fingerprinted internal hook missing: %x", unsigned(rva));
+    const MH_STATUS status = createHook(address, target, original);
+    if (status != MH_OK) {
+        log("Required fingerprinted internal hook missing: %x (status %d)", unsigned(rva), int(status));
         return false;
     }
     ownedHooks.push_back(address);

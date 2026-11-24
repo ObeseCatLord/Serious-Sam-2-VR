@@ -27,6 +27,8 @@ bool labOnlineIsolationInstalled() noexcept;
 void startLabProfiler() noexcept;
 bool foregroundGame();
 bool vrInputLive() noexcept;
+void noteLoadingPrompt() noexcept;
+bool lowSpecActive() noexcept; // [Render] LowSpec in effect (ARM64 / emulated machines). // The loading screen asks to press a key (benchmark auto-continue).
 // Native eye canvas at the runtime's recommended size (installed before the
 // engine creates its window canvas; applied on the main thread's input poll).
 void installEyeCanvas() noexcept;

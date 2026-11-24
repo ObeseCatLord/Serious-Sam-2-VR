@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cross-compile the SS2VR installer for Linux and Windows into dist/.
+# Cross-compile the SS2VR installer for Linux (x86-64, ARM64: Steam Frame) and Windows into dist/.
 # Usage: ./build.sh [version]   (default: git describe of this repo, else "dev")
 set -eu
 cd "$(dirname "$0")"
@@ -11,6 +11,7 @@ build() {
 		-ldflags "-s -w -X main.version=$VERSION" -o "dist/$3" .
 }
 build linux amd64 ss2vr-installer-linux-x86_64
+build linux arm64 ss2vr-installer-linux-arm64
 build windows amd64 ss2vr-installer-windows-x86_64.exe
-(cd dist && sha256sum ss2vr-installer-linux-x86_64 ss2vr-installer-windows-x86_64.exe > SHA256SUMS)
+(cd dist && sha256sum ss2vr-installer-linux-x86_64 ss2vr-installer-linux-arm64 ss2vr-installer-windows-x86_64.exe > SHA256SUMS)
 ls -l dist

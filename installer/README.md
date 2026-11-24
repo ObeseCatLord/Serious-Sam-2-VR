@@ -8,6 +8,7 @@ latest SS2VR release from GitHub and installs it, updates it, or removes it.
 1. Download the installer for your system from the latest SS2VR release:
    - Windows: `ss2vr-installer-windows-x86_64.exe`
    - Linux: `ss2vr-installer-linux-x86_64`
+   - Steam Frame (and other ARM64 Linux): `ss2vr-installer-linux-arm64`
 2. Run it.
    - Windows: double-click it. A console window opens.
    - Linux: make it executable first, then run it from a terminal:
@@ -19,8 +20,16 @@ If it can't find the game (or finds more than one copy), it asks you for the
 folder, which is the one that contains `Bin/Sam2.exe`, for example
 `C:\Program Files (x86)\Steam\steamapps\common\Serious Sam 2`.
 
-**Linux:** SS2VR is a Windows mod that runs through Proton, so the Linux
-installer just puts the files into the game folder; nothing else is needed.
+**Linux / Steam Frame:** SS2VR is a Windows mod that runs through Proton. After
+installing, the Linux installer adds what the game needs to its Steam launch
+options (`WINEDLLOVERRIDES="d3d9=n,b" PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1`,
+and on ARM64 `STEAM_COMPAT_FEX_CONFIG=TSOEnabled:0,Multiblock:1` for faster x86
+emulation), keeping any options you already had. Steam saves its settings when it
+exits, so it asks to close Steam briefly and starts it again (the Steam Frame and
+Deck start it by themselves). A backup of the changed file is kept next to it as
+`localconfig.vdf.ss2vr-backup`. On the Steam Frame it also sets SteamVR's refresh
+rate for the game to 72 Hz, unless you already chose one. Use `--no-steam-setup`
+to leave Steam alone.
 
 ## What it does (and doesn't do)
 

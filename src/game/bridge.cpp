@@ -1,3 +1,4 @@
+#include "hook_memory.hpp"
 #include "common/color.hpp"
 #include "common/controls.hpp"
 #include "common/foveation.hpp"
@@ -338,7 +339,7 @@ static void (__cdecl *labOriginalInitialize)() = nullptr;
 // IP:port joins that dedicated server with +connect <its SteamID>). Read once and
 // deleted, so a later plain launch is unaffected. [VR] Enabled=0 in SS2VR.ini or
 // SS2VR.user.ini turns VR off for every launch.
-struct LaunchOptions { bool vr = true; char server[64]{}; };
+struct LaunchOptions { bool vr = true, autoContinue = false; char server[64]{}; };
 static const LaunchOptions &launchOptions() {
     static const LaunchOptions options = [] {
         LaunchOptions o;
@@ -349,6 +350,10 @@ static const LaunchOptions &launchOptions() {
             const UINT value = GetPrivateProfileIntW(L"VR", L"Enabled", 2, (folder + name).c_str());
             if (value != 2) o.vr = value != 0;
         }
+        // [Benchmark] AutoContinue=1 (SS2VR.user.ini): unattended runs press Enter on
+        // the loading screen's "press to continue" (headset benchmarks with nobody in it).
+        o.autoContinue = GetPrivateProfileIntW(L"Benchmark", L"AutoContinue", 0, (folder + L"SS2VR.user.ini").c_str()) != 0;
+        if (o.autoContinue) log("Benchmark: loading screens continue by themselves");
         const std::wstring once = folder + L"next-launch.ini";
         if (GetFileAttributesW(once.c_str()) != INVALID_FILE_ATTRIBUTES) {
             const UINT value = GetPrivateProfileIntW(L"Launch", L"VR", 2, once.c_str());
@@ -407,7 +412,7 @@ bool installServerConnect() noexcept {
     labServerPort = reinterpret_cast<int32_t *>(GetProcAddress(engine, "?net_iServerPort@SeriousEngine@@3JA"));
     void *connect = reinterpret_cast<void *>(GetProcAddress(engine, "?Connect@CClientInterface@SeriousEngine@@UAEHHH@Z"));
     if (!labSteamGameserver || !labServerLobby || !connect ||
-        MH_CreateHook(connect, reinterpret_cast<void *>(labClientConnect), reinterpret_cast<void **>(&labOriginalClientConnect)) != MH_OK ||
+        createHook(connect, reinterpret_cast<void *>(labClientConnect), reinterpret_cast<void **>(&labOriginalClientConnect)) != MH_OK ||
         MH_EnableHook(connect) != MH_OK) {
         log("Multiplayer: direct server connect unavailable");
         return false;
@@ -420,8 +425,8 @@ static void labInstallSteamWriteBarrier() {
     void *storage = steam ? reinterpret_cast<void *>(GetProcAddress(steam, "SteamRemoteStorage")) : nullptr;
     void *stats = steam ? reinterpret_cast<void *>(GetProcAddress(steam, "SteamUserStats")) : nullptr;
     if (!storage || !stats ||
-        MH_CreateHook(storage, reinterpret_cast<void *>(labRemoteStorage), reinterpret_cast<void **>(&labRealRemoteStorage)) != MH_OK ||
-        MH_CreateHook(stats, reinterpret_cast<void *>(labUserStats), reinterpret_cast<void **>(&labRealUserStats)) != MH_OK ||
+        createHook(storage, reinterpret_cast<void *>(labRemoteStorage), reinterpret_cast<void **>(&labRealRemoteStorage)) != MH_OK ||
+        createHook(stats, reinterpret_cast<void *>(labUserStats), reinterpret_cast<void **>(&labRealUserStats)) != MH_OK ||
         MH_EnableHook(storage) != MH_OK || MH_EnableHook(stats) != MH_OK)
         abortLab("multiplayer Steam write barrier unavailable");
     if (!installServerConnect()) abortLab("multiplayer direct server connect unavailable");
@@ -488,10 +493,10 @@ void installLabOnlineIsolation() {
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
         reinterpret_cast<LPCWSTR>(engine),&pinned)) abortLab("native online module pin failed");
     if (labMultiplayer()) labInstallSteamWriteBarrier();
-    if (MH_CreateHook(entry,reinterpret_cast<void *>(suppressLabOnlineInitialization),
+    if (createHook(entry,reinterpret_cast<void *>(suppressLabOnlineInitialization),
         reinterpret_cast<void **>(&labOriginalInitialize))!=MH_OK || !labOriginalInitialize)
         abortLab("online isolation hook creation failed");
-    if (MH_CreateHook(uninitialize,reinterpret_cast<void *>(labOnlineUninitialize),
+    if (createHook(uninitialize,reinterpret_cast<void *>(labOnlineUninitialize),
         reinterpret_cast<void **>(&labOriginalUninitialize))!=MH_OK || !labOriginalUninitialize)
         abortLab("online shutdown observation hook creation failed");
     labStartupThread=GetCurrentThreadId();
@@ -520,7 +525,7 @@ void installLabOnlineIsolation() {
         reinterpret_cast<uintptr_t>(labStreamSeek)!=cb+0x4a160 ||
         reinterpret_cast<uintptr_t>(labStreamRead)!=cb+0x4a130)
         abortLab("native scene stream ABI exports mismatch");
-    if (MH_CreateHook(open,reinterpret_cast<void *>(labOpenScene),reinterpret_cast<void **>(&labOriginalOpen))!=MH_OK ||
+    if (createHook(open,reinterpret_cast<void *>(labOpenScene),reinterpret_cast<void **>(&labOriginalOpen))!=MH_OK ||
         !labOriginalOpen || MH_EnableHook(open)!=MH_OK) abortLab("native scene observation hook unavailable");
     labIsolationPhase.store(2,std::memory_order_release);
     log("Lab online isolation installed synchronously at D3D9 factory entry; interface=0");
@@ -2477,7 +2482,7 @@ static void installPromptMarks(HMODULE game) noexcept {
         symbol("?GetCharTexPos@CFontInstance@SeriousEngine@@QAE?AVBox2f@2@J@Z", promptFontGlyph) &&
         symbol("?gfuGetTextRect@SeriousEngine@@YA?AVVector2f@1@PBDPBVCFontInstance@1@@Z", promptTextRect);
     const bool ok = slots && font && put &&
-        MH_CreateHook(put, reinterpret_cast<void *>(putTexturePart), reinterpret_cast<void **>(&originalPutTexturePart)) == MH_OK;
+        createHook(put, reinterpret_cast<void *>(putTexturePart), reinterpret_cast<void **>(&originalPutTexturePart)) == MH_OK;
     if (ok) promptSlots = base + 0x40a014; // Before the hook can run.
     const bool enabled = ok && MH_EnableHook(put) == MH_OK;
     if (ok && !enabled) promptSlots = 0;
@@ -2493,7 +2498,7 @@ static void installPromptMarks(HMODULE game) noexcept {
         netricsaPromptB = site(0x18a13e);
         netricsaPromptY = site(0x18a19f);
         const bool hooked = rotated && netricsaPromptB && netricsaPromptY &&
-            MH_CreateHook(rotated, reinterpret_cast<void *>(putRotatedTexture), reinterpret_cast<void **>(&originalPutRotatedTexture)) == MH_OK &&
+            createHook(rotated, reinterpret_cast<void *>(putRotatedTexture), reinterpret_cast<void **>(&originalPutRotatedTexture)) == MH_OK &&
             MH_EnableHook(rotated) == MH_OK;
         if (!hooked) netricsaPromptB = netricsaPromptY = 0;
         log("Netricsa prompt hand marks hook=%d", int(hooked));
@@ -2530,7 +2535,7 @@ void installMainMenuLayout() noexcept {
     const HMODULE sam = GetModuleHandleW(L"Sam2Game.dll");
     void *target = sam ? reinterpret_cast<void *>(GetProcAddress(sam, "?PostCreate@CMainMenu@SeriousEngine@@UAEXXZ")) : nullptr;
     const bool ok = target &&
-        MH_CreateHook(target, reinterpret_cast<void *>(mainMenuPostCreate), reinterpret_cast<void **>(&originalMainMenuPostCreate)) == MH_OK &&
+        createHook(target, reinterpret_cast<void *>(mainMenuPostCreate), reinterpret_cast<void **>(&originalMainMenuPostCreate)) == MH_OK &&
         MH_EnableHook(target) == MH_OK;
     if (!ok) log("Main menu layout hook unavailable");
     installPromptMarks(sam);
@@ -2568,15 +2573,15 @@ void installEyeCanvas() noexcept {
         "?wndGetWindowClientRect@SeriousEngine@@YA?AVCTRect@1@ABVCWindow@1@@Z"));
     void *metrics = reinterpret_cast<void *>(GetProcAddress(user, "GetSystemMetrics"));
     bool ok = clientRect && metrics &&
-        MH_CreateHook(clientRect, reinterpret_cast<void *>(eyeClientRect), reinterpret_cast<void **>(&originalClientRect)) == MH_OK &&
-        MH_CreateHook(metrics, reinterpret_cast<void *>(eyeSystemMetrics), reinterpret_cast<void **>(&originalSystemMetrics)) == MH_OK &&
+        createHook(clientRect, reinterpret_cast<void *>(eyeClientRect), reinterpret_cast<void **>(&originalClientRect)) == MH_OK &&
+        createHook(metrics, reinterpret_cast<void *>(eyeSystemMetrics), reinterpret_cast<void **>(&originalSystemMetrics)) == MH_OK &&
         MH_EnableHook(clientRect) == MH_OK && MH_EnableHook(metrics) == MH_OK;
     if (const HMODULE engine = GetModuleHandleW(L"Engine.dll")) {
         pixResWidth = reinterpret_cast<int32_t *>(GetProcAddress(engine, "?gfx_pixResWidth@SeriousEngine@@3JA"));
         pixResHeight = reinterpret_cast<int32_t *>(GetProcAddress(engine, "?gfx_pixResHeight@SeriousEngine@@3JA"));
         void *save = reinterpret_cast<void *>(GetProcAddress(engine, "?vmSaveCvars@SeriousEngine@@YAXXZ"));
         if (!pixResWidth || !pixResHeight || !save ||
-            MH_CreateHook(save, reinterpret_cast<void *>(saveCvars), reinterpret_cast<void **>(&originalSaveCvars)) != MH_OK ||
+            createHook(save, reinterpret_cast<void *>(saveCvars), reinterpret_cast<void **>(&originalSaveCvars)) != MH_OK ||
             MH_EnableHook(save) != MH_OK) {
             originalSaveCvars = nullptr;
             log("Eye canvas: configured resolution not followed (exports unavailable)");
@@ -2857,7 +2862,7 @@ template <class T> static bool deviceHook(void *address, void *detour, T &origin
     if (original)
         return address == boundAddress;
     static std::atomic<bool> createOk{false}, createFailed{false}, enableOk{false}, enableFailed{false};
-    const auto created = MH_CreateHook(address, detour, reinterpret_cast<void **>(&original));
+    const auto created = createHook(address, detour, reinterpret_cast<void **>(&original));
     auto &createReported = created == MH_OK ? createOk : createFailed;
     if (!createReported.exchange(true, std::memory_order_relaxed))
         log("Startup routing hook=%s operation=create status=%d thread=%lu", name,
@@ -3261,7 +3266,9 @@ void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept {
     if (lastStereoEnd.QuadPart) perf.postStereo += PerfClock::seconds(lastStereoEnd, start);
     lastStereoEnd = {};
     pollSharedFences(); // Present flushed the frame: its pair is often complete already.
-    paceToHeadset();
+    // Low spec: the next frame's simulation runs while the headset's request is on
+    // its way; the wait moves to just before the stereo render (stereo()).
+    if (!lowSpecActive() || menuFramePaced) paceToHeadset();
     lastPresentEnd = PerfClock::now();
 }
 static void presentBody(IDirect3DDevice9 *d);
@@ -3383,7 +3390,14 @@ static void collectMenuImage() {
         if (aborted) { uiHalted = true; nestedNativePresentation(); }
     });
 }
+static std::atomic<uint64_t> loadingPromptTick{0};
+void noteLoadingPrompt() noexcept { loadingPromptTick.store(GetTickCount64(), std::memory_order_relaxed); }
 static void presentBody(IDirect3DDevice9 *d) {
+    if (launchOptions().autoContinue) {
+        static uint64_t lastTap = 0;
+        const uint64_t now = GetTickCount64(), seen = loadingPromptTick.load(std::memory_order_relaxed);
+        if (seen && now - seen < 1000 && now - lastTap > 2000) { lastTap = now; keyTap(VK_RETURN); log("Benchmark: loading screen continued"); }
+    }
     menuFramePaced = false; // Until this frame is known to be an interactive menu's.
     {
         const LARGE_INTEGER t = PerfClock::now();
@@ -3673,7 +3687,7 @@ static void presentBody(IDirect3DDevice9 *d) {
             pausedForFocus = false;
         } else {
             if (!unfocusedSince) unfocusedSince = now;
-            if (!pausedForFocus && now - unfocusedSince > 300 && action == MenuAction::None && !menuVisible) {
+            if (!pausedForFocus && !launchOptions().autoContinue && now - unfocusedSince > 300 && action == MenuAction::None && !menuVisible) {
                 pausedForFocus = true;
                 action = MenuAction::Back;
                 log("Input focus left the game (runtime menu): pause menu opened");
@@ -4993,6 +5007,17 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
             }
         }
     };
+    if (lowSpecActive() && !menuFramePaced && lastPairTick && GetTickCount64() - lastPairTick <= 250 && channel.shared &&
+        !requestWaiting()) {
+        const LARGE_INTEGER start = PerfClock::now();
+        const ULONGLONG deadline = GetTickCount64() + 25;
+        do {
+            Sleep(1);
+            pollSharedFences();
+        } while (!requestWaiting() && GetTickCount64() < deadline && !stopping);
+        perf.wait += PerfClock::seconds(start, PerfClock::now());
+        ++perf.waits;
+    }
     acquireRequest();
     collectMenuImage(); // After the pacing wait: the GPU has finished the last frame.
     static unsigned requestDiagnostics = 0;

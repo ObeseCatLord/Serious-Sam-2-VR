@@ -1,4 +1,5 @@
 // Spatial audio, game side (spatial_audio.hpp).
+#include "hook_memory.hpp"
 #include "spatial_audio.hpp"
 #include "common/spatial_audio.hpp"
 #include "game.hpp"
@@ -148,11 +149,11 @@ bool hookOpenAl() {
     void *del = reinterpret_cast<void *>(GetProcAddress(openal, "alDeleteSources"));
     void *play = reinterpret_cast<void *>(GetProcAddress(openal, "alSourcePlay"));
     if (!s3f || !del || !play) return false;
-    if (MH_CreateHook(play, reinterpret_cast<void *>(sourcePlay), reinterpret_cast<void **>(&originalSourcePlay)) != MH_OK ||
+    if (createHook(play, reinterpret_cast<void *>(sourcePlay), reinterpret_cast<void **>(&originalSourcePlay)) != MH_OK ||
         MH_EnableHook(play) != MH_OK)
         return false;
-    if (MH_CreateHook(s3f, reinterpret_cast<void *>(source3f), reinterpret_cast<void **>(&originalSource3f)) != MH_OK ||
-        MH_CreateHook(del, reinterpret_cast<void *>(deleteSources), reinterpret_cast<void **>(&originalDeleteSources)) != MH_OK)
+    if (createHook(s3f, reinterpret_cast<void *>(source3f), reinterpret_cast<void **>(&originalSource3f)) != MH_OK ||
+        createHook(del, reinterpret_cast<void *>(deleteSources), reinterpret_cast<void **>(&originalDeleteSources)) != MH_OK)
         return false;
     return MH_EnableHook(s3f) == MH_OK && MH_EnableHook(del) == MH_OK;
 }
@@ -262,8 +263,8 @@ void hookSoundNames(HMODULE engine) {
     void *source = reinterpret_cast<void *>(GetProcAddress(engine, "?Play@CSoundSource@SeriousEngine@@QAEXPAVCBaseSound@2@K@Z"));
     void *channel = reinterpret_cast<void *>(GetProcAddress(engine, "?Play@CSoundChannel@SeriousEngine@@QAEXPAVCBaseSound@2@K@Z"));
     const bool ok = resourceFileOf && fileNameOf && source && channel &&
-        MH_CreateHook(source, reinterpret_cast<void *>(sourceSoundPlay), reinterpret_cast<void **>(&originalSourceSoundPlay)) == MH_OK &&
-        MH_CreateHook(channel, reinterpret_cast<void *>(channelSoundPlay), reinterpret_cast<void **>(&originalChannelSoundPlay)) == MH_OK &&
+        createHook(source, reinterpret_cast<void *>(sourceSoundPlay), reinterpret_cast<void **>(&originalSourceSoundPlay)) == MH_OK &&
+        createHook(channel, reinterpret_cast<void *>(channelSoundPlay), reinterpret_cast<void **>(&originalChannelSoundPlay)) == MH_OK &&
         MH_EnableHook(source) == MH_OK && MH_EnableHook(channel) == MH_OK;
     log("Sound file names %s", ok ? "logged" : "unavailable");
 }
@@ -320,7 +321,7 @@ void installStartupHook() {
     HMODULE engine = GetModuleHandleW(L"Engine.dll");
     if (engine) hookSoundNames(engine);
     void *target = engine ? reinterpret_cast<void *>(GetProcAddress(engine, "?sfxStartup_t@SeriousEngine@@YAXW4SfxAPI@1@J@Z")) : nullptr;
-    if (!target || MH_CreateHook(target, reinterpret_cast<void *>(startup), reinterpret_cast<void **>(&originalStartup)) != MH_OK ||
+    if (!target || createHook(target, reinterpret_cast<void *>(startup), reinterpret_cast<void **>(&originalStartup)) != MH_OK ||
         MH_EnableHook(target) != MH_OK) {
         log("Spatial audio: sound startup hook unavailable");
         return;

@@ -1348,6 +1348,28 @@ struct Host {
     // XR_EXT_eye_gaze_interaction is not offered. The profile is applied to the
     // eye swapchains as the extension requires; any failure leaves it unused.
     bool metaFoveationExtension = false, metaFoveation = false;
+    bool refreshExtension = false;
+    PFN_xrEnumerateDisplayRefreshRatesFB enumerateRefreshRates = nullptr;
+    PFN_xrRequestDisplayRefreshRateFB requestRefreshRate = nullptr;
+    // [Render] RefreshRate: the closest rate the headset offers, asked for once
+    // the session runs (the Steam Frame's 72 Hz in the low-spec profile).
+    void applyRefreshRate() {
+        if (!(settings.refreshRate > 0) || !enumerateRefreshRates || !requestRefreshRate || !session) return;
+        uint32_t count = 0;
+        if (XR_FAILED(enumerateRefreshRates(session, 0, &count, nullptr)) || !count || count > 64) return;
+        std::vector<float> rates(count);
+        if (XR_FAILED(enumerateRefreshRates(session, count, &count, rates.data()))) return;
+        float best = 0;
+        for (float r : rates)
+            if (std::isfinite(r) && r > 0 && (!best || std::fabs(r - settings.refreshRate) < std::fabs(best - settings.refreshRate)))
+                best = r;
+        if (!best) return;
+        const XrResult result = requestRefreshRate(session, best);
+        char line[160];
+        std::snprintf(line, sizeof line, "Display refresh rate %.1f Hz requested (setting %.1f, %u offered): %d",
+                      double(best), double(settings.refreshRate), count, int(result));
+        log.write(line);
+    }
     PFN_xrCreateFoveationProfileFB createFoveationProfile = nullptr;
     PFN_xrDestroyFoveationProfileFB destroyFoveationProfile = nullptr;
     PFN_xrUpdateSwapchainFB updateSwapchain = nullptr;
@@ -1587,6 +1609,17 @@ struct Host {
                                                       XrExtensionProperties{XR_TYPE_EXTENSION_PROPERTIES});
         api.check(api.EnumerateInstanceExtensionProperties(nullptr, count, &count, extensions.data()),
                   "xrEnumerateInstanceExtensionProperties");
+        {
+            // What the runtime offers (one line, bounded): which controller profiles,
+            // eye gaze and foveation are possible here.
+            std::string offered = "OpenXR runtime extensions:";
+            for (const auto &e : extensions) {
+                if (offered.size() > 3800) { offered += " ..."; break; }
+                offered += ' ';
+                offered += e.extensionName;
+            }
+            log.write(offered.c_str());
+        }
         const bool supported = std::any_of(extensions.begin(), extensions.end(), [](const auto &e) {
             return !std::strcmp(e.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
         });
@@ -1620,6 +1653,9 @@ struct Host {
         });
         if (metaFoveationExtension)
             for (const char *name : metaNames) enabled.push_back(name);
+        refreshExtension = settings.refreshRate > 0 && std::any_of(extensions.begin(), extensions.end(),
+            [](const auto &e) { return !std::strcmp(e.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME); });
+        if (refreshExtension) enabled.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
         XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
         std::strcpy(create.applicationInfo.applicationName, "Serious Sam 2 VR");
         std::strcpy(create.applicationInfo.engineName, "SS2VR host");
@@ -1653,6 +1689,14 @@ struct Host {
         api.check(api.GetSystemProperties(instance, system, &systemProperties), "xrGetSystemProperties");
         systemProperties.next = nullptr;
         eyeGazeSupported = eyeGazeExtension && gazeProperties.supportsEyeGazeInteraction;
+        if (refreshExtension) {
+            PFN_xrVoidFunction fn = nullptr;
+            if (XR_SUCCEEDED(api.GetInstanceProcAddr(instance, "xrEnumerateDisplayRefreshRatesFB", &fn)))
+                enumerateRefreshRates = reinterpret_cast<PFN_xrEnumerateDisplayRefreshRatesFB>(fn);
+            fn = nullptr;
+            if (XR_SUCCEEDED(api.GetInstanceProcAddr(instance, "xrRequestDisplayRefreshRateFB", &fn)))
+                requestRefreshRate = reinterpret_cast<PFN_xrRequestDisplayRefreshRateFB>(fn);
+        }
         if (metaFoveationExtension && metaProperties.supportsFoveationEyeTracked) {
             const auto optional = [&](const char *name) {
                 PFN_xrVoidFunction fn = nullptr;
@@ -1918,6 +1962,7 @@ struct Host {
                     begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     api.check(api.BeginSession(session, &begin), "xrBeginSession");
                     running = true;
+                    applyRefreshRate();
                     sessionBeganTick = GetTickCount64();
                     if (++sessionGeneration == 0)
                         throw std::runtime_error("Session generation overflow");

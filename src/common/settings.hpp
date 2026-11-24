@@ -28,6 +28,10 @@ struct VrSettings {
     bool shadowReuse = true; // Dynamic shadow images rendered once per frame and reused for the second eye.
     bool desktopWorld = false; // Also draw the world into the desktop window on VR frames (costs a third render).
     float uiAspect = 16.f / 9; // Aspect the game lays out its 2D view (menus, HUD, movies) at in VR.
+    // Low-spec profile (Steam Frame and other ARM64 machines running the game under
+    // emulation): lower defaults and the game's costly effects off (see LowSpec).
+    bool lowSpec = false;
+    float refreshRate = 0; // Requested display refresh rate (Hz, XR_FB_display_refresh_rate); 0: the runtime's.
     float drawDistance = 2; // Multiplies the game's model detail and clutter distances (1 = as configured).
     float throwStrength = 2.5f; // Thrown objects' speed over the hand's (after the game's heavier gravity is matched).
     bool labWeaponAudit = false; // Private lab: cycle every weapon and log its hand references.

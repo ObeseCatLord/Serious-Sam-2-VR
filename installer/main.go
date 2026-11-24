@@ -25,6 +25,7 @@ var errAborted = errors.New("cancelled; nothing was changed")
 type options struct {
 	game, pkg, repo, apiURL       string
 	yes, dry, force, offline, ver bool
+	noSteamSetup                  bool
 }
 
 type app struct {
@@ -68,6 +69,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.BoolVar(&o.dry, "dry-run", false, "check everything but change nothing")
 	fs.BoolVar(&o.force, "force-reinstall", false, "reinstall even if the same version is installed")
 	fs.BoolVar(&o.offline, "offline", false, "status: do not contact GitHub")
+	fs.BoolVar(&o.noSteamSetup, "no-steam-setup", false, "Linux: leave Steam's launch options (and the Steam Frame's refresh rate) alone")
 	fs.BoolVar(&o.ver, "version", false, "print the installer version")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, usageText, version)
@@ -293,20 +295,33 @@ func (a *app) doInstall(game string, confirmFirst bool) error {
 	force := a.opts.force
 	if rec, err := readReceipt(game); err == nil && rec.Version == src.manifest.Version && !force {
 		if !a.prompt {
-			_, err := installOrUpdate(a.out, game, src.dir, src.manifest, a.opts.dry, false)
-			return err
+			if _, err := installOrUpdate(a.out, game, src.dir, src.manifest, a.opts.dry, false); err != nil {
+				return err
+			}
+			return a.afterInstall()
 		}
 		fmt.Fprintf(a.out, "SS2VR %s is already installed and up to date.\n", rec.Version)
 		if !a.confirm("Reinstall it anyway?") {
-			return nil
+			return a.afterInstall()
 		}
 		force, confirmFirst = true, false
 	}
 	if confirmFirst && !a.opts.dry && !a.opts.yes && !a.confirm("Install SS2VR "+src.manifest.Version+" into this game folder?") {
 		return errAborted
 	}
-	_, err = installOrUpdate(a.out, game, src.dir, src.manifest, a.opts.dry, force)
-	return err
+	if _, err = installOrUpdate(a.out, game, src.dir, src.manifest, a.opts.dry, force); err != nil {
+		return err
+	}
+	return a.afterInstall()
+}
+
+// afterInstall: Steam's side of the setup (Linux: launch options; Steam Frame:
+// refresh rate), unless --no-steam-setup.
+func (a *app) afterInstall() error {
+	if a.opts.noSteamSetup {
+		return nil
+	}
+	return a.steamSetup()
 }
 
 func (a *app) doUninstall(game string, confirmFirst bool) error {

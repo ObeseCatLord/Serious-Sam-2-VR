@@ -1,4 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
+#include "hook_memory.hpp"
 #include "common/winproc.hpp"
 #include "common/winpath.hpp"
 #include "game.hpp"
@@ -87,7 +88,7 @@ static void discoverChain(IDirect3DDevice9 *device, IDirect3DSwapChain9 *chain) 
     }
     auto &hook = chainHooks[index];
     const auto detour = index == 0 ? chainPresent<0> : chainPresent<1>;
-    const auto created = MH_CreateHook(address, reinterpret_cast<void *>(detour),
+    const auto created = ss2vr::createHook(address, reinterpret_cast<void *>(detour),
                                        reinterpret_cast<void **>(&hook.original));
     MH_STATUS enabled = MH_UNKNOWN;
     if (created == MH_OK) {
@@ -142,7 +143,7 @@ static void logHook(const char *name, const char *operation, MH_STATUS status,
 }
 template <class T> static void proxyHook(void *address, void *detour, T &original, const char *name) {
     static std::atomic<bool> createOk{false}, createFailed{false}, enableOk{false}, enableFailed{false};
-    const auto created = MH_CreateHook(address, detour, reinterpret_cast<void **>(&original));
+    const auto created = ss2vr::createHook(address, detour, reinterpret_cast<void **>(&original));
     logHook(name, "create", created, createOk, createFailed);
     if (created == MH_OK) {
         const auto enabled = MH_EnableHook(address);
