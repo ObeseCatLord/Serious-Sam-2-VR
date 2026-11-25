@@ -1815,6 +1815,34 @@ static void __fastcall challengeAuthenticate(void *self, void *, int client, voi
     const uint32_t state = client >= 0 && client < 16 ? primaryField(self, 0xa4 + 4 * unsigned(client)) : 0;
     log("Steam authentication of client %d (%08x%08x, ticket %d bytes): state %u", client, steam[1], steam[0], size, state);
 }
+// A dedicated server's Steam listing (the in-game server list, A2S) never said
+// that a password is needed, so players picked it there and were refused. A
+// server with a password (+pass sets net_strConnectPassword) now says so
+// (ISteamGameServer011::SetPasswordProtected, slot 16), checked every 2 s.
+using SteamStep = void(__thiscall *)(void *);
+static SteamStep originalSteamStep = nullptr;
+static void __fastcall steamStep(void *self, void *) {
+    originalSteamStep(self);
+    static DWORD next = 0;
+    static int advertised = -1;
+    const DWORD now = GetTickCount();
+    if (int(now - next) < 0) return;
+    next = now + 2000;
+    static const auto password = reinterpret_cast<const char *const *>(
+        GetProcAddress(GetModuleHandleW(L"Engine.dll"), "?net_strConnectPassword@SeriousEngine@@3VCString@1@A"));
+    const char *text = password && readableMemory(password, sizeof *password) ? *password : nullptr;
+    const bool locked = text && readableMemory(text, 1) && *text;
+    using SteamInterface = void *(__cdecl *)();
+    static const auto steamServer = loadProc<SteamInterface>(GetModuleHandleW(L"steam_api.dll"), "SteamGameServer");
+    void *server = steamServer ? steamServer() : nullptr;
+    if (!server) return;
+    using SetPasswordProtected = void(__thiscall *)(void *, bool);
+    reinterpret_cast<SetPasswordProtected>((*static_cast<void ***>(server))[16])(server, locked);
+    if (int(locked) != advertised) {
+        advertised = int(locked);
+        log("Steam server listing: password %s", locked ? "required" : "not required");
+    }
+}
 static uintptr_t sprintPatchedBase = 0;
 static bool patchSprintForward(HMODULE game) {
     const auto base = reinterpret_cast<uintptr_t>(game);
@@ -13382,6 +13410,9 @@ bool attach(bool headless) {
           originalSteamClientApprove);
         H(e, "?ChallengeAuthenticate@CSteamOnlineInterface@SeriousEngine@@UAEXJAAVCSteamID@@PAEJ@Z", challengeAuthenticate,
           originalChallengeAuthenticate);
+        // Optional: the listing's password flag (nothing else depends on it).
+        hook(e, "?Step@CSteamOnlineInterface@SeriousEngine@@UAEXXZ", reinterpret_cast<void *>(steamStep),
+             reinterpret_cast<void **>(&originalSteamStep));
         H(g, "?InitializeHeadUpDisplay@CPlayerPuppetEntity@SeriousEngine@@QAEXXZ", serverInitializeHud, originalInitializeHud);
         ok = symbol(g, "?GetCameraPlacement@CPuppetEntity@SeriousEngine@@UAE?AVQuatVect@2@XZ",
                     originalCamera) &&
