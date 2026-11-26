@@ -31,6 +31,7 @@ struct VrSettings {
     // Low-spec profile (Steam Frame and other ARM64 machines running the game under
     // emulation): lower defaults and the game's costly effects off (see LowSpec).
     bool lowSpec = false;
+    bool renderScaleSet = false; // [Render] Scale chosen in SS2VR.user.ini (never adjusted).
     float refreshRate = 0; // Requested display refresh rate (Hz, XR_FB_display_refresh_rate); 0: the runtime's.
     float drawDistance = 2; // Multiplies the game's model detail and clutter distances (1 = as configured).
     float throwStrength = 2.5f; // Thrown objects' speed over the hand's (after the game's heavier gravity is matched).

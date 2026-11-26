@@ -43,6 +43,13 @@ On Linux the installer sets the game's Steam launch options to (or add them your
 WINEDLLOVERRIDES="d3d9=n,b" PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 %command%
 ```
 
+**Windows performance:** on Windows the game's Direct3D 9 device cannot hand its eye
+images to the headset directly, so they are copied through the CPU and the eyes render
+at 0.7 of the headset's recommended size. An experimental faster mode shares them
+directly: add `D3D9Ex=1` under `[Render]` in `Bin/SS2VR/SS2VR.user.ini` (create the
+file if it does not exist). If the game then looks wrong, remove the line and please
+send `Bin/SS2VR.log`. Linux (Proton) already shares them directly.
+
 ### Steam Frame (standalone)
 
 The game runs on the Frame itself (Proton for ARM64 with x86 emulation), no PC needed.

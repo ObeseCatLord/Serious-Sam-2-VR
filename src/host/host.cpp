@@ -1249,6 +1249,7 @@ struct OptionsButton {
 constexpr float OptionsWidth = 1.f, OptionsAspect = .75f, OptionsDistance = 1.f;
 constexpr float OptionsButtonWidth = .5f, OptionsButtonAspect = .25f, OptionsButtonGap = .06f;
 
+constexpr double CpuPairScale = .7; // See Host::cpuPairs.
 struct Host {
     Log &log;
     Api api;
@@ -1313,6 +1314,10 @@ struct Host {
     Com<ID3D11Texture2D> sharedEye[2][2];
     uint32_t sharedOpened = 0, sharedTried = 0, sharedWidth = 0, sharedHeight = 0;
     uint64_t zeroCopyPairs = 0, latched = 0, capturePolls = 0;
+    // Windows itself (not Wine): eye pairs arrive through the CPU (the game could not
+    // share its images), so the eyes are made smaller to keep those copies short.
+    bool cpuPairs = false;
+    unsigned cpuPairStreak = 0;
     Actions actions;
     WorldSubmissionStream worldSubmission;
     Swapchain eye[2];
@@ -1513,12 +1518,28 @@ struct Host {
         if (instance && api.DestroyInstance)
             api.cleanup(api.DestroyInstance(instance), "xrDestroyInstance");
     }
-    bool drainGpu() noexcept {
+    void noteDrainRetry(const char *what) noexcept {
+        static unsigned traced = 0;
+        if (traced++ < 8) {
+            char line[96];
+            std::snprintf(line, sizeof line, "GPU busy before %s; retried next frame", what);
+            log.write(line);
+        }
+    }
+    // A resize retried after a failed drain waits briefly, so a GPU that stays busy
+    // costs the frame loop little (the next frame tries again).
+    bool resizeDrainFailed = false;
+    bool resizeDrain() noexcept {
+        const bool ok = drainGpu(resizeDrainFailed ? 20 : 500);
+        resizeDrainFailed = !ok;
+        return ok;
+    }
+    bool drainGpu(ULONGLONG timeoutMs = 500) noexcept {
         if (!context.p || !drainQuery.p)
             return true; // No upload can precede creation of this query.
         context->End(drainQuery.p);
         context->Flush();
-        const ULONGLONG deadline = GetTickCount64() + 500;
+        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
         for (;;) {
             const HRESULT result = context->GetData(drainQuery.p, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
             if (result == S_OK || FAILED(device->GetDeviceRemovedReason()))
@@ -2148,7 +2169,7 @@ struct Host {
         maxWidth = std::min(maxWidth, g.maxSwapchainImageWidth);
         maxHeight = std::min(maxHeight, g.maxSwapchainImageHeight);
         if (!width || !height || !maxWidth || !maxHeight) return {0, 0};
-        const double scale = settings.renderScale;
+        const double scale = settings.renderScale * (cpuPairs ? CpuPairScale : 1.);
         return {std::clamp(uint32_t(std::lround(width * scale)), 1u, maxWidth),
                 std::clamp(uint32_t(std::lround(height * scale)), 1u, maxHeight)};
     }
@@ -2270,8 +2291,10 @@ struct Host {
             return;
         invalidateCachedPair();
         cancelRequests();
-        if (!drainGpu())
-            throw std::runtime_error("GPU did not drain before eye swapchain resize");
+        if (!resizeDrain()) {
+            noteDrainRetry("eye swapchain resize");
+            return; // Tried again with the next request.
+        }
         for (auto &chain : eye)
             chain.destroy();
         XrSwapchainCreateInfoFoveationFB foveationInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO_FOVEATION_FB};
@@ -2474,8 +2497,10 @@ struct Host {
             return;
         invalidateCachedPair();
         cancelRequests();
-        if (!drainGpu())
-            throw std::runtime_error("GPU did not drain before inset swapchain resize");
+        if (!resizeDrain()) {
+            noteDrainRetry("inset swapchain resize");
+            return; // Tried again with the next request (eyeChains cancelled it).
+        }
         for (auto &chain : inset)
             chain.destroy();
         for (auto &chain : inset)
@@ -2594,6 +2619,14 @@ struct Host {
                         (reply.foveated != 1 || insets);
                     for (unsigned h = 0; h < 2; h++)
                         source[h] = accepted && !zeroCopy ? pixels.buffer(slotPixelBuffer(candidate, h)) : nullptr;
+                    // Thirty CPU pairs in a row (one now and then happens while images are
+                    // recreated): sharing is not working on this machine.
+                    if (accepted) cpuPairStreak = zeroCopy ? 0 : cpuPairStreak + 1;
+                    if (accepted && cpuPairStreak >= 30 && !cpuPairs && !settings.renderScaleSet && !settings.lowSpec &&
+                        !GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version")) {
+                        cpuPairs = true;
+                        log.write("Eye pairs copied through the CPU (no shared images): eyes at 0.7 of the recommended size");
+                    }
                     if (accepted && reply.foveated == 1) {
                         accepted = foveationFits(reply.width, reply.height, reply.lowWidth, reply.lowHeight,
                                                  reply.insetWidth, reply.insetHeight);
@@ -3350,8 +3383,12 @@ struct Host {
             const auto &limits = systemProperties.graphicsProperties;
             if (width > limits.maxSwapchainImageWidth || height > limits.maxSwapchainImageHeight)
                 return;
-            if (!drainGpu())
-                throw std::runtime_error("GPU drain before menu resize failed");
+            // A busy GPU (Windows: each eye uploaded from the CPU) may not drain in
+            // time: no menu layer this frame, tried again next frame; never end VR.
+            if (!resizeDrain()) {
+                noteDrainRetry("menu resize");
+                return;
+            }
             menuChain.destroy();
             menuChain.create(api, session, width, imageHeight);
             menuSequence = 0;

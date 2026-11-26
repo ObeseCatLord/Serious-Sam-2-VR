@@ -288,8 +288,11 @@ static bool boundInputs(IDirect3DDevice9 *d,BoundInputs &b,const ScopeIndexedDra
     if(index.Type!=D3DRTYPE_INDEXBUFFER)return fail(17);
     if(!identity(b.index,b.identity[4],&result))return fail(18);
     if(!identity(b.declaration,b.identity[5],&result))return fail(19);
-    b.values.vertex={vertex.Size,vertex.Usage,uint32_t(vertex.Pool),uint32_t(vertex.Format),vertex.FVF};
-    b.values.index={index.Size,index.Usage,uint32_t(index.Pool),uint32_t(index.Format),0};
+    // Under Direct3D 9Ex (Windows) the game's managed buffers were created in the
+    // default pool (proxy): they are still the game's own, as the layouts expect.
+    const auto pool=[](D3DPOOL p){return uint32_t(managedEmulated() && p==D3DPOOL_DEFAULT ? D3DPOOL_MANAGED : p);};
+    b.values.vertex={vertex.Size,vertex.Usage,pool(vertex.Pool),uint32_t(vertex.Format),vertex.FVF};
+    b.values.index={index.Size,index.Usage,pool(index.Pool),uint32_t(index.Format),0};
     b.values.indexObject=reinterpret_cast<uintptr_t>(b.identity[4]);
     if(diagnostic){diagnostic->valid|=4;diagnostic->inputs=b.values;}
     ScopeCopyRanges ranges;

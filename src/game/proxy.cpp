@@ -27,6 +27,147 @@ using AdditionalChain = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DPRESENT_PARAMET
 using ChainPresent = HRESULT(WINAPI *)(IDirect3DSwapChain9 *, const RECT *, const RECT *, HWND,
                                      const RGNDATA *, DWORD);
 static AdditionalChain originalAdditional = nullptr;
+// Windows itself (not Wine/Proton): a classic Direct3D 9 device cannot share its
+// eye images with the headset program (D3D11), so every frame went through the
+// CPU (single-digit frame rates). The game's device is created from Direct3D 9Ex
+// instead, whose render targets can be shared. 9Ex refuses the managed pool, which
+// the game uses for its textures and meshes: those are created in the default
+// pool instead (textures dynamic, so the game can still lock and fill them).
+// [Render] D3D9Ex: 1 on (Windows only), 0 off (default until confirmed on Windows).
+using ss2vr::game::managedEmulation;
+static UINT factoryVersion = D3D_SDK_VERSION; // The version the game asked for.
+using CreateTextureFn = HRESULT(WINAPI *)(IDirect3DDevice9 *, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+                                          IDirect3DTexture9 **, HANDLE *);
+using CreateVolumeFn = HRESULT(WINAPI *)(IDirect3DDevice9 *, UINT, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+                                         IDirect3DVolumeTexture9 **, HANDLE *);
+using CreateCubeFn = HRESULT(WINAPI *)(IDirect3DDevice9 *, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+                                       IDirect3DCubeTexture9 **, HANDLE *);
+using CreateVertexFn = HRESULT(WINAPI *)(IDirect3DDevice9 *, UINT, DWORD, DWORD, D3DPOOL, IDirect3DVertexBuffer9 **,
+                                         HANDLE *);
+using CreateIndexFn = HRESULT(WINAPI *)(IDirect3DDevice9 *, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DIndexBuffer9 **,
+                                        HANDLE *);
+static CreateTextureFn originalCreateTexture = nullptr;
+static CreateVolumeFn originalCreateVolume = nullptr;
+static CreateCubeFn originalCreateCube = nullptr;
+static CreateVertexFn originalCreateVertex = nullptr;
+static CreateIndexFn originalCreateIndex = nullptr;
+static void noteManaged(const char *kind, HRESULT hr) {
+    static std::atomic<unsigned> converted{0}, failed{0};
+    if (SUCCEEDED(hr)) {
+        if (converted.fetch_add(1, std::memory_order_relaxed) == 0)
+            ss2vr::game::log("Direct3D 9Ex: managed %s created in the default pool", kind);
+    } else if (failed.fetch_add(1, std::memory_order_relaxed) < 8)
+        ss2vr::game::log("Direct3D 9Ex: default-pool %s refused hr=%08lx", kind, static_cast<unsigned long>(hr));
+}
+// Textures: dynamic so they stay lockable (default-pool textures can be locked only
+// when dynamic). A format or usage the driver refuses as dynamic is created static:
+// it cannot be locked, so it is logged (format/usage) for a Windows report.
+static void noteStatic(const char *kind, D3DFORMAT format, DWORD usage) {
+    static std::atomic<unsigned> traced{0};
+    if (traced.fetch_add(1, std::memory_order_relaxed) < 16)
+        ss2vr::game::log("Direct3D 9Ex: %s format=%lu usage=%08lx not available dynamic; created static (not lockable)",
+                         kind, static_cast<unsigned long>(format), static_cast<unsigned long>(usage));
+}
+static HRESULT WINAPI createTexture(IDirect3DDevice9 *d, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT format,
+                                    D3DPOOL pool, IDirect3DTexture9 **out, HANDLE *share) {
+    if (pool != D3DPOOL_MANAGED || !managedEmulation.load(std::memory_order_relaxed))
+        return originalCreateTexture(d, w, h, levels, usage, format, pool, out, share);
+    HRESULT hr = originalCreateTexture(d, w, h, levels, usage | D3DUSAGE_DYNAMIC, format, D3DPOOL_DEFAULT, out, share);
+    if (FAILED(hr)) {
+        hr = originalCreateTexture(d, w, h, levels, usage, format, D3DPOOL_DEFAULT, out, share);
+        if (SUCCEEDED(hr)) noteStatic("texture", format, usage);
+    }
+    noteManaged("texture", hr);
+    return hr;
+}
+static HRESULT WINAPI createVolume(IDirect3DDevice9 *d, UINT w, UINT h, UINT depth, UINT levels, DWORD usage,
+                                   D3DFORMAT format, D3DPOOL pool, IDirect3DVolumeTexture9 **out, HANDLE *share) {
+    if (pool != D3DPOOL_MANAGED || !managedEmulation.load(std::memory_order_relaxed))
+        return originalCreateVolume(d, w, h, depth, levels, usage, format, pool, out, share);
+    HRESULT hr = originalCreateVolume(d, w, h, depth, levels, usage | D3DUSAGE_DYNAMIC, format, D3DPOOL_DEFAULT, out, share);
+    if (FAILED(hr)) {
+        hr = originalCreateVolume(d, w, h, depth, levels, usage, format, D3DPOOL_DEFAULT, out, share);
+        if (SUCCEEDED(hr)) noteStatic("volume texture", format, usage);
+    }
+    noteManaged("volume texture", hr);
+    return hr;
+}
+static HRESULT WINAPI createCube(IDirect3DDevice9 *d, UINT edge, UINT levels, DWORD usage, D3DFORMAT format,
+                                 D3DPOOL pool, IDirect3DCubeTexture9 **out, HANDLE *share) {
+    if (pool != D3DPOOL_MANAGED || !managedEmulation.load(std::memory_order_relaxed))
+        return originalCreateCube(d, edge, levels, usage, format, pool, out, share);
+    HRESULT hr = originalCreateCube(d, edge, levels, usage | D3DUSAGE_DYNAMIC, format, D3DPOOL_DEFAULT, out, share);
+    if (FAILED(hr)) {
+        hr = originalCreateCube(d, edge, levels, usage, format, D3DPOOL_DEFAULT, out, share);
+        if (SUCCEEDED(hr)) noteStatic("cube texture", format, usage);
+    }
+    noteManaged("cube texture", hr);
+    return hr;
+}
+// One line per start for a Windows report: what this driver allows of the
+// textures the game's managed ones became.
+static void selfTest(IDirect3DDevice9 *d) {
+    char line[256]{};
+    int used = std::snprintf(line, sizeof line, "Direct3D 9Ex self-test:");
+    const struct { const char *name; D3DFORMAT format; } formats[]{
+        {"A8R8G8B8", D3DFMT_A8R8G8B8}, {"DXT1", D3DFMT_DXT1}, {"DXT3", D3DFMT_DXT3}, {"DXT5", D3DFMT_DXT5}};
+    for (const auto &f : formats) {
+        IDirect3DTexture9 *t = nullptr;
+        HRESULT created = originalCreateTexture(d, 64, 64, 0, D3DUSAGE_DYNAMIC, f.format, D3DPOOL_DEFAULT, &t, nullptr);
+        bool locked = false;
+        if (SUCCEEDED(created) && t) {
+            D3DLOCKED_RECT r{};
+            locked = SUCCEEDED(t->LockRect(1, &r, nullptr, 0)) && r.pBits;
+            if (locked) t->UnlockRect(1);
+            t->Release();
+        }
+        IDirect3DCubeTexture9 *c = nullptr;
+        const bool cube = SUCCEEDED(originalCreateCube(d, 64, 0, D3DUSAGE_DYNAMIC, f.format, D3DPOOL_DEFAULT, &c, nullptr)) && c;
+        if (c) c->Release();
+        IDirect3DTexture9 *a = nullptr;
+        const bool autogen = SUCCEEDED(originalCreateTexture(d, 64, 64, 0, D3DUSAGE_DYNAMIC | D3DUSAGE_AUTOGENMIPMAP, f.format,
+                                                             D3DPOOL_DEFAULT, &a, nullptr)) && a;
+        if (a) a->Release();
+        if (used > 0 && used < int(sizeof line))
+            used += std::snprintf(line + used, sizeof line - used, " %s dynamic=%d lock=%d cube=%d autogen=%d", f.name,
+                                  int(SUCCEEDED(created)), int(locked), int(cube), int(autogen));
+    }
+    ss2vr::game::log("%s", line);
+}
+// Buffers in the default pool stay lockable (static, as the game made them).
+static HRESULT WINAPI createVertex(IDirect3DDevice9 *d, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool,
+                                   IDirect3DVertexBuffer9 **out, HANDLE *share) {
+    if (pool != D3DPOOL_MANAGED || !managedEmulation.load(std::memory_order_relaxed))
+        return originalCreateVertex(d, length, usage, fvf, pool, out, share);
+    const HRESULT hr = originalCreateVertex(d, length, usage, fvf, D3DPOOL_DEFAULT, out, share);
+    noteManaged("vertex buffer", hr);
+    return hr;
+}
+static HRESULT WINAPI createIndex(IDirect3DDevice9 *d, UINT length, DWORD usage, D3DFORMAT format, D3DPOOL pool,
+                                  IDirect3DIndexBuffer9 **out, HANDLE *share) {
+    if (pool != D3DPOOL_MANAGED || !managedEmulation.load(std::memory_order_relaxed))
+        return originalCreateIndex(d, length, usage, format, pool, out, share);
+    const HRESULT hr = originalCreateIndex(d, length, usage, format, D3DPOOL_DEFAULT, out, share);
+    noteManaged("index buffer", hr);
+    return hr;
+}
+static bool wantD3D9Ex() {
+    // Lab: SS2VR_LAB_D3D9EX=1 takes this route under Wine too (DXVK), to exercise it.
+    wchar_t lab[2]{};
+    if (GetEnvironmentVariableW(L"SS2VR_LAB_D3D9EX", lab, 2) == 1 && lab[0] == L'1') return true;
+    if (GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version")) return false; // DXVK shares already.
+    std::wstring bin;
+    if (!ss2vr::moduleDirectory(nullptr, bin)) return true;
+    int value = -1;
+    for (const wchar_t *name : {L"SS2VR\\SS2VR.user.ini", L"SS2VR\\SS2VR.ini"}) {
+        wchar_t buffer[16]{};
+        if (GetPrivateProfileStringW(L"Render", L"D3D9Ex", L"", buffer, 16, (bin + name).c_str())) {
+            value = _wtoi(buffer);
+            break;
+        }
+    }
+    return value == 1; // Opt-in until confirmed on Windows drivers.
+}
 // Two method implementations suffice for this bounded discovery probe. Unknown
 // implementations are logged and left untouched, never mapped to a wrong ABI.
 static struct ChainHook { void *address = nullptr; ChainPresent original = nullptr; bool enabled = false; }
@@ -243,6 +384,15 @@ static HRESULT WINAPI reset(IDirect3DDevice9 *d, D3DPRESENT_PARAMETERS *p) {
 static HRESULT WINAPI createDevice(IDirect3D9 *api, UINT adapter, D3DDEVTYPE type, HWND window, DWORD flags,
                                    D3DPRESENT_PARAMETERS *p, IDirect3DDevice9 **out) {
     HRESULT hr = originalCreate(api, adapter, type, window, flags, p, out);
+    if (FAILED(hr) && managedEmulation.load(std::memory_order_relaxed) && create9) {
+        // The 9Ex device was refused: a classic device from a classic factory instead.
+        ss2vr::game::log("Direct3D 9Ex CreateDevice failed hr=%08lx; classic device", static_cast<unsigned long>(hr));
+        managedEmulation.store(false, std::memory_order_relaxed);
+        if (IDirect3D9 *classic = create9(factoryVersion)) {
+            hr = originalCreate(classic, adapter, type, window, flags, p, out);
+            classic->Release(); // The device keeps its factory alive.
+        }
+    }
     static std::atomic<bool> createOk{false}, createFailed{false};
     auto &reported = SUCCEEDED(hr) ? createOk : createFailed;
     if (!reported.exchange(true, std::memory_order_relaxed))
@@ -258,6 +408,14 @@ static HRESULT WINAPI createDevice(IDirect3D9 *api, UINT adapter, D3DDEVTYPE typ
             proxyHook(table[17], reinterpret_cast<void *>(present), originalPresent, "Present");
         if (!originalAdditional)
             proxyHook(table[13], reinterpret_cast<void *>(additionalChain), originalAdditional, "AdditionalSwapChain");
+        if (managedEmulation.load(std::memory_order_relaxed) && !originalCreateTexture) {
+            proxyHook(table[23], reinterpret_cast<void *>(createTexture), originalCreateTexture, "CreateTexture");
+            proxyHook(table[24], reinterpret_cast<void *>(createVolume), originalCreateVolume, "CreateVolumeTexture");
+            proxyHook(table[25], reinterpret_cast<void *>(createCube), originalCreateCube, "CreateCubeTexture");
+            proxyHook(table[26], reinterpret_cast<void *>(createVertex), originalCreateVertex, "CreateVertexBuffer");
+            proxyHook(table[27], reinterpret_cast<void *>(createIndex), originalCreateIndex, "CreateIndexBuffer");
+            if (originalCreateTexture && originalCreateCube) selfTest(*out);
+        }
         ss2vr::game::deviceCreated(*out);
         seedChain(*out);
     }
@@ -269,7 +427,19 @@ extern "C" __declspec(dllexport) IDirect3D9 *WINAPI Direct3DCreate9(UINT version
     // On the fingerprinted native startup route this synchronous boundary
     // precedes onlInitialize. The lab adapter fails closed if unavailable.
     ss2vr::game::installLabOnlineIsolation();
-    IDirect3D9 *api = create9 ? create9(version) : nullptr;
+    IDirect3D9 *api = nullptr;
+    factoryVersion = version;
+    if (vrEnabled && create9ex && wantD3D9Ex()) {
+        IDirect3D9Ex *ex = nullptr;
+        const HRESULT hr = create9ex(version, &ex);
+        if (SUCCEEDED(hr) && ex) {
+            api = ex; // IDirect3D9Ex extends IDirect3D9: the game keeps its classic calls.
+            managedEmulation.store(true, std::memory_order_relaxed);
+            ss2vr::game::log("Startup Direct3D 9Ex: eye images can be shared with the headset program");
+        } else
+            ss2vr::game::log("Startup Direct3D 9Ex unavailable hr=%08lx; classic device", static_cast<unsigned long>(hr));
+    }
+    if (!api) api = create9 ? create9(version) : nullptr;
     static std::atomic<bool> apiOk{false}, apiFailed{false};
     auto &reported = api ? apiOk : apiFailed;
     if (!reported.exchange(true, std::memory_order_relaxed))

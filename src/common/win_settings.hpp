@@ -70,6 +70,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.scopeZoomByEye = number(L"Scope", L"ZoomByEye", 1, 0, 1) >= .5f;
     settings.scopeIdleMagnification = number(L"Scope", L"IdleMagnification", 4, 1.5f, 10);
     settings.renderScale = profiled(L"Render", L"Scale", 1, .75f, .25f, 4);
+    settings.renderScaleSet = userHas(L"Render", L"Scale");
     settings.foveation.mode = int(number(L"Render", L"Foveation", 1, 0, 2) + .5f);
     settings.desktopWorld = number(L"Render", L"DesktopWorld", 0, 0, 1) >= .5f;
     settings.shadowReuse = number(L"Render", L"ShadowReuse", 1, 0, 1) >= .5f;
