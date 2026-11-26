@@ -25,6 +25,10 @@ enum class HostStep {
 };
 struct HostSupervisor {
     static constexpr uint64_t StartMs = 30000, ExitMs = 10000, StableMs = 30000;
+    // Hosts started again, before VR ran, because the runtime was still starting.
+    static constexpr unsigned MaxRuntimeRetries = 6;
+    unsigned runtimeRetries = 0;
+    bool retrying = false;
     uint64_t since = 0, downSince = 0, restartAt = 0, startedAt = 0, healthySince = 0;
     unsigned failures = 0;
     bool seen = false, vrStarted = false, desktop = false, awaitingConnect = false, terminated = false;
@@ -42,6 +46,7 @@ struct HostSupervisor {
         if (o.session) vrStarted = true;
         const bool connected = o.spawned && o.alive && o.hostPid && !o.error;
         if (connected) {
+            retrying = false;
             downSince = 0;
             awaitingConnect = terminated = false;
             if (!healthySince) healthySince = std::max<uint64_t>(o.now, 1);
@@ -49,7 +54,17 @@ struct HostSupervisor {
             return HostStep::None;
         }
         healthySince = 0;
-        if (!vrStarted) {
+        if (!vrStarted && o.error == HostErrorRuntimeStarting && !retrying) {
+            // The runtime was still starting (SteamVR launched by the host restarts its
+            // server once) or had no headset yet: a new host, a bounded number of times.
+            if (runtimeRetries >= MaxRuntimeRetries) return fallback("the VR runtime did not become ready");
+            ++runtimeRetries;
+            retrying = true;
+        }
+        // Whatever goes wrong while retrying (a host that never connects, exits or
+        // cannot be created) ends in desktop play after as many restarts.
+        if (!vrStarted && retrying && failures > MaxRuntimeRetries) return fallback("the VR runtime did not become ready");
+        if (!vrStarted && !retrying) {
             if (o.error) return fallback("headset host reported an error");
             if (seen && !o.hostPid) return fallback("headset host exited");
             if (o.spawned && !o.alive) return fallback("headset host exited before it connected");
@@ -64,7 +79,8 @@ struct HostSupervisor {
             return HostStep::Terminate;
         }
         if (!downSince) {
-            down(o.now, o.error ? "reported an error" : process ? "stopped" : "exited");
+            down(o.now, o.error == HostErrorRuntimeStarting ? "found the VR runtime still starting" :
+                         o.error ? "reported an error" : process ? "stopped" : "exited");
             return HostStep::Stopped;
         }
         if (process) {

@@ -60,6 +60,57 @@ void beforeVr() {
         assert(s.step(at(600100, true, true, 77, 0, 1)) == HostStep::None && s.vrStarted);
     }
 }
+void runtimeStarting() {
+    { // SteamVR started by the host restarts once: the host reports "still starting", a
+      // new host follows and VR runs.
+        HostSupervisor s;
+        assert(s.step(at(1000, true, true, 77, 0, 0)) == HostStep::None);
+        assert(s.step(at(4000, true, true, 0, HostErrorRuntimeStarting, 0)) == HostStep::Stopped && !s.desktop);
+        assert(s.retrying && s.runtimeRetries == 1);
+        assert(s.step(at(4500, true, false, 0, HostErrorRuntimeStarting, 0)) == HostStep::None); // Delay 1 s.
+        assert(s.step(at(5000, true, false, 0, HostErrorRuntimeStarting, 0)) == HostStep::Restart);
+        s.restarted(5000, true);
+        assert(s.step(at(5100, true, true, 0, 0, 0)) == HostStep::None);   // Starting, not "exited".
+        assert(s.step(at(6000, true, true, 78, 0, 0)) == HostStep::None && !s.retrying);
+        assert(s.step(at(9000, true, true, 78, 0, 1)) == HostStep::None && s.vrStarted && !s.desktop);
+    }
+    { // A runtime that never becomes ready: desktop after the bounded retries.
+        HostSupervisor s;
+        uint64_t t = 1000;
+        uint32_t pid = 77;
+        HostStep step = HostStep::None;
+        for (int i = 0; i != 40 && !s.desktop; ++i) {
+            assert(s.step(at(t, true, true, pid, 0, 0)) == HostStep::None || s.desktop);
+            t += 500;
+            step = s.step(at(t, true, false, 0, HostErrorRuntimeStarting, 0));
+            while (step == HostStep::Stopped || step == HostStep::None) {
+                if (s.desktop) break;
+                t += 500;
+                step = s.step(at(t, true, false, 0, HostErrorRuntimeStarting, 0));
+            }
+            if (step == HostStep::Restart) s.restarted(t, true);
+            ++pid;
+        }
+        assert(s.desktop && s.runtimeRetries == HostSupervisor::MaxRuntimeRetries);
+    }
+    { // A plain host error before VR is still desktop play at once.
+        HostSupervisor s;
+        assert(s.step(at(1000, true, true, 77, 0, 0)) == HostStep::None);
+        assert(s.step(at(2000, true, true, 0, HostErrorFailed, 0)) == HostStep::Desktop);
+    }
+    { // A retried host that crashes before connecting does not loop forever.
+        HostSupervisor s;
+        assert(s.step(at(1000, true, true, 77, 0, 0)) == HostStep::None);
+        uint64_t t = 2000;
+        assert(s.step(at(t, true, false, 0, HostErrorRuntimeStarting, 0)) == HostStep::Stopped);
+        for (int i = 0; i != 200 && !s.desktop; ++i) {
+            t += 1000;
+            const HostStep step = s.step(at(t, true, false, 0, 0, 0));
+            if (step == HostStep::Restart) s.restarted(t, true);
+        }
+        assert(s.desktop);
+    }
+}
 void afterVr() {
     { // VR ran and ended between two observations (a load presents no frame): still VR.
         HostSupervisor s;
@@ -228,6 +279,7 @@ void focus() {
 } // namespace
 int main() {
     beforeVr();
+    runtimeStarting();
     afterVr();
     channel();
     focus();

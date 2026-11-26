@@ -161,6 +161,9 @@ struct HandVelocity {
     Vec3 linear{}, angular{};
     uint32_t valid = 0, reserved = 0;
 };
+// Shared::error: 0 none, HostErrorFailed, or HostErrorRuntimeStarting (the OpenXR
+// runtime was still starting or had no headset yet: a new host may succeed).
+constexpr uint32_t HostErrorFailed = 1, HostErrorRuntimeStarting = 2;
 struct Shared {
     uint32_t magic = Magic, abi = Abi, bytes = sizeof(Shared), gamePid = 0;
     uint32_t hostPid = 0, width = 0, height = 0, shutdown = 0, rendererReady = 0, error = 0;

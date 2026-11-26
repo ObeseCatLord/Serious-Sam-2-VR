@@ -105,8 +105,10 @@ static HRESULT WINAPI createCube(IDirect3DDevice9 *d, UINT edge, UINT levels, DW
     return hr;
 }
 // One line per start for a Windows report: what this driver allows of the
-// textures the game's managed ones became.
-static void selfTest(IDirect3DDevice9 *d) {
+// textures the game's managed ones became. False when a format the game's
+// textures use cannot be created dynamic and locked: the classic device then.
+static bool selfTest(IDirect3DDevice9 *d) {
+    bool usable = true;
     char line[256]{};
     int used = std::snprintf(line, sizeof line, "Direct3D 9Ex self-test:");
     const struct { const char *name; D3DFORMAT format; } formats[]{
@@ -131,8 +133,10 @@ static void selfTest(IDirect3DDevice9 *d) {
         if (used > 0 && used < int(sizeof line))
             used += std::snprintf(line + used, sizeof line - used, " %s dynamic=%d lock=%d cube=%d autogen=%d", f.name,
                                   int(SUCCEEDED(created)), int(locked), int(cube), int(autogen));
+        usable = usable && SUCCEEDED(created) && locked;
     }
     ss2vr::game::log("%s", line);
+    return usable;
 }
 // Buffers in the default pool stay lockable (static, as the game made them).
 static HRESULT WINAPI createVertex(IDirect3DDevice9 *d, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool,
@@ -166,7 +170,7 @@ static bool wantD3D9Ex() {
             break;
         }
     }
-    return value == 1; // Opt-in until confirmed on Windows drivers.
+    return value != 0; // Default on (Windows); D3D9Ex=0 keeps the classic device.
 }
 // Two method implementations suffice for this bounded discovery probe. Unknown
 // implementations are logged and left untouched, never mapped to a wrong ABI.
@@ -414,7 +418,21 @@ static HRESULT WINAPI createDevice(IDirect3D9 *api, UINT adapter, D3DDEVTYPE typ
             proxyHook(table[25], reinterpret_cast<void *>(createCube), originalCreateCube, "CreateCubeTexture");
             proxyHook(table[26], reinterpret_cast<void *>(createVertex), originalCreateVertex, "CreateVertexBuffer");
             proxyHook(table[27], reinterpret_cast<void *>(createIndex), originalCreateIndex, "CreateIndexBuffer");
-            if (originalCreateTexture && originalCreateCube) selfTest(*out);
+            if (originalCreateTexture && originalCreateCube && !selfTest(*out) && create9) {
+                // Nothing else holds the device yet: a classic one replaces it.
+                managedEmulation.store(false, std::memory_order_relaxed);
+                IDirect3DDevice9 *classicDevice = nullptr;
+                HRESULT classicHr = D3DERR_NOTAVAILABLE;
+                if (IDirect3D9 *classic = create9(factoryVersion)) {
+                    (*out)->Release();
+                    *out = nullptr;
+                    classicHr = originalCreate(classic, adapter, type, window, flags, p, &classicDevice);
+                    classic->Release();
+                }
+                ss2vr::game::log("Direct3D 9Ex self-test failed; classic device hr=%08lx", static_cast<unsigned long>(classicHr));
+                if (FAILED(classicHr)) return classicHr;
+                *out = classicDevice;
+            }
         }
         ss2vr::game::deviceCreated(*out);
         seedChain(*out);

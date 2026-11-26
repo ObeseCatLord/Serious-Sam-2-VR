@@ -1255,7 +1255,7 @@ struct Host {
     Api api;
     Channel channel;
     Handle gameProcess;
-    bool ownsChannel = false, running = false, quit = false, failed = false;
+    bool ownsChannel = false, running = false, quit = false, failed = false, runtimeStarting = false;
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId system = XR_NULL_SYSTEM_ID;
     XrSession session = XR_NULL_HANDLE;
@@ -1591,7 +1591,7 @@ struct Host {
                 channel.shared->worldSubmission=worldSubmission.value;
                 channel.shared->pointer = {};
                 if (failed && !channel.shared->error)
-                    channel.shared->error = 1;
+                    channel.shared->error = runtimeStarting ? HostErrorRuntimeStarting : HostErrorFailed;
                 channel.shared->hostPid = 0;
                 // Invalidate input even if a damaged slot cannot be reaped. Only
                 // touch requests we own, and never release a Rendering slot.
@@ -1685,7 +1685,12 @@ struct Host {
         create.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
         create.enabledExtensionCount = uint32_t(enabled.size());
         create.enabledExtensionNames = enabled.data();
-        api.check(api.CreateInstance(&create, &instance), "xrCreateInstance");
+        // SteamVR started by this call restarts its server once while it comes up, and
+        // the first instance fails with XR_ERROR_RUNTIME_FAILURE: the game starts a new
+        // host (see HostSupervisor) instead of playing on the desktop.
+        const XrResult instanceResult = api.CreateInstance(&create, &instance);
+        runtimeStarting = instanceResult == XR_ERROR_RUNTIME_FAILURE || instanceResult == XR_ERROR_RUNTIME_UNAVAILABLE;
+        api.check(instanceResult, "xrCreateInstance");
         log.write(frameController ? "Frame controller extension enabled; native profile bindings available" :
                                    "Frame controller extension unavailable; existing runtime profile fallbacks retained");
         for (const auto &name : profileExtensions) log.write(("Controller profile extension enabled: " + name).c_str());
@@ -1702,7 +1707,9 @@ struct Host {
         log.write("OpenXR enabled extension: XR_KHR_D3D11_enable");
         XrSystemGetInfo get{XR_TYPE_SYSTEM_GET_INFO};
         get.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-        api.check(api.GetSystem(instance, &get, &system), "xrGetSystem HMD");
+        const XrResult systemResult = api.GetSystem(instance, &get, &system);
+        runtimeStarting = systemResult == XR_ERROR_FORM_FACTOR_UNAVAILABLE; // The spec's "retry later".
+        api.check(systemResult, "xrGetSystem HMD");
         XrSystemEyeGazeInteractionPropertiesEXT gazeProperties{XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT};
         XrSystemFoveationEyeTrackedPropertiesMETA metaProperties{XR_TYPE_SYSTEM_FOVEATION_EYE_TRACKED_PROPERTIES_META};
         if (eyeGazeExtension) systemProperties.next = &gazeProperties;
