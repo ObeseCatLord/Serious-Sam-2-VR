@@ -7,7 +7,11 @@
 #include "native_finally.hpp"
 #include <MinHook.h>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <d3d9.h>
+#include <new>
+#include <unordered_map>
 #include <vector>
 #include <windows.h>
 using Create9 = IDirect3D9 *(WINAPI *)(UINT);
@@ -138,6 +142,267 @@ static bool selfTest(IDirect3DDevice9 *d) {
     ss2vr::game::log("%s", line);
     return usable;
 }
+// Direct3D 9Ex buffer copies: the game's managed vertex and index buffers keep a
+// system-memory copy, as the managed pool did. The game reads its meshes back
+// through READONLY locks every frame (collision hulls, CPU-side mesh work); in the
+// default pool those reads came straight from driver memory. A lock returns the
+// copy; the unlock of a writing lock uploads the written range to the real buffer.
+// [Render] D3D9ExBufferCopies=0 turns this off (locks reach the driver again).
+namespace buffer_copies {
+using LockFn = HRESULT(WINAPI *)(void *, UINT, UINT, void **, DWORD);
+using UnlockFn = HRESULT(WINAPI *)(void *);
+LockFn oLock[2]{};     // [vertex, index]
+UnlockFn oUnlock[2]{};
+void *hookedLock[2]{}, *hookedUnlock[2]{}; // The implementations those detours cover.
+std::atomic<uint64_t> foreign{0};          // Buffers of another implementation: locked directly.
+std::atomic<bool> enabled{true};
+std::atomic<uint64_t> buffers{0}, bytes{0}, uploads{0}, uploadBytes{0}, uploadTicks{0}, uploadFailures{0};
+SRWLOCK guard = SRWLOCK_INIT;
+struct Copy;
+std::unordered_map<void *, Copy *> *copies = nullptr; // Never destroyed: buffers may outlive static teardown.
+static const GUID tag{0x5b0a6c5e, 0x4d21, 0x4f0b, {0x9a, 0x3e, 0x53, 0x53, 0x32, 0x56, 0x52, 0x01}};
+static const GUID unknownId{0x00000000, 0x0000, 0x0000, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+// Owned by the buffer (private data): destroyed with it.
+struct Copy final : IUnknown {
+    std::atomic<ULONG> references{1};
+    void *buffer = nullptr;
+    uint8_t *data = nullptr;
+    UINT length = 0, locks = 0, dirtyLow = ~0u, dirtyHigh = 0;
+    unsigned locker = 0, unlocker = 0; // Which originals reach this buffer's driver methods.
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+        if (!out) return E_POINTER;
+        if (std::memcmp(&id, &unknownId, sizeof(GUID))) { *out = nullptr; return E_NOINTERFACE; }
+        *out = static_cast<IUnknown *>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return references.fetch_add(1, std::memory_order_relaxed) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = references.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (!left) {
+            AcquireSRWLockExclusive(&guard);
+            if (copies) {
+                const auto found = copies->find(buffer);
+                if (found != copies->end() && found->second == this) copies->erase(found);
+            }
+            ReleaseSRWLockExclusive(&guard);
+            buffers.fetch_sub(1, std::memory_order_relaxed);
+            bytes.fetch_sub(length, std::memory_order_relaxed);
+            std::free(data);
+            delete this;
+        }
+        return left;
+    }
+    virtual ~Copy() = default;
+};
+// A buffer the game asked for in the managed pool, just created in the default one.
+template <class Buffer> void adopt(Buffer *b, UINT length, unsigned kind) noexcept {
+    if (!enabled.load(std::memory_order_relaxed) || !b || !length) return;
+    // Only a buffer whose own Lock and Unlock are both detoured: with one of them
+    // missed, writes would stay in the copy and never reach the driver.
+    void **methods = *reinterpret_cast<void ***>(b);
+    int locker = -1, unlocker = -1;
+    for (int k = 0; k < 2; ++k) {
+        if (locker < 0 && hookedLock[k] && oLock[k] && methods[11] == hookedLock[k]) locker = k;
+        if (unlocker < 0 && hookedUnlock[k] && oUnlock[k] && methods[12] == hookedUnlock[k]) unlocker = k;
+    }
+    if (locker < 0 || unlocker < 0) {
+        if (foreign.fetch_add(1, std::memory_order_relaxed) < 4)
+            ss2vr::game::log("Direct3D 9Ex: %s buffer of another implementation; locked directly", kind ? "index" : "vertex");
+        return;
+    }
+    auto *data = static_cast<uint8_t *>(std::calloc(1, length));
+    auto *copy = data ? new (std::nothrow) Copy : nullptr;
+    if (!copy) { std::free(data); return; }
+    copy->buffer = b; copy->data = data; copy->length = length; copy->locker = unsigned(locker); copy->unlocker = unsigned(unlocker);
+    buffers.fetch_add(1, std::memory_order_relaxed);
+    bytes.fetch_add(length, std::memory_order_relaxed);
+    AcquireSRWLockExclusive(&guard);
+    if (!copies) copies = new (std::nothrow) std::unordered_map<void *, Copy *>;
+    bool listed = false;
+    if (copies) {
+        try { (*copies)[b] = copy; listed = true; } catch (...) {}
+    }
+    ReleaseSRWLockExclusive(&guard);
+    // The buffer holds the copy from here; a refusal leaves the buffer as it was.
+    if (listed && FAILED(b->SetPrivateData(tag, static_cast<IUnknown *>(copy), sizeof(IUnknown *), D3DSPD_IUNKNOWN))) {
+        static std::atomic<unsigned> refused{0};
+        if (refused.fetch_add(1, std::memory_order_relaxed) < 4) ss2vr::game::log("Direct3D 9Ex: buffer copy not attached; buffer locked directly");
+    }
+    copy->Release();
+}
+// True when the lock was answered from the copy (hr set).
+bool lock(void *b, UINT offset, UINT size, void **out, DWORD flags, HRESULT &hr) noexcept {
+    AcquireSRWLockExclusive(&guard);
+    Copy *copy = nullptr;
+    if (copies) {
+        const auto found = copies->find(b);
+        if (found != copies->end()) copy = found->second;
+    }
+    if (copy) {
+        if (!out || offset > copy->length || size > copy->length - offset) hr = D3DERR_INVALIDCALL;
+        else {
+            const UINT count = size ? size : copy->length - offset; // Size 0: to the end.
+            ++copy->locks;
+            if (!(flags & D3DLOCK_READONLY) && count) {
+                if (offset < copy->dirtyLow) copy->dirtyLow = offset;
+                if (offset + count > copy->dirtyHigh) copy->dirtyHigh = offset + count;
+            }
+            *out = copy->data + offset;
+            hr = D3D_OK;
+        }
+    }
+    ReleaseSRWLockExclusive(&guard);
+    return copy != nullptr;
+}
+// True when the buffer has a copy (hr set); the last unlock uploads what was written.
+bool unlock(void *b, HRESULT &hr) noexcept {
+    AcquireSRWLockExclusive(&guard);
+    Copy *copy = nullptr;
+    if (copies) {
+        const auto found = copies->find(b);
+        if (found != copies->end()) copy = found->second;
+    }
+    UINT low = 0, high = 0;
+    if (copy) {
+        if (copy->locks) --copy->locks;
+        if (!copy->locks && copy->dirtyHigh > copy->dirtyLow) {
+            low = copy->dirtyLow; high = copy->dirtyHigh;
+            copy->dirtyLow = ~0u; copy->dirtyHigh = 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&guard);
+    if (!copy) return false;
+    hr = D3D_OK;
+    if (high > low) { // The caller holds the buffer: the copy outlives this call.
+        LARGE_INTEGER a, c;
+        QueryPerformanceCounter(&a);
+        void *mapped = nullptr;
+        const HRESULT locked = oLock[copy->locker](b, low, high - low, &mapped, 0);
+        if (SUCCEEDED(locked) && mapped) {
+            std::memcpy(mapped, copy->data + low, high - low);
+            oUnlock[copy->unlocker](b);
+            QueryPerformanceCounter(&c);
+            uploads.fetch_add(1, std::memory_order_relaxed);
+            uploadBytes.fetch_add(high - low, std::memory_order_relaxed);
+            uploadTicks.fetch_add(uint64_t(c.QuadPart - a.QuadPart), std::memory_order_relaxed);
+        } else {
+            if (SUCCEEDED(locked)) oUnlock[copy->unlocker](b);
+            AcquireSRWLockExclusive(&guard); // Kept for the next unlock.
+            if (low < copy->dirtyLow) copy->dirtyLow = low;
+            if (high > copy->dirtyHigh) copy->dirtyHigh = high;
+            ReleaseSRWLockExclusive(&guard);
+            if (uploadFailures.fetch_add(1, std::memory_order_relaxed) < 8)
+                ss2vr::game::log("Direct3D 9Ex: buffer upload refused hr=%08lx bytes=%u", static_cast<unsigned long>(locked), high - low);
+        }
+    }
+    return true;
+}
+} // namespace buffer_copies
+// Direct3D 9Ex lock timing (Windows reports): how long the game's locks of the
+// resources its managed ones became take, per kind and flags, every 5 s. A
+// default-pool lock waits for the GPU where a managed one wrote a system copy.
+namespace lock_timing {
+enum Kind { Texture, Cube, Vertex, Index, Kinds };
+struct Totals { std::atomic<uint64_t> ticks{0}, count{0}, plain{0}, discard{0}, noOverwrite{0}, readOnly{0}, heldRead{0}, heldWrite{0}; };
+// Lock to unlock (the game reading or filling the memory), per buffer kind.
+struct Held { void *buffer = nullptr; LARGE_INTEGER start{}; bool readOnly = false; };
+thread_local Held held[2];
+Totals totals[Kinds];
+std::atomic<uint64_t> reportedAt{0};
+LARGE_INTEGER frequency{};
+using LockTexture = HRESULT(WINAPI *)(IDirect3DTexture9 *, UINT, D3DLOCKED_RECT *, const RECT *, DWORD);
+using LockCube = HRESULT(WINAPI *)(IDirect3DCubeTexture9 *, D3DCUBEMAP_FACES, UINT, D3DLOCKED_RECT *, const RECT *, DWORD);
+using LockVertex = HRESULT(WINAPI *)(IDirect3DVertexBuffer9 *, UINT, UINT, void **, DWORD);
+using LockIndex = HRESULT(WINAPI *)(IDirect3DIndexBuffer9 *, UINT, UINT, void **, DWORD);
+LockTexture oTexture = nullptr; LockCube oCube = nullptr; LockVertex oVertex = nullptr; LockIndex oIndex = nullptr;
+void report() noexcept {
+    const uint64_t now = GetTickCount64();
+    uint64_t last = reportedAt.load(std::memory_order_relaxed);
+    if (now - last < 5000 || !reportedAt.compare_exchange_strong(last, now)) return;
+    if (!last) return; // The first call starts the window.
+    const double seconds = double(now - last) / 1000., toMs = frequency.QuadPart ? 1000. / double(frequency.QuadPart) : 0.;
+    static const char *names[Kinds]{"texture", "cube", "vertex", "index"};
+    char line[512]; int used = std::snprintf(line, sizeof line, "Direct3D 9Ex locks per s:");
+    for (unsigned k = 0; k < Kinds && used > 0 && used < int(sizeof line); ++k) {
+        auto &t = totals[k];
+        used += std::snprintf(line + used, sizeof line - used, " %s n=%.0f ms=%.2f (plain=%.0f discard=%.0f nooverwrite=%.0f readonly=%.0f)", names[k],
+                              double(t.count.exchange(0)) / seconds, double(t.ticks.exchange(0)) * toMs / seconds, double(t.plain.exchange(0)) / seconds,
+                              double(t.discard.exchange(0)) / seconds, double(t.noOverwrite.exchange(0)) / seconds, double(t.readOnly.exchange(0)) / seconds);
+    }
+    static std::atomic<unsigned> lines{0};
+    if (lines.fetch_add(1, std::memory_order_relaxed) >= 200) return;
+    ss2vr::game::log("%s", line);
+    // Held: lock to unlock, the game's own reads and writes of the memory.
+    using namespace buffer_copies;
+    const double uploaded = double(uploads.exchange(0));
+    ss2vr::game::log("Direct3D 9Ex buffers per s: vertex held read=%.2fms write=%.2fms | index held read=%.2fms write=%.2fms | "
+                     "copies=%llu (%.1f MB) direct=%llu uploads=%.0f %.2f MB %.2fms failed=%llu",
+                     double(totals[Vertex].heldRead.exchange(0)) * toMs / seconds, double(totals[Vertex].heldWrite.exchange(0)) * toMs / seconds,
+                     double(totals[Index].heldRead.exchange(0)) * toMs / seconds, double(totals[Index].heldWrite.exchange(0)) * toMs / seconds,
+                     static_cast<unsigned long long>(buffers.load()), double(bytes.load()) / 1048576.,
+                     static_cast<unsigned long long>(foreign.load()), uploaded / seconds,
+                     double(uploadBytes.exchange(0)) / 1048576. / seconds, double(uploadTicks.exchange(0)) * toMs / seconds,
+                     static_cast<unsigned long long>(uploadFailures.load()));
+}
+template <class F> HRESULT timed(Kind kind, DWORD flags, F &&call) {
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    const HRESULT hr = call();
+    QueryPerformanceCounter(&b);
+    auto &t = totals[kind];
+    t.ticks.fetch_add(uint64_t(b.QuadPart - a.QuadPart), std::memory_order_relaxed);
+    t.count.fetch_add(1, std::memory_order_relaxed);
+    (flags & D3DLOCK_READONLY ? t.readOnly : flags & D3DLOCK_DISCARD ? t.discard : flags & D3DLOCK_NOOVERWRITE ? t.noOverwrite : t.plain)
+        .fetch_add(1, std::memory_order_relaxed);
+    report();
+    return hr;
+}
+HRESULT WINAPI texture(IDirect3DTexture9 *t, UINT level, D3DLOCKED_RECT *r, const RECT *rect, DWORD flags) {
+    return timed(Texture, flags, [&] { return oTexture(t, level, r, rect, flags); });
+}
+HRESULT WINAPI cube(IDirect3DCubeTexture9 *t, D3DCUBEMAP_FACES face, UINT level, D3DLOCKED_RECT *r, const RECT *rect, DWORD flags) {
+    return timed(Cube, flags, [&] { return oCube(t, face, level, r, rect, flags); });
+}
+template <class F> HRESULT buffer(Kind kind, void *b, UINT offset, UINT size, void **data, DWORD flags, F &&original) {
+    const HRESULT hr = timed(kind, flags, [&] {
+        HRESULT copied = D3D_OK;
+        return buffer_copies::lock(b, offset, size, data, flags, copied) ? copied : original();
+    });
+    if (SUCCEEDED(hr)) {
+        auto &h = held[kind - Vertex];
+        h.buffer = b; h.readOnly = (flags & D3DLOCK_READONLY) != 0;
+        QueryPerformanceCounter(&h.start);
+    }
+    return hr;
+}
+template <class F> HRESULT release(Kind kind, void *b, F &&original) {
+    auto &h = held[kind - Vertex];
+    if (h.buffer == b) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        (h.readOnly ? totals[kind].heldRead : totals[kind].heldWrite).fetch_add(uint64_t(now.QuadPart - h.start.QuadPart), std::memory_order_relaxed);
+        h.buffer = nullptr;
+    }
+    HRESULT hr = D3D_OK;
+    return buffer_copies::unlock(b, hr) ? hr : original();
+}
+HRESULT WINAPI vertex(IDirect3DVertexBuffer9 *b, UINT offset, UINT size, void **data, DWORD flags) {
+    return buffer(Vertex, b, offset, size, data, flags, [&] { return oVertex(b, offset, size, data, flags); });
+}
+HRESULT WINAPI index(IDirect3DIndexBuffer9 *b, UINT offset, UINT size, void **data, DWORD flags) {
+    return buffer(Index, b, offset, size, data, flags, [&] { return oIndex(b, offset, size, data, flags); });
+}
+using UnlockVertex = HRESULT(WINAPI *)(IDirect3DVertexBuffer9 *);
+using UnlockIndex = HRESULT(WINAPI *)(IDirect3DIndexBuffer9 *);
+UnlockVertex oVertexUnlock = nullptr; UnlockIndex oIndexUnlock = nullptr;
+HRESULT WINAPI vertexUnlock(IDirect3DVertexBuffer9 *b) {
+    return release(Vertex, b, [&] { return oVertexUnlock(b); });
+}
+HRESULT WINAPI indexUnlock(IDirect3DIndexBuffer9 *b) {
+    return release(Index, b, [&] { return oIndexUnlock(b); });
+}
+} // namespace lock_timing
 // Buffers in the default pool stay lockable (static, as the game made them).
 static HRESULT WINAPI createVertex(IDirect3DDevice9 *d, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool,
                                    IDirect3DVertexBuffer9 **out, HANDLE *share) {
@@ -145,6 +410,7 @@ static HRESULT WINAPI createVertex(IDirect3DDevice9 *d, UINT length, DWORD usage
         return originalCreateVertex(d, length, usage, fvf, pool, out, share);
     const HRESULT hr = originalCreateVertex(d, length, usage, fvf, D3DPOOL_DEFAULT, out, share);
     noteManaged("vertex buffer", hr);
+    if (SUCCEEDED(hr) && out && *out && !(usage & D3DUSAGE_DYNAMIC)) buffer_copies::adopt(*out, length, 0);
     return hr;
 }
 static HRESULT WINAPI createIndex(IDirect3DDevice9 *d, UINT length, DWORD usage, D3DFORMAT format, D3DPOOL pool,
@@ -153,7 +419,22 @@ static HRESULT WINAPI createIndex(IDirect3DDevice9 *d, UINT length, DWORD usage,
         return originalCreateIndex(d, length, usage, format, pool, out, share);
     const HRESULT hr = originalCreateIndex(d, length, usage, format, D3DPOOL_DEFAULT, out, share);
     noteManaged("index buffer", hr);
+    if (SUCCEEDED(hr) && out && *out && !(usage & D3DUSAGE_DYNAMIC)) buffer_copies::adopt(*out, length, 1);
     return hr;
+}
+// [Render] D3D9ExBufferCopies: 1 (default) keeps system-memory copies of the game's
+// managed vertex and index buffers on the 9Ex device; 0 locks the driver's memory.
+static bool wantBufferCopies() {
+    wchar_t lab[2]{};
+    if (GetEnvironmentVariableW(L"SS2VR_LAB_BUFFER_COPIES", lab, 2) == 1) return lab[0] != L'0';
+    std::wstring bin;
+    if (!ss2vr::moduleDirectory(nullptr, bin)) return true;
+    for (const wchar_t *name : {L"SS2VR\\SS2VR.user.ini", L"SS2VR\\SS2VR.ini"}) {
+        wchar_t buffer[16]{};
+        if (GetPrivateProfileStringW(L"Render", L"D3D9ExBufferCopies", L"", buffer, 16, (bin + name).c_str()))
+            return _wtoi(buffer) != 0;
+    }
+    return true;
 }
 static bool wantD3D9Ex() {
     // Lab: SS2VR_LAB_D3D9EX=1 takes this route under Wine too (DXVK), to exercise it.
@@ -418,6 +699,43 @@ static HRESULT WINAPI createDevice(IDirect3D9 *api, UINT adapter, D3DDEVTYPE typ
             proxyHook(table[25], reinterpret_cast<void *>(createCube), originalCreateCube, "CreateCubeTexture");
             proxyHook(table[26], reinterpret_cast<void *>(createVertex), originalCreateVertex, "CreateVertexBuffer");
             proxyHook(table[27], reinterpret_cast<void *>(createIndex), originalCreateIndex, "CreateIndexBuffer");
+            if (managedEmulation.load(std::memory_order_relaxed) && originalCreateTexture && originalCreateCube &&
+                originalCreateVertex && originalCreateIndex) {
+                // Lock timing on the 9Ex device's resources (its vtables), for Windows reports.
+                IDirect3DTexture9 *t = nullptr; IDirect3DCubeTexture9 *c = nullptr;
+                IDirect3DVertexBuffer9 *v = nullptr; IDirect3DIndexBuffer9 *i = nullptr;
+                QueryPerformanceFrequency(&lock_timing::frequency);
+                if (SUCCEEDED(originalCreateTexture(*out, 4, 4, 1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &t, nullptr)) && t)
+                    proxyHook((*reinterpret_cast<void ***>(t))[19], reinterpret_cast<void *>(lock_timing::texture), lock_timing::oTexture, "Texture LockRect");
+                if (SUCCEEDED(originalCreateCube(*out, 4, 1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &c, nullptr)) && c)
+                    proxyHook((*reinterpret_cast<void ***>(c))[19], reinterpret_cast<void *>(lock_timing::cube), lock_timing::oCube, "Cube LockRect");
+                if (SUCCEEDED(originalCreateVertex(*out, 64, 0, 0, D3DPOOL_DEFAULT, &v, nullptr)) && v)
+                    proxyHook((*reinterpret_cast<void ***>(v))[11], reinterpret_cast<void *>(lock_timing::vertex), lock_timing::oVertex, "Vertex Lock");
+                if (v)
+                    proxyHook((*reinterpret_cast<void ***>(v))[12], reinterpret_cast<void *>(lock_timing::vertexUnlock), lock_timing::oVertexUnlock, "Vertex Unlock");
+                if (SUCCEEDED(originalCreateIndex(*out, 64, 0, D3DFMT_INDEX16, D3DPOOL_DEFAULT, &i, nullptr)) && i)
+                    proxyHook((*reinterpret_cast<void ***>(i))[11], reinterpret_cast<void *>(lock_timing::index), lock_timing::oIndex, "Index Lock");
+                if (i)
+                    proxyHook((*reinterpret_cast<void ***>(i))[12], reinterpret_cast<void *>(lock_timing::indexUnlock), lock_timing::oIndexUnlock, "Index Unlock");
+                // Copies need all four originals of a kind; one implementation may serve both kinds.
+                {
+                    using namespace buffer_copies;
+                    oLock[0] = reinterpret_cast<LockFn>(lock_timing::oVertex);
+                    oUnlock[0] = reinterpret_cast<UnlockFn>(lock_timing::oVertexUnlock);
+                    oLock[1] = reinterpret_cast<LockFn>(lock_timing::oIndex);
+                    oUnlock[1] = reinterpret_cast<UnlockFn>(lock_timing::oIndexUnlock);
+                    // The same code behind both tables is hooked once, by the vertex detour:
+                    // adopt() matches each buffer's own methods against these addresses.
+                    if (v && oLock[0]) hookedLock[0] = (*reinterpret_cast<void ***>(v))[11];
+                    if (v && oUnlock[0]) hookedUnlock[0] = (*reinterpret_cast<void ***>(v))[12];
+                    if (i && oLock[1]) hookedLock[1] = (*reinterpret_cast<void ***>(i))[11];
+                    if (i && oUnlock[1]) hookedUnlock[1] = (*reinterpret_cast<void ***>(i))[12];
+                    enabled.store(wantBufferCopies(), std::memory_order_relaxed);
+                    ss2vr::game::log("Direct3D 9Ex buffer copies=%d (system-memory copies of the game's managed vertex and index buffers)",
+                                     int(enabled.load() && hookedLock[0] && hookedUnlock[0] && hookedLock[1] && hookedUnlock[1]));
+                }
+                if (t) t->Release(); if (c) c->Release(); if (v) v->Release(); if (i) i->Release();
+            }
             if (originalCreateTexture && originalCreateCube && !selfTest(*out) && create9) {
                 // Nothing else holds the device yet: a classic one replaces it.
                 managedEmulation.store(false, std::memory_order_relaxed);

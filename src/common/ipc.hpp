@@ -22,6 +22,9 @@ inline void publishTrackingEpoch(Shared &shared, uint32_t epoch) {
 }
 struct Channel {
     HANDLE mapping = nullptr, mutex = nullptr, ready = nullptr;
+    // Set by the host when it posts a new eye request: the game's pacing wait wakes
+    // at once instead of polling. Optional (a peer without it leaves it null).
+    HANDLE request = nullptr;
     Shared *shared = nullptr;
     std::wstring token;
     ~Channel() {
@@ -51,6 +54,8 @@ struct Channel {
             close();
             return false;
         }
+        request = create ? CreateEventW(nullptr, FALSE, FALSE, (n + L"-request").c_str())
+                         : OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, (n + L"-request").c_str());
         if (create) {
             ZeroMemory(shared, sizeof(Shared));
             shared->magic = Magic;
@@ -81,10 +86,10 @@ struct Channel {
         if (shared)
             UnmapViewOfFile(shared);
         shared = nullptr;
-        for (auto h : {mapping, mutex, ready})
+        for (auto h : {mapping, mutex, ready, request})
             if (h)
                 CloseHandle(h);
-        mapping = mutex = ready = nullptr;
+        mapping = mutex = ready = request = nullptr;
     }
 };
 // One section per pixel buffer: a 32-bit game never needs a single huge view.

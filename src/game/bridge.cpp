@@ -28,6 +28,8 @@
 #include "scope_observer.hpp"
 #include "remote_render.hpp"
 #include <MinHook.h>
+#include <windows.h>
+#include <mmsystem.h>
 #include <atomic>
 #include <bcrypt.h>
 #include <cstdarg>
@@ -1682,7 +1684,17 @@ struct LabWorldDraws {
     uint64_t fullRangeCalls[16]{},worldRangeCalls[16]{},otherRangeCalls[16]{};
 };
 static thread_local LabWorldDraws labWorldDraws{};
+static void pollSharedFences(DWORD lockMs = 5);
+static bool sharedFencePending() noexcept;
+// A zero-copy pair's GPU work usually finishes while the next frame is being
+// drawn. Its fence was polled only at frame boundaries, so the host saw the pair
+// (and posted the next request) up to a frame late; polled between draws instead.
+static void pollSharedFencesInFrame() {
+    static unsigned draws = 0;
+    if (sharedFencePending() && !(++draws & 15)) pollSharedFences(0);
+}
 static void countDraw() {
+    pollSharedFencesInFrame();
     if (uiBypass) ++perf.hudDuplicates;
     else if (activeEye >= 0) ++perf.eyeDraws;
     else ++perf.desktopDraws;
@@ -2729,13 +2741,14 @@ static void createSharedImages() {
         handles[0][0], handles[0][1], handles[1][0], handles[1][1]);
 }
 // Marks pairs whose GPU work has finished; the host copies only those.
-static void pollSharedFences() {
+static bool sharedFencePending() noexcept { return sharedPending[0] || sharedPending[1]; }
+static void pollSharedFences(DWORD lockMs) {
     for (unsigned slot = 0; slot != 2; ++slot) {
         if (!sharedPending[slot]) continue;
         BOOL done = FALSE;
         const HRESULT result = sharedFence[slot] ? sharedFence[slot]->GetData(&done, sizeof(done), 0) : E_FAIL;
         if (result == S_FALSE) continue;
-        Lock l(channel, 5);
+        Lock l(channel, lockMs);
         if (!l) continue;
         sharedPending[slot] = false;
         auto &target = channel.shared->slot[slot];
@@ -3244,6 +3257,18 @@ static bool requestWaiting() {
 // 33 fps menu cap lifted, and frames that took no pair do not wait in
 // paceToHeadset): hundreds of frames a second, its pairs and menu copies
 // irregular. The host publishes a new input sample each frame.
+// One step of a pacing wait: until the host posts a request (its event), or a
+// millisecond (the fences are polled between steps). Sleep(1) alone slept up to a
+// 15.6 ms timer tick on Windows; the timer runs at 1 ms while the game is in VR.
+static void finePacingTimer() noexcept {
+    static const bool fine = [] { return timeBeginPeriod(1) == TIMERR_NOERROR; }();
+    (void)fine;
+}
+static void pacingStep() noexcept {
+    finePacingTimer();
+    if (channel.request) WaitForSingleObject(channel.request, 1);
+    else Sleep(1);
+}
 static bool menuFramePaced = false; // Set by presentBody for its frame.
 static void paceMenuToHeadset() {
     static uint64_t paced = 0;
@@ -3256,7 +3281,8 @@ static void paceMenuToHeadset() {
     const LARGE_INTEGER start = PerfClock::now();
     const ULONGLONG deadline = GetTickCount64() + 25;
     while (now == paced && GetTickCount64() < deadline && !stopping) {
-        Sleep(1);
+        finePacingTimer();
+        Sleep(1); // The input sample has no event.
         pollSharedFences();
         now = sequence();
     }
@@ -3271,7 +3297,7 @@ static void paceToHeadset() {
     const LARGE_INTEGER start = PerfClock::now();
     const ULONGLONG deadline = GetTickCount64() + 25;
     do {
-        Sleep(1);
+        pacingStep();
         pollSharedFences(); // Finished pairs must keep freeing slots while we wait.
     } while (!requestWaiting() && GetTickCount64() < deadline && !stopping);
     perf.wait += PerfClock::seconds(start, PerfClock::now());
@@ -3549,14 +3575,16 @@ static void presentBody(IDirect3DDevice9 *d) {
             {
                 // Render-thread CPU time (excludes preemption by other processes,
                 // unlike the wall-clock figures below).
-                static uint64_t lastThreadCpu = 0;
+                static uint64_t lastThreadCpu = 0, lastKernelCpu = 0;
                 FILETIME created{}, exited{}, kernel{}, user{};
                 if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
-                    const uint64_t cpu = ((uint64_t(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
-                                         ((uint64_t(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+                    const uint64_t kernelCpu = (uint64_t(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime;
+                    const uint64_t cpu = kernelCpu + ((uint64_t(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+                    // Kernel share: driver and system calls (waits that spin, page faults).
                     if (lastThreadCpu && perf.frames)
-                        log("Perf render thread cpu per frame=%.2fms", double(cpu - lastThreadCpu) / 1e4 / perf.frames);
-                    lastThreadCpu = cpu;
+                        log("Perf render thread cpu per frame=%.2fms (kernel=%.2fms)", double(cpu - lastThreadCpu) / 1e4 / perf.frames,
+                            double(kernelCpu - lastKernelCpu) / 1e4 / perf.frames);
+                    lastThreadCpu = cpu; lastKernelCpu = kernelCpu;
                 }
             }
             log("Perf frames=%u pairs=%u mono=%u size=%ux%u frame=%.1fms | per pair cpu: stereo=%.1f eyes=%.1f,%.1f "
@@ -5028,7 +5056,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         const LARGE_INTEGER start = PerfClock::now();
         const ULONGLONG deadline = GetTickCount64() + 25;
         do {
-            Sleep(1);
+            pacingStep();
             pollSharedFences();
         } while (!requestWaiting() && GetTickCount64() < deadline && !stopping);
         perf.wait += PerfClock::seconds(start, PerfClock::now());

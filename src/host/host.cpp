@@ -1444,6 +1444,9 @@ struct Host {
     uint64_t xrEndSuccess = 0, xrLayerSuccess = 0, xrMenuSuccess = 0, xrWorldSuccess = 0;
     uint64_t uiPairs = 0, clearedPairs = 0; // Pairs with the native HUD composited; head-clearance opaque pairs.
     uint64_t completed = 0, timeouts = 0, fullSlots = 0, discarded = 0, imageTimeouts = 0, invalidViews = 0, copyWaits = 0;
+    uint64_t requestLoop = 0, lastCompletionLoop = 0, eagerRequests = 0, copyRetries = 0;
+    bool retryRequest = false, retryEager = false;
+    Request retried{};
     uint64_t retired = 0, submissions = 0, reused = 0, lastSubmittedSequence = 0;
     ULONGLONG lastDiagnostics = 0, lastMutexDiagnostic = 0;
     // Host cost accounting for the 5 s diagnostics line (milliseconds sums).
@@ -2757,16 +2760,19 @@ struct Host {
             cachedValid = true;
         }
     }
-    void requestEyes(Request request, bool allowSecond = true) {
+    // Posted: a new request went into a slot. CopyGate: the only free slot's last eye
+    // copy has not executed yet (retried after this frame is submitted).
+    enum class Admission { None, Posted, CopyGate };
+    Admission requestEyes(Request request, bool allowSecond = true) {
         Mutex lock(channel, 2);
         if (!lock)
-            return;
+            return Admission::None;
         reapLocked();
         auto &shared = *channel.shared;
         request.trackingGeneration = trackingEpoch(shared);
         uint64_t deadline = GetTickCount64() + FrameAgeMs;
         if (shared.shutdown || !eligibleFrame(request, deadline, frameContext()))
-            return;
+            return Admission::None;
         // One request may wait while the game holds the other slot (rendering it,
         // or Ready and waiting for its GPU work or for this loop), so the game finds
         // work as soon as it finishes a pair instead of drawing a frame the headset
@@ -2781,7 +2787,7 @@ struct Host {
             ++active;
             if (outstanding[i].expired || shared.slot[i].cancelled) {
                 ++fullSlots;
-                return;
+                return Admission::None;
             }
             if (shared.slot[i].state == SlotState::Requested)
                 waiting = int(i);
@@ -2792,13 +2798,13 @@ struct Host {
             slot.request = request;
             ++latched;
             SetEvent(channel.ready);
-            return;
+            return Admission::None;
         }
         // A second request in flight only helps when the game is behind the
         // display; when it keeps up, it would render a pair that is discarded.
         if (active > 1 || (active == 1 && !allowSecond)) {
             ++fullSlots;
-            return;
+            return Admission::None;
         }
         int index = -1;
         bool copying = false;
@@ -2813,7 +2819,7 @@ struct Host {
             }
         if (index < 0 && copying) {
             ++copyWaits;
-            return;
+            return Admission::CopyGate;
         }
         if (index < 0)
             throw std::runtime_error("Admission found no owned empty slot");
@@ -2826,6 +2832,8 @@ struct Host {
         slot.headClearance = {};
         slot.state = SlotState::Requested;
         SetEvent(channel.ready);
+        if (channel.request) SetEvent(channel.request); // The game's pacing wait ends now.
+        return Admission::Posted;
     }
     bool projection(XrCompositionLayerProjection &layer,
                     std::array<XrCompositionLayerProjectionView, 2> &views,
@@ -3625,11 +3633,12 @@ struct Host {
         log.write(line);
         if (perfLoops) {
             std::snprintf(line, sizeof(line),
-                          "Host perf loops=%llu loop=%.2fms wait=%.2fms submit=%.2fms uploads=%llu upload=%.2fms pair_age=%.1fms zero_copy=%llu latched=%llu",
+                          "Host perf loops=%llu loop=%.2fms wait=%.2fms submit=%.2fms uploads=%llu upload=%.2fms pair_age=%.1fms zero_copy=%llu latched=%llu eager=%llu copy_retries=%llu",
                           static_cast<unsigned long long>(perfLoops), perfLoop / perfLoops, perfWait / perfLoops,
                           perfSubmit / perfLoops, static_cast<unsigned long long>(perfUploads),
                           perfUploads ? perfUpload / perfUploads : 0., perfUploads ? perfPairAge / perfUploads : 0.,
-                          static_cast<unsigned long long>(zeroCopyPairs), static_cast<unsigned long long>(latched));
+                          static_cast<unsigned long long>(zeroCopyPairs), static_cast<unsigned long long>(latched),
+                          static_cast<unsigned long long>(eagerRequests), static_cast<unsigned long long>(copyRetries));
             log.write(line);
         }
         if (mutexStats.longHolds) {
@@ -3643,6 +3652,8 @@ struct Host {
         perfLoops = perfUploads = 0;
     }
     void run() {
+        timeBeginPeriod(1); // Sleep(1) in the drain loops is a millisecond, not a 15.6 ms tick.
+        struct TimerPeriod { ~TimerPeriod() { timeEndPeriod(1); } } timerPeriod;
         while (!quit && !api.lossPending) {
             if (WaitForSingleObject(gameProcess.h, 0) != WAIT_TIMEOUT) {
                 quit = true;
@@ -3803,7 +3814,23 @@ struct Host {
                     }
                     const uint64_t completedBefore = completed;
                     pollEyes();
-                    requestEyes(request, completed == completedBefore);
+                    // A pair that took two display frames or more: the game is behind the
+                    // display, so its next request is posted now (with the other still in
+                    // flight) instead of a display frame later, which it spent idle. A game
+                    // that keeps up (a pair every frame) is held to one request as before.
+                    ++requestLoop;
+                    bool behind = false;
+                    if (completed != completedBefore) {
+                        behind = settings.eagerRequests && lastCompletionLoop && requestLoop - lastCompletionLoop >= 2;
+                        lastCompletionLoop = requestLoop;
+                    }
+                    const Admission admission = requestEyes(request, completed == completedBefore || behind);
+                    if (behind && admission == Admission::Posted) ++eagerRequests;
+                    // The slot just consumed is the only free one and its zero-copy eye copy
+                    // was issued a moment ago: asked again once this frame is submitted.
+                    retryRequest = settings.eagerRequests && admission == Admission::CopyGate;
+                    retryEager = behind;
+                    if (retryRequest) retried = request;
                     if (projection(projectionLayer, projectionViews, insetLayer, insetViews)) {
                         layers.push_back(
                             reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projectionLayer));
@@ -3863,6 +3890,10 @@ struct Host {
             const LARGE_INTEGER submitStart = perfNow();
             const auto endResult = frame.submit(layers);
             perfSubmit += perfMs(submitStart, perfNow());
+            if (retryRequest) {
+                retryRequest = false;
+                if (requestEyes(retried) == Admission::Posted) { ++copyRetries; if (retryEager) ++eagerRequests; }
+            }
             worldSubmission.sample(GetCurrentProcessId(),cachedRequest,endResult==XR_SUCCESS &&
                 worldPresented && std::find(layers.begin(),layers.end(),world)!=layers.end());
             publishWorldSubmission();
