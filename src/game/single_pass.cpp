@@ -142,6 +142,108 @@ ProbePixel probePixelOf(IDirect3DDevice9 *d, IDirect3DPixelShader9 *s) noexcept 
         probe.perPixel ? ", per pixel" : "");
     return probe;
 }
+// Reflection off (water_reflection.hpp): whenever a VR water draw cannot reflect
+// world-fixed, its reflection image is replaced by a neutral one. For programs
+// without the cube variants (and outside the pass) the image is found from the
+// programs themselves: the texcoord set the vertex program writes its
+// reflection lookup to (-1: not a water program), and the samplers the pixel
+// program looks that set up with. Keys are held (AddRef) like the variants'.
+std::unordered_map<IDirect3DVertexShader9 *, int> shaderWaterSet;
+int waterSetOf(IDirect3DVertexShader9 *s) noexcept {
+    if (!s) return -1;
+    if (const auto it = shaderWaterSet.find(s); it != shaderWaterSet.end()) return it->second;
+    int set = -1;
+    UINT bytes = 0;
+    if (SUCCEEDED(s->GetFunction(nullptr, &bytes)) && bytes >= 8 && bytes % 4 == 0) {
+        std::vector<uint32_t> words(bytes / 4);
+        UINT got = bytes;
+        if (SUCCEEDED(s->GetFunction(words.data(), &got))) set = sp::waterLookupSet(words.data(), words.size());
+    }
+    s->AddRef();
+    shaderWaterSet.emplace(s, set);
+    return set;
+}
+struct WaterImages { int set = -1; uint32_t samplers = 0; };
+std::unordered_map<IDirect3DPixelShader9 *, WaterImages> pixelWaterImages;
+uint32_t waterImagesOf(IDirect3DPixelShader9 *s, int set) noexcept {
+    if (!s || set < 0) return 0;
+    const auto [it, fresh] = pixelWaterImages.try_emplace(s);
+    if (fresh) s->AddRef();
+    if (it->second.set != set) {
+        it->second = {set, 0};
+        UINT bytes = 0;
+        if (SUCCEEDED(s->GetFunction(nullptr, &bytes)) && bytes >= 8 && bytes % 4 == 0) {
+            std::vector<uint32_t> words(bytes / 4);
+            UINT got = bytes;
+            if (SUCCEEDED(s->GetFunction(words.data(), &got)))
+                it->second.samplers = sp::samplersOfTexcoord(words.data(), words.size(), unsigned(set));
+        }
+    }
+    return it->second.samplers;
+}
+// The neutral image (a neutral cube where the program looks a cube up) on those
+// samplers for one draw, under whatever programs are bound; then as it was.
+struct NeutralImages {
+    DWORD stage[4]{}, srgb[4]{};
+    IDirect3DBaseTexture9 *saved[4]{};
+    unsigned count = 0;
+    bool bind(IDirect3DDevice9 *d, uint32_t samplers) noexcept {
+        for (DWORD at = 0; at < 16 && count < 4; ++at) {
+            if (!(samplers & (1u << at))) continue;
+            IDirect3DBaseTexture9 *bound = nullptr, *neutral = nullptr;
+            if (FAILED(d->GetTexture(at, &bound)) || !bound) continue;
+            const auto type = bound->GetType();
+            if (type == D3DRTYPE_TEXTURE) neutral = env_probe::neutralImage(d, waterGain());
+            else if (type == D3DRTYPE_CUBETEXTURE) neutral = env_probe::neutralCube(d);
+            if (!neutral) { bound->Release(); continue; }
+            stage[count] = at; saved[count] = bound;
+            d->GetSamplerState(at, D3DSAMP_SRGBTEXTURE, &srgb[count]);
+            d->SetTexture(at, neutral);
+            d->SetSamplerState(at, D3DSAMP_SRGBTEXTURE, FALSE);
+            ++count;
+        }
+        return count != 0;
+    }
+    void restore(IDirect3DDevice9 *d) noexcept {
+        for (unsigned i = 0; i < count; ++i) {
+            d->SetSamplerState(stage[i], D3DSAMP_SRGBTEXTURE, srgb[i]);
+            d->SetTexture(stage[i], saved[i]);
+            saved[i]->Release();
+        }
+        count = 0;
+    }
+};
+// What water draws reflect, and why not the world-fixed cube (bounded, on change):
+// a lab run proves from these lines that no draw kept the engine's image.
+void traceWaterReflection(const char *where, ss2vr::water::Reflection chosen, unsigned why, uint32_t samplers,
+                          IDirect3DPixelShader9 *ps = nullptr) noexcept {
+    // Each distinct outcome once, and the changes between them while the budget lasts.
+    static unsigned traced = 0, previous = ~0u, seen[16]{}, seenCount = 0;
+    const unsigned key = why | unsigned(chosen) << 12 | unsigned(where[0] == 'o') << 16;
+    if (key == previous) return;
+    previous = key;
+    const bool known = std::find(seen, seen + seenCount, key) != seen + seenCount;
+    if (!known && seenCount < std::size(seen)) seen[seenCount++] = key;
+    else if (traced >= 32) return;
+    ++traced;
+    static const char *const names[]{"world-fixed cube", "neutral (cube variants)", "neutral (image replaced)", "ENGINE IMAGE KEPT"};
+    log("Water reflection %s: %s reasons=%x samplers=%x (1 no cube, 2 no rotation, 4 lab, 8 no variant, 16 no camera, 32 no anchor, "
+        "64 no pixel variant, 128 no sampler, 256 no stereo)", where, names[unsigned(chosen) & 3], why, samplers);
+    // The program whose reflection lookup was not found (its bytecode hash and version), to identify it.
+    if (chosen == ss2vr::water::Reflection::Engine && !(why & ss2vr::water::reason::Lab) && ps) {
+        UINT bytes = 0;
+        std::vector<uint32_t> words;
+        if (SUCCEEDED(ps->GetFunction(nullptr, &bytes)) && bytes >= 4 && bytes % 4 == 0) {
+            words.resize(bytes / 4);
+            UINT got = bytes;
+            if (FAILED(ps->GetFunction(words.data(), &got))) words.clear();
+        }
+        uint32_t hash = 2166136261u;
+        for (uint32_t w : words) { hash ^= w; hash *= 16777619u; }
+        log("Water reflection %s: pixel program %p hash=%08x version=%08x words=%zu has no reflection lookup that could be found",
+            where, static_cast<void *>(ps), hash, words.empty() ? 0u : words[0], words.size());
+    }
+}
 std::unordered_map<IDirect3DVertexDeclaration9 *, IDirect3DVertexDeclaration9 *> declarationVariants;
 
 IDirect3DVertexShader9 *variantOf(IDirect3DDevice9 *d, IDirect3DVertexShader9 *s) noexcept {
@@ -917,8 +1019,24 @@ struct WaterConstantsScope {
     ProbePixel pixel;
     IDirect3DBaseTexture9 *image = nullptr;
     DWORD sampling[4]{};
+    NeutralImages neutral; // Reflection off under the engine's programs.
+    // Reflection off without the cube variants: the neutral image where the pixel
+    // program looks the reflection up. Logged when that cannot be found.
+    void neutralImage(unsigned why) noexcept {
+        namespace reason = ss2vr::water::reason;
+        const uint32_t samplers = waterImagesOf(enginePixelShader, waterSetOf(engineShader));
+        const bool bound = neutral.bind(d, samplers);
+        traceWaterReflection("in the pass", bound ? ss2vr::water::Reflection::NeutralImage : ss2vr::water::Reflection::Engine,
+                             why | (bound ? 0u : reason::NoSampler), samplers, enginePixelShader);
+    }
     WaterConstantsScope(IDirect3DDevice9 *device, bool stereo) noexcept : d(device) {
-        if (!stereo || !waterDraw()) return;
+        namespace reason = ss2vr::water::reason;
+        if (!stereo || !waterDraw()) {
+            // A water program without the stereo variant's per-eye lookup still looks
+            // its reflection up by screen position: reflection off for it too.
+            if (!labWaterUnpatched() && waterSetOf(engineShader) >= 0) { env_probe::noteWater(); neutralImage(reason::NotStereo); }
+            return;
+        }
         env_probe::noteWater();
         active = SUCCEEDED(d->GetVertexShaderConstantF(WaterConstant, saved, 5)) &&
                  SUCCEEDED(d->GetVertexShaderConstantF(4, view, 1));
@@ -985,13 +1103,36 @@ struct WaterConstantsScope {
                 }
             }
         }
-        // The environment cube once it holds something, with both programs' variants.
-        IDirect3DCubeTexture9 *environment = active ? env_probe::cube(d) : nullptr;
+        if (!active) return; // Not drawn (unusable()).
+        // The environment cube once it is rendered from its anchor, with both
+        // programs' variants: the world-fixed reflection. Otherwise reflection off
+        // (the neutral cube through the same variants, else the neutral image under
+        // the engine's programs): never the engine's own image, which follows the head.
+        pixel = probePixelOf(d, enginePixelShader);
+        IDirect3DCubeTexture9 *environment = env_probe::cube(d);
+        const bool variants = vertex != shaderProbe.end() && vertex->second.variant && pixel.variant;
+        // The cube's anchor in the water's model space (its sphere is centred there);
+        // for the neutral cube any finite point does: the viewer.
+        float anchorModel[4]{view[0], view[1], view[2], 1};
+        bool placed = false;
+        if (environment && turned && engineAdjusted && variants) {
+            float anchorWorld[3], at[3]{};
+            M4 inv, model, modelInverse;
+            placed = env_probe::anchor(anchorWorld) && invert(multiply(m4(engineAdjusted, 4), m4(engineView, 3)), inv) &&
+                     invert(model = multiply(inv, m4(wvp, 4)), modelInverse);
+            for (unsigned r = 0; r < 3 && placed; ++r) {
+                const double v = modelInverse[4 * r] * anchorWorld[0] + modelInverse[4 * r + 1] * anchorWorld[1] +
+                                 modelInverse[4 * r + 2] * anchorWorld[2] + modelInverse[4 * r + 3];
+                placed = std::isfinite(v);
+                at[r] = float(v);
+            }
+            if (placed) std::copy(std::begin(at), std::end(at), anchorModel);
+        }
+        unsigned why = (environment ? 0u : reason::NoCube) | (turned ? 0u : reason::NoRotation) | (labWaterUnpatched() ? reason::Lab : 0u) |
+            (vertex != shaderProbe.end() && vertex->second.variant ? 0u : reason::NoVariant) | (engineAdjusted ? 0u : reason::NoCamera) |
+            (pixel.variant ? 0u : reason::NoPixelVariant);
+        if (!placed && !(why & reason::NotWorld)) why |= reason::NoAnchor;
         {
-            // Why a water draw keeps the engine's screen-mapped reflection (bounded, on change).
-            static unsigned traced = 0, previous = ~0u;
-            const unsigned why = unsigned(!environment) | unsigned(!turned) << 1 | unsigned(labWaterUnpatched()) << 2 |
-                unsigned(vertex == shaderProbe.end() || !vertex->second.variant) << 3 | unsigned(!engineAdjusted) << 4;
             // Lab (SS2VR_LAB_WATER_TRACE=1): every water draw of a few stereo passes in the level.
             static const bool every = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_WATER_TRACE", v, 2) == 1 && v[0] == L'1'; }();
             static unsigned everyTraced = 0;
@@ -1003,28 +1144,21 @@ struct WaterConstantsScope {
                     static_cast<void *>(engineShader), enginePixelShader ? pixelInfo(enginePixelShader).hash : 0u, why, cull, zfunc, blend,
                     int(vertex != shaderProbe.end() && vertex->second.variant));
             }
-            if (why != previous && traced < 24) {
-                ++traced;
-                previous = why;
-                log("Single pass water cube use reasons=%x (1 no cube, 2 no rotation, 4 lab, 8 no variant, 16 no camera)", why);
-            }
         }
-        if (!environment || !turned || labWaterUnpatched() || !vertex->second.variant || !engineAdjusted) return;
-        // The cube's anchor in the water's model space (its sphere is centred there).
-        float anchorWorld[3], anchorModel[4]{0, 0, 0, 1};
-        {
-            M4 inv, model, modelInverse;
-            if (!env_probe::anchor(anchorWorld) || !invert(multiply(m4(engineAdjusted, 4), m4(engineView, 3)), inv) ||
-                !invert(model = multiply(inv, m4(wvp, 4)), modelInverse)) return;
-            for (unsigned r = 0; r < 3; ++r) {
-                const double v = modelInverse[4 * r] * anchorWorld[0] + modelInverse[4 * r + 1] * anchorWorld[1] +
-                                 modelInverse[4 * r + 2] * anchorWorld[2] + modelInverse[4 * r + 3];
-                if (!std::isfinite(v)) return;
-                anchorModel[r] = float(v);
-            }
+        auto chosen = ss2vr::water::reflectionFor(why);
+        if (chosen == ss2vr::water::Reflection::Engine) { traceWaterReflection("in the pass", chosen, why, 0); return; } // Lab only.
+        if (chosen == ss2vr::water::Reflection::NeutralCube && !(environment = env_probe::neutralCube(d)))
+            chosen = ss2vr::water::Reflection::NeutralImage;
+        if (chosen != ss2vr::water::Reflection::NeutralImage && FAILED(d->GetTexture(pixel.sampler, &image))) {
+            image = nullptr;
+            chosen = ss2vr::water::Reflection::NeutralImage;
         }
-        pixel = probePixelOf(d, enginePixelShader);
-        if (!pixel.variant || FAILED(d->GetTexture(pixel.sampler, &image))) return;
+        if (chosen == ss2vr::water::Reflection::NeutralImage) { neutralImage(why); return; }
+        traceWaterReflection("in the pass", chosen, why, 1u << pixel.sampler);
+        if (!turned) { // The neutral cube is the same in every direction: any rotation does.
+            const float identity[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+            std::copy(std::begin(identity), std::end(identity), rows);
+        }
         const D3DSAMPLERSTATETYPE kinds[4]{D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_SRGBTEXTURE};
         for (unsigned k = 0; k < 4; ++k) d->GetSamplerState(pixel.sampler, kinds[k], &sampling[k]);
         cube = true;
@@ -1091,6 +1225,7 @@ struct WaterConstantsScope {
             appliedPixelShader = enginePixelShader;
         }
         if (image) image->Release();
+        neutral.restore(d);
         if (active) d->SetVertexShaderConstantF(WaterConstant, saved, 5);
     }
 };
@@ -1274,7 +1409,9 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
         return result;
     }
     // Programs whose view position is set per eye (ReflectionViewScope) need the per-eye draws.
-    if (stereo && instancing && !instancingSuspended && !eyePixelCount && !waterDraw() && !shaderReflectionView.count(engineShader) &&
+    // So does any water program (its reflection image is replaced around its draw, WaterConstantsScope).
+    if (stereo && instancing && !instancingSuspended && !eyePixelCount && !waterDraw() && waterSetOf(engineShader) < 0 &&
+        !shaderReflectionView.count(engineShader) &&
         !grabBound(d) && instanced(d, call, result)) return result;
     return perHalf(d, call, stereo);
 }
@@ -1473,6 +1610,28 @@ void setEngineMatrices(const float *adjusted, const float *projection, const flo
     engineAdjusted = adjusted; engineProjection = projection; engineView = view;
 }
 bool waterBound() noexcept { return waterDraw(); }
+static NeutralImages outsideNeutral;
+bool neutralWaterBegin(IDirect3DDevice9 *d) noexcept {
+    if (!d || outsideNeutral.count || labWaterUnpatched()) return false;
+    // Without the pass's hooks ([Render] SinglePass=0) the engine's programs are not tracked.
+    IDirect3DVertexShader9 *vs = engineShader;
+    if (!hooked && FAILED(d->GetVertexShader(&vs))) vs = nullptr;
+    const int set = waterSetOf(vs);
+    if (!hooked && vs) vs->Release();
+    // The pass, the mirror pass and the cube faces handle (or leave out) their own water.
+    if (set < 0 || drawing(d) || water_mirror::drawing(d) || env_probe::facePass(d)) return false;
+    IDirect3DPixelShader9 *ps = enginePixelShader;
+    if (!hooked && FAILED(d->GetPixelShader(&ps))) ps = nullptr;
+    const uint32_t samplers = waterImagesOf(ps, set);
+    env_probe::noteWater();
+    const bool bound = outsideNeutral.bind(d, samplers);
+    namespace reason = ss2vr::water::reason;
+    traceWaterReflection("outside the pass", bound ? ss2vr::water::Reflection::NeutralImage : ss2vr::water::Reflection::Engine,
+                         reason::NotStereo | (bound ? 0u : reason::NoSampler), samplers, ps);
+    if (!hooked && ps) ps->Release();
+    return bound;
+}
+void neutralWaterEnd(IDirect3DDevice9 *d) noexcept { if (d) outsideNeutral.restore(d); }
 bool engineCamera(const float *&adjusted, const float *&view) noexcept {
     adjusted = engineAdjusted; view = engineView;
     return engineAdjusted && engineView && engineProjection;

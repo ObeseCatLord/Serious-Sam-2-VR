@@ -106,6 +106,9 @@ int main() {
         for (size_t i = 0; i + 3 < out.size(); ++i)
             if (out[i] == 0x03 && out[i + 3] == src(Const, 35)) anchoredCentre = true;
         assert(anchoredCentre);
+        // The set the reflection lookup is written to (oT2 here); none without the water site.
+        assert(waterLookupSet(water.data(), water.size()) == 2 && waterLookupSet(program.data(), program.size()) == -1);
+        assert(waterLookupSet(nullptr, 0) == -1);
         // Per pixel: o = P - anchor (c35) turned into the lookup's texcoord, the view
         // ray P - eye (c30) turned into r9 and written to set 7; no sphere in the program.
         VertexInfo perPixel;
@@ -248,6 +251,36 @@ int main() {
         std::vector<uint32_t> other(ps.begin(), ps.begin() + 17);
         other.push_back(0x0000ffffu);
         assert(!patchWaterPixelShader(other.data(), other.size(), cube, sampler));
+        // The reflection image's sampler, for replacing the image in VR when the
+        // reflection cannot be world-fixed: found from the lookup's texcoord set
+        // alone, so also in programs that have no cube variant (c30 in use), and
+        // not the ripple map's sampler (looked up with another set).
+        assert(samplersOfTexcoord(ps.data(), ps.size(), 2) == 1u << 2);
+        assert(samplersOfTexcoord(ps.data(), ps.size(), 0) == 1u << 0);
+        assert(samplersOfTexcoord(busy.data(), busy.size(), 2) == 1u << 2);
+        assert(samplersOfTexcoord(other.data(), other.size(), 2) == 0);      // No lookup with that set.
+        assert(samplersOfTexcoord(ps.data(), ps.size(), 5) == 0 && samplersOfTexcoord(ps.data(), ps.size(), 8) == 0);
+        assert(samplersOfTexcoord(nullptr, 0, 2) == 0);
+        {
+            // A temp wholly rewritten from something else no longer carries the set:
+            // `mov r2, c0` ahead of the lookup, and the lookup is not the set's.
+            std::vector<uint32_t> rewritten(ps.begin(), ps.begin() + 25);
+            rewritten.insert(rewritten.end(), {0x02000001u, dst(Temp, 2, 0xf), src(Const, 0)});
+            rewritten.insert(rewritten.end(), ps.begin() + 25, ps.end());
+            assert(samplersOfTexcoord(rewritten.data(), rewritten.size(), 2) == 0);
+            // A direct lookup (no ripple): texld r1, t2, s3.
+            std::vector<uint32_t> direct{Ps20,
+                0x03000042u, dst(Temp, 1, 0xf), 0x80000000u | reg(Tex, 2) | (0xe4u << 16), 0x80000000u | reg(Smp, 3) | (0xe4u << 16),
+                0x02000001u, 0x80000000u | reg(Out, 0) | (0xfu << 16), src(Temp, 1), 0x0000ffffu};
+            assert(samplersOfTexcoord(direct.data(), direct.size(), 2) == 1u << 3);
+            // Truncated: nothing found rather than a guess.
+            direct.resize(3);
+            assert(samplersOfTexcoord(direct.data(), direct.size(), 2) == 0);
+            // ps_1_1: `tex t1` looks stage 1 up with set 1.
+            const std::vector<uint32_t> ps11{PsVersion11, 0x42u, dst(Tex, 0, 0xf), 0x42u, dst(Tex, 1, 0xf),
+                                             0x03u, dst(Temp, 0, 0xf), src(Tex, 0), src(Tex, 1), 0x0000ffffu};
+            assert(samplersOfTexcoord(ps11.data(), ps11.size(), 1) == 1u << 1 && samplersOfTexcoord(ps11.data(), ps11.size(), 2) == 0);
+        }
     }
     // Optional private check: every dumped engine vertex program patches.
     if (const char *dir = std::getenv("SS2VR_SHADER_DUMPS")) {

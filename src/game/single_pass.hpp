@@ -81,6 +81,13 @@ void afterRenderTarget(IDirect3DDevice9 *device, DWORD index, IDirect3DSurface9 
 // camera, a program (not fixed function) bound, the engine's user plane mask,
 // and the device's clip plane/render state set past the pass's own tracking.
 bool waterBound() noexcept;
+// A VR water draw outside the pass (two-pass eyes, scope views; also without the
+// pass's hooks) is drawn by the engine's own programs, whose reflection is
+// looked up by screen position and so follows the head. Around such a draw the
+// reflection image is replaced by the neutral one (reflection off). Begin
+// returns whether anything was replaced; End then puts the engine's back.
+bool neutralWaterBegin(IDirect3DDevice9 *device) noexcept;
+void neutralWaterEnd(IDirect3DDevice9 *device) noexcept;
 bool engineCamera(const float *&adjusted, const float *&view) noexcept;
 const float *engineProjectionMatrix() noexcept;
 bool backgroundBound() noexcept;

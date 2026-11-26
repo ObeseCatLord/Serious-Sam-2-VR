@@ -15,21 +15,24 @@ IDirect3DDevice9 *owner = nullptr;
 // anchor and radius) while a new anchor's faces render into the other; they
 // swap once all of its faces are done, so the reflection never mixes anchors.
 IDirect3DCubeTexture9 *cubeTexture = nullptr, *backTexture = nullptr;
-IDirect3DTexture9 *source = nullptr, *faceSource = nullptr;
-IDirect3DSurface9 *sourceSurface = nullptr, *faceSourceSurface = nullptr;
-// Rendered faces: the face being rendered, its target, which faces hold a render
-// of the current anchor, and when one last completed.
-unsigned passFace = 0, faceNext = 0, faceFresh = 0, faceEver = 0;
+IDirect3DTexture9 *faceSource = nullptr;
+IDirect3DSurface9 *faceSourceSurface = nullptr;
+// The neutral reflection (reflection off): one texel of sky colour as a cube and
+// as an image. Not render targets: they are made in the middle of a water draw.
+IDirect3DDevice9 *neutralOwner = nullptr;
+IDirect3DCubeTexture9 *neutralCubeTexture = nullptr;
+IDirect3DTexture9 *neutralImageTexture = nullptr;
+bool neutralCubeFailed = false, neutralImageFailed = false;
+// Rendered faces: the face being rendered and its target.
+unsigned passFace = 0;
 IDirect3DSurface9 *passTarget = nullptr;
 bool passActive = false, passCaptured = false;
-uint64_t lastFaceTick = 0;
-IDirect3DPixelShader9 *program = nullptr;
 IDirect3DStateBlock9 *state = nullptr;
-bool failed = false, filled = false;
+bool failed = false;
 uint64_t lastWater = 0;
-float lastCamera[3]{}, anchorAt[3]{};
+// The front cube holds a complete render from anchorAt (only then is it looked up).
+float anchorAt[3]{};
 bool anchored = false;
-bool renderedOnce = false; // A face-rendered cube was completed (this resource lifetime).
 // The cube's fixed world point moves to the viewer only once they are this far
 // from it (metres): within that, reflections stay put as the head moves.
 constexpr float AnchorMove = 4.f;
@@ -51,11 +54,12 @@ constexpr float RadiusMin = 8.f, RadiusMax = 40.f;
 // on the sphere it would reflect from the wrong place and slide as the head moves.
 constexpr float NearShare = .6f;
 float surroundings = ss2vr::water::ProxyRadius, sphereRadius = ss2vr::water::ProxyRadius;
-constexpr UINT SourceSize = 512;
 constexpr uint64_t KeepMs = 4000; // After the last water draw.
 template<class T> void drop(T *&p) { if (p) { p->Release(); p = nullptr; } }
-// Sky-like start until views fill the cube (water seen before any capture).
-constexpr D3DCOLOR Neutral = D3DCOLOR_XRGB(150, 175, 200);
+// Sky-like start of the cubes' faces (the water looks a cube up only once it is
+// rendered; until then it gets the neutral reflection below, the same colour).
+constexpr D3DCOLOR Neutral = D3DCOLOR_XRGB(ss2vr::water::NeutralSky[0], ss2vr::water::NeutralSky[1], ss2vr::water::NeutralSky[2]);
+void releaseCube() noexcept;
 bool clearFaces(IDirect3DDevice9 *d, const Device &device, IDirect3DCubeTexture9 *cube = nullptr) {
     if (!cube) cube = cubeTexture;
     IDirect3DSurface9 *previous = nullptr;
@@ -72,21 +76,17 @@ bool clearFaces(IDirect3DDevice9 *d, const Device &device, IDirect3DCubeTexture9
     return ok;
 }
 bool ensure(IDirect3DDevice9 *d, const Device &device, D3DFORMAT format) {
-    if (owner != d) release();
+    if (owner != d) releaseCube();
     if (failed) return false;
     if (cubeTexture) return true;
     owner = d;
-    const auto words = probe::captureProgram();
     if (FAILED(d->CreateCubeTexture(probe::FaceSize, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &cubeTexture, nullptr)) ||
         FAILED(d->CreateCubeTexture(probe::FaceSize, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &backTexture, nullptr)) ||
-        FAILED(d->CreateTexture(SourceSize, SourceSize, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &source, nullptr)) ||
-        FAILED(source->GetSurfaceLevel(0, &sourceSurface)) ||
         FAILED(d->CreateTexture(probe::FaceSize, probe::FaceSize, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &faceSource, nullptr)) ||
         FAILED(faceSource->GetSurfaceLevel(0, &faceSourceSurface)) ||
-        FAILED(d->CreatePixelShader(reinterpret_cast<const DWORD *>(words.data()), &program)) ||
         FAILED(d->CreateStateBlock(D3DSBT_ALL, &state)) || !clearFaces(d, device) || !clearFaces(d, device, backTexture)) {
         log("Water environment cube unavailable");
-        release();
+        releaseCube();
         failed = true;
         return false;
     }
@@ -139,13 +139,10 @@ static void labDump(IDirect3DDevice9 *d, D3DFORMAT format, unsigned every) noexc
 }
 void noteWater() noexcept { lastWater = GetTickCount64(); }
 bool wanted() noexcept { return lastWater && GetTickCount64() - lastWater < KeepMs && !failed; }
-bool everRendered() noexcept { return renderedOnce; }
-bool rendered() noexcept { return faceEver == AllRendered || pending || (lastFaceTick && GetTickCount64() - lastFaceTick < 1000); }
 
 bool nextFace(IDirect3DDevice9 *d, const Device &device, D3DFORMAT format, const float (&viewer)[3], unsigned &face,
               float (&anchorOut)[3]) noexcept {
     if (!wanted() || !d || !std::isfinite(viewer[0] + viewer[1] + viewer[2]) || !ensure(d, device, format)) return false;
-    std::copy(std::begin(viewer), std::end(viewer), lastCamera);
     const uint64_t now = GetTickCount64();
     const auto away = [&](const float (&at)[3]) {
         const float dx = viewer[0] - at[0], dy = viewer[1] - at[1], dz = viewer[2] - at[2];
@@ -154,10 +151,10 @@ bool nextFace(IDirect3DDevice9 *d, const Device &device, D3DFORMAT format, const
     // Walking away from the cube's anchor (or from a new one still settling, or a
     // jump: respawn, load) starts a new anchor at the viewer.
     if ((!anchored && !pending) || (anchored && !pending && away(anchorAt)) || (pending && away(pendingAt))) {
-        // A jump (respawn, load): the old place's reflection goes; a neutral sky until the new one is ready.
+        // A jump (respawn, load): the old place's reflection goes; the neutral one until the new cube is ready.
         if (anchored) {
             const float dx = viewer[0] - anchorAt[0], dy = viewer[1] - anchorAt[1], dz = viewer[2] - anchorAt[2];
-            if (dx * dx + dy * dy + dz * dz > 40.f * 40.f) { clearFaces(d, device); anchored = false; faceFresh = faceEver = 0; renderedOnce = false; }
+            if (dx * dx + dy * dy + dz * dz > 40.f * 40.f) { clearFaces(d, device); anchored = false; }
         }
         std::copy(std::begin(viewer), std::end(viewer), pendingAt);
         pending = true;
@@ -254,21 +251,17 @@ bool captureFace(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *t
 void endFace(bool complete) noexcept {
     if (passActive && complete && passCaptured) {
         backFresh |= 1u << passFace;
-        lastFaceTick = GetTickCount64();
         if (backFresh == AllRendered) {
             // The new anchor's cube is complete: the water looks it up from now on.
             std::swap(cubeTexture, backTexture);
             std::copy(std::begin(pendingAt), std::end(pendingAt), anchorAt);
             sphereRadius = pendingRadius;
             anchored = true;
-            renderedOnce = true;
             pending = false;
-            faceFresh = faceEver = AllRendered;
             static unsigned traced = 0;
             if (traced++ < 12)
                 log("Water environment cube rendered from its anchor %.1f,%.1f,%.1f radius %.1f m, nearer than %.1f m left out",
                     double(anchorAt[0]), double(anchorAt[1]), double(anchorAt[2]), double(sphereRadius), double(sphereRadius * NearShare));
-            filled = true;
             if (owner) {
                 D3DSURFACE_DESC desc{};
                 if (SUCCEEDED(cubeTexture->GetLevelDesc(0, &desc))) labDump(owner, desc.Format, 1);
@@ -279,80 +272,68 @@ void endFace(bool complete) noexcept {
     passTarget = nullptr;
 }
 
-void capture(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *eye, UINT width, UINT height, const float *view,
-             const float *projection) noexcept {
-    if (!wanted() || !d || !eye || !view || !projection || !device.setRT || !device.drawUp || !device.stretch) return;
-    D3DSURFACE_DESC desc{};
-    if (FAILED(eye->GetDesc(&desc)) || !ensure(d, device, desc.Format)) return;
-    // A jump (respawn, load) starts the cube again; walking away from its anchor
-    // moves the anchor (the old views fade out as new ones blend in).
-    const float camera[3]{-(view[0] * view[3] + view[4] * view[7] + view[8] * view[11]),
-                          -(view[1] * view[3] + view[5] * view[7] + view[9] * view[11]),
-                          -(view[2] * view[3] + view[6] * view[7] + view[10] * view[11])};
-    const float dx = camera[0] - lastCamera[0], dy = camera[1] - lastCamera[1], dz = camera[2] - lastCamera[2];
-    if (filled && dx * dx + dy * dy + dz * dz > 40.f * 40.f) { clearFaces(d, device); anchored = false; }
-    std::copy(std::begin(camera), std::end(camera), lastCamera);
-    // Anchored once, where the capture began: moving the anchor under old texels
-    // (or easing the radius) made the reflections swim with the viewer.
-    if (!anchored) {
-        std::copy(std::begin(camera), std::end(camera), anchorAt);
-        sphereRadius = surroundings;
-        anchored = true;
-    }
-    const RECT whole{0, 0, LONG(width), LONG(height)};
-    if (FAILED(device.stretch(d, eye, &whole, sourceSurface, nullptr, D3DTEXF_LINEAR))) return;
-    float rows[16];
-    probe::captureRows(view, projection, anchorAt, sphereRadius, rows);
-    IDirect3DSurface9 *previous = nullptr;
-    if (FAILED(state->Capture()) || FAILED(d->GetRenderTarget(0, &previous))) { drop(previous); return; }
-    d->SetVertexShader(nullptr);
-    d->SetPixelShader(program);
-    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE3(0));
-    d->SetPixelShaderConstantF(0, rows, 4);
-    d->SetTexture(0, source);
-    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR); d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-    d->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-    d->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP); d->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-    d->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
-    const std::pair<D3DRENDERSTATETYPE, DWORD> states[]{
-        {D3DRS_ZENABLE, FALSE}, {D3DRS_ZWRITEENABLE, FALSE}, {D3DRS_ALPHATESTENABLE, FALSE}, {D3DRS_ALPHABLENDENABLE, TRUE},
-        {D3DRS_SRCBLEND, D3DBLEND_SRCALPHA}, {D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA}, {D3DRS_BLENDOP, D3DBLENDOP_ADD},
-        {D3DRS_SEPARATEALPHABLENDENABLE, FALSE},
-        {D3DRS_CULLMODE, D3DCULL_NONE}, {D3DRS_FOGENABLE, FALSE}, {D3DRS_STENCILENABLE, FALSE}, {D3DRS_SCISSORTESTENABLE, FALSE},
-        {D3DRS_COLORWRITEENABLE, 0x7}, {D3DRS_SRGBWRITEENABLE, FALSE}, {D3DRS_CLIPPLANEENABLE, 0}, {D3DRS_FILLMODE, D3DFILL_SOLID}};
-    for (const auto &[which, value] : states) d->SetRenderState(which, value);
-    struct Vertex { float x, y, z, rhw, u, v, w; };
-    const float size = float(probe::FaceSize);
-    bool ok = true;
-    for (UINT face = 0; face < 6 && ok; ++face) {
-        IDirect3DSurface9 *surface = nullptr;
-        Vertex quad[4];
-        const float corners[4][2]{{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
-        for (unsigned k = 0; k < 4; ++k) {
-            float dir[3];
-            probe::faceDirection(face, corners[k][0], corners[k][1], dir);
-            quad[k] = {(corners[k][0] + 1) * .5f * size - .5f, (corners[k][1] + 1) * .5f * size - .5f, 0, 1, dir[0], dir[1], dir[2]};
-        }
-        const D3DVIEWPORT9 viewport{0, 0, probe::FaceSize, probe::FaceSize, 0, 1};
-        ok = SUCCEEDED(cubeTexture->GetCubeMapSurface(D3DCUBEMAP_FACES(face), 0, &surface)) &&
-             SUCCEEDED(device.setRT(d, 0, surface)) && SUCCEEDED(d->SetViewport(&viewport)) &&
-             SUCCEEDED(device.drawUp(d, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vertex)));
-        drop(surface);
-    }
-    device.setRT(d, 0, previous);
-    drop(previous);
-    state->Apply();
-    if (ok && !filled) log("Water environment cube filled from the eye view");
-    filled = filled || ok;
-    labDump(d, desc.Format, 600);
-}
-
 IDirect3DCubeTexture9 *cube(IDirect3DDevice9 *d) noexcept {
-    // Whenever the cube exists (its unrendered faces hold a neutral sky): without
-    // it the water fell back to the engine's reflection, a flipped copy of the
-    // screen, which in single pass is both eyes side by side (a band split at
-    // each eye's centre, fixed to the head; lab V799-V830).
-    return d == owner ? cubeTexture : nullptr;
+    // Only a cube completely rendered from its anchor: nothing else in it is fixed
+    // in the world. Before that (a new level, after a device reset or a jump) the
+    // water gets the neutral reflection (neutralCube), never the engine's own (a
+    // screen-mapped image, on some levels a flipped copy of the screen, which in
+    // single pass is both eyes side by side, fixed to the head; lab V799-V830)
+    // and never the eye's view projected into the cube (it followed the head).
+    return d == owner && anchored ? cubeTexture : nullptr;
+}
+namespace {
+// One texel from system memory into a default-pool texture (lockable and
+// managed pools are not there on every device kind, e.g. D3D9Ex).
+template<class T, class Create, class Fill> T *neutralTexture(IDirect3DDevice9 *d, Create create, Fill fill) noexcept {
+    T *staging = nullptr, *texture = nullptr;
+    if (FAILED(create(D3DPOOL_SYSTEMMEM, &staging)) || !fill(staging) || FAILED(create(D3DPOOL_DEFAULT, &texture)) ||
+        FAILED(d->UpdateTexture(staging, texture))) drop(texture);
+    drop(staging);
+    return texture;
+}
+void neutralFor(IDirect3DDevice9 *d) noexcept {
+    if (neutralOwner == d) return;
+    drop(neutralCubeTexture); drop(neutralImageTexture);
+    neutralOwner = d;
+    neutralCubeFailed = neutralImageFailed = false;
+}
+} // namespace
+IDirect3DCubeTexture9 *neutralCube(IDirect3DDevice9 *d) noexcept {
+    if (!d) return nullptr;
+    neutralFor(d);
+    if (neutralCubeTexture || neutralCubeFailed) return neutralCubeTexture;
+    neutralCubeTexture = neutralTexture<IDirect3DCubeTexture9>(d,
+        [&](D3DPOOL pool, IDirect3DCubeTexture9 **out) { return d->CreateCubeTexture(1, 1, 0, D3DFMT_A8R8G8B8, pool, out, nullptr); },
+        [](IDirect3DCubeTexture9 *t) {
+            for (UINT face = 0; face < 6; ++face) {
+                D3DLOCKED_RECT locked{};
+                if (FAILED(t->LockRect(D3DCUBEMAP_FACES(face), 0, &locked, nullptr, 0))) return false;
+                *static_cast<D3DCOLOR *>(locked.pBits) = Neutral;
+                t->UnlockRect(D3DCUBEMAP_FACES(face), 0);
+            }
+            return true;
+        });
+    if (!neutralCubeTexture) { neutralCubeFailed = true; log("Water neutral reflection cube unavailable"); }
+    return neutralCubeTexture;
+}
+IDirect3DTexture9 *neutralImage(IDirect3DDevice9 *d, float gain) noexcept {
+    if (!d) return nullptr;
+    neutralFor(d);
+    if (neutralImageTexture || neutralImageFailed) return neutralImageTexture;
+    using ss2vr::water::NeutralSky, ss2vr::water::neutralImageLevel;
+    const D3DCOLOR texel = D3DCOLOR_XRGB(neutralImageLevel(NeutralSky[0], gain), neutralImageLevel(NeutralSky[1], gain),
+                                         neutralImageLevel(NeutralSky[2], gain));
+    neutralImageTexture = neutralTexture<IDirect3DTexture9>(d,
+        [&](D3DPOOL pool, IDirect3DTexture9 **out) { return d->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, pool, out, nullptr); },
+        [&](IDirect3DTexture9 *t) {
+            D3DLOCKED_RECT locked{};
+            if (FAILED(t->LockRect(0, &locked, nullptr, 0))) return false;
+            *static_cast<D3DCOLOR *>(locked.pBits) = texel;
+            t->UnlockRect(0);
+            return true;
+        });
+    if (!neutralImageTexture) { neutralImageFailed = true; log("Water neutral reflection image unavailable"); }
+    return neutralImageTexture;
 }
 void setSurroundings(float metres) noexcept {
     if (std::isfinite(metres)) { surroundings = std::clamp(metres, RadiusMin, RadiusMax); surroundingsTick = GetTickCount64(); }
@@ -371,23 +352,26 @@ bool anchor(float (&out)[3]) noexcept {
     return true;
 }
 
-void release() noexcept {
-    drop(state); drop(program); drop(sourceSurface); drop(source); drop(faceSourceSurface); drop(faceSource); drop(cubeTexture);
+namespace {
+void releaseCube() noexcept {
+    drop(state); drop(faceSourceSurface); drop(faceSource); drop(cubeTexture);
     drop(backTexture);
     pending = false;
     backFresh = 0;
     owner = nullptr;
-    filled = false;
     anchored = false;
-    faceFresh = faceEver = 0;
     passActive = false;
     passTarget = nullptr;
     // A new resource lifetime (device reset, new level) starts clean: one failed
     // creation no longer disables the cube for good, and no old anchor survives.
     failed = false;
-    renderedOnce = false;
-    lastFaceTick = 0;
     surroundings = sphereRadius = ss2vr::water::ProxyRadius;
-    std::fill(std::begin(lastCamera), std::end(lastCamera), 0.f);
+}
+} // namespace
+void release() noexcept {
+    releaseCube();
+    drop(neutralCubeTexture); drop(neutralImageTexture);
+    neutralOwner = nullptr;
+    neutralCubeFailed = neutralImageFailed = false;
 }
 } // namespace ss2vr::game::env_probe

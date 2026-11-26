@@ -668,6 +668,72 @@ inline bool patchWaterPixelShader(const uint32_t *words, size_t count, std::vect
     return true;
 }
 
+// The texcoord set a water vertex program (eyeClipSite) writes its reflection
+// lookup to: the first texcoord output written from the lookup's register after
+// the site (the one the probe variant replaces). -1 when there is none.
+inline int waterLookupSet(const uint32_t *words, size_t count) {
+    using namespace detail;
+    unsigned reg = 0;
+    const size_t at = words && count >= 2 ? eyeClipSite(words, count, reg) : 0;
+    if (!at) return -1;
+    for (size_t i = at; i < count && words[i] != 0x0000ffffu;) {
+        const uint32_t token = words[i], opcode = token & 0xffffu;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const int n = operands(opcode);
+        if (n < 0 || i + 1 + size_t(n) > count) break;
+        if (n >= 2 && opcode != 0x1f && opcode != 0x51 && regType(words[i + 1]) == TexCrdOut && regNum(words[i + 1]) < 8)
+            for (int k = 1; k < n; ++k)
+                if (regType(words[i + 1 + k]) == Temp && regNum(words[i + 1 + k]) == reg) return int(regNum(words[i + 1]));
+        i += 1 + size_t(n);
+    }
+    return -1;
+}
+// The samplers (bit N = sN) a pixel program looks up with coordinates that come
+// from texcoord set `set`: for the water's reflection set (waterLookupSet) its
+// reflection image, whatever the program does with it. Unlike
+// patchWaterPixelShader this needs no particular sequence and no free
+// constants, so the image can be replaced (a neutral one, in VR, when the
+// reflection cannot be world-fixed) under programs that have no cube variant.
+// ps_2_0: lookups whose coordinates are the set or temps computed from it;
+// ps_1_1..1_3: the set's own stage (tex, texbem, texbeml). 0 when none.
+inline uint32_t samplersOfTexcoord(const uint32_t *words, size_t count, unsigned set) {
+    using namespace detail;
+    constexpr unsigned Sampler = 10;
+    if (!words || count < 2 || set >= 8) return 0;
+    const uint32_t version = words[0];
+    const bool sm1 = version == PsVersion11 || version == PsVersion12 || version == PsVersion13;
+    if (!sm1 && version != PsVersion20) return 0;
+    uint32_t found = 0, derived = 0; // derived: bit per temp holding something computed from the set.
+    for (size_t i = 1; i < count && words[i] != 0x0000ffffu;) {
+        const uint32_t token = words[i], opcode = token & 0xffffu;
+        if (opcode == 0xfffeu) { i += 1 + ((token >> 16) & 0x7fffu); continue; }
+        const int n = sm1 ? pixelOperands(opcode) : int((token >> 24) & 0xfu);
+        if (n < 0 || i + 1 + size_t(n) > count) return 0;
+        const uint32_t *op = words + i + 1;
+        if (sm1) {
+            if ((opcode == 0x42 || opcode == 0x43 || opcode == 0x44) && regType(op[0]) == Texture && regNum(op[0]) == set)
+                found |= 1u << set;
+        } else if (opcode != 0x1f && opcode != 0x51 && n >= 1) {
+            const auto from = [&](uint32_t operand) {
+                return (regType(operand) == Texture && regNum(operand) == set) ||
+                       (regType(operand) == Temp && regNum(operand) < 32 && (derived & (1u << regNum(operand))));
+            };
+            const bool lookup = opcode == 0x42 && n == 3 && regType(op[2]) == Sampler;
+            bool fromSet = false;
+            if (lookup) {
+                if (from(op[1]) && regNum(op[2]) < 16) found |= 1u << regNum(op[2]);
+            } else
+                for (int k = 1; k < n; ++k) fromSet = fromSet || from(op[k]);
+            if (regType(op[0]) == Temp && regNum(op[0]) < 32) {
+                if (fromSet) derived |= 1u << regNum(op[0]);
+                else if (((op[0] >> 16) & 0xfu) == 0xf) derived &= ~(1u << regNum(op[0])); // Wholly rewritten.
+            }
+        }
+        i += 1 + size_t(n);
+    }
+    return found;
+}
+
 // One eye's instance record (v10..v15): misc (0,1,1,1), R rows 0..3, kill row K.
 struct EyeRecord {
     float misc[4]{0, 1, 1, 1};

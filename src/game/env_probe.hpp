@@ -2,8 +2,9 @@
 #include <windows.h>
 #include <d3d9.h>
 
-// Environment cube for water reflections (common/env_probe.hpp): filled from
-// each frame's left-eye world image, sampled by the patched water programs.
+// Environment cube for water reflections (common/env_probe.hpp): rendered from
+// a fixed world point, sampled by the patched water programs. Until it is
+// rendered the water gets a neutral reflection; never the eye's view.
 namespace ss2vr::game::env_probe {
 struct Device { // The device's original (unhooked) entry points.
     HRESULT(WINAPI *setRT)(IDirect3DDevice9 *, DWORD, IDirect3DSurface9 *) = nullptr;
@@ -26,18 +27,14 @@ bool facePass(IDirect3DDevice9 *d) noexcept; // A draw of the face's render.
 // From the render's pre-bloom capture: `target` into the face (mirrored to D3D's layout).
 bool captureFace(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *target) noexcept;
 void endFace(bool complete) noexcept;
-// Faces are being rendered (the eye-view capture below is then not used).
-bool rendered() noexcept;
-// A cube of rendered faces has been completed since the device's resources were made
-// (the eye-view capture must not overwrite it with a head-following projection).
-bool everRendered() noexcept;
-// Fallback when faces cannot be rendered: projects `eye` (the left eye's world
-// image, `width` x `height`), seen with `view` (world -> view, 3x4) and
-// `projection` (4x4), into the cube.
-void capture(IDirect3DDevice9 *d, const Device &device, IDirect3DSurface9 *eye, UINT width, UINT height, const float *view,
-             const float *projection) noexcept;
-// The cube once anything was captured into it on this device, else null.
+// The cube once it holds a complete render from its anchor on this device, else null.
 IDirect3DCubeTexture9 *cube(IDirect3DDevice9 *d) noexcept;
+// Reflection off: one texel of sky colour, the same from every direction and
+// for every head pose. As a cube (for the water programs' cube variants) and as
+// an image (for the engine's own programs: the cube's colour times `gain`, the
+// factor the cube variants apply). Made on first use; null when that failed.
+IDirect3DCubeTexture9 *neutralCube(IDirect3DDevice9 *d) noexcept;
+IDirect3DTexture9 *neutralImage(IDirect3DDevice9 *d, float gain) noexcept;
 // The cube's fixed world point (its surroundings lie on a sphere around it).
 bool anchor(float (&out)[3]) noexcept;
 // The measured distance of the surroundings from the anchor (metres): the

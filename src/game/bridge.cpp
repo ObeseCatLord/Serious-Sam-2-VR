@@ -1791,6 +1791,18 @@ static void traceWorldDraw(IDirect3DDevice9 *d,UINT count) {
     else if(vp.MinZ==0 && vp.MaxZ==0.89999997615814208984375f) ++sample.worldRangeCalls[key];
     else ++sample.otherRangeCalls[key];
 }
+// VR renders outside the single pass (two-pass eyes, scope views): water drawn by
+// the engine's own programs gets the neutral reflection (single_pass.hpp), bound
+// before the draw is recorded for the eye replay and restored after it. The
+// desktop's own renders (no eye, no scope view) are left as the engine draws them.
+struct VrWaterReflectionOff {
+    IDirect3DDevice9 *device;
+    explicit VrWaterReflectionOff(IDirect3DDevice9 *d) noexcept
+        : device((activeEye>=0 || scopeScratch) && single_pass::neutralWaterBegin(d) ? d : nullptr) {}
+    ~VrWaterReflectionOff() { if(device) single_pass::neutralWaterEnd(device); }
+    VrWaterReflectionOff(const VrWaterReflectionOff &)=delete;
+    VrWaterReflectionOff &operator=(const VrWaterReflectionOff &)=delete;
+};
 static HRESULT WINAPI draw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT start,UINT count) {
     scopeGpuOutput(d);
     return uiDrawCall(d,type,[&]{
@@ -1798,6 +1810,7 @@ static HRESULT WINAPI draw(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT start,
         if(activeEye==0 && !uiBypass) ++drawCensus.plain;
         traceWorldDraw(d,count);
         countDraw();
+        const VrWaterReflectionOff water(d);
         replay::recordDraw(type,start,count);
         if(single_pass::drawing(d)) return single_pass::draw(d,type,start,count);
         if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDraw(d,type,start,count); });
@@ -1812,6 +1825,7 @@ static HRESULT forwardIndexed(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,INT base
         if(activeEye==0 && !uiBypass) ++drawCensus.indexed;
         traceWorldDraw(d,count);
         countDraw();
+        const VrWaterReflectionOff water(d);
         replay::recordDrawIndexed(type,base,minimum,vertices,start,count);
         if(single_pass::drawing(d)) return single_pass::drawIndexed(d,type,base,minimum,vertices,start,count);
         if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDrawIndexed(d,type,base,minimum,vertices,start,count); });
@@ -1884,6 +1898,7 @@ static HRESULT WINAPI drawUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UINT coun
     scopeGpuOutput(d);
     replay::invalidate("user-pointer draw");
     return observeUiOutput(d,[&]{ traceWorldDraw(d,count);
+        const VrWaterReflectionOff water(d);
         if(single_pass::drawing(d)) return single_pass::drawUp(d,type,count,vertices,stride);
         if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDrawUp(d,type,count,vertices,stride); });
         if(env_probe::facePass(d) && single_pass::waterBound()) return D3D_OK; // A cube face leaves the water out.
@@ -1894,6 +1909,7 @@ static HRESULT WINAPI drawIndexedUp(IDirect3DDevice9 *d,D3DPRIMITIVETYPE type,UI
     scopeGpuOutput(d);
     replay::invalidate("user-pointer draw");
     return observeUiOutput(d,[&]{ traceWorldDraw(d,count);
+        const VrWaterReflectionOff water(d);
         if(single_pass::drawing(d)) return single_pass::drawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride);
         if(water_mirror::drawing(d)) return water_mirror::around(d,[&]{ return originalDrawIndexedUp(d,type,minimum,vertices,count,indices,format,data,stride); });
         if(env_probe::facePass(d) && single_pass::waterBound()) return D3D_OK; // A cube face leaves the water out.
@@ -5286,14 +5302,6 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
                             SUCCEEDED(originalStretch(d,wideColor,&half,uiFrame.target[k],nullptr,D3DTEXF_NONE));
                     }
                     if(foveated) ++perf.foveatedPairs;
-                    if(centreReady && env_probe::wanted() && !env_probe::rendered() && !env_probe::everRendered()) {
-                        // Water reflections: this frame's left eye (world only) into the environment cube.
-                        float eyeView[12], eyeProjection[16];
-                        if(singlePassEyeView(request,0,eyeView,eyeProjection)) {
-                            const env_probe::Device device{originalSetRT,originalDrawUp,originalStretch};
-                            env_probe::capture(d,device,uiFrame.target[0],width,height,eyeView,eyeProjection);
-                        }
-                    }
                     ++labStagePair;
                     labStageDump(d,uiFrame.target[1],L"stage-a-pass.ppm");
                     {

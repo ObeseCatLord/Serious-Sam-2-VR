@@ -29,5 +29,35 @@ int main() {
         }
     const float flat[12]{};
     assert(!water::invert3(flat, inv));
+    {
+        // In VR a water draw never keeps the engine's own reflection (screen-mapped,
+        // it follows the head): world-fixed, or else neutral. Every combination of
+        // reasons: the engine's image stays only under the lab switch, or when a
+        // program without the cube variants has no findable reflection lookup.
+        using water::Reflection;
+        namespace reason = water::reason;
+        assert(water::reflectionFor(0) == Reflection::World);
+        for (unsigned why = 0; why < 512; ++why) {
+            const Reflection chosen = water::reflectionFor(why);
+            const bool noVariants = why & (reason::NoVariant | reason::NoPixelVariant | reason::NotStereo);
+            if (why & reason::Lab) assert(chosen == Reflection::Engine);
+            else if (chosen == Reflection::Engine) assert(noVariants && (why & reason::NoSampler));
+            // World-fixed only with the rendered cube, its anchor, the model's rotation, the camera and both variants.
+            assert((chosen == Reflection::World) == !(why & (reason::Lab | reason::NotWorld)));
+            if (chosen == Reflection::NeutralCube) assert(!noVariants && (why & reason::NotWorld));
+            if (chosen == Reflection::NeutralImage) assert(noVariants && !(why & reason::NoSampler));
+        }
+        // No cube yet (a new level, a device reset, a jump), no anchor, no rotation: neutral through the variants.
+        assert(water::reflectionFor(reason::NoCube) == Reflection::NeutralCube);
+        assert(water::reflectionFor(reason::NoAnchor) == Reflection::NeutralCube);
+        assert(water::reflectionFor(reason::NoCube | reason::NoRotation | reason::NoCamera) == Reflection::NeutralCube);
+        // A pixel program without the cube variant, or a draw outside the pass: the image is replaced.
+        assert(water::reflectionFor(reason::NoPixelVariant) == Reflection::NeutralImage);
+        assert(water::reflectionFor(reason::NotStereo | reason::NoCube) == Reflection::NeutralImage);
+        // The image's texel is the cube's times the variants' gain (they look the same on the water).
+        assert(water::neutralImageLevel(200, .45f) == 90 && water::neutralImageLevel(150, .45f) == 68);
+        assert(water::neutralImageLevel(200, 0) == 0 && water::neutralImageLevel(200, -1) == 0 && water::neutralImageLevel(200, 9) == 255);
+        assert(water::neutralImageLevel(200, std::nanf("")) == 0);
+    }
     std::puts("Water reflection checks passed");
 }
