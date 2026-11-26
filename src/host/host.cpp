@@ -1868,15 +1868,25 @@ struct Host {
         hresult(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(factory.put())),
                 "CreateDXGIFactory1", log);
         Com<IDXGIAdapter1> adapter;
+        // A runtime without a display adapter of its own (SteamVR's null headset)
+        // names no LUID: the primary adapter, as for the game.
+        const bool anyAdapter = !requirements.adapterLuid.LowPart && !requirements.adapterLuid.HighPart;
+        if (anyAdapter) log.write("OpenXR runtime names no adapter LUID; using the primary adapter");
         for (UINT i = 0;; ++i) {
             const HRESULT result = factory->EnumAdapters1(i, adapter.put());
-            if (result == DXGI_ERROR_NOT_FOUND)
+            if (result == DXGI_ERROR_NOT_FOUND) {
+                char line[96];
+                std::snprintf(line, sizeof line, "OpenXR adapter LUID %08lx:%08lx not among the system's adapters",
+                              static_cast<unsigned long>(requirements.adapterLuid.HighPart),
+                              static_cast<unsigned long>(requirements.adapterLuid.LowPart));
+                log.write(line);
                 throw std::runtime_error("Required OpenXR adapter LUID not found");
+            }
             hresult(result, "EnumAdapters1", log);
             DXGI_ADAPTER_DESC1 desc{};
             hresult(adapter->GetDesc1(&desc), "GetDesc1", log);
-            if (desc.AdapterLuid.LowPart == requirements.adapterLuid.LowPart &&
-                desc.AdapterLuid.HighPart == requirements.adapterLuid.HighPart)
+            if (anyAdapter || (desc.AdapterLuid.LowPart == requirements.adapterLuid.LowPart &&
+                               desc.AdapterLuid.HighPart == requirements.adapterLuid.HighPart))
                 break;
         }
         const D3D_FEATURE_LEVEL available[] = {
