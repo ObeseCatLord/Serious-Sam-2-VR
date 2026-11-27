@@ -602,7 +602,7 @@ struct PerfClock {
     double frame = 0, stereo = 0, mono = 0, eyeCpu[2]{}, desktopCpu = 0;
     double readTarget = 0, lock = 0, copy = 0, dim = 0, publish = 0, wait = 0, presentCall = 0, presentHook = 0;
     double preStereo = 0, postStereo = 0; // Present end -> stereo start, stereo end -> present start.
-    double section[3]{};
+    double section[7]{};
     uint64_t eyeDraws = 0, desktopDraws = 0, hudDuplicates = 0, hudDraws = 0;
     double hudCpu = 0; // Whole HUD draw path (desktop draw, capture, both eye duplicates, restore).
     double hudFlushCpu = 0;
@@ -749,6 +749,7 @@ extern void beginEye(void *, const Request &, int);
 extern void *shadowReuseProbeTexture() noexcept;
 extern void rootExecuteStats(double &left, double &right) noexcept;
 extern void shadowReuseStats(unsigned &created, unsigned &reused, unsigned &missed, double &createdMs, double &reusedMs) noexcept;
+extern void shadowCarryStats(unsigned &carried, double &carriedMs, unsigned &imageDraws, unsigned &projectionDraws) noexcept;
 extern void endEye();
 static bool sameSurface(IDirect3DSurface9 *a, IDirect3DSurface9 *b) {
     if (a == b)
@@ -1690,10 +1691,20 @@ static bool sharedFencePending() noexcept;
 // drawn. Its fence was polled only at frame boundaries, so the host saw the pair
 // (and posted the next request) up to a frame late; polled between draws instead.
 static void pollSharedFencesInFrame() {
+    // Every 16th draw. Lab: SS2VR_LAB_FENCE_POLL_DRAWS=<power of two; 0 = frame
+    // boundaries only>, to measure what the polls themselves cost on a driver.
+    static const unsigned mask = [] {
+        wchar_t v[8]{};
+        const unsigned every = GetEnvironmentVariableW(L"SS2VR_LAB_FENCE_POLL_DRAWS", v, 8) ? unsigned(wcstoul(v, nullptr, 10)) : 16u;
+        return every && !(every & (every - 1)) ? every - 1 : every ? 15u : ~0u;
+    }();
     static unsigned draws = 0;
-    if (sharedFencePending() && !(++draws & 15)) pollSharedFences(0);
+    if (mask != ~0u && sharedFencePending() && !(++draws & mask)) pollSharedFences(0);
 }
+static uint64_t drawCallTotal = 0;
+uint64_t deviceDrawCalls() noexcept { return drawCallTotal; }
 static void countDraw() {
+    ++drawCallTotal;
     pollSharedFencesInFrame();
     if (uiBypass) ++perf.hudDuplicates;
     else if (activeEye >= 0) ++perf.eyeDraws;
@@ -3237,7 +3248,7 @@ void presentDevice(IDirect3DDevice9 *d, uintptr_t caller, const RECT *src, const
 }
 static LARGE_INTEGER lastPresentEnd{}, lastStereoEnd{};
 void notePerfSection(unsigned section, LARGE_INTEGER start) noexcept {
-    if (section < 3) perf.section[section] += PerfClock::seconds(start, PerfClock::now());
+    if (section < 7) perf.section[section] += PerfClock::seconds(start, PerfClock::now());
 }
 // VR frame pacing, at the frame boundary: while the headset streams pairs, the
 // next frame starts only once the host has a request waiting, so its simulation
@@ -3315,6 +3326,7 @@ void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept {
 }
 static void presentBody(IDirect3DDevice9 *d);
 void present(IDirect3DDevice9 *d) {
+    noteReadableEpoch();
     const LARGE_INTEGER hookStart = PerfClock::now();
     presentBody(d);
     perf.presentHook += PerfClock::seconds(hookStart, PerfClock::now());
@@ -3518,10 +3530,16 @@ static void presentBody(IDirect3DDevice9 *d) {
                         if (level) level->Release();
                     }
                 }
-                if (created || reused || missed)
+                unsigned carried = 0, imageDraws = 0, projectionDraws = 0;
+                double carriedMs = 0;
+                shadowCarryStats(carried, carriedMs, imageDraws, projectionDraws);
+                if (created || reused || missed || carried)
                     log("Perf shadows per frame: created=%.1f reused=%.1f missed=%.1f | per shadow: render+project=%.3fms "
-                        "project only=%.3fms", double(created) / perf.frames, double(reused) / perf.frames,
-                        double(missed) / perf.frames, created ? createdMs / created : 0., reused ? reusedMs / reused : 0.);
+                        "project only=%.3fms | kept=%.1f at %.3fms | draws per frame: image=%.0f projection=%.0f",
+                        double(created) / perf.frames, double(reused) / perf.frames,
+                        double(missed) / perf.frames, created ? createdMs / created : 0., reused ? reusedMs / reused : 0.,
+                        double(carried) / perf.frames, carried ? carriedMs / carried : 0.,
+                        double(imageDraws) / perf.frames, double(projectionDraws) / perf.frames);
             }
             {
                 double left = 0, right = 0;
@@ -3567,6 +3585,11 @@ static void presentBody(IDirect3DDevice9 *d) {
             }
             log("Perf mod sections per frame: update=%.2fms lasers=%.2fms wheels=%.2fms", 1000 * perf.section[0] / perf.frames,
                 1000 * perf.section[1] / perf.frames, 1000 * perf.section[2] / perf.frames);
+            // Sound: the occlusion rays, the water cube's surroundings rays, the game's
+            // listener update (its whole call, the head pose substituted), the mod's own upkeep.
+            log("Perf sound per frame: occlusion rays=%.3fms surroundings rays=%.3fms listener update=%.3fms upkeep=%.3fms",
+                1000 * perf.section[3] / perf.frames, 1000 * perf.section[4] / perf.frames,
+                1000 * perf.section[5] / perf.frames, 1000 * perf.section[6] / perf.frames);
             log("Perf pacing: waits=%u wait=%.2fms per frame", perf.waits, 1000 * perf.wait / perf.frames);
             log("Perf per frame: present call=%.2fms hook=%.2fms | before stereo=%.2fms after stereo=%.2fms (n=%u)",
                 1000 * perf.presentCall / perf.frames, 1000 * perf.presentHook / perf.frames,
@@ -4996,6 +5019,7 @@ static void start() {
 } // namespace sampler
 void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRender) {
     sampler::start();
+    noteReadableEpoch();
     const LARGE_INTEGER stereoStart = PerfClock::now();
     struct StereoTimer {
         LARGE_INTEGER start;

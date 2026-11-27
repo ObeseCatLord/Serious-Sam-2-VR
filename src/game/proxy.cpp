@@ -158,6 +158,14 @@ std::atomic<uint64_t> foreign{0};          // Buffers of another implementation:
 std::atomic<bool> enabled{true};
 std::atomic<uint64_t> buffers{0}, bytes{0}, uploads{0}, uploadBytes{0}, uploadTicks{0}, uploadFailures{0};
 SRWLOCK guard = SRWLOCK_INIT;
+// Most locks (tens of thousands a second) are of the game's dynamic buffers, which
+// have no copy: the buffers last found to have none, so those locks skip the table
+// and its lock. A slot is cleared when a buffer at that address gets a copy.
+std::atomic<void *> uncopied[256]{};
+inline std::atomic<void *> &uncopiedSlot(void *b) noexcept {
+    return uncopied[(uint32_t(reinterpret_cast<uintptr_t>(b) >> 4) * 2654435761u) >> 24];
+}
+inline bool knownUncopied(void *b) noexcept { return uncopiedSlot(b).load(std::memory_order_relaxed) == b; }
 struct Copy;
 std::unordered_map<void *, Copy *> *copies = nullptr; // Never destroyed: buffers may outlive static teardown.
 static const GUID tag{0x5b0a6c5e, 0x4d21, 0x4f0b, {0x9a, 0x3e, 0x53, 0x53, 0x32, 0x56, 0x52, 0x01}};
@@ -223,6 +231,7 @@ template <class Buffer> void adopt(Buffer *b, UINT length, unsigned kind) noexce
     if (copies) {
         try { (*copies)[b] = copy; listed = true; } catch (...) {}
     }
+    uncopiedSlot(b).store(nullptr, std::memory_order_relaxed);
     ReleaseSRWLockExclusive(&guard);
     // The buffer holds the copy from here; a refusal leaves the buffer as it was.
     if (listed && FAILED(b->SetPrivateData(tag, static_cast<IUnknown *>(copy), sizeof(IUnknown *), D3DSPD_IUNKNOWN))) {
@@ -345,7 +354,11 @@ void report() noexcept {
                      double(uploadBytes.exchange(0)) / 1048576. / seconds, double(uploadTicks.exchange(0)) * toMs / seconds,
                      static_cast<unsigned long long>(uploadFailures.load()));
 }
+// SS2VR_LAB_LOCK_TIMING=1: the counters and times above (four clock reads and a
+// table lookup per lock otherwise spent on every one of the game's locks).
+static const bool timing = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_LOCK_TIMING", v, 2) == 1 && v[0] == L'1'; }();
 template <class F> HRESULT timed(Kind kind, DWORD flags, F &&call) {
+    if (!timing) return call();
     LARGE_INTEGER a, b;
     QueryPerformanceCounter(&a);
     const HRESULT hr = call();
@@ -365,6 +378,13 @@ HRESULT WINAPI cube(IDirect3DCubeTexture9 *t, D3DCUBEMAP_FACES face, UINT level,
     return timed(Cube, flags, [&] { return oCube(t, face, level, r, rect, flags); });
 }
 template <class F> HRESULT buffer(Kind kind, void *b, UINT offset, UINT size, void **data, DWORD flags, F &&original) {
+    if (!timing) {
+        if (buffer_copies::knownUncopied(b)) return original();
+        HRESULT copied = D3D_OK;
+        if (buffer_copies::lock(b, offset, size, data, flags, copied)) return copied;
+        buffer_copies::uncopiedSlot(b).store(b, std::memory_order_relaxed);
+        return original();
+    }
     const HRESULT hr = timed(kind, flags, [&] {
         HRESULT copied = D3D_OK;
         return buffer_copies::lock(b, offset, size, data, flags, copied) ? copied : original();
@@ -377,6 +397,7 @@ template <class F> HRESULT buffer(Kind kind, void *b, UINT offset, UINT size, vo
     return hr;
 }
 template <class F> HRESULT release(Kind kind, void *b, F &&original) {
+    if (!timing && buffer_copies::knownUncopied(b)) return original();
     auto &h = held[kind - Vertex];
     if (h.buffer == b) {
         LARGE_INTEGER now;

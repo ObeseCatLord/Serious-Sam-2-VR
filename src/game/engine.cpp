@@ -724,6 +724,8 @@ static void pollSettingsFile() {
     settings.snapTurnDegrees = fresh.snapTurnDegrees;
     settings.moveDirection = fresh.moveDirection;
     settings.singlePassInstancing = fresh.singlePassInstancing;
+    settings.singlePassLazyState = fresh.singlePassLazyState;
+    settings.shadowRefreshFrames = fresh.shadowRefreshFrames;
     settings.waterMirror = fresh.waterMirror;
     settings.waterMirrorScale = fresh.waterMirrorScale;
     settings.desktopWorld = fresh.desktopWorld;
@@ -739,6 +741,7 @@ static void pollSettingsFile() {
     settings.hudWristScale = fresh.hudWristScale;
     settings.voice = fresh.voice;
     single_pass::setInstancing(fresh.singlePassInstancing);
+    single_pass::setLazyState(fresh.singlePassLazyState);
     setDesktopWorld(fresh.desktopWorld);
     log("Settings reloaded: lasers=%d snapTurn=%d turnRate=%.0f snap=%.0f move=%d instancing=%d mirror=%d hud=%d", int(fresh.lasers),
         int(fresh.snapTurn), double(fresh.smoothTurnRate * 180 / Pi), double(fresh.snapTurnDegrees), fresh.moveDirection,
@@ -7255,8 +7258,8 @@ static void trackedRayInitBody(uintptr_t caller, bool outermost) {
             laserTraceValue(LaserTraceStage::Query,"admission-rejected",Snapshot{},2,0,1,nullptr,caller);
         return;
     }
-    traceSoundOcclusion();
-    traceWaterSurroundings();
+    { LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart); traceSoundOcclusion(); notePerfSection(3, sectionStart); }
+    { LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart); traceWaterSurroundings(); notePerfSection(4, sectionStart); }
     auto s = copySnapshot();
     if ((!settings.lasers && !s.zoom[0] && !s.zoom[1]) ||
         !vrSession(s) || !fresh(s.input) || !s.ui.gameplay || !livePlayer(s)) {
@@ -11123,10 +11126,13 @@ using SfxApiCall = void(__cdecl *)(int, long);
 static SfxApiCall originalChangeApi = nullptr;
 static void __cdecl changeSoundApi(int api, long frequency) {
     originalChangeApi(spatial_audio::chooseApi(api), frequency);
+    spatial_audio::measureBackend();
 }
 using SoundListener = void(__thiscall *)(void *, float, float, const Pose &, const Vec3 &);
 static SoundListener originalSoundListener = nullptr;
 static void __fastcall soundListener(void *list, void *, float a, float b, const Pose &placement, const Vec3 &velocity) {
+    LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart);
+    struct Section { LARGE_INTEGER start; ~Section() { notePerfSection(5, start); } } section{sectionStart};
     if (settings.spatialAudio) {
         const auto s = copySnapshot();
         Pose body;
@@ -11140,6 +11146,8 @@ static void __fastcall soundListener(void *list, void *, float a, float b, const
     originalSoundListener(list, a, b, placement, velocity);
 }
 static void maintainSpatialAudio() {
+    LARGE_INTEGER sectionStart{}; QueryPerformanceCounter(&sectionStart);
+    struct Section { LARGE_INTEGER start; ~Section() { notePerfSection(6, start); } } section{sectionStart};
     spatial_audio::configure({settings.spatialAudio, settings.audioOcclusion});
     hud_wrist::configure(settings.hudMode == 1, settings.hudWristScale);
     spatial_audio::frame();
@@ -12792,7 +12800,9 @@ bool replayAdoptEye(const ss2vr::replay::EyeChange &change) noexcept {
 // Fingerprinted Engine RVAs: RenderModelShadow 0xe54c0 (instance, placement,
 // lod), shadow image+projection 0xe39c0 (box, light, light projection, colour),
 // shared canvas pointer 0x2eadf4, shadow resource end callback 0xe3290.
+extern uint64_t deviceDrawCalls() noexcept; // bridge.cpp: every draw call of the game's.
 namespace shadow_reuse {
+static uint64_t singlePassDrawCalls() noexcept { return single_pass::totalDraws(); } // Those the pass issued for both eyes.
 using ModelShadow = void(__cdecl *)(void *, const void *, float);
 using Image = void(__cdecl *)(const void *, const void *, const void *, uint32_t);
 using End = void(__cdecl *)();
@@ -12810,8 +12820,21 @@ static void **sharedCanvas = nullptr;
 static uint8_t *textures = nullptr; // _gfx_atpTextures: data pointer at +4, 0x1c-byte records, texture first.
 static thread_local void *caster = nullptr;
 constexpr unsigned PoolSize = 64;
-struct Entry { void *instance; uint8_t light[48], projection[64]; int32_t handle; bool used; };
+struct Entry { void *instance; uint8_t light[48], projection[64]; int32_t handle; bool used; unsigned slot; };
 static void *pool[PoolSize]{};
+// [Render] ShadowRefreshFrames (1 = every frame, the default): a caster whose light
+// and light projection are those of the previous frame keeps that frame's image,
+// projected again (the engine's quality <= 2 path, as for the second eye), and is
+// rendered anew every that many frames; the casters take turns (by canvas), so the
+// work is even. A caster that moved (another projection) is always rendered. Each
+// entry owns a canvas (`slot`), so a kept image is never drawn over before its use.
+static Entry kept[PoolSize];          // The previous frame's producer entries.
+static bool keptTaken[PoolSize]{};    // Matched this frame, or its canvas given away.
+static unsigned keptCount = 0;
+static bool slotUsed[PoolSize]{};     // Canvases owned by this frame's entries.
+static uint64_t frameNumber = 0;
+static unsigned carried = 0, imageDraws = 0, projectionDraws = 0;
+static double carriedSeconds = 0;
 static int32_t poolImageSize = 0;
 static Entry entries[PoolSize];
 static unsigned entryCount = 0;
@@ -12830,6 +12853,31 @@ static void releasePool() noexcept {
         canvas = nullptr;
     }
     entryCount = 0; frameSequence = 0; producerEye = -1;
+    keptCount = 0;
+    for (auto &used : slotUsed) used = false;
+}
+// A new frame's first shadow: last frame's entries become the kept ones.
+static void beginFrame() noexcept {
+    // Only the frame just before: after a pause in shadow drawing every image is rendered anew.
+    static uint64_t lastFrameTick = 0;
+    const uint64_t now = GetTickCount64();
+    keptCount = producerEye >= 0 && now - lastFrameTick < 100 ? entryCount : 0;
+    lastFrameTick = now;
+    for (unsigned i = 0; i < keptCount; ++i) { kept[i] = entries[i]; keptTaken[i] = false; }
+    for (auto &used : slotUsed) used = false;
+    frameSequence = eyeRequest.sequence; producerEye = eyeIndex; entryCount = 0;
+    ++frameNumber;
+}
+// A canvas for a newly rendered image: the caster's own from last frame, else one
+// no kept image waits in, else a kept image's (which is then no longer kept).
+static int renderSlot(int own) noexcept {
+    if (own >= 0) return int(kept[own].slot);
+    bool held[PoolSize]{};
+    for (unsigned i = 0; i < keptCount; ++i) if (!keptTaken[i]) held[kept[i].slot] = true;
+    for (unsigned c = 0; c < PoolSize; ++c) if (!slotUsed[c] && !held[c]) return int(c);
+    for (unsigned i = 0; i < keptCount; ++i)
+        if (!keptTaken[i] && !slotUsed[kept[i].slot]) { keptTaken[i] = true; return int(kept[i].slot); }
+    return -1;
 }
 static void __cdecl resourceEnd() {
     releasePool(); // The renderer's shadow resources are going away: pooled canvases first.
@@ -12850,16 +12898,49 @@ static void __cdecl image(const void *box, const void *light, const void *projec
     const bool eligible = settings.shadowReuse && caster && light && projection && eyePlayer &&
         (eyeIndex == 0 || eyeIndex == 1) && *quality >= 3 && !*showPolys && !*showTexture && *imageSize > 0;
     if (!eligible) return originalImage(box, light, projection, color);
-    if (eyeRequest.sequence != frameSequence) {
-        frameSequence = eyeRequest.sequence; producerEye = eyeIndex; entryCount = 0;
-    }
+    if (eyeRequest.sequence != frameSequence) beginFrame();
     if (eyeIndex == producerEye) {
-        if (poolImageSize != *imageSize) { releasePool(); poolImageSize = *imageSize;
-            frameSequence = eyeRequest.sequence; producerEye = eyeIndex; }
+        if (poolImageSize != *imageSize) { releasePool(); poolImageSize = *imageSize; beginFrame(); }
         if (entryCount >= PoolSize) return originalImage(box, light, projection, color);
-        void *&canvas = pool[entryCount];
+        // Last frame's entry of this caster under the same light and projection.
+        int own = -1;
+        for (unsigned i = 0; i < keptCount && own < 0; ++i)
+            if (!keptTaken[i] && kept[i].instance == caster && kept[i].handle && !slotUsed[kept[i].slot] &&
+                !std::memcmp(kept[i].light, light, sizeof(kept[i].light)) &&
+                !std::memcmp(kept[i].projection, projection, sizeof(kept[i].projection))) own = int(i);
+        const unsigned refresh = unsigned(std::clamp(settings.shadowRefreshFrames, 1, 8));
+        const uint64_t drawsBefore = deviceDrawCalls(), passBefore = singlePassDrawCalls();
+        if (own >= 0 && refresh > 1 && pool[kept[own].slot] && canvasHandle(pool[kept[own].slot]) == kept[own].handle &&
+            (frameNumber + kept[own].slot) % refresh != 0) {
+            // Kept image: projection only.
+            const Entry previous = kept[own];
+            keptTaken[own] = true; slotUsed[previous.slot] = true;
+            const int32_t savedQuality = *quality, savedCircle = *circleTexture;
+            *quality = 2; *circleTexture = previous.handle;
+            LARGE_INTEGER start{}; QueryPerformanceCounter(&start);
+            (*scissor)(0, 0, -1, -1); // The skipped drawport restore resets the scissor.
+            bool aborted = false;
+            withNativeFinally([&] { originalImage(box, light, projection, color); }, [&](bool unwound) noexcept {
+                *quality = savedQuality; *circleTexture = savedCircle;
+                aborted = unwound;
+            });
+            carriedSeconds += since(start);
+            if (aborted) return;
+            projectionDraws += unsigned(singlePassDrawCalls() - passBefore);
+            auto &entry = entries[entryCount++];
+            entry = previous;
+            entry.used = false;
+            ++carried;
+            return;
+        }
+        // Every frame anew (the default): the canvases in order, as before.
+        const int slot = refresh > 1 ? renderSlot(own) : int(entryCount);
+        if (own >= 0) keptTaken[own] = true;
+        if (slot < 0) return originalImage(box, light, projection, color);
+        void *&canvas = pool[slot];
         if (!canvas) canvas = createCanvas(*imageSize, *imageSize, 0, 0xde, 0);
         if (!canvas) return originalImage(box, light, projection, color);
+        slotUsed[slot] = true;
         void *saved = *sharedCanvas;
         *sharedCanvas = canvas;
         bool aborted = false;
@@ -12872,12 +12953,18 @@ static void __cdecl image(const void *box, const void *light, const void *projec
         });
         createdSeconds += since(start);
         if (aborted || !canvas) return;
+        {
+            // Draws on the pass's target are the projection; the rest drew the image.
+            const unsigned pass = unsigned(singlePassDrawCalls() - passBefore), all = unsigned(deviceDrawCalls() - drawsBefore);
+            projectionDraws += pass; imageDraws += all > pass ? all - pass : 0;
+        }
         auto &entry = entries[entryCount++];
         entry.instance = caster;
         std::memcpy(entry.light, light, sizeof(entry.light));
         std::memcpy(entry.projection, projection, sizeof(entry.projection));
         entry.handle = canvasHandle(canvas);
         entry.used = false;
+        entry.slot = unsigned(slot);
         ++created;
         return;
     }
@@ -12932,6 +13019,12 @@ void *shadowReuseProbeTexture() noexcept {
     std::memcpy(&texture, data + size_t(handle - 1) * 0x1c, 4);
     return texture;
 }
+void shadowCarryStats(unsigned &carried, double &carriedMs, unsigned &imageDraws, unsigned &projectionDraws) noexcept {
+    carriedMs = 1000 * std::exchange(shadow_reuse::carriedSeconds, 0.);
+    carried = std::exchange(shadow_reuse::carried, 0u);
+    imageDraws = std::exchange(shadow_reuse::imageDraws, 0u);
+    projectionDraws = std::exchange(shadow_reuse::projectionDraws, 0u);
+}
 void shadowReuseStats(unsigned &created, unsigned &reused, unsigned &missed, double &createdMs, double &reusedMs) noexcept {
     createdMs = 1000 * std::exchange(shadow_reuse::createdSeconds, 0.);
     reusedMs = 1000 * std::exchange(shadow_reuse::reusedSeconds, 0.);
@@ -12960,6 +13053,7 @@ bool attach(bool headless) {
     setEyeReplay(settings.eyeReplay);
     setSinglePass(settings.singlePass);
     single_pass::setInstancing(settings.singlePassInstancing);
+    single_pass::setLazyState(settings.singlePassLazyState);
     setLabAutoContinue(settings.labAutoContinue);
     auto g = GetModuleHandleW(L"Sam2Game.dll"), e = GetModuleHandleW(L"Engine.dll"),
          c = GetModuleHandleW(L"Core.dll");

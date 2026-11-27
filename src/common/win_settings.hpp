@@ -74,6 +74,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
     settings.foveation.mode = int(number(L"Render", L"Foveation", 1, 0, 2) + .5f);
     settings.desktopWorld = number(L"Render", L"DesktopWorld", 0, 0, 1) >= .5f;
     settings.shadowReuse = number(L"Render", L"ShadowReuse", 1, 0, 1) >= .5f;
+    settings.shadowRefreshFrames = int(number(L"Render", L"ShadowRefreshFrames", 1, 1, 8) + .5f);
     settings.eagerRequests = number(L"Render", L"EagerRequests", 0, 0, 1) >= .5f;
     settings.waterMirror = number(L"Render", L"WaterMirror", 0, 0, 1) >= .5f;
     settings.waterMirrorScale = number(L"Render", L"WaterMirrorScale", .5f, .25f, 1);
@@ -102,6 +103,7 @@ inline VrSettings loadSettings(const std::wstring &filename) {
         std::wcsncpy(v.device, device, 63);
     }
     settings.singlePassInstancing = number(L"Render", L"SinglePassInstancing", 0, 0, 1) >= .5f;
+    settings.singlePassLazyState = number(L"Render", L"SinglePassLazyState", 1, 0, 1) >= .5f;
     settings.uiAspect = number(L"Render", L"UiAspect", 16.f / 9, 1.f, 2.5f);
     settings.refreshRate = profiled(L"Render", L"RefreshRate", 0, 72, 0, 240);
     settings.drawDistance = profiled(L"Render", L"DrawDistance", 2, 1, 1, 4);

@@ -22,6 +22,7 @@ struct Originals {
 bool install(IDirect3DDevice9 *device, const Originals &originals) noexcept;
 bool installed() noexcept;
 void setInstancing(bool enabled) noexcept; // [Render] SinglePassInstancing
+void setLazyState(bool enabled) noexcept;  // [Render] SinglePassLazyState
 // Draws made while set show the centre view in every eye (no per-eye
 // reprojection): camera-attached effects, which two-pass renders draw in front
 // of each eye's own camera.
@@ -105,6 +106,7 @@ struct Stats {
     unsigned passes = 0, draws = 0, instanced = 0, unpatched = 0, stateChanges = 0, variants = 0, failedVariants = 0, suspensions = 0, userPointer = 0, screenLocked = 0, scissors = 0, farExtended = 0;
 };
 Stats takeStats() noexcept;
+uint64_t totalDraws() noexcept; // Engine draws the pass has issued for both eyes, ever.
 // Lab: instance only eligible draws with index in [lo, hi) (counted per pass);
 // logs the programs of eligible draw `detail`.
 void labInstanceRange(unsigned lo, unsigned hi, unsigned detail) noexcept;

@@ -268,6 +268,70 @@ void hookSoundNames(HMODULE engine) {
         MH_EnableHook(source) == MH_OK && MH_EnableHook(channel) == MH_OK;
     log("Sound file names %s", ok ? "logged" : "unavailable");
 }
+// Lab (SS2VR_LAB_SOUND_PERF=1): the engine reaches its sound backend (SfxOAL or
+// SfxDSD) through exported function pointers; the per-frame ones are wrapped to
+// count their calls and time, so the two backends can be compared in one table.
+namespace backend_perf {
+struct Counter { std::atomic<uint64_t> calls{0}, ticks{0}; };
+Counter counters[5]; // isPlaying, hasFreePacket, loadSoundPacket, updateSource, applyChanges
+struct Timed {
+    Counter &counter; LARGE_INTEGER start;
+    explicit Timed(Counter &c) : counter(c) { QueryPerformanceCounter(&start); }
+    ~Timed() {
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        counter.calls.fetch_add(1, std::memory_order_relaxed);
+        counter.ticks.fetch_add(uint64_t(now.QuadPart - start.QuadPart), std::memory_order_relaxed);
+    }
+};
+using SourceInt = int(__cdecl *)(void *);
+using SourcePacket = int(__cdecl *)(void *, void *);
+using SourceVoid = void(__cdecl *)(void *);
+using Plain = void(__cdecl *)();
+SourceInt oIsPlaying = nullptr, oHasFreePacket = nullptr;
+SourcePacket oLoadSoundPacket = nullptr;
+SourceVoid oUpdateSource = nullptr;
+Plain oApplyChanges = nullptr;
+int __cdecl isPlaying(void *source) { Timed t(counters[0]); return oIsPlaying(source); }
+int __cdecl hasFreePacket(void *source) { Timed t(counters[1]); return oHasFreePacket(source); }
+int __cdecl loadSoundPacket(void *source, void *data) { Timed t(counters[2]); return oLoadSoundPacket(source, data); }
+void __cdecl updateSource(void *source) { Timed t(counters[3]); oUpdateSource(source); }
+void __cdecl applyChanges() { Timed t(counters[4]); oApplyChanges(); }
+bool enabled() {
+    static const bool on = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SOUND_PERF", v, 2) == 1 && v[0] == L'1'; }();
+    return on;
+}
+// The backend has just set its pointers (sound startup or an API change).
+template <class F> void wrap(HMODULE engine, const char *name, F detour, F &original) {
+    auto *slot = reinterpret_cast<F *>(GetProcAddress(engine, name));
+    if (!slot || !*slot || *slot == detour) return;
+    original = *slot;
+    *slot = detour;
+}
+void install() {
+    const HMODULE engine = enabled() ? GetModuleHandleW(L"Engine.dll") : nullptr;
+    if (!engine) return;
+    wrap(engine, "?_sfxIsPlaying@SeriousEngine@@3P6AHAAUSoundSource@1@@ZA", &isPlaying, oIsPlaying);
+    wrap(engine, "?_sfxHasFreePacket@SeriousEngine@@3P6AHAAUSoundSource@1@@ZA", &hasFreePacket, oHasFreePacket);
+    wrap(engine, "?_sfxLoadSoundPacket@SeriousEngine@@3P6AHAAUSoundSource@1@PAX@ZA", &loadSoundPacket, oLoadSoundPacket);
+    wrap(engine, "?_sfxUpdateSource@SeriousEngine@@3P6AXAAUSoundSource@1@@ZA", &updateSource, oUpdateSource);
+    wrap(engine, "?_sfxApplyChanges@SeriousEngine@@3P6AXXZA", &applyChanges, oApplyChanges);
+    log("Sound backend calls timed: isPlaying=%d hasFreePacket=%d loadSoundPacket=%d updateSource=%d applyChanges=%d",
+        int(oIsPlaying != nullptr), int(oHasFreePacket != nullptr), int(oLoadSoundPacket != nullptr), int(oUpdateSource != nullptr),
+        int(oApplyChanges != nullptr));
+}
+void report(double seconds) {
+    if (!enabled() || !(seconds > 0)) return;
+    LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
+    const double toMs = frequency.QuadPart ? 1000. / double(frequency.QuadPart) : 0.;
+    double n[5], ms[5];
+    for (unsigned i = 0; i < 5; ++i) {
+        n[i] = double(counters[i].calls.exchange(0)) / seconds;
+        ms[i] = double(counters[i].ticks.exchange(0)) * toMs / seconds;
+    }
+    log("Sound backend per s: isPlaying n=%.0f %.2fms | hasFreePacket n=%.0f %.2fms | loadSoundPacket n=%.0f %.2fms | "
+        "updateSource n=%.0f %.2fms | applyChanges n=%.0f %.2fms", n[0], ms[0], n[1], ms[1], n[2], ms[2], n[3], ms[3], n[4], ms[4]);
+}
+} // namespace backend_perf
 void(__cdecl *originalStartup)(int, long) = nullptr;
 void __cdecl startup(int api, long frequency) {
     // The engine's settings are not loaded yet: read [Audio] here.
@@ -279,11 +343,13 @@ void __cdecl startup(int api, long frequency) {
     const int chosen = chooseApi(api);
     originalStartup(chosen, frequency);
     log("Spatial audio: sound started (api %d)", chosen);
+    backend_perf::install();
 }
 
 } // namespace
 
 void configure(const Config &c) { config = c; }
+void measureBackend() { backend_perf::install(); }
 
 void guardSawEngine(bool active, bool sawHeld) {
     if (!channelPlaying || !channelSound || !channelStop) return;
@@ -421,6 +487,11 @@ void frame() {
     const uint64_t now = GetTickCount64();
     const float seconds = lastFrame && now > lastFrame ? std::min(.25f, float(now - lastFrame) / 1000.f) : 0.f;
     lastFrame = now;
+    {
+        static uint64_t backendReported = 0;
+        if (!backendReported) backendReported = now;
+        else if (now - backendReported >= 5000) { backend_perf::report(double(now - backendReported) / 1000.); backendReported = now; }
+    }
     static uint64_t reported = 0;
     static unsigned reports = 0;
     if (preparedOk && now - reported >= 5000 && reports < 60) {

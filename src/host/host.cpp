@@ -1450,7 +1450,7 @@ struct Host {
     uint64_t retired = 0, submissions = 0, reused = 0, lastSubmittedSequence = 0;
     ULONGLONG lastDiagnostics = 0, lastMutexDiagnostic = 0;
     // Host cost accounting for the 5 s diagnostics line (milliseconds sums).
-    double perfWait = 0, perfUpload = 0, perfLoop = 0, perfSubmit = 0, perfPairAge = 0;
+    double perfWait = 0, perfUpload = 0, perfLoop = 0, perfSubmit = 0, perfPairAge = 0, perfRetry = 0;
     uint64_t perfLoops = 0, perfUploads = 0;
     LARGE_INTEGER perfLoopStart{};
     static double perfMs(LARGE_INTEGER a, LARGE_INTEGER b) {
@@ -3633,12 +3633,13 @@ struct Host {
         log.write(line);
         if (perfLoops) {
             std::snprintf(line, sizeof(line),
-                          "Host perf loops=%llu loop=%.2fms wait=%.2fms submit=%.2fms uploads=%llu upload=%.2fms pair_age=%.1fms zero_copy=%llu latched=%llu eager=%llu copy_retries=%llu",
+                          "Host perf loops=%llu loop=%.2fms wait=%.2fms submit=%.2fms uploads=%llu upload=%.2fms pair_age=%.1fms zero_copy=%llu latched=%llu eager=%llu copy_retries=%llu retry=%.2fms",
                           static_cast<unsigned long long>(perfLoops), perfLoop / perfLoops, perfWait / perfLoops,
                           perfSubmit / perfLoops, static_cast<unsigned long long>(perfUploads),
                           perfUploads ? perfUpload / perfUploads : 0., perfUploads ? perfPairAge / perfUploads : 0.,
                           static_cast<unsigned long long>(zeroCopyPairs), static_cast<unsigned long long>(latched),
-                          static_cast<unsigned long long>(eagerRequests), static_cast<unsigned long long>(copyRetries));
+                          static_cast<unsigned long long>(eagerRequests), static_cast<unsigned long long>(copyRetries),
+                          perfRetry / perfLoops);
             log.write(line);
         }
         if (mutexStats.longHolds) {
@@ -3648,7 +3649,7 @@ struct Host {
             log.write(line);
             mutexStats = {};
         }
-        perfWait = perfUpload = perfLoop = perfSubmit = perfPairAge = 0;
+        perfWait = perfUpload = perfLoop = perfSubmit = perfPairAge = perfRetry = 0;
         perfLoops = perfUploads = 0;
     }
     void run() {
@@ -3891,8 +3892,22 @@ struct Host {
             const auto endResult = frame.submit(layers);
             perfSubmit += perfMs(submitStart, perfNow());
             if (retryRequest) {
+                // The eye copy runs on the GPU between the game's own work, usually within
+                // a millisecond or two; checked only once here, the request waited for
+                // the next display frame (the game idle meanwhile). This loop would
+                // otherwise sleep in xrWaitFrame, so a bounded part of that time goes to
+                // watching the copy: at most 3 ms and under a third of the display period.
                 retryRequest = false;
-                if (requestEyes(retried) == Admission::Posted) { ++copyRetries; if (retryEager) ++eagerRequests; }
+                const double periodMs = double(frameState.predictedDisplayPeriod) / 1e6;
+                const double budget = std::min(3.0, periodMs > 0 ? periodMs * .3 : 2.0);
+                const LARGE_INTEGER retryStart = perfNow();
+                for (;;) {
+                    const Admission again = requestEyes(retried);
+                    if (again == Admission::Posted) { ++copyRetries; if (retryEager) ++eagerRequests; }
+                    if (again != Admission::CopyGate || perfMs(retryStart, perfNow()) >= budget || quit || api.lossPending) break;
+                    Sleep(1);
+                }
+                perfRetry += perfMs(retryStart, perfNow());
             }
             worldSubmission.sample(GetCurrentProcessId(),cachedRequest,endResult==XR_SUCCESS &&
                 worldPresented && std::find(layers.begin(),layers.end(),world)!=layers.end());

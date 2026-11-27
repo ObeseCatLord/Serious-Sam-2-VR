@@ -16,6 +16,8 @@ void configure(const Config &config);
 // At Direct3DCreate9, before the game starts its sound: hooks Engine's
 // sfxStartup_t so sound starts on OpenAL (the configured API is left alone).
 void installStartupHook();
+// Lab (SS2VR_LAB_SOUND_PERF=1): times the sound backend's per-frame calls (either backend).
+void measureBackend();
 // Loads Bin/SS2VR/OpenAL32.dll (so SfxOAL's import binds to it) with its
 // configuration and checks that it opens a device. True when the game may use
 // the OpenAL backend.

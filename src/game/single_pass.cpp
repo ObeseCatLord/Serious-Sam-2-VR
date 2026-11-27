@@ -47,6 +47,17 @@ bool hooked = false, hookFailed = false;
 // seam column) came from the engine reading back the wide viewport, the seam
 // pixel centre and the eye test reaching texcoord sets pixel programs read.
 bool instancingEnabled = false;
+// [Render] SinglePassLazyState: the state applied for the halves (whole-target
+// viewport, forced scissor test, region scissor, instancing frequency, pixel
+// variant) stays on the device between consecutive pass draws and is put back
+// only when something other than a pass draw could see it (a clear, a render
+// target change, a draw the pass does not split, the pass's end). The engine's
+// own reads of that state are answered from the tracked values either way (the
+// Get hooks). On native Direct3D 9 each engine draw otherwise costs five more
+// state calls (viewport twice, scissor test twice, scissor rectangle) and a
+// viewport change the driver revalidates.
+bool lazyState = false;
+uint64_t drawTotal = 0;
 const float *engineAdjusted = nullptr, *engineProjection = nullptr, *engineView = nullptr;
 
 // Engine-side binding state, tracked on every call.
@@ -633,7 +644,9 @@ bool scissorApplied = false; // The device scissor is `appliedScissor`, not the 
 RECT appliedScissor{};
 IDirect3DPixelShader9 *appliedPixelShader = nullptr;
 void applyScissor(IDirect3DDevice9 *d, const RECT &r) noexcept {
-    if (scissorApplied && !std::memcmp(&appliedScissor, &r, sizeof(r))) return;
+    // Lazy state: always set (a render target bound and restored past the pass's
+    // hooks resets the device rectangle without this cache knowing).
+    if (!lazyState && scissorApplied && !std::memcmp(&appliedScissor, &r, sizeof(r))) return;
     oSetScissor(d, &r);
     appliedScissor = r; scissorApplied = true;
 }
@@ -664,7 +677,10 @@ HRESULT WINAPI hSetPixelShader(IDirect3DDevice9 *d, IDirect3DPixelShader9 *s) {
     appliedPixelShader = s;
     return oSetPixelShader(d, s);
 }
+void applyPlanes(IDirect3DDevice9 *d, int k) noexcept;
 HRESULT WINAPI hSetClipPlane(IDirect3DDevice9 *d, DWORD index, const float *plane) {
+    // Lazy state: the other planes still hold a region's transformed values.
+    if (lazyState && planesApplied) applyPlanes(d, -1);
     if (index < 6 && plane) std::memcpy(enginePlanes[index], plane, sizeof(enginePlanes[index]));
     planesApplied = false;
     return oSetClipPlane(d, index, plane);
@@ -691,7 +707,10 @@ HRESULT WINAPI hSetScissor(IDirect3DDevice9 *d, const RECT *r) {
 }
 HRESULT WINAPI hSetRenderState(IDirect3DDevice9 *d, D3DRENDERSTATETYPE s, DWORD v) {
     if (s == D3DRS_COLORWRITEENABLE) colorWrites = v;
-    if (s == D3DRS_CLIPPLANEENABLE) clipPlanes = v & 0x3f;
+    if (s == D3DRS_CLIPPLANEENABLE) {
+        if (lazyState && planesApplied) applyPlanes(d, -1); // Under the mask they were applied for.
+        clipPlanes = v & 0x3f;
+    }
     if (s == D3DRS_SCISSORTESTENABLE) {
         scissorEnabled = v != 0;
         forcedScissor = false;
@@ -1237,7 +1256,7 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
 // applied for the halves.
 template<class Call> HRESULT bothHalves(IDirect3DDevice9 *d, Call call, bool instancing = true) noexcept {
     const HRESULT hr = issueHalves(d, call, instancing);
-    perHalfState(d);
+    if (!lazyState) perHalfState(d);
     return hr;
 }
 template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool instancing) noexcept {
@@ -1384,7 +1403,7 @@ template<class Call> HRESULT issueHalves(IDirect3DDevice9 *d, Call call, bool in
         }
     }
     const bool stereo = stereoBound();
-    if (stereo && !writeRecords(d)) return call(false);
+    if (stereo && !writeRecords(d)) { perHalfState(d); return call(false); }
     HRESULT result = D3D_OK;
     if (labMirrorMode() == 2) {
         result = perHalf(d, call, stereo, true);
@@ -1588,6 +1607,8 @@ bool install(IDirect3DDevice9 *d, const Originals &o) noexcept {
 }
 bool installed() noexcept { return hooked; }
 void setInstancing(bool enabled) noexcept { instancingEnabled = enabled; }
+uint64_t totalDraws() noexcept { return drawTotal; }
+void setLazyState(bool enabled) noexcept { lazyState = enabled; }
 void setScreenLocked(bool locked) noexcept { engineScreenLock = locked; }
 void setMainView(const float *v) noexcept {
     if (!v) return;
@@ -1640,8 +1661,15 @@ const float *engineProjectionMatrix() noexcept { return engineProjection; }
 bool backgroundBound() noexcept { return engineView && engineProjection && backgroundViewer(engineView, engineProjection); }
 bool programBound() noexcept { return engineShader != nullptr; }
 DWORD engineClipPlanes() noexcept { return clipPlanes; }
-void rawClipPlane(IDirect3DDevice9 *d, DWORD index, const float *plane) noexcept { if (oSetClipPlane) oSetClipPlane(d, index, plane); }
-void rawRenderState(IDirect3DDevice9 *d, D3DRENDERSTATETYPE state, DWORD value) noexcept { if (oSetRenderState) oSetRenderState(d, state, value); }
+// Lazy state: these callers work past the pass's tracking and expect the engine's state on the device.
+void rawClipPlane(IDirect3DDevice9 *d, DWORD index, const float *plane) noexcept {
+    if (lazyState && active) perHalfState(d);
+    if (oSetClipPlane) oSetClipPlane(d, index, plane);
+}
+void rawRenderState(IDirect3DDevice9 *d, D3DRENDERSTATETYPE state, DWORD value) noexcept {
+    if (lazyState && active) perHalfState(d);
+    if (oSetRenderState) oSetRenderState(d, state, value);
+}
 Layout wideLayoutOf(UINT width, UINT height) noexcept {
     Layout l;
     l.width = width * 2; l.height = height; l.count = 2;
@@ -1761,7 +1789,7 @@ unsigned vertexCount(D3DPRIMITIVETYPE type, UINT primitives) noexcept {
     }
 }
 HRESULT draw(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT start, UINT count) noexcept {
-    ++stats.draws;
+    ++stats.draws; ++drawTotal;
     currentPrimitive = type;
     const unsigned vertices = vertexCount(type, count);
     return bothHalves(d, [&](bool instances) -> HRESULT {
@@ -1777,18 +1805,18 @@ HRESULT draw(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT start, UINT count)
     }, identityIndices && vertices <= 65536 && labInstancePlain());
 }
 HRESULT drawIndexed(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, INT base, UINT minimum, UINT vertices, UINT start, UINT count) noexcept {
-    ++stats.draws;
+    ++stats.draws; ++drawTotal;
     currentPrimitive = type;
     return bothHalves(d, [&](bool) { return bridge.drawIndexed(d, type, base, minimum, vertices, start, count); });
 }
 HRESULT drawUp(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT count, const void *data, UINT stride) noexcept {
-    ++stats.draws; ++stats.userPointer;
+    ++stats.draws; ++drawTotal; ++stats.userPointer;
     currentPrimitive = type;
     return bothHalves(d, [&](bool) { return bridge.drawUp(d, type, count, data, stride); }, false);
 }
 HRESULT drawIndexedUp(IDirect3DDevice9 *d, D3DPRIMITIVETYPE type, UINT minimum, UINT vertices, UINT count, const void *indices,
                       D3DFORMAT format, const void *data, UINT stride) noexcept {
-    ++stats.draws; ++stats.userPointer;
+    ++stats.draws; ++drawTotal; ++stats.userPointer;
     currentPrimitive = type;
     return bothHalves(d, [&](bool) { return bridge.drawIndexedUp(d, type, minimum, vertices, count, indices, format, data, stride); }, false);
 }
