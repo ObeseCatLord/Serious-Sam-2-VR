@@ -3247,6 +3247,8 @@ void presentDevice(IDirect3DDevice9 *d, uintptr_t caller, const RECT *src, const
     });
 }
 static LARGE_INTEGER lastPresentEnd{}, lastStereoEnd{};
+// Lab sampler window SS2VR_LAB_SAMPLER=2: stereo end -> Present start ("after stereo").
+static std::atomic<bool> afterStereoWindow{false};
 void notePerfSection(unsigned section, LARGE_INTEGER start) noexcept {
     if (section < 7) perf.section[section] += PerfClock::seconds(start, PerfClock::now());
 }
@@ -3316,6 +3318,7 @@ static void paceToHeadset() {
 }
 void notePresentCall(LARGE_INTEGER start, LARGE_INTEGER end) noexcept {
     perf.presentCall += PerfClock::seconds(start, end);
+    afterStereoWindow.store(false, std::memory_order_relaxed);
     if (lastStereoEnd.QuadPart) perf.postStereo += PerfClock::seconds(lastStereoEnd, start);
     lastStereoEnd = {};
     pollSharedFences(); // Present flushed the frame: its pair is often complete already.
@@ -4882,6 +4885,8 @@ namespace sampler {
 static HANDLE target = nullptr;
 static std::atomic<bool> running{false};
 static std::atomic<bool> inEyes{false}; // Sample only while an eye renders.
+static bool afterMode = false;           // SS2VR_LAB_SAMPLER=2: the after-stereo window instead.
+static bool window() noexcept { return (afterMode ? afterStereoWindow : inEyes).load(std::memory_order_relaxed); }
 struct Module { uintptr_t base = 0, end = 0; char name[48]{}; uint32_t samples = 0; };
 static Module modules[96];
 static unsigned moduleCount = 0;
@@ -4958,10 +4963,10 @@ static DWORD WINAPI run(void *) {
     uint64_t last = GetTickCount64();
     while (running.load()) {
         Sleep(1);
-        if (inEyes.load(std::memory_order_relaxed) && SuspendThread(target) != DWORD(-1)) {
+        if (window() && SuspendThread(target) != DWORD(-1)) {
             CONTEXT context{};
             context.ContextFlags = CONTEXT_CONTROL;
-            const bool ok = GetThreadContext(target, &context) && inEyes.load(std::memory_order_relaxed);
+            const bool ok = GetThreadContext(target, &context) && window();
             ResumeThread(target);
             if (ok) {
                 record(context.Eip);
@@ -5009,12 +5014,14 @@ static DWORD WINAPI run(void *) {
     return 0;
 }
 static void start() {
-    static const bool enabled = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SAMPLER", value, 2) == 1 && value[0] == L'1'; }();
+    static const wchar_t mode = [] { wchar_t value[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_SAMPLER", value, 2) == 1 ? value[0] : L'0'; }();
+    const bool enabled = mode == L'1' || mode == L'2';
+    afterMode = mode == L'2';
     if (!enabled || running.exchange(true)) return;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &target,
                          THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0)) return;
     if (HANDLE thread = CreateThread(nullptr, 0, run, nullptr, 0, nullptr)) CloseHandle(thread);
-    log("Lab sampler started on render thread %lu", GetCurrentThreadId());
+    log("Lab sampler started on render thread %lu window=%s", GetCurrentThreadId(), afterMode ? "after stereo" : "eyes");
 }
 } // namespace sampler
 void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRender) {
@@ -5026,6 +5033,7 @@ void stereo(void *puppet,void(__thiscall *original)(void *),EyePostRender postRe
         bool pair = false;
         ~StereoTimer() {
             lastStereoEnd = PerfClock::now();
+            afterStereoWindow.store(true, std::memory_order_relaxed);
             const double spent = PerfClock::seconds(start, lastStereoEnd);
             if (pair) perf.stereo += spent;
             else { perf.mono += spent; ++perf.monoFrames; }

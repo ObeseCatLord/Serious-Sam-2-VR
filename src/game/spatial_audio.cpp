@@ -332,6 +332,110 @@ void report(double seconds) {
         "updateSource n=%.0f %.2fms | applyChanges n=%.0f %.2fms", n[0], ms[0], n[1], ms[1], n[2], ms[2], n[3], ms[3], n[4], ms[4]);
 }
 } // namespace backend_perf
+// Stream recovery. Measured on Windows: with the OpenAL backend (SfxOAL) the
+// engine loads about eight more stream packets every frame than with DirectSound
+// (the same 8 KB packets, queue of eight: about thirty times real time of OGG
+// decoding, 0.9 ms of every frame on the render thread). The explanation this
+// acts on, not yet confirmed by a run: a stream whose queue ran dry (a stall
+// longer than its 0.37 s, e.g. a level load) is stopped by OpenAL; the backend
+// never starts it again (its start waits for "not every buffer processed", and a
+// stopped source reports every buffer processed), while its free-packet test
+// stays true for the same reason, so the engine refills the whole queue every
+// frame for a stream nobody hears. DirectSound's looping buffer has no such state.
+// The free-packet test is wrapped: a source found stopped while the engine still
+// feeds it gets one full queue of fresh packets and is started again (Windows
+// A/B: packet traffic then matches DirectSound's: ~22 loads/s instead of ~700). The engine's own stop rewinds the source (initial state): left alone.
+// A stream fed that fast in any other state is only reported (state, queue).
+// Lab: SS2VR_LAB_STREAM_RECOVERY=0 leaves the backend as it is; =2 only holds a
+// dry stream (no restart). Default: the refilled stream is started again, as
+// DirectSound would still be playing it (the music stayed silent without it).
+namespace stream_recovery {
+constexpr ALenum AlSourceState = 0x1010, AlStopped = 0x1014, AlBuffersQueued = 0x1015;
+using HasFreePacket = int(__cdecl *)(void *);
+HasFreePacket original = nullptr;
+struct Stream { ALuint source = 0; int fed = 0; unsigned restarts = 0; uint64_t restartedAt = 0, burstAt = 0; unsigned burst = 0; };
+Stream streams[16];
+std::atomic<unsigned> restarted{0}, held{0};
+bool restart = false;
+std::atomic<uint32_t> polled{0}; // Bit per stream slot asked about since the last report.
+Stream &streamOf(ALuint source) {
+    Stream *free = nullptr;
+    for (auto &s : streams) {
+        if (s.source == source) return s;
+        if (!s.source && !free) free = &s;
+    }
+    if (!free) free = &streams[source % std::size(streams)];
+    *free = {};
+    free->source = source;
+    return *free;
+}
+void(__cdecl *alSourcePlayRaw)(ALuint) = nullptr;
+int __cdecl hasFreePacket(void *source) {
+    if (!source || !alGetSourcei) return original(source);
+    const ALuint id = *static_cast<const ALuint *>(source);
+    ALint state = 0, queued = 0;
+    alGetSourcei(id, AlSourceState, &state);
+    Stream &stream = streamOf(id);
+    polled.fetch_or(1u << unsigned(&stream - streams), std::memory_order_relaxed);
+    if (state != AlStopped) {
+        stream.fed = 0; stream.restarts = 0;
+        const int free = original(source);
+        // A stream fed far faster than it plays in any other state: reported, not changed.
+        const uint64_t now = GetTickCount64();
+        if (now - stream.burstAt > 100) { stream.burstAt = now; stream.burst = 0; }
+        if (free && ++stream.burst == 17) {
+            static unsigned logged = 0;
+            ALint processed = 0;
+            alGetSourcei(id, AlBuffersQueued, &queued);
+            alGetSourcei(id, 0x1016, &processed); // AL_BUFFERS_PROCESSED
+            if (logged++ < 6) log("Spatial audio: stream source %u fed %u packets in 0.1 s in state %x (queued %d processed %d)", id, stream.burst, state, queued, processed);
+        }
+        return free;
+    }
+    alGetSourcei(id, AlBuffersQueued, &queued);
+    if (queued <= 0) return original(source); // Nothing queued: the backend's own first fill.
+    if (stream.fed < queued) {
+        // A full queue of fresh packets first (each "free" answer is followed by a load).
+        const int free = original(source);
+        if (free) ++stream.fed;
+        return free;
+    }
+    const uint64_t now = GetTickCount64();
+    if (restart && stream.restarts < 3 && (!stream.restartedAt || now - stream.restartedAt > 250)) {
+        ++stream.restarts;
+        stream.restartedAt = now;
+        stream.fed = 0;
+        if (originalSourcePlay) originalSourcePlay(id); else if (alSourcePlayRaw) alSourcePlayRaw(id);
+        static unsigned logged = 0;
+        if (logged++ < 12) log("Spatial audio: stream source %u had run dry (%d buffers); refilled and started again", id, queued);
+        ++restarted;
+        ALint after = 0;
+        alGetSourcei(id, AlSourceState, &after);
+        if (after != AlStopped) return original(source);
+    }
+    ++held; // Stopped and full: decoding more would only replace what nobody hears.
+    return 0;
+}
+void install() {
+    wchar_t v[2]{};
+    const bool set = GetEnvironmentVariableW(L"SS2VR_LAB_STREAM_RECOVERY", v, 2) == 1;
+    if (set && v[0] == L'0') return;
+    restart = !(set && v[0] == L'2'); // Windows A/B: restarting matches DirectSound's packet traffic exactly.
+    const HMODULE engine = GetModuleHandleW(L"Engine.dll");
+    // Only the OpenAL the mod loaded, behind the game's own OpenAL backend.
+    const HMODULE backend = GetModuleHandleW(L"SfxOAL.dll");
+    auto *slot = engine ? reinterpret_cast<HasFreePacket *>(GetProcAddress(engine, "?_sfxHasFreePacket@SeriousEngine@@3P6AHAAUSoundSource@1@@ZA")) : nullptr;
+    HMODULE owner = nullptr;
+    if (!preparedOk || !openal || GetModuleHandleW(L"OpenAL32.dll") != openal || !alGetSourcei || !backend || !slot || !*slot ||
+        !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(*slot), &owner) || owner != backend) return; // Not SfxOAL's own test.
+    alSourcePlayRaw = reinterpret_cast<void(__cdecl *)(ALuint)>(GetProcAddress(openal, "alSourcePlay"));
+    for (auto &s : streams) s = {};
+    original = *slot;
+    *slot = &hasFreePacket;
+    log("Spatial audio: stream recovery on (a stream that ran dry is refilled once and %s)", restart ? "started again" : "fed no more");
+}
+} // namespace stream_recovery
 void(__cdecl *originalStartup)(int, long) = nullptr;
 void __cdecl startup(int api, long frequency) {
     // The engine's settings are not loaded yet: read [Audio] here.
@@ -343,13 +447,14 @@ void __cdecl startup(int api, long frequency) {
     const int chosen = chooseApi(api);
     originalStartup(chosen, frequency);
     log("Spatial audio: sound started (api %d)", chosen);
+    stream_recovery::install(); // Before the timing wrappers, which then time it too.
     backend_perf::install();
 }
 
 } // namespace
 
 void configure(const Config &c) { config = c; }
-void measureBackend() { backend_perf::install(); }
+void measureBackend() { stream_recovery::install(); backend_perf::install(); }
 
 void guardSawEngine(bool active, bool sawHeld) {
     if (!channelPlaying || !channelSound || !channelStop) return;
@@ -502,9 +607,11 @@ void frame() {
         for (const auto &s : tracker.sources)
             if (s.used) { ++tracked; if (s.occlusion > .5f) ++occluded; }
         ReleaseSRWLockShared(&lock);
-        log("Spatial audio: module=%d plays=%u positions=%u listener=%u head=%u rays=%u blocked=%u sources=%u occluded=%u", int(GetModuleHandleW(L"OpenAL32.dll") == openal),
+        log("Spatial audio: module=%d plays=%u positions=%u listener=%u head=%u rays=%u blocked=%u sources=%u occluded=%u streams=%u restarted=%u held=%u", int(GetModuleHandleW(L"OpenAL32.dll") == openal),
             playCalls.exchange(0), positionCalls.exchange(0),
-            listenerCalls.exchange(0), listenerHead.exchange(0), traceCalls.exchange(0), blockedCalls.exchange(0), tracked, occluded);
+            listenerCalls.exchange(0), listenerHead.exchange(0), traceCalls.exchange(0), blockedCalls.exchange(0), tracked, occluded,
+            unsigned(__builtin_popcount(stream_recovery::polled.exchange(0))),
+            stream_recovery::restarted.exchange(0), stream_recovery::held.exchange(0));
     }
     if (!preparedOk || !hooked || !alcGetCurrentContext || !alcGetCurrentContext()) return;
     static const bool trace = [] { wchar_t v[2]{}; return GetEnvironmentVariableW(L"SS2VR_LAB_AUDIO_TRACE", v, 2) == 1 && v[0] == L'1'; }();
